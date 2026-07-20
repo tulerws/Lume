@@ -1,0 +1,84 @@
+import type { AgentSession, HistoryEntry } from "$lib/domain";
+
+export const demoSessions: AgentSession[] = [
+  {
+    id: "codex-lume",
+    agent: "codex",
+    agentLabel: "Codex",
+    project: "Lume",
+    source: "vscode",
+    status: "running",
+    statusLabel: "Implementando a interface",
+    startedAt: "2026-07-20T15:32:00-03:00",
+    permissionProfile: {
+      mode: "workspace_write",
+      label: "Acesso ao projeto",
+      approvalPolicy: "Pede confirmação fora do workspace",
+      canRespondFromLume: true,
+      availableActions: ["allow_once", "deny"],
+    },
+  },
+  {
+    id: "claude-api",
+    agent: "claude",
+    agentLabel: "Claude",
+    project: "vibeservice-api",
+    source: "cli",
+    status: "permission_required",
+    statusLabel: "Aguardando permissão",
+    startedAt: "2026-07-20T15:28:00-03:00",
+    permissionProfile: {
+      mode: "read_only",
+      label: "Somente leitura",
+      approvalPolicy: "Confirma alterações e comandos",
+      canRespondFromLume: true,
+      availableActions: ["allow_once", "allow_session", "deny"],
+    },
+    pendingPermission: {
+      id: "permission-claude-1",
+      kind: "command",
+      summary: "Executar a suíte de testes do projeto",
+      resource: "npm test",
+      risk: "low",
+      requestedAt: "2026-07-20T15:35:00-03:00",
+    },
+  },
+  {
+    id: "gemini-web",
+    agent: "gemini",
+    agentLabel: "Gemini",
+    project: "Pesquisa de referências",
+    source: "web",
+    status: "completed",
+    statusLabel: "Finalizado há 2 min",
+    startedAt: "2026-07-20T15:18:00-03:00",
+    permissionProfile: {
+      mode: "full_access",
+      label: "Sem acesso local",
+      approvalPolicy: "Monitoramento da aba",
+      canRespondFromLume: false,
+      availableActions: ["open_source"],
+    },
+  },
+];
+
+export const demoHistory: HistoryEntry[] = [
+  {
+    id: "history-1",
+    sessionId: "gemini-web",
+    agentLabel: "Gemini",
+    project: "Pesquisa de referências",
+    event: "completed",
+    summary: "Sessão finalizada",
+    createdAt: "2026-07-20T15:34:00-03:00",
+  },
+  {
+    id: "history-2",
+    sessionId: "codex-auth",
+    agentLabel: "Codex",
+    project: "auth-service",
+    event: "permission_allowed",
+    summary: "Permissão concedida uma vez",
+    createdAt: "2026-07-20T14:58:00-03:00",
+  },
+];
