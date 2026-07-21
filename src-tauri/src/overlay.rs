@@ -90,6 +90,8 @@ mod linux {
         window: &WebviewWindow,
         show_over_fullscreen: bool,
         monitor_id: Option<&str>,
+        position_x: Option<i32>,
+        position_y: Option<i32>,
     ) -> bool {
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
             return false;
@@ -110,6 +112,7 @@ mod linux {
             if (api.is_layer_window)(pointer) == 0 {
                 (api.init)(pointer);
             }
+            let mut left_margin = 0;
             let mut top_margin = 12;
             if let Some(display) = gtk::gdk::Display::default() {
                 let selected_index = monitor_id.and_then(|id| {
@@ -128,19 +131,34 @@ mod linux {
                 if let Some(monitor) = monitor {
                     let geometry = monitor.geometry();
                     let workarea = monitor.workarea();
+                    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+                    let window_width = window
+                        .outer_size()
+                        .map(|size| (f64::from(size.width) / scale).round() as i32)
+                        .unwrap_or(78);
+                    left_margin = position_x
+                        .map(|value| (f64::from(value) / scale).round() as i32)
+                        .unwrap_or_else(|| ((geometry.width() - window_width) / 2).max(0));
                     top_margin = (workarea.y() - geometry.y() + 12).max(12);
+                    if let Some(value) = position_y {
+                        top_margin = (f64::from(value) / scale).round() as i32;
+                    }
                     (api.set_monitor)(pointer, monitor.to_glib_none().0);
                 }
             }
             let desktop = std::env::var("XDG_CURRENT_DESKTOP")
                 .unwrap_or_default()
                 .to_lowercase();
-            if desktop.contains("gnome") || desktop.contains("cosmic") {
+            if position_y.is_none() && (desktop.contains("gnome") || desktop.contains("cosmic")) {
                 top_margin = top_margin.max(44);
             }
             // Top stays below fullscreen surfaces; Overlay is an explicit opt-in.
             (api.set_layer)(pointer, if show_over_fullscreen { 3 } else { 2 });
+            (api.set_anchor)(pointer, 0, 1);
+            (api.set_anchor)(pointer, 1, 0);
             (api.set_anchor)(pointer, 2, 1);
+            (api.set_anchor)(pointer, 3, 0);
+            (api.set_margin)(pointer, 0, left_margin.max(0));
             (api.set_margin)(pointer, 2, top_margin);
             (api.set_exclusive_zone)(pointer, -1);
             (api.set_keyboard_mode)(pointer, 2);
@@ -150,22 +168,115 @@ mod linux {
         }
         true
     }
+
+    pub fn move_to(window: &WebviewWindow, x: i32, y: i32, monitor_id: Option<&str>) -> bool {
+        if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
+            return false;
+        }
+        let Some(api) = api() else {
+            return false;
+        };
+        let Ok(gtk_window) = window.gtk_window() else {
+            return false;
+        };
+        unsafe {
+            let application_pointer: *mut gtk::ffi::GtkApplicationWindow =
+                gtk_window.to_glib_none().0;
+            let pointer = application_pointer.cast::<gtk::ffi::GtkWindow>();
+            if (api.is_layer_window)(pointer) == 0 {
+                return false;
+            }
+            if let Some(display) = gtk::gdk::Display::default() {
+                let selected_index = monitor_id.and_then(|id| {
+                    window.available_monitors().ok().and_then(|monitors| {
+                        monitors.iter().position(|monitor| {
+                            monitor
+                                .name()
+                                .as_ref()
+                                .is_some_and(|name| name.as_str() == id)
+                        })
+                    })
+                });
+                let monitor = selected_index
+                    .and_then(|index| display.monitor(index as i32))
+                    .or_else(|| display.primary_monitor());
+                if let Some(monitor) = monitor {
+                    (api.set_monitor)(pointer, monitor.to_glib_none().0);
+                }
+            }
+            let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+            (api.set_anchor)(pointer, 0, 1);
+            (api.set_anchor)(pointer, 1, 0);
+            (api.set_anchor)(pointer, 2, 1);
+            (api.set_anchor)(pointer, 3, 0);
+            (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
+            (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+        }
+        true
+    }
 }
 
 pub fn configure(
     window: &tauri::WebviewWindow,
     show_over_fullscreen: bool,
     monitor_id: Option<&str>,
+    position_x: Option<i32>,
+    position_y: Option<i32>,
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
-        linux::configure(window, show_over_fullscreen, monitor_id)
+        linux::configure(
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            position_x,
+            position_y,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (window, show_over_fullscreen, monitor_id);
+        let _ = (
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            position_x,
+            position_y,
+        );
         false
     }
+}
+
+pub fn move_to(
+    window: &tauri::WebviewWindow,
+    x: i32,
+    y: i32,
+    monitor_id: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux::move_to(window, x, y, monitor_id) {
+        return Ok(());
+    }
+
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let monitor = monitor_id
+        .and_then(|id| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name().is_some_and(|name| name == id))
+        })
+        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
+        .or_else(|| monitors.first());
+    let Some(monitor) = monitor else {
+        return Err("Nenhum monitor disponível".into());
+    };
+    window
+        .set_position(tauri::PhysicalPosition::new(
+            monitor.position().x + x,
+            monitor.position().y + y,
+        ))
+        .map_err(|error| error.to_string())
 }
 
 pub fn start_fullscreen_guard(

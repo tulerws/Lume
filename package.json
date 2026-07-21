@@ -1,6 +1,6 @@
 {
   "name": "lume",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Monitor local e discreto para agentes de IA no Windows e Linux.",
   "type": "module",
   "scripts": {
@@ -14,9 +14,12 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@iconify-icons/logos": "^1.2.36",
+    "@iconify/svelte": "^5.2.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "simple-icons": "^16.27.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

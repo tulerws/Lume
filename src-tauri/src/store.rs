@@ -221,4 +221,14 @@ mod tests {
         assert!(loaded[0].pending_permission.is_none());
         assert!(loaded[0].working_directory.is_none());
     }
+
+    #[test]
+    fn old_preferences_gain_optional_overlay_position() {
+        let preferences: Preferences = serde_json::from_str(
+            r#"{"soundEnabled":true,"autostart":true,"monitorId":null,"showOverFullscreen":false,"historyRetentionDays":30,"launchTarget":"auto"}"#,
+        )
+        .expect("preferências antigas");
+        assert!(preferences.overlay_x.is_none());
+        assert!(preferences.overlay_y.is_none());
+    }
 }

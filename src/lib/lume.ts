@@ -14,6 +14,8 @@ const inDesktop = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" i
 export const defaultPreferences: Preferences = {
   soundEnabled: true,
   autostart: true,
+  overlayX: undefined,
+  overlayY: undefined,
   showOverFullscreen: false,
   historyRetentionDays: 30,
   launchTarget: "auto",
@@ -41,6 +43,14 @@ export async function decidePermission(
 
 export async function openSessionSource(sessionId: string): Promise<void> {
   await invoke("open_session_source", { sessionId });
+}
+
+export async function moveOverlay(x: number, y: number, persist: boolean): Promise<void> {
+  await invoke("move_overlay", { x: Math.round(x), y: Math.round(y), persist });
+}
+
+export async function submitPrompt(sessionId: string, prompt: string): Promise<void> {
+  await invoke("submit_prompt", { sessionId, prompt });
 }
 
 export async function loadHistory(): Promise<HistoryEntry[]> {

@@ -100,11 +100,13 @@ pub struct HistoryEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
     pub sound_enabled: bool,
     pub autostart: bool,
     pub monitor_id: Option<String>,
+    pub overlay_x: Option<i32>,
+    pub overlay_y: Option<i32>,
     pub show_over_fullscreen: bool,
     pub history_retention_days: u16,
     pub launch_target: String,
@@ -116,6 +118,8 @@ impl Default for Preferences {
             sound_enabled: true,
             autostart: true,
             monitor_id: None,
+            overlay_x: None,
+            overlay_y: None,
             show_over_fullscreen: false,
             history_retention_days: 30,
             launch_target: "auto".into(),

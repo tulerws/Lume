@@ -84,6 +84,28 @@ impl CodexBridge {
         let _ = process.kill();
         Err("O servidor do Codex não respondeu a tempo".into())
     }
+
+    pub fn submit_prompt(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        profile: PermissionProfile,
+        state: AppState,
+        app: AppHandle,
+    ) -> Result<(), String> {
+        self.ensure_server()?;
+        let mut server = prompt_connection(thread_id, prompt, profile, &state, &app)?;
+        let thread_id = thread_id.to_string();
+        thread::Builder::new()
+            .name("lume-codex-prompt".into())
+            .spawn(move || {
+                if let Err(error) = monitor_prompt(&mut server, &thread_id, &state, &app) {
+                    eprintln!("Prompt do Lume encerrado: {error}");
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 impl Drop for CodexBridge {
@@ -186,6 +208,145 @@ fn transient(error: &std::io::Error) -> bool {
         error.kind(),
         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
     )
+}
+
+fn prompt_connection(
+    thread_id: &str,
+    prompt: &str,
+    profile: PermissionProfile,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+    let mut profiles = HashMap::from([(thread_id.to_string(), profile)]);
+
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") }
+            }
+        }),
+    )?;
+    wait_for_response(&mut server, 1, state, app, &profiles)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+    send_json(
+        &mut server,
+        json!({ "method": "thread/resume", "id": 2, "params": { "threadId": thread_id } }),
+    )?;
+    wait_for_response(&mut server, 2, state, app, &profiles)?;
+
+    let turn = prompt_turn_request(thread_id, prompt);
+    observe_client_message(&Message::Text(turn.to_string().into()), &mut profiles);
+    send_json(&mut server, turn)?;
+    wait_for_response(&mut server, 3, state, app, &profiles)?;
+    set_server_timeout(&mut server, Duration::from_millis(200))?;
+    Ok(server)
+}
+
+fn prompt_turn_request(thread_id: &str, prompt: &str) -> Value {
+    json!({
+        "method": "turn/start",
+        "id": 3,
+        "params": {
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": prompt }]
+        }
+    })
+}
+
+fn set_server_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| error.to_string()),
+        _ => Err("O Codex local deve usar uma conexão WebSocket sem TLS".into()),
+    }
+}
+
+fn send_json(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    value: Value,
+) -> Result<(), String> {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .map_err(|error| error.to_string())
+}
+
+fn wait_for_response(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    expected_id: i64,
+    state: &AppState,
+    app: &AppHandle,
+    profiles: &HashMap<String, PermissionProfile>,
+) -> Result<(), String> {
+    loop {
+        let message = socket.read().map_err(|error| error.to_string())?;
+        if let Message::Text(text) = &message {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                if value.get("id").and_then(Value::as_i64) == Some(expected_id) {
+                    if let Some(error) = value.get("error") {
+                        return Err(error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("O Codex recusou o prompt")
+                            .to_string());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(response) = intercept_server_message(&message, state, app, profiles)? {
+            socket.send(response).map_err(|error| error.to_string())?;
+        }
+    }
+}
+
+fn monitor_prompt(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    thread_id: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
+    loop {
+        match socket.read() {
+            Ok(message) => {
+                let completed =
+                    match &message {
+                        Message::Text(text) => serde_json::from_str::<Value>(text)
+                            .ok()
+                            .is_some_and(|value| {
+                                value.get("method").and_then(Value::as_str)
+                                    == Some("turn/completed")
+                                    && value
+                                        .get("params")
+                                        .and_then(|params| text_at(params, "threadId"))
+                                        == Some(thread_id)
+                            }),
+                        _ => false,
+                    };
+                if let Some(response) = intercept_server_message(&message, state, app, &profiles)? {
+                    socket.send(response).map_err(|error| error.to_string())?;
+                }
+                if completed {
+                    return Ok(());
+                }
+            }
+            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(tungstenite::Error::Io(error)) if transient(&error) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 fn intercept_server_message(
@@ -547,5 +708,20 @@ mod tests {
         assert_eq!(profile.mode, AccessMode::ReadOnly);
         assert_eq!(profile.label, "Somente leitura");
         assert_eq!(profile.approval_policy, "on-request");
+    }
+
+    #[test]
+    fn prompt_uses_the_documented_turn_start_shape() {
+        assert_eq!(
+            prompt_turn_request("thread-1", "Continue os testes"),
+            json!({
+                "method": "turn/start",
+                "id": 3,
+                "params": {
+                    "threadId": "thread-1",
+                    "input": [{ "type": "text", "text": "Continue os testes" }]
+                }
+            })
+        );
     }
 }

@@ -12,6 +12,9 @@ Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Win
 - Companion para VS Code e para Chrome, Edge e Brave;
 - histórico local sanitizado, sons opcionais, bandeja e autostart;
 - monitor configurável e sobreposição Wayland por `gtk-layer-shell`;
+- cápsula arrastável com posição salva entre reinicializações;
+- Whiteboard para acoplar sessões e enviar uma direção compartilhada;
+- continuação por prompt no Codex aberto pelo Lume e nos chats web conectados;
 - comportamento padrão abaixo de vídeos e jogos em tela cheia;
 - tema claro/escuro, movimento reduzido e microinterações fluidas.
 
@@ -46,11 +49,11 @@ O Lume aparece no topo do monitor principal e também cria um ícone na bandeja.
 | Gemini CLI | Processos + hooks | Observação |
 | ChatGPT, Claude e Gemini web | Companion Chromium | Abrir a aba correta |
 
-O Lume só mostra botões que a sessão atual suporta. No Gemini e em sessões externas do Codex, a origem continua responsável pela decisão; o Lume não simula uma autorização que a integração não oferece.
+O Lume só mostra botões que a sessão atual suporta. No Gemini e em sessões externas do Codex, a origem continua responsável pela decisão; o Lume não simula uma autorização que a integração não oferece. O composer envia diretamente para sessões Codex abertas pelo Lume e para páginas conectadas pelo Companion. Terminais externos permanecem somente para acompanhamento.
 
 Depois de conectar o Codex pela primeira vez, abra `/hooks` no próprio Codex e confie no hook **Lume**. O Codex exige essa confirmação para hooks locais novos ou alterados.
 
-Para instalar o Companion web, abra **Ajustes → Navegadores → Abrir pasta**, acesse `chrome://extensions` (ou a página equivalente do Edge/Brave), ative o modo de desenvolvedor e carregue a pasta sem compactação. O Companion envia apenas agente, estado, título sanitizado, origem e um hash local do caminho.
+Para instalar o Companion web, abra **Ajustes → Navegadores → Abrir pasta**, acesse `chrome://extensions` (ou a página equivalente do Edge/Brave), ative o modo de desenvolvedor e carregue a pasta sem compactação. O Companion envia apenas agente, estado, título sanitizado, origem e um hash local do caminho. Quando você usa o composer, o texto segue somente pela conexão local até a aba selecionada e não entra no histórico do Lume.
 
 ## Build e instaladores
 

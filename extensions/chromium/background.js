@@ -15,7 +15,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await chrome.windows.update(sender.tab.windowId, { focused: true });
           }
         }
-        sendResponse({ ok: response.ok, focus: Boolean(result.focus) });
+        sendResponse({
+          ok: response.ok,
+          focus: Boolean(result.focus),
+          prompt: typeof result.prompt === "string" ? result.prompt : null,
+        });
       })
       .catch(() => sendResponse({ ok: false }));
     return true;

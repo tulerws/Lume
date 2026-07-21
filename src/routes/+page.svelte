@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
   import { fade, fly, slide } from "svelte/transition";
@@ -9,9 +9,9 @@
     availableMonitors,
     getCurrentWindow,
     LogicalSize,
-    PhysicalPosition,
     primaryMonitor,
   } from "@tauri-apps/api/window";
+  import BrandIcon from "$lib/BrandIcon.svelte";
   import type {
     AgentKind,
     AgentSession,
@@ -34,12 +34,14 @@
     loadSessions,
     openSessionSource,
     loadVscodeStatus,
+    moveOverlay,
     revealBrowserCompanion,
     launchAgentSession,
     savePreferences,
+    submitPrompt,
   } from "$lib/lume";
 
-  type View = "sessions" | "history" | "settings";
+  type View = "sessions" | "board" | "history" | "settings";
   type ShellStatus = SessionStatus | "idle";
   type MonitorOption = { id: string; label: string };
 
@@ -68,6 +70,27 @@
   let browserCompanionPath = $state<string | null>(null);
   let settingsMessage = $state<string | null>(null);
   let settingsMessageIsError = $state(false);
+  let composerSessionId = $state<string | null>(null);
+  let composerPrompt = $state("");
+  let composerMessage = $state<string | null>(null);
+  let composerSending = $state(false);
+  let boardSessionIds = $state<string[]>([]);
+  let boardPrompt = $state("");
+  let boardMessage = $state<string | null>(null);
+  let boardSending = $state(false);
+  let overlayPosition = $state({ x: 0, y: 12 });
+  let overlayReady = $state(false);
+  let monitorBounds = $state({ width: 1920, height: 1080, scale: 1 });
+  let dragging = $state(false);
+  let suppressCompactToggle = false;
+  let dragState: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null = null;
+  let moveFrame: number | null = null;
 
   const activeCount = $derived(
     sessions.filter((session) =>
@@ -151,11 +174,11 @@
     }
   }
 
-  async function positionWindow() {
+  async function positionWindow(resetPosition = false, targetExpanded = expanded) {
     if (!isTauri) return;
     try {
       const currentWindow = getCurrentWindow();
-      const target = expanded
+      const target = targetExpanded
         ? { width: 392, height: 560 }
         : { width: 78, height: 46 };
       await currentWindow.setSize(new LogicalSize(target.width, target.height));
@@ -168,29 +191,193 @@
         : undefined;
       const monitor = configured ?? (await primaryMonitor());
       if (!monitor) return;
-
-      const windowSize = await currentWindow.outerSize();
-      const x = monitor.position.x + Math.round((monitor.size.width - windowSize.width) / 2);
-      const y = monitor.position.y + 12;
-      await currentWindow.setPosition(new PhysicalPosition(x, y));
+      const scale = monitor.scaleFactor || 1;
+      monitorBounds = { width: monitor.size.width, height: monitor.size.height, scale };
+      if (!overlayReady || resetPosition) {
+        overlayPosition = {
+          x:
+            preferences.overlayX ??
+            Math.max(0, Math.round((monitor.size.width - target.width * scale) / 2)),
+          y:
+            preferences.overlayY ??
+            (navigator.userAgent.toLowerCase().includes("linux") ? Math.round(44 * scale) : 12),
+        };
+        overlayReady = true;
+      }
+      overlayPosition = clampOverlayPosition(overlayPosition.x, overlayPosition.y, target);
+      await moveOverlay(overlayPosition.x, overlayPosition.y, false);
     } catch {
       // Alguns compositores Wayland ignoram posicionamento solicitado pelo cliente.
     }
   }
 
   async function toggleExpanded() {
-    expanded = !expanded;
+    if (suppressCompactToggle) {
+      suppressCompactToggle = false;
+      return;
+    }
+    if (!expanded) {
+      await positionWindow(false, true);
+      expanded = true;
+      return;
+    }
+    expanded = false;
     if (!expanded) {
       selectedId = null;
       view = "sessions";
       launcherOpen = false;
     }
-    await positionWindow();
+    await tick();
+    await positionWindow(false, false);
+  }
+
+  function clampOverlayPosition(
+    x: number,
+    y: number,
+    target = expanded ? { width: 392, height: 560 } : { width: 78, height: 46 },
+  ) {
+    return {
+      x: Math.max(0, Math.min(x, monitorBounds.width - target.width * monitorBounds.scale)),
+      y: Math.max(0, Math.min(y, monitorBounds.height - target.height * monitorBounds.scale)),
+    };
+  }
+
+  function beginOverlayDrag(event: PointerEvent, compact = false) {
+    if (!isTauri || event.button !== 0) return;
+    if (!compact && (event.target as HTMLElement).closest("button, input, select, textarea")) {
+      return;
+    }
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture(event.pointerId);
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.screenX,
+      startY: event.screenY,
+      originX: overlayPosition.x,
+      originY: overlayPosition.y,
+    };
+    dragging = false;
+  }
+
+  function moveOverlayDrag(event: PointerEvent) {
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const dx = event.screenX - dragState.startX;
+    const dy = event.screenY - dragState.startY;
+    if (!dragging && Math.hypot(dx, dy) < 3) return;
+    dragging = true;
+    event.preventDefault();
+    overlayPosition = clampOverlayPosition(dragState.originX + dx, dragState.originY + dy);
+    if (moveFrame !== null) cancelAnimationFrame(moveFrame);
+    moveFrame = requestAnimationFrame(() => {
+      moveFrame = null;
+      void moveOverlay(overlayPosition.x, overlayPosition.y, false);
+    });
+  }
+
+  async function endOverlayDrag(event: PointerEvent, compact = false) {
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const target = event.currentTarget as HTMLElement;
+    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    dragState = null;
+    if (!dragging) return;
+    if (compact) suppressCompactToggle = true;
+    preferences = {
+      ...preferences,
+      overlayX: Math.round(overlayPosition.x),
+      overlayY: Math.round(overlayPosition.y),
+    };
+    await moveOverlay(overlayPosition.x, overlayPosition.y, true);
+    dragging = false;
   }
 
   function openSession(session: AgentSession) {
     selectedId = selectedId === session.id ? null : session.id;
+    if (selectedId !== session.id) composerSessionId = null;
     permissionError = null;
+  }
+
+  function canSubmitToSession(session: AgentSession) {
+    return (
+      session.source === "web" ||
+      (session.agent === "codex" &&
+        session.permissionProfile.canRespondFromLume &&
+        Boolean(session.nativeSessionId))
+    );
+  }
+
+  function canContinueSession(session: AgentSession) {
+    return ["completed", "failed", "waiting_for_input"].includes(session.status);
+  }
+
+  function toggleSessionComposer(session: AgentSession) {
+    composerSessionId = composerSessionId === session.id ? null : session.id;
+    composerPrompt = "";
+    composerMessage = null;
+  }
+
+  async function sendSessionPrompt(session: AgentSession) {
+    const prompt = composerPrompt.trim();
+    if (!prompt || composerSending) return;
+    composerSending = true;
+    composerMessage = null;
+    try {
+      if (isTauri) await submitPrompt(session.id, prompt);
+      sessions = sessions.map((item) =>
+        item.id === session.id
+          ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume" }
+          : item,
+      );
+      composerPrompt = "";
+      composerSessionId = null;
+    } catch (error) {
+      composerMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      composerSending = false;
+    }
+  }
+
+  function toggleBoardSession(session: AgentSession) {
+    if (!canSubmitToSession(session)) return;
+    boardSessionIds = boardSessionIds.includes(session.id)
+      ? boardSessionIds.filter((id) => id !== session.id)
+      : [...boardSessionIds, session.id];
+    boardMessage = null;
+  }
+
+  async function sendBoardPrompt() {
+    const prompt = boardPrompt.trim();
+    if (!prompt || boardSending) return;
+    const targets = sessions.filter(
+      (session) =>
+        boardSessionIds.includes(session.id) &&
+        canSubmitToSession(session) &&
+        canContinueSession(session),
+    );
+    if (targets.length === 0) {
+      boardMessage = "Selecione ao menos uma sessão pronta para continuar.";
+      return;
+    }
+    boardSending = true;
+    boardMessage = null;
+    const results = await Promise.allSettled(
+      targets.map((session) => (isTauri ? submitPrompt(session.id, prompt) : Promise.resolve())),
+    );
+    const sentIds = targets
+      .filter((_, index) => results[index].status === "fulfilled")
+      .map((session) => session.id);
+    const failures = results.length - sentIds.length;
+    if (sentIds.length > 0) {
+      sessions = sessions.map((session) =>
+        sentIds.includes(session.id)
+          ? { ...session, status: "running", statusLabel: "Prompt enviado pelo Whiteboard" }
+          : session,
+      );
+      boardPrompt = "";
+    }
+    boardMessage = failures
+      ? `${sentIds.length} enviado(s); ${failures} origem(ns) não responderam.`
+      : `Prompt enviado para ${sentIds.length} ${sentIds.length === 1 ? "agente" : "agentes"}.`;
+    boardSending = false;
   }
 
   async function handlePermission(session: AgentSession, action: PermissionAction) {
@@ -235,6 +422,14 @@
     selectedId = null;
     permissionError = null;
     launcherOpen = false;
+    composerSessionId = null;
+    composerMessage = null;
+    boardMessage = null;
+    if (nextView === "board" && boardSessionIds.length === 0) {
+      boardSessionIds = sessions
+        .filter((session) => canSubmitToSession(session) && canContinueSession(session))
+        .map((session) => session.id);
+    }
     if (nextView === "history") history = await loadHistory();
     if (nextView === "settings") {
       settingsMessage = null;
@@ -386,10 +581,6 @@
     }[action];
   }
 
-  function agentInitial(agent: AgentKind) {
-    return { codex: "C", claude: "A", gemini: "G", unknown: "?" }[agent];
-  }
-
   function sourceLabel(source: AgentSession["source"]) {
     return { cli: "CLI", vscode: "VS Code", web: "Web", desktop: "Desktop" }[source];
   }
@@ -425,8 +616,13 @@
   {#if !expanded}
     <button
       class="lume-orb status-{shellStatus}"
+      class:dragging
       type="button"
       onclick={toggleExpanded}
+      onpointerdown={(event) => beginOverlayDrag(event, true)}
+      onpointermove={moveOverlayDrag}
+      onpointerup={(event) => endOverlayDrag(event, true)}
+      onpointercancel={(event) => endOverlayDrag(event, true)}
       aria-label="Abrir Lume, {activeCount} agentes ativos"
       transition:fade={{ duration: 120 }}
     >
@@ -443,7 +639,15 @@
     </button>
   {:else}
     <section class="panel" transition:fly={{ y: -8, duration: 220, easing: cubicOut }}>
-      <header class="panel-header" data-tauri-drag-region>
+      <header
+        role="banner"
+        class:dragging
+        class="panel-header"
+        onpointerdown={beginOverlayDrag}
+        onpointermove={moveOverlayDrag}
+        onpointerup={endOverlayDrag}
+        onpointercancel={endOverlayDrag}
+      >
         {#if view === "sessions"}
           <div class="brand-lockup">
             <span class="lume-mark large status-{shellStatus}" aria-hidden="true">
@@ -463,7 +667,7 @@
         {:else}
           <button class="back-button" type="button" onclick={() => openView("sessions")}>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 5-5 5 5 5" /></svg>
-            <span>{view === "history" ? "Histórico" : "Configurações"}</span>
+            <span>{view === "board" ? "Whiteboard" : view === "history" ? "Histórico" : "Configurações"}</span>
           </button>
         {/if}
         <div class="header-actions">
@@ -483,7 +687,7 @@
           <span class="launcher-title">Abrir sessão</span>
           {#each integrations.filter((integration) => integration.installed) as integration}
             <div class="launcher-row">
-              <span class="agent-avatar agent-{integration.kind}">{agentInitial(integration.kind)}</span>
+              <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
               <strong>{integration.label}</strong>
               <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, false)}>Nova</button>
               <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, true)}>Retomar</button>
@@ -506,11 +710,18 @@
                 class="session-row"
               >
                 <button class="session-summary" type="button" onclick={() => openSession(session)}>
-                  <span class="agent-avatar agent-{session.agent}">{agentInitial(session.agent)}</span>
+                  <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={20} /></span>
                   <span class="session-copy">
                     <span class="session-title-row">
                       <strong>{session.agentLabel}</strong>
-                      <span class="source-label">{sourceLabel(session.source)}</span>
+                      <span class="source-label">
+                        {#if session.source === "vscode"}
+                          <BrandIcon name="vscode" size={9} />
+                        {:else if session.source === "web"}
+                          <BrandIcon name="browsers" size={11} />
+                        {/if}
+                        {sourceLabel(session.source)}
+                      </span>
                     </span>
                     <span class="project-name">{session.project}</span>
                     <span class="status-line status-{session.status}">
@@ -555,6 +766,39 @@
                         O Lume acompanha esta origem; as ações continuam nela.
                       </p>
                     {/if}
+
+                    {#if canContinueSession(session) && canSubmitToSession(session)}
+                      <button
+                        class:active={composerSessionId === session.id}
+                        class="continue-trigger"
+                        type="button"
+                        onclick={() => toggleSessionComposer(session)}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
+                        Continuar pelo Lume
+                      </button>
+                      {#if composerSessionId === session.id}
+                        <form
+                          class="inline-composer"
+                          onsubmit={(event) => {
+                            event.preventDefault();
+                            void sendSessionPrompt(session);
+                          }}
+                          transition:slide={{ duration: 160, easing: cubicOut }}
+                        >
+                          <textarea
+                            bind:value={composerPrompt}
+                            aria-label="Novo prompt para {session.agentLabel}"
+                            placeholder="Digite o próximo prompt…"
+                            rows="2"
+                          ></textarea>
+                          <button disabled={!composerPrompt.trim() || composerSending} type="submit" aria-label="Enviar prompt">
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
+                          </button>
+                        </form>
+                        {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
+                      {/if}
+                    {/if}
                   </div>
                 {/if}
               </article>
@@ -565,6 +809,60 @@
                 <p>Novas sessões aparecerão aqui automaticamente.</p>
               </div>
             {/each}
+          </div>
+        {:else if view === "board"}
+          <div class="whiteboard" in:fade={{ duration: 150 }}>
+            <div class="board-intro">
+              <span class="eyebrow">Mesa compartilhada</span>
+              <strong>Acople as sessões ao mesmo prompt</strong>
+              <p>Selecione os agentes que devem receber a próxima direção.</p>
+            </div>
+
+            <div class="board-map">
+              <div class="board-hub" aria-hidden="true"><span class="lume-mark"><i></i></span></div>
+              <div class="board-rail" aria-hidden="true"></div>
+              <div class="board-targets">
+                {#each sessions as session (session.id)}
+                  <button
+                    class:selected={boardSessionIds.includes(session.id)}
+                    class:unavailable={!canSubmitToSession(session) || !canContinueSession(session)}
+                    disabled={!canSubmitToSession(session) || !canContinueSession(session)}
+                    type="button"
+                    onclick={() => toggleBoardSession(session)}
+                  >
+                    <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={18} /></span>
+                    <span><strong>{session.agentLabel}</strong><small>{session.project}</small></span>
+                    <i aria-hidden="true"></i>
+                  </button>
+                {:else}
+                  <p class="board-empty">As sessões aparecerão aqui quando forem detectadas.</p>
+                {/each}
+              </div>
+            </div>
+
+            <form
+              class="board-composer"
+              onsubmit={(event) => {
+                event.preventDefault();
+                void sendBoardPrompt();
+              }}
+            >
+              <textarea
+                bind:value={boardPrompt}
+                aria-label="Prompt compartilhado"
+                placeholder="Uma direção para os agentes acoplados…"
+                rows="3"
+              ></textarea>
+              <div>
+                <span>{boardSessionIds.length} selecionado(s)</span>
+                <button disabled={!boardPrompt.trim() || boardSending} type="submit">
+                  {boardSending ? "Enviando…" : "Enviar"}
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
+                </button>
+              </div>
+            </form>
+            {#if boardMessage}<p class="board-message" transition:fade>{boardMessage}</p>{/if}
+            <p class="board-note">Terminais externos aparecem na mesa, mas só origens com canal direto podem ser selecionadas.</p>
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
@@ -589,7 +887,7 @@
             <div class="settings-section-label">Agentes</div>
             {#each integrations as integration}
               <div class="integration-row">
-                <span class="agent-avatar agent-{integration.kind}">{agentInitial(integration.kind)}</span>
+                <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
                 <div>
                   <strong>{integration.label}</strong>
                   <span>{integration.detail}</span>
@@ -615,7 +913,7 @@
             {/if}
             <div class="settings-section-label preferences-label">Interface</div>
             <div class="integration-row">
-              <span class="agent-avatar agent-vscode">V</span>
+              <span class="agent-avatar agent-vscode"><BrandIcon name="vscode" size={19} /></span>
               <div>
                 <strong>VS Code Companion</strong>
                 <span>{vscodeStatus.detail}</span>
@@ -628,7 +926,7 @@
               >{configuringVscode ? "…" : vscodeStatus.configured ? "Conectado" : "Conectar"}</button>
             </div>
             <div class="integration-row browser-row">
-              <span class="agent-avatar agent-browser">W</span>
+              <span class="agent-avatar agent-browser"><BrandIcon name="browsers" size={21} /></span>
               <div>
                 <strong>Chrome, Edge e Brave</strong>
                 <span>Carregue a pasta como extensão descompactada.</span>
@@ -734,6 +1032,18 @@
           <span>Sessões</span>
         </button>
         <button
+          class:active={view === "board"}
+          type="button"
+          onclick={() => openView("board")}
+          aria-label="Whiteboard"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="5" cy="6" r="2" /><circle cx="15" cy="6" r="2" /><circle cx="10" cy="15" r="2" />
+            <path d="m6.7 7 2.2 6M13.3 7l-2.2 6M7 6h6" />
+          </svg>
+          <span>Mesa</span>
+        </button>
+        <button
           class:active={view === "history"}
           type="button"
           onclick={() => openView("history")}
@@ -767,15 +1077,16 @@
     height: 100%;
     display: flex;
     align-items: flex-start;
-    justify-content: center;
+    justify-content: flex-start;
   }
 
   .overlay-shell.expanded {
-    padding: 8px;
+    padding: 0 8px 16px 0;
   }
 
   button,
-  select {
+  select,
+  textarea {
     -webkit-tap-highlight-color: transparent;
   }
 
@@ -793,6 +1104,7 @@
     box-shadow: 0 7px 26px rgba(28, 43, 37, 0.17);
     backdrop-filter: blur(22px) saturate(120%);
     cursor: pointer;
+    touch-action: none;
     transition: transform 160ms ease, box-shadow 160ms ease;
   }
 
@@ -802,6 +1114,7 @@
   }
 
   .lume-orb:active { transform: scale(0.97); }
+  .lume-orb.dragging { cursor: grabbing; transform: scale(0.985); }
 
   .lume-mark {
     width: 20px;
@@ -867,7 +1180,6 @@
     border-radius: 21px;
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
-    box-shadow: 0 20px 58px rgba(25, 39, 33, 0.2);
     backdrop-filter: blur(28px) saturate(125%);
   }
 
@@ -878,7 +1190,11 @@
     align-items: center;
     justify-content: space-between;
     border-bottom: 1px solid rgba(101, 120, 112, 0.11);
+    cursor: grab;
+    touch-action: none;
   }
+
+  .panel-header.dragging { cursor: grabbing; }
 
   .brand-lockup { display: flex; align-items: center; gap: 10px; color: #4e7567; }
   .brand-lockup div { display: grid; gap: 1px; }
@@ -987,17 +1303,17 @@
   }
 
   .session-summary:hover .agent-avatar { transform: scale(1.04); }
-  .agent-codex { color: #edf5f1; background: #294138; }
-  .agent-claude { color: #583928; background: #ead2c0; }
-  .agent-gemini { color: #34456d; background: #dbe4f8; }
-  .agent-vscode { color: #e7f3fb; background: #287aa9; }
-  .agent-browser { color: #52615a; background: #e1e7e4; }
+  .agent-codex { color: #202523; background: #edf0ee; }
+  .agent-claude { color: #d97757; background: #f7ece6; }
+  .agent-gemini { color: #6e73ca; background: #eef0fb; }
+  .agent-vscode { color: #287aa9; background: #edf6fb; }
+  .agent-browser { color: #52615a; background: #f1f3f2; }
   .agent-unknown { color: #48534f; background: #e2e7e4; }
 
   .session-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
-  .session-title-row { display: flex; align-items: baseline; gap: 6px; }
+  .session-title-row { display: flex; align-items: center; gap: 6px; }
   .session-title-row strong { color: #27342f; font-size: 11px; }
-  .source-label { color: #87918d; font-size: 9px; font-weight: 720; letter-spacing: 0.045em; text-transform: uppercase; }
+  .source-label { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 8px; font-weight: 720; letter-spacing: 0.045em; line-height: 1.25; text-transform: uppercase; }
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
@@ -1041,6 +1357,51 @@
   .permission-actions button.danger { color: #a54c4c; }
   .inline-error { margin: 1px 0 0; color: #a54c4c; font-size: 9px; }
   .integration-note { margin: 0; color: #7c8983; font-size: 10px; line-height: 1.45; }
+
+  .continue-trigger { margin-top: 9px; padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #557266; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
+  .continue-trigger svg { width: 13px; height: 13px; transition: transform 150ms ease; }
+  .continue-trigger:hover svg,
+  .continue-trigger.active svg { transform: translateX(2px); }
+  .inline-composer { margin-top: 8px; display: flex; align-items: flex-end; gap: 6px; }
+  .inline-composer textarea,
+  .board-composer textarea { resize: none; outline: none; font: inherit; }
+  .inline-composer textarea { min-width: 0; min-height: 52px; flex: 1; padding: 8px 9px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 10px; color: #34423c; background: rgba(255, 255, 255, 0.48); font-size: 10px; line-height: 1.4; }
+  .inline-composer textarea:focus,
+  .board-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
+  .inline-composer button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
+  .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
+  .inline-composer button:disabled { opacity: 0.35; cursor: default; }
+
+  .whiteboard { height: 100%; padding: 7px 16px 15px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
+  .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .board-intro .eyebrow { display: block; margin-bottom: 4px; color: #7a8c84; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
+  .board-intro strong { color: #2d3a35; font-size: 12px; }
+  .board-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; line-height: 1.45; }
+  .board-map { position: relative; min-height: 150px; padding: 12px 0 8px; display: grid; grid-template-columns: 30px 1fr; gap: 10px; }
+  .board-hub { position: relative; z-index: 1; padding-top: 10px; display: flex; justify-content: center; color: #4e7567; }
+  .board-hub .lume-mark { width: 23px; height: 23px; background: #f8faf9; }
+  .board-hub .lume-mark i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .board-rail { position: absolute; top: 46px; bottom: 17px; left: 14px; width: 1px; background: linear-gradient(#6f9183, rgba(111, 145, 131, 0.08)); }
+  .board-targets { min-width: 0; }
+  .board-targets > button { position: relative; width: 100%; min-height: 51px; padding: 7px 1px; display: flex; align-items: center; gap: 9px; border: 0; border-bottom: 1px solid rgba(105, 123, 115, 0.09); color: inherit; background: transparent; text-align: left; cursor: pointer; transition: opacity 150ms ease, transform 150ms ease; }
+  .board-targets > button:last-child { border-bottom: 0; }
+  .board-targets > button:hover:not(:disabled) { transform: translateX(2px); }
+  .board-targets > button.unavailable { opacity: 0.42; cursor: default; }
+  .board-targets > button > span:nth-child(2) { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .board-targets strong { color: #35423d; font-size: 10px; }
+  .board-targets small { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .board-targets > button > i { width: 9px; height: 9px; border: 1px solid #aab5b0; border-radius: 50%; transition: border 150ms ease, background 150ms ease, box-shadow 150ms ease; }
+  .board-targets > button.selected > i { border-color: #527c6c; background: #527c6c; box-shadow: inset 0 0 0 2px #f8faf9; }
+  .board-empty { margin: 22px 0; color: #89938f; font-size: 9px; line-height: 1.45; }
+  .board-composer { padding-top: 11px; border-top: 1px solid rgba(105, 123, 115, 0.1); }
+  .board-composer textarea { width: 100%; min-height: 70px; padding: 10px 11px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 12px; color: #34423c; background: rgba(255, 255, 255, 0.42); font-size: 10px; line-height: 1.45; }
+  .board-composer > div { min-height: 36px; display: flex; align-items: center; justify-content: space-between; }
+  .board-composer > div > span { color: #8b9590; font-size: 8px; }
+  .board-composer button { height: 29px; padding: 0 9px 0 11px; display: flex; align-items: center; gap: 5px; border: 0; border-radius: 9px; color: white; background: #496f60; font-size: 9px; font-weight: 720; cursor: pointer; }
+  .board-composer button:disabled { opacity: 0.35; cursor: default; }
+  .board-composer button svg { width: 13px; height: 13px; }
+  .board-message { margin: 1px 0 4px; color: #5f756b; font-size: 9px; }
+  .board-note { margin: 8px 4px 0; color: #929b97; font-size: 8px; line-height: 1.4; text-align: center; }
 
   .empty-state { height: 100%; min-height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #73807a; text-align: center; }
   .empty-state strong { margin-top: 10px; color: #44524c; font-size: 11px; }
@@ -1108,7 +1469,7 @@
     min-height: 52px;
     padding: 6px 10px 8px;
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     align-items: center;
     border-top: 1px solid rgba(101, 120, 112, 0.11);
   }
@@ -1124,10 +1485,12 @@
   @media (prefers-color-scheme: dark) {
     .lume-orb,
     .panel,
-    .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); box-shadow: 0 20px 58px rgba(0, 0, 0, 0.34); }
+    .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
     .brand-lockup strong,
     .back-button,
     .session-title-row strong,
+    .board-intro strong,
+    .board-targets strong,
     .history-row strong,
     .setting-row strong,
     .integration-row strong,
@@ -1143,6 +1506,8 @@
     .session-row:hover,
     .session-row.selected { background: rgba(198, 218, 208, 0.045); }
     .project-name,
+    .board-intro p,
+    .board-targets small,
     .history-row span,
     .settings-feedback { color: #adbab4; }
     .settings-feedback.error { color: #d68d8d; }
@@ -1152,7 +1517,15 @@
     .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
     .permission-block > strong { color: #e2d0bd; }
     .permission-actions button,
-    .field-row select { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+    .field-row select,
+    .inline-composer textarea,
+    .board-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+    .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
+    .board-intro,
+    .board-targets > button,
+    .board-composer { border-color: rgba(190, 209, 200, 0.09); }
+    .board-hub .lume-mark { background: #202824; }
+    .board-targets > button.selected > i { box-shadow: inset 0 0 0 2px #202824; }
     .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
     .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
   }

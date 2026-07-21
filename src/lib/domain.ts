@@ -68,6 +68,8 @@ export interface Preferences {
   soundEnabled: boolean;
   autostart: boolean;
   monitorId?: string;
+  overlayX?: number;
+  overlayY?: number;
   showOverFullscreen: boolean;
   historyRetentionDays: number;
   launchTarget: "auto" | "terminal" | "vscode";

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -44,6 +44,7 @@ struct BrowserEvent {
 #[derive(Clone, Default)]
 pub struct BrowserControl {
     focus_requests: Arc<Mutex<HashSet<String>>>,
+    prompt_requests: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl BrowserControl {
@@ -55,11 +56,26 @@ impl BrowserControl {
         Ok(())
     }
 
+    pub fn request_prompt(&self, session_id: String, prompt: String) -> Result<(), String> {
+        self.prompt_requests
+            .lock()
+            .map_err(|_| "Não foi possível acessar o conector web".to_string())?
+            .insert(session_id, prompt);
+        Ok(())
+    }
+
     fn take_focus(&self, session_id: &str) -> bool {
         self.focus_requests
             .lock()
             .map(|mut requests| requests.remove(session_id))
             .unwrap_or(false)
+    }
+
+    fn take_prompt(&self, session_id: &str) -> Option<String> {
+        self.prompt_requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(session_id))
     }
 }
 
@@ -108,6 +124,7 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                         browser_event.provider, browser_event.session_id
                     );
                     let focus = control.take_focus(&session_id);
+                    let prompt = control.take_prompt(&session_id);
                     let event = map_event(browser_event)?;
                     let notification = matches!(
                         event.event,
@@ -133,11 +150,11 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                             .body(format!("{label} · {project}"))
                             .show();
                     }
-                    Ok(focus)
+                    Ok((focus, prompt))
                 }) {
-                Ok(focus) => (
+                Ok((focus, prompt)) => (
                     "202 Accepted",
-                    format!("{{\"ok\":true,\"focus\":{focus}}}"),
+                    serde_json::json!({ "ok": true, "focus": focus, "prompt": prompt }).to_string(),
                     request.origin,
                 ),
                 Err(_) => ("400 Bad Request", "{\"ok\":false}".into(), request.origin),
@@ -298,5 +315,18 @@ mod tests {
             event.permission.expect("permissão").resource,
             "https://chatgpt.com"
         );
+    }
+
+    #[test]
+    fn browser_prompt_is_kept_only_until_the_next_extension_poll() {
+        let control = BrowserControl::default();
+        control
+            .request_prompt("web:codex:hash-only".into(), "Continue".into())
+            .expect("fila local");
+        assert_eq!(
+            control.take_prompt("web:codex:hash-only").as_deref(),
+            Some("Continue")
+        );
+        assert!(control.take_prompt("web:codex:hash-only").is_none());
     }
 }

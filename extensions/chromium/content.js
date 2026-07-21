@@ -77,6 +77,52 @@
       .trim()
       .slice(0, 100) || "Sessão web";
 
+  const submitPrompt = async (text) => {
+    const candidates = [
+      ...document.querySelectorAll(
+        'textarea, [contenteditable="true"][role="textbox"], [contenteditable="true"].ProseMirror, [contenteditable="true"][data-lexical-editor="true"]',
+      ),
+    ].filter((element) => visible(element) && !element.disabled);
+    const composer = candidates.at(-1);
+    if (!composer) return false;
+
+    composer.focus();
+    if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+      const prototype = composer instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      setter?.call(composer, text);
+    } else {
+      composer.textContent = text;
+    }
+    composer.dispatchEvent(
+      new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }),
+    );
+    composer.dispatchEvent(new Event("change", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    const scope = composer.closest("form") ?? document;
+    const sendButton = [...scope.querySelectorAll("button")]
+      .filter((button) => visible(button) && !button.disabled)
+      .find((button) => {
+        const label = `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""} ${button.dataset.testid ?? ""}`.toLowerCase();
+        return /(^|\s)(send|enviar|submit|enviar mensagem|send message)(\s|$)/.test(label);
+      });
+    if (sendButton) {
+      sendButton.click();
+      return true;
+    }
+    if (scope instanceof HTMLFormElement) {
+      scope.requestSubmit();
+      return true;
+    }
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }),
+    );
+    return true;
+  };
+
   const report = (force = false) => {
     const state = detectState();
     const path = location.pathname;
@@ -92,6 +138,8 @@
         origin: location.origin,
         state,
       },
+    }).then((response) => {
+      if (response?.prompt) void submitPrompt(response.prompt);
     }).catch(() => {});
   };
 
