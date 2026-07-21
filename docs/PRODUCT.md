@@ -14,6 +14,7 @@ Lume acompanha sessões de agentes de IA que já estejam abertas ou que tenham s
 - Sons sutis de conclusão e erro podem ser desativados.
 - A bandeja permite mostrar ou ocultar o painel e sair.
 - Sessões podem ser abertas ou retomadas no terminal ou VS Code habitual.
+- O Whiteboard abre cada sessão em seu próprio mini terminal; janelas próximas podem ser acopladas e movidas como um conjunto.
 
 ## Estados normalizados
 

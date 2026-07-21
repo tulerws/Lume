@@ -107,6 +107,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         agent_label: None,
         project: cwd.as_deref().and_then(project_name),
         source: Some(source),
+        source_app: None,
         status_label: status_label(hook_name.as_str()).map(str::to_string),
         started_at: string(raw, "timestamp"),
         process_id,

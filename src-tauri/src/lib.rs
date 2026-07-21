@@ -9,6 +9,7 @@ mod launcher;
 mod overlay;
 mod state;
 mod store;
+mod terminal_windows;
 
 use std::io::Read;
 
@@ -181,6 +182,66 @@ fn move_overlay(
 }
 
 #[tauri::command]
+fn open_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    session_id: String,
+) -> Result<String, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+    let preferences = state.preferences()?;
+    terminals.open(
+        &app,
+        &session,
+        preferences.monitor_id.as_deref(),
+        preferences.overlay_x.unwrap_or(40),
+        preferences.overlay_y.unwrap_or(44),
+        preferences.show_over_fullscreen,
+    )
+}
+
+#[tauri::command]
+fn list_terminal_windows(
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
+    terminals.list()
+}
+
+#[tauri::command]
+fn get_terminal_window_state(
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    terminals.state(&label)
+}
+
+#[tauri::command]
+fn move_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    x: i32,
+    y: i32,
+    finalize: bool,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.move_window(&app, &label, x, y, finalize, monitor_id.as_deref())
+}
+
+#[tauri::command]
+fn undock_terminal_window(
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    terminals.undock(&label)
+}
+
+#[tauri::command]
 fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     Ok(integrations::statuses(&executable.to_string_lossy()))
@@ -283,6 +344,7 @@ pub fn run() {
             let browser_control = browser_server::BrowserControl::default();
             browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;
             app.manage(browser_control);
+            app.manage(terminal_windows::TerminalWindows::default());
             discovery::start(state.clone(), app.handle().clone())?;
             overlay::start_fullscreen_guard(state.clone(), app.handle().clone())?;
 
@@ -354,6 +416,11 @@ pub fn run() {
             get_preferences,
             set_preferences,
             move_overlay,
+            open_terminal_window,
+            list_terminal_windows,
+            get_terminal_window_state,
+            move_terminal_window,
+            undock_terminal_window,
             integration_statuses,
             configure_integration,
             vscode_status,

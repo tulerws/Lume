@@ -424,6 +424,7 @@ fn approval_response(
         agent_label: Some("Codex".into()),
         project: cwd.as_deref().and_then(project_name),
         source: Some(SessionSource::Cli),
+        source_app: None,
         status_label: Some("Aguardando sua permissão".into()),
         started_at: None,
         process_id: None,
@@ -579,6 +580,7 @@ fn notification_event(
             .map(str::to_string)
             .or_else(|| cwd.and_then(project_name)),
         source: Some(SessionSource::Cli),
+        source_app: None,
         status_label: Some(status_label.into()),
         started_at,
         process_id: None,

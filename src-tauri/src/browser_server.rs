@@ -38,6 +38,7 @@ struct BrowserEvent {
     session_id: String,
     title: String,
     origin: String,
+    browser: Option<String>,
     state: BrowserState,
 }
 
@@ -238,6 +239,10 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
         _ => return Err("Agente web desconhecido".into()),
     };
     let now = now_millis();
+    let source_app = match event.browser.as_deref() {
+        Some("chrome" | "edge" | "brave") => event.browser.clone(),
+        _ => None,
+    };
     let (kind, status_label, permission) = match event.state {
         BrowserState::Running => (HookEventKind::Running, "Executando", None),
         BrowserState::WaitingForInput => (
@@ -267,6 +272,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
         agent_label: Some(label.into()),
         project: Some(truncate(&event.title, 100)),
         source: Some(SessionSource::Web),
+        source_app,
         status_label: Some(status_label.into()),
         started_at: None,
         process_id: None,
@@ -307,10 +313,12 @@ mod tests {
             session_id: "hash-only".into(),
             title: "Projeto".into(),
             origin: "https://chatgpt.com".into(),
+            browser: Some("brave".into()),
             state: BrowserState::PermissionRequired,
         })
         .expect("evento web");
         assert_eq!(event.session_id, "web:codex:hash-only");
+        assert_eq!(event.source_app.as_deref(), Some("brave"));
         assert_eq!(
             event.permission.expect("permissão").resource,
             "https://chatgpt.com"

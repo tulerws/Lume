@@ -6,6 +6,7 @@ import type {
   IntegrationStatus,
   PermissionAction,
   Preferences,
+  TerminalWindowState,
 } from "$lib/domain";
 import { demoHistory, demoSessions } from "$lib/demo";
 
@@ -51,6 +52,37 @@ export async function moveOverlay(x: number, y: number, persist: boolean): Promi
 
 export async function submitPrompt(sessionId: string, prompt: string): Promise<void> {
   await invoke("submit_prompt", { sessionId, prompt });
+}
+
+export async function openTerminalWindow(sessionId: string): Promise<string> {
+  return invoke<string>("open_terminal_window", { sessionId });
+}
+
+export async function loadTerminalWindows(): Promise<TerminalWindowState[]> {
+  if (!inDesktop()) return [];
+  return invoke<TerminalWindowState[]>("list_terminal_windows");
+}
+
+export async function loadTerminalWindowState(label: string): Promise<TerminalWindowState> {
+  return invoke<TerminalWindowState>("get_terminal_window_state", { label });
+}
+
+export async function moveTerminalWindow(
+  label: string,
+  x: number,
+  y: number,
+  finalize: boolean,
+): Promise<TerminalWindowState> {
+  return invoke<TerminalWindowState>("move_terminal_window", {
+    label,
+    x: Math.round(x),
+    y: Math.round(y),
+    finalize,
+  });
+}
+
+export async function undockTerminalWindow(label: string): Promise<TerminalWindowState> {
+  return invoke<TerminalWindowState>("undock_terminal_window", { label });
 }
 
 export async function loadHistory(): Promise<HistoryEntry[]> {

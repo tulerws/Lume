@@ -43,6 +43,7 @@ export interface AgentSession {
   agentLabel: string;
   project: string;
   source: "cli" | "vscode" | "web" | "desktop";
+  sourceApp?: "chrome" | "edge" | "brave";
   status: SessionStatus;
   statusLabel: string;
   startedAt: string;
@@ -88,4 +89,14 @@ export interface CompanionStatus {
   installed: boolean;
   configured: boolean;
   detail: string;
+}
+
+export interface TerminalWindowState {
+  label: string;
+  sessionId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  docked: boolean;
 }

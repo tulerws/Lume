@@ -1,12 +1,18 @@
 const endpoint = "http://127.0.0.1:43120";
+const browserName = (async () => {
+  if (/Edg\//.test(navigator.userAgent)) return "edge";
+  if (navigator.brave?.isBrave && (await navigator.brave.isBrave())) return "brave";
+  return "chrome";
+})();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "lume:event") {
-    fetch(`${endpoint}/events`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(message.event),
-    })
+    browserName
+      .then((browser) => fetch(`${endpoint}/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...message.event, browser }),
+      }))
       .then(async (response) => {
         const result = await response.json().catch(() => ({ ok: response.ok }));
         if (result.focus && sender.tab?.id) {

@@ -366,6 +366,7 @@ impl AppState {
                 agent_label: agent_name,
                 project,
                 source: process.source,
+                source_app: None,
                 status: SessionStatus::Running,
                 status_label: "Processo detectado".into(),
                 started_at: now.to_string(),
@@ -457,6 +458,7 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .unwrap_or_else(|| agent_label(&event.agent).into()),
         project,
         source: event.source.clone().unwrap_or(SessionSource::Cli),
+        source_app: event.source_app.clone(),
         status: SessionStatus::Running,
         status_label: "Detectado".into(),
         started_at: event.started_at.clone().unwrap_or_else(|| now.to_string()),
@@ -481,6 +483,9 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     }
     if let Some(source) = &event.source {
         session.source = source.clone();
+    }
+    if let Some(source_app) = &event.source_app {
+        session.source_app = Some(source_app.clone());
     }
     if let Some(process_id) = event.process_id {
         session.process_id = Some(process_id);
@@ -589,6 +594,7 @@ mod tests {
             agent_label: None,
             project: Some("lume".into()),
             source: Some(SessionSource::Cli),
+            source_app: None,
             status_label: Some("Sessão detectada".into()),
             started_at: None,
             process_id: Some(process_id),

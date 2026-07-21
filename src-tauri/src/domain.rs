@@ -76,6 +76,8 @@ pub struct AgentSession {
     pub agent_label: String,
     pub project: String,
     pub source: SessionSource,
+    #[serde(default)]
+    pub source_app: Option<String>,
     pub status: SessionStatus,
     pub status_label: String,
     pub started_at: String,
@@ -148,6 +150,8 @@ pub struct HookEvent {
     pub agent_label: Option<String>,
     pub project: Option<String>,
     pub source: Option<SessionSource>,
+    #[serde(default)]
+    pub source_app: Option<String>,
     pub status_label: Option<String>,
     pub started_at: Option<String>,
     pub process_id: Option<u32>,

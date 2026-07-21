@@ -7,7 +7,17 @@
   import vscode from "@iconify-icons/logos/visual-studio-code";
   import { siClaude, siGooglegemini } from "simple-icons";
 
-  type Brand = "codex" | "claude" | "gemini" | "vscode" | "browsers" | "unknown";
+  type Brand =
+    | "codex"
+    | "claude"
+    | "gemini"
+    | "vscode"
+    | "chrome"
+    | "edge"
+    | "brave"
+    | "browsers"
+    | "terminal"
+    | "unknown";
 
   let { name, size = 18 }: { name: Brand; size?: number } = $props();
 </script>
@@ -32,10 +42,20 @@
     </svg>
   {:else if name === "vscode"}
     <OfflineIcon icon={vscode} />
+  {:else if name === "chrome"}
+    <OfflineIcon icon={chrome} />
+  {:else if name === "edge"}
+    <OfflineIcon icon={edge} />
+  {:else if name === "brave"}
+    <OfflineIcon icon={brave} />
   {:else if name === "browsers"}
     <i class="browser-icon chrome"><OfflineIcon icon={chrome} /></i>
     <i class="browser-icon edge"><OfflineIcon icon={edge} /></i>
     <i class="browser-icon brave"><OfflineIcon icon={brave} /></i>
+  {:else if name === "terminal"}
+    <svg class="terminal" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m5 7 5 5-5 5M16 7v10" />
+    </svg>
   {:else}
     <svg class="unknown" viewBox="0 0 24 24" aria-hidden="true">
       <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4" />
@@ -64,6 +84,14 @@
     stroke: currentColor;
     stroke-linecap: round;
     stroke-width: 1.5;
+  }
+
+  .terminal {
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
   }
 
   .browsers { width: calc(var(--brand-size) * 1.28); }

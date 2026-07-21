@@ -12,6 +12,8 @@
     primaryMonitor,
   } from "@tauri-apps/api/window";
   import BrandIcon from "$lib/BrandIcon.svelte";
+  import LumeLogo from "$lib/LumeLogo.svelte";
+  import TerminalWindow from "$lib/TerminalWindow.svelte";
   import type {
     AgentKind,
     AgentSession,
@@ -21,6 +23,7 @@
     PermissionAction,
     Preferences,
     SessionStatus,
+    TerminalWindowState,
   } from "$lib/domain";
   import { demoSessions } from "$lib/demo";
   import {
@@ -32,7 +35,9 @@
     loadIntegrationStatuses,
     loadPreferences,
     loadSessions,
+    loadTerminalWindows,
     openSessionSource,
+    openTerminalWindow,
     loadVscodeStatus,
     moveOverlay,
     revealBrowserCompanion,
@@ -46,8 +51,15 @@
   type MonitorOption = { id: string; label: string };
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
+  const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
+  const compactSize = { width: 78, height: 46 };
+  const expandedSize = { width: 392, height: 560 };
 
   let expanded = $state(!isTauri);
+  let contentVisible = $state(!isTauri);
+  let morphing = $state<"opening" | "closing" | null>(null);
+  let morphProgress = $state(isTauri ? 0 : 1);
   let view = $state<View>("sessions");
   let sessions = $state<AgentSession[]>(isTauri ? [] : structuredClone(demoSessions));
   let history = $state<HistoryEntry[]>([]);
@@ -74,10 +86,9 @@
   let composerPrompt = $state("");
   let composerMessage = $state<string | null>(null);
   let composerSending = $state(false);
-  let boardSessionIds = $state<string[]>([]);
-  let boardPrompt = $state("");
-  let boardMessage = $state<string | null>(null);
-  let boardSending = $state(false);
+  let terminalWindows = $state<TerminalWindowState[]>([]);
+  let openingTerminal = $state<string | null>(null);
+  let terminalMessage = $state<string | null>(null);
   let overlayPosition = $state({ x: 0, y: 12 });
   let overlayReady = $state(false);
   let monitorBounds = $state({ width: 1920, height: 1080, scale: 1 });
@@ -112,6 +123,7 @@
   });
 
   onMount(() => {
+    if (isTerminalWindow) return;
     let disposed = false;
     let stopListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -174,13 +186,11 @@
     }
   }
 
-  async function positionWindow(resetPosition = false, targetExpanded = expanded) {
+  async function positionWindow(resetPosition = false) {
     if (!isTauri) return;
     try {
       const currentWindow = getCurrentWindow();
-      const target = targetExpanded
-        ? { width: 392, height: 560 }
-        : { width: 78, height: 46 };
+      const target = expanded ? expandedSize : compactSize;
       await currentWindow.setSize(new LogicalSize(target.width, target.height));
 
       const found = await availableMonitors();
@@ -216,25 +226,68 @@
       suppressCompactToggle = false;
       return;
     }
+    if (morphing) return;
     if (!expanded) {
-      await positionWindow(false, true);
+      morphing = "opening";
       expanded = true;
+      contentVisible = false;
+      await tick();
+      await animateWindowSize(true);
+      contentVisible = true;
+      morphing = null;
       return;
     }
+    morphing = "closing";
+    contentVisible = false;
+    await animateWindowSize(false);
     expanded = false;
-    if (!expanded) {
-      selectedId = null;
-      view = "sessions";
-      launcherOpen = false;
+    morphing = null;
+    selectedId = null;
+    view = "sessions";
+    launcherOpen = false;
+  }
+
+  async function animateWindowSize(opening: boolean) {
+    const from = opening ? compactSize : expandedSize;
+    const to = opening ? expandedSize : compactSize;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const duration = reducedMotion ? 1 : opening ? 360 : 320;
+    if (!isTauri) {
+      morphProgress = opening ? 1 : 0;
+      return;
     }
-    await tick();
-    await positionWindow(false, false);
+    const currentWindow = getCurrentWindow();
+    const startedAt = performance.now();
+    await new Promise<void>((resolve) => {
+      const frame = async (now: number) => {
+        const linear = Math.min(1, (now - startedAt) / duration);
+        const eased = linear < 0.5
+          ? 4 * linear * linear * linear
+          : 1 - Math.pow(-2 * linear + 2, 3) / 2;
+        morphProgress = opening ? eased : 1 - eased;
+        if (opening && eased > 0.48) contentVisible = true;
+        const width = Math.round(from.width + (to.width - from.width) * eased);
+        const height = Math.round(from.height + (to.height - from.height) * eased);
+        try {
+          await currentWindow.setSize(new LogicalSize(width, height));
+        } catch {
+          resolve();
+          return;
+        }
+        if (linear < 1) {
+          requestAnimationFrame((next) => void frame(next));
+        } else {
+          resolve();
+        }
+      };
+      requestAnimationFrame((now) => void frame(now));
+    });
   }
 
   function clampOverlayPosition(
     x: number,
     y: number,
-    target = expanded ? { width: 392, height: 560 } : { width: 78, height: 46 },
+    target = expanded ? expandedSize : compactSize,
   ) {
     return {
       x: Math.max(0, Math.min(x, monitorBounds.width - target.width * monitorBounds.scale)),
@@ -243,7 +296,7 @@
   }
 
   function beginOverlayDrag(event: PointerEvent, compact = false) {
-    if (!isTauri || event.button !== 0) return;
+    if (!isTauri || event.button !== 0 || morphing) return;
     if (!compact && (event.target as HTMLElement).closest("button, input, select, textarea")) {
       return;
     }
@@ -336,48 +389,30 @@
     }
   }
 
-  function toggleBoardSession(session: AgentSession) {
-    if (!canSubmitToSession(session)) return;
-    boardSessionIds = boardSessionIds.includes(session.id)
-      ? boardSessionIds.filter((id) => id !== session.id)
-      : [...boardSessionIds, session.id];
-    boardMessage = null;
+  async function refreshTerminalWindows() {
+    terminalWindows = await loadTerminalWindows();
   }
 
-  async function sendBoardPrompt() {
-    const prompt = boardPrompt.trim();
-    if (!prompt || boardSending) return;
-    const targets = sessions.filter(
-      (session) =>
-        boardSessionIds.includes(session.id) &&
-        canSubmitToSession(session) &&
-        canContinueSession(session),
-    );
-    if (targets.length === 0) {
-      boardMessage = "Selecione ao menos uma sessão pronta para continuar.";
-      return;
+  async function showTerminal(session: AgentSession) {
+    if (openingTerminal) return;
+    openingTerminal = session.id;
+    terminalMessage = null;
+    try {
+      if (isTauri) {
+        await openTerminalWindow(session.id);
+        await refreshTerminalWindows();
+      } else {
+        terminalMessage = `O mini terminal de ${session.agentLabel} abre em uma janela separada no app.`;
+      }
+    } catch (error) {
+      terminalMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      openingTerminal = null;
     }
-    boardSending = true;
-    boardMessage = null;
-    const results = await Promise.allSettled(
-      targets.map((session) => (isTauri ? submitPrompt(session.id, prompt) : Promise.resolve())),
-    );
-    const sentIds = targets
-      .filter((_, index) => results[index].status === "fulfilled")
-      .map((session) => session.id);
-    const failures = results.length - sentIds.length;
-    if (sentIds.length > 0) {
-      sessions = sessions.map((session) =>
-        sentIds.includes(session.id)
-          ? { ...session, status: "running", statusLabel: "Prompt enviado pelo Whiteboard" }
-          : session,
-      );
-      boardPrompt = "";
-    }
-    boardMessage = failures
-      ? `${sentIds.length} enviado(s); ${failures} origem(ns) não responderam.`
-      : `Prompt enviado para ${sentIds.length} ${sentIds.length === 1 ? "agente" : "agentes"}.`;
-    boardSending = false;
+  }
+
+  function terminalIsOpen(session: AgentSession) {
+    return terminalWindows.some((terminal) => terminal.sessionId === session.id);
   }
 
   async function handlePermission(session: AgentSession, action: PermissionAction) {
@@ -424,12 +459,8 @@
     launcherOpen = false;
     composerSessionId = null;
     composerMessage = null;
-    boardMessage = null;
-    if (nextView === "board" && boardSessionIds.length === 0) {
-      boardSessionIds = sessions
-        .filter((session) => canSubmitToSession(session) && canContinueSession(session))
-        .map((session) => session.id);
-    }
+    terminalMessage = null;
+    if (nextView === "board") await refreshTerminalWindows();
     if (nextView === "history") history = await loadHistory();
     if (nextView === "settings") {
       settingsMessage = null;
@@ -581,8 +612,21 @@
     }[action];
   }
 
-  function sourceLabel(source: AgentSession["source"]) {
-    return { cli: "CLI", vscode: "VS Code", web: "Web", desktop: "Desktop" }[source];
+  function sourceLabel(session: AgentSession) {
+    if (session.source === "web") {
+      if (session.sourceApp === "chrome") return "Chrome";
+      if (session.sourceApp === "edge") return "Edge";
+      if (session.sourceApp === "brave") return "Brave";
+      return "Web";
+    }
+    return { cli: "CLI", vscode: "VS Code", desktop: "Desktop" }[session.source];
+  }
+
+  function sourceIcon(session: AgentSession) {
+    if (session.source === "cli") return "terminal" as const;
+    if (session.source === "vscode") return "vscode" as const;
+    if (session.source === "web") return session.sourceApp ?? ("browsers" as const);
+    return "unknown" as const;
   }
 
   function relativeTime(timestamp: number) {
@@ -612,7 +656,15 @@
   <meta name="description" content="Monitor local e discreto para sessões de agentes de IA." />
 </svelte:head>
 
-<main class:expanded class="overlay-shell" aria-label="Lume, monitor de agentes">
+{#if isTerminalWindow}
+  <TerminalWindow />
+{:else}
+<main
+  class:expanded
+  class="overlay-shell"
+  style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
+  aria-label="Lume, monitor de agentes"
+>
   {#if !expanded}
     <button
       class="lume-orb status-{shellStatus}"
@@ -624,21 +676,23 @@
       onpointerup={(event) => endOverlayDrag(event, true)}
       onpointercancel={(event) => endOverlayDrag(event, true)}
       aria-label="Abrir Lume, {activeCount} agentes ativos"
-      transition:fade={{ duration: 120 }}
     >
-      <span class="lume-mark" aria-hidden="true">
+      <span class="lume-brand-icon status-{shellStatus}" aria-hidden="true">
+        <LumeLogo size={28} />
+        <span class="logo-state">
         {#if shellStatus === "completed"}
           <svg class="status-glyph" viewBox="0 0 20 20"><path d="m5.5 10.2 3 3 6-6.2" /></svg>
         {:else if shellStatus === "failed"}
           <svg class="status-glyph" viewBox="0 0 20 20"><path d="M10 5.2v6.2M10 14.7h.01" /></svg>
         {:else}
-          <span></span>
+          <i></i>
         {/if}
+        </span>
       </span>
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section class="panel" transition:fly={{ y: -8, duration: 220, easing: cubicOut }}>
+    <section class:content-visible={contentVisible} class:morphing class="panel">
       <header
         role="banner"
         class:dragging
@@ -650,15 +704,7 @@
       >
         {#if view === "sessions"}
           <div class="brand-lockup">
-            <span class="lume-mark large status-{shellStatus}" aria-hidden="true">
-              {#if shellStatus === "completed"}
-                <svg class="status-glyph" viewBox="0 0 20 20"><path d="m5.5 10.2 3 3 6-6.2" /></svg>
-              {:else if shellStatus === "failed"}
-                <svg class="status-glyph" viewBox="0 0 20 20"><path d="M10 5.2v6.2M10 14.7h.01" /></svg>
-              {:else}
-                <span></span>
-              {/if}
-            </span>
+            <LumeLogo size={31} />
             <div>
               <strong>Lume</strong>
               <span>{activeCount === 1 ? "1 agente ativo" : `${activeCount} agentes ativos`}</span>
@@ -715,17 +761,18 @@
                     <span class="session-title-row">
                       <strong>{session.agentLabel}</strong>
                       <span class="source-label">
-                        {#if session.source === "vscode"}
-                          <BrandIcon name="vscode" size={9} />
-                        {:else if session.source === "web"}
-                          <BrandIcon name="browsers" size={11} />
-                        {/if}
-                        {sourceLabel(session.source)}
+                        <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
+                        {sourceLabel(session)}
                       </span>
                     </span>
                     <span class="project-name">{session.project}</span>
                     <span class="status-line status-{session.status}">
-                      <i></i>{session.statusLabel}
+                      {#if session.status === "running"}
+                        <span class="running-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                      {:else}
+                        <i></i>
+                      {/if}
+                      {session.statusLabel}
                     </span>
                   </span>
                   <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true">
@@ -813,56 +860,41 @@
         {:else if view === "board"}
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="board-intro">
-              <span class="eyebrow">Mesa compartilhada</span>
-              <strong>Acople as sessões ao mesmo prompt</strong>
-              <p>Selecione os agentes que devem receber a próxima direção.</p>
+              <span class="eyebrow">Terminais flutuantes</span>
+              <strong>Um espaço separado para cada agente</strong>
+              <p>Abra mini terminais independentes e aproxime um do outro para acoplá-los.</p>
             </div>
 
-            <div class="board-map">
-              <div class="board-hub" aria-hidden="true"><span class="lume-mark"><i></i></span></div>
-              <div class="board-rail" aria-hidden="true"></div>
-              <div class="board-targets">
-                {#each sessions as session (session.id)}
+            <div class="terminal-picker">
+              {#each sessions as session (session.id)}
+                <div class="terminal-picker-row">
+                  <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={18} /></span>
+                  <span class="terminal-picker-copy">
+                    <strong>{session.agentLabel}</strong>
+                    <small>{session.project}</small>
+                  </span>
+                  <span class="source-label">
+                    <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
+                    {sourceLabel(session)}
+                  </span>
                   <button
-                    class:selected={boardSessionIds.includes(session.id)}
-                    class:unavailable={!canSubmitToSession(session) || !canContinueSession(session)}
-                    disabled={!canSubmitToSession(session) || !canContinueSession(session)}
+                    class:opened={terminalIsOpen(session)}
+                    disabled={openingTerminal !== null}
                     type="button"
-                    onclick={() => toggleBoardSession(session)}
+                    onclick={() => showTerminal(session)}
                   >
-                    <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={18} /></span>
-                    <span><strong>{session.agentLabel}</strong><small>{session.project}</small></span>
-                    <i aria-hidden="true"></i>
+                    {openingTerminal === session.id ? "Abrindo…" : terminalIsOpen(session) ? "Mostrar" : "Abrir"}
                   </button>
-                {:else}
-                  <p class="board-empty">As sessões aparecerão aqui quando forem detectadas.</p>
-                {/each}
-              </div>
+                </div>
+              {:else}
+                <p class="board-empty">As sessões aparecerão aqui quando forem detectadas.</p>
+              {/each}
             </div>
-
-            <form
-              class="board-composer"
-              onsubmit={(event) => {
-                event.preventDefault();
-                void sendBoardPrompt();
-              }}
-            >
-              <textarea
-                bind:value={boardPrompt}
-                aria-label="Prompt compartilhado"
-                placeholder="Uma direção para os agentes acoplados…"
-                rows="3"
-              ></textarea>
-              <div>
-                <span>{boardSessionIds.length} selecionado(s)</span>
-                <button disabled={!boardPrompt.trim() || boardSending} type="submit">
-                  {boardSending ? "Enviando…" : "Enviar"}
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
-                </button>
-              </div>
-            </form>
-            {#if boardMessage}<p class="board-message" transition:fade>{boardMessage}</p>{/if}
-            <p class="board-note">Terminais externos aparecem na mesa, mas só origens com canal direto podem ser selecionadas.</p>
+            {#if terminalMessage}<p class="board-message" transition:fade>{terminalMessage}</p>{/if}
+            <div class="dock-guide">
+              <svg viewBox="0 0 32 20" aria-hidden="true"><rect x="2" y="3" width="12" height="14" rx="3" /><rect x="18" y="3" width="12" height="14" rx="3" /><path d="M14 10h4" /></svg>
+              <span>Cada janela tem seu próprio prompt. Arraste duas pelas bordas para formar um conjunto.</span>
+            </div>
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
@@ -1070,6 +1102,7 @@
     </section>
   {/if}
 </main>
+{/if}
 
 <style>
   .overlay-shell {
@@ -1081,7 +1114,7 @@
   }
 
   .overlay-shell.expanded {
-    padding: 0 8px 16px 0;
+    padding: 0 var(--panel-gap-right) var(--panel-gap-bottom) 0;
   }
 
   button,
@@ -1116,39 +1149,22 @@
   .lume-orb:active { transform: scale(0.97); }
   .lume-orb.dragging { cursor: grabbing; transform: scale(0.985); }
 
-  .lume-mark {
-    width: 20px;
-    height: 20px;
-    display: grid;
-    place-items: center;
-    border: 1.4px solid currentColor;
-    border-radius: 50%;
-    transition: color 180ms ease, transform 180ms ease;
-  }
-
-  .lume-mark > span {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  .lume-mark .status-glyph {
-    width: 14px;
-    height: 14px;
-    stroke-width: 2;
-  }
-
-  .lume-mark.large .status-glyph { width: 17px; height: 17px; }
-
-  .lume-mark.large { width: 27px; height: 27px; }
-  .lume-mark.large > span { width: 7px; height: 7px; }
+  .lume-brand-icon { position: relative; width: 28px; height: 28px; flex: 0 0 auto; }
+  .logo-state { position: absolute; right: -3px; bottom: -2px; width: 12px; height: 12px; display: grid; place-items: center; border: 2px solid rgba(249, 251, 250, 0.96); border-radius: 50%; color: white; background: currentColor; }
+  .logo-state i { width: 4px; height: 4px; border-radius: 50%; background: white; }
+  .logo-state .status-glyph { width: 9px; height: 9px; stroke: white; stroke-width: 2.4; }
+  .status-permission_required .logo-state { background: #ae6b24; }
+  .status-failed .logo-state { background: #a84d4d; }
+  .status-completed .logo-state { background: #678476; }
+  .status-running .logo-state { background: #4f7f6c; }
+  .status-waiting_for_input .logo-state { background: #627f9d; }
+  .status-idle .logo-state { background: #829089; }
   .status-permission_required { color: #ae6b24; }
   .status-failed { color: #a84d4d; }
   .status-completed { color: #708079; }
   .status-idle { color: #829089; }
 
-  .status-permission_required.lume-orb .lume-mark {
+  .status-permission_required.lume-orb .lume-brand-icon {
     animation: attention 1.8s ease-in-out infinite;
   }
 
@@ -1171,16 +1187,35 @@
 
   .panel {
     position: relative;
-    width: 376px;
-    height: 544px;
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: column;
     overflow: hidden;
     border: 1px solid rgba(105, 124, 116, 0.18);
-    border-radius: 21px;
+    border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
     backdrop-filter: blur(28px) saturate(125%);
+  }
+
+  .panel-content,
+  .panel footer,
+  .panel .brand-lockup > div,
+  .panel .header-actions,
+  .panel .back-button,
+  .panel .launcher-popover {
+    transition: opacity 150ms ease, transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .panel:not(.content-visible) .panel-content,
+  .panel:not(.content-visible) footer,
+  .panel:not(.content-visible) .brand-lockup > div,
+  .panel:not(.content-visible) .header-actions,
+  .panel:not(.content-visible) .back-button,
+  .panel:not(.content-visible) .launcher-popover {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-4px) scale(0.985);
   }
 
   .panel-header {
@@ -1317,13 +1352,22 @@
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
-  .status-line i { width: 5px; height: 5px; border-radius: 50%; background: #82908a; }
-  .status-line.status-running i { background: #4c8871; }
+  .status-line > i { width: 5px; height: 5px; border-radius: 50%; background: #82908a; }
+  .status-line.status-running { color: #4e7faf; }
+  .running-dots { height: 8px; display: inline-flex; align-items: center; gap: 2px; }
+  .running-dots i { width: 3px; height: 3px; border-radius: 50%; background: #5388bd; animation: status-dot-bounce 900ms ease-in-out infinite; }
+  .running-dots i:nth-child(2) { animation-delay: 120ms; }
+  .running-dots i:nth-child(3) { animation-delay: 240ms; }
   .status-line.status-permission_required { color: #a46522; }
-  .status-line.status-permission_required i { background: #cb8235; box-shadow: 0 0 0 3px rgba(203, 130, 53, 0.1); }
-  .status-line.status-completed i { background: #78a18f; }
-  .status-line.status-failed i { background: #b95454; }
-  .status-line.status-waiting_for_input i { background: #6681a4; }
+  .status-line.status-permission_required > i { background: #cb8235; box-shadow: 0 0 0 3px rgba(203, 130, 53, 0.1); }
+  .status-line.status-completed > i { background: #78a18f; }
+  .status-line.status-failed > i { background: #b95454; }
+  .status-line.status-waiting_for_input > i { background: #6681a4; }
+
+  @keyframes status-dot-bounce {
+    0%, 60%, 100% { opacity: 0.48; transform: translateY(1px); }
+    30% { opacity: 1; transform: translateY(-2px); }
+  }
 
   .chevron { width: 13px; height: 13px; color: #98a19d; transition: transform 180ms ease; }
   .selected .chevron { transform: rotate(90deg); }
@@ -1363,11 +1407,9 @@
   .continue-trigger:hover svg,
   .continue-trigger.active svg { transform: translateX(2px); }
   .inline-composer { margin-top: 8px; display: flex; align-items: flex-end; gap: 6px; }
-  .inline-composer textarea,
-  .board-composer textarea { resize: none; outline: none; font: inherit; }
+  .inline-composer textarea { resize: none; outline: none; font: inherit; }
   .inline-composer textarea { min-width: 0; min-height: 52px; flex: 1; padding: 8px 9px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 10px; color: #34423c; background: rgba(255, 255, 255, 0.48); font-size: 10px; line-height: 1.4; }
-  .inline-composer textarea:focus,
-  .board-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
+  .inline-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
   .inline-composer button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
   .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer button:disabled { opacity: 0.35; cursor: default; }
@@ -1377,31 +1419,20 @@
   .board-intro .eyebrow { display: block; margin-bottom: 4px; color: #7a8c84; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
   .board-intro strong { color: #2d3a35; font-size: 12px; }
   .board-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; line-height: 1.45; }
-  .board-map { position: relative; min-height: 150px; padding: 12px 0 8px; display: grid; grid-template-columns: 30px 1fr; gap: 10px; }
-  .board-hub { position: relative; z-index: 1; padding-top: 10px; display: flex; justify-content: center; color: #4e7567; }
-  .board-hub .lume-mark { width: 23px; height: 23px; background: #f8faf9; }
-  .board-hub .lume-mark i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-  .board-rail { position: absolute; top: 46px; bottom: 17px; left: 14px; width: 1px; background: linear-gradient(#6f9183, rgba(111, 145, 131, 0.08)); }
-  .board-targets { min-width: 0; }
-  .board-targets > button { position: relative; width: 100%; min-height: 51px; padding: 7px 1px; display: flex; align-items: center; gap: 9px; border: 0; border-bottom: 1px solid rgba(105, 123, 115, 0.09); color: inherit; background: transparent; text-align: left; cursor: pointer; transition: opacity 150ms ease, transform 150ms ease; }
-  .board-targets > button:last-child { border-bottom: 0; }
-  .board-targets > button:hover:not(:disabled) { transform: translateX(2px); }
-  .board-targets > button.unavailable { opacity: 0.42; cursor: default; }
-  .board-targets > button > span:nth-child(2) { min-width: 0; flex: 1; display: grid; gap: 2px; }
-  .board-targets strong { color: #35423d; font-size: 10px; }
-  .board-targets small { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-  .board-targets > button > i { width: 9px; height: 9px; border: 1px solid #aab5b0; border-radius: 50%; transition: border 150ms ease, background 150ms ease, box-shadow 150ms ease; }
-  .board-targets > button.selected > i { border-color: #527c6c; background: #527c6c; box-shadow: inset 0 0 0 2px #f8faf9; }
+  .terminal-picker { padding: 9px 0 6px; }
+  .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
+  .terminal-picker-row:last-child { border-bottom: 0; }
+  .terminal-picker-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .terminal-picker-copy strong { color: #35423d; font-size: 10px; }
+  .terminal-picker-copy small { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-picker-row > button { min-width: 52px; height: 28px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 9px; color: #4d6f61; background: rgba(255, 255, 255, 0.38); font-size: 9px; font-weight: 720; cursor: pointer; transition: transform 140ms ease, background 140ms ease; }
+  .terminal-picker-row > button:hover:not(:disabled) { transform: translateY(-1px); background: white; }
+  .terminal-picker-row > button.opened { color: #73827b; background: transparent; }
+  .terminal-picker-row > button:disabled { opacity: 0.5; cursor: default; }
   .board-empty { margin: 22px 0; color: #89938f; font-size: 9px; line-height: 1.45; }
-  .board-composer { padding-top: 11px; border-top: 1px solid rgba(105, 123, 115, 0.1); }
-  .board-composer textarea { width: 100%; min-height: 70px; padding: 10px 11px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 12px; color: #34423c; background: rgba(255, 255, 255, 0.42); font-size: 10px; line-height: 1.45; }
-  .board-composer > div { min-height: 36px; display: flex; align-items: center; justify-content: space-between; }
-  .board-composer > div > span { color: #8b9590; font-size: 8px; }
-  .board-composer button { height: 29px; padding: 0 9px 0 11px; display: flex; align-items: center; gap: 5px; border: 0; border-radius: 9px; color: white; background: #496f60; font-size: 9px; font-weight: 720; cursor: pointer; }
-  .board-composer button:disabled { opacity: 0.35; cursor: default; }
-  .board-composer button svg { width: 13px; height: 13px; }
   .board-message { margin: 1px 0 4px; color: #5f756b; font-size: 9px; }
-  .board-note { margin: 8px 4px 0; color: #929b97; font-size: 8px; line-height: 1.4; text-align: center; }
+  .dock-guide { margin-top: 9px; padding: 11px 9px; display: flex; align-items: center; gap: 9px; border-top: 1px solid rgba(105, 123, 115, 0.1); color: #8a9590; font-size: 8px; line-height: 1.4; }
+  .dock-guide svg { width: 34px; height: 22px; flex: 0 0 auto; fill: none; stroke: #6f8f81; stroke-width: 1.3; }
 
   .empty-state { height: 100%; min-height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #73807a; text-align: center; }
   .empty-state strong { margin-top: 10px; color: #44524c; font-size: 11px; }
@@ -1490,7 +1521,7 @@
     .back-button,
     .session-title-row strong,
     .board-intro strong,
-    .board-targets strong,
+    .terminal-picker-copy strong,
     .history-row strong,
     .setting-row strong,
     .integration-row strong,
@@ -1507,7 +1538,7 @@
     .session-row.selected { background: rgba(198, 218, 208, 0.045); }
     .project-name,
     .board-intro p,
-    .board-targets small,
+    .terminal-picker-copy small,
     .history-row span,
     .settings-feedback { color: #adbab4; }
     .settings-feedback.error { color: #d68d8d; }
@@ -1518,14 +1549,13 @@
     .permission-block > strong { color: #e2d0bd; }
     .permission-actions button,
     .field-row select,
-    .inline-composer textarea,
-    .board-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+    .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
     .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
     .board-intro,
-    .board-targets > button,
-    .board-composer { border-color: rgba(190, 209, 200, 0.09); }
-    .board-hub .lume-mark { background: #202824; }
-    .board-targets > button.selected > i { box-shadow: inset 0 0 0 2px #202824; }
+    .terminal-picker-row,
+    .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
+    .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+    .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
     .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
     .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
   }

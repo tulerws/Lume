@@ -192,6 +192,7 @@ mod tests {
             agent_label: "Codex".into(),
             project: "Lume".into(),
             source: SessionSource::Cli,
+            source_app: None,
             status: SessionStatus::PermissionRequired,
             status_label: "Aguardando permissão".into(),
             started_at: "0".into(),

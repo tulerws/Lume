@@ -13,7 +13,7 @@ Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Win
 - histórico local sanitizado, sons opcionais, bandeja e autostart;
 - monitor configurável e sobreposição Wayland por `gtk-layer-shell`;
 - cápsula arrastável com posição salva entre reinicializações;
-- Whiteboard para acoplar sessões e enviar uma direção compartilhada;
+- Whiteboard com um mini terminal flutuante por sessão e acoplamento entre janelas;
 - continuação por prompt no Codex aberto pelo Lume e nos chats web conectados;
 - comportamento padrão abaixo de vídeos e jogos em tela cheia;
 
