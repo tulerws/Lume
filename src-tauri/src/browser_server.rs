@@ -40,6 +40,8 @@ struct BrowserEvent {
     origin: String,
     browser: Option<String>,
     state: BrowserState,
+    #[serde(default)]
+    last_response: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -124,15 +126,16 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                         "web:{}:{}",
                         browser_event.provider, browser_event.session_id
                     );
+                    let previous_status = state
+                        .sessions()?
+                        .into_iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.status);
                     let focus = control.take_focus(&session_id);
                     let prompt = control.take_prompt(&session_id);
                     let event = map_event(browser_event)?;
-                    let notification = matches!(
-                        event.event,
-                        HookEventKind::PermissionRequest
-                            | HookEventKind::Completed
-                            | HookEventKind::Failed
-                    );
+                    let notification =
+                        crate::domain::should_notify(&event.event, previous_status.as_ref());
                     let label = event.agent_label.clone().unwrap_or_else(|| "Agente".into());
                     let project = event.project.clone().unwrap_or_else(|| "sessão web".into());
                     let event_kind = event.event.clone();
@@ -286,6 +289,12 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
             available_actions: vec![PermissionAction::OpenSource],
         }),
         permission,
+        last_response: event
+            .last_response
+            .as_deref()
+            .map(str::trim)
+            .filter(|response| !response.is_empty())
+            .map(|response| truncate(response, 32 * 1024)),
         wait_for_decision: false,
     })
 }
@@ -315,6 +324,7 @@ mod tests {
             origin: "https://chatgpt.com".into(),
             browser: Some("brave".into()),
             state: BrowserState::PermissionRequired,
+            last_response: None,
         })
         .expect("evento web");
         assert_eq!(event.session_id, "web:codex:hash-only");

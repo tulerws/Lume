@@ -148,6 +148,7 @@ fn proxy_connection(stream: TcpStream, state: AppState, app: AppHandle) -> Resul
     configure_client_timeout(&mut client)?;
     configure_server_timeout(&mut server)?;
     let mut profiles = HashMap::new();
+    let mut responses = HashMap::new();
 
     loop {
         match client.read() {
@@ -167,7 +168,8 @@ fn proxy_connection(stream: TcpStream, state: AppState, app: AppHandle) -> Resul
         match server.read() {
             Ok(message) => {
                 let closing = matches!(message, Message::Close(_));
-                if let Some(response) = intercept_server_message(&message, &state, &app, &profiles)?
+                if let Some(response) =
+                    intercept_server_message(&message, &state, &app, &profiles, &mut responses)?
                 {
                     server.send(response).map_err(|error| error.to_string())?;
                 } else {
@@ -289,6 +291,7 @@ fn wait_for_response(
     app: &AppHandle,
     profiles: &HashMap<String, PermissionProfile>,
 ) -> Result<(), String> {
+    let mut responses = HashMap::new();
     loop {
         let message = socket.read().map_err(|error| error.to_string())?;
         if let Message::Text(text) = &message {
@@ -305,7 +308,9 @@ fn wait_for_response(
                 }
             }
         }
-        if let Some(response) = intercept_server_message(&message, state, app, profiles)? {
+        if let Some(response) =
+            intercept_server_message(&message, state, app, profiles, &mut responses)?
+        {
             socket.send(response).map_err(|error| error.to_string())?;
         }
     }
@@ -318,6 +323,7 @@ fn monitor_prompt(
     app: &AppHandle,
 ) -> Result<(), String> {
     let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
+    let mut responses = HashMap::new();
     loop {
         match socket.read() {
             Ok(message) => {
@@ -335,7 +341,9 @@ fn monitor_prompt(
                             }),
                         _ => false,
                     };
-                if let Some(response) = intercept_server_message(&message, state, app, &profiles)? {
+                if let Some(response) =
+                    intercept_server_message(&message, state, app, &profiles, &mut responses)?
+                {
                     socket.send(response).map_err(|error| error.to_string())?;
                 }
                 if completed {
@@ -354,6 +362,7 @@ fn intercept_server_message(
     state: &AppState,
     app: &AppHandle,
     profiles: &HashMap<String, PermissionProfile>,
+    responses: &mut HashMap<String, String>,
 ) -> Result<Option<Message>, String> {
     let Message::Text(text) = message else {
         return Ok(None);
@@ -365,7 +374,8 @@ fn intercept_server_message(
     if is_approval(method) && value.get("id").is_some() {
         return approval_response(&value, method, state, app, profiles).map(Some);
     }
-    if let Some(event) = notification_event(&value, method, profiles) {
+    remember_response(&value, method, responses);
+    if let Some(event) = notification_event(&value, method, profiles, responses) {
         let _ = event_server::publish_event(state, app, event);
     }
     Ok(None)
@@ -444,6 +454,7 @@ fn approval_response(
             risk,
             requested_at: now_millis().to_string(),
         }),
+        last_response: None,
         wait_for_decision: true,
     };
     event_server::publish_event(state, app, event)?;
@@ -524,9 +535,10 @@ fn notification_event(
     value: &Value,
     method: &str,
     profiles: &HashMap<String, PermissionProfile>,
+    responses: &mut HashMap<String, String>,
 ) -> Option<HookEvent> {
     let params = value.get("params")?;
-    let (event, thread_id, status_label, cwd, name, started_at) = match method {
+    let (event, thread_id, status_label, cwd, name, started_at, last_response) = match method {
         "thread/started" => {
             let thread = params.get("thread")?;
             (
@@ -539,17 +551,24 @@ fn notification_event(
                     .get("createdAt")
                     .and_then(Value::as_i64)
                     .map(|value| value.to_string()),
+                None,
             )
         }
-        "turn/started" => (
-            HookEventKind::Running,
-            text_at(params, "threadId")?,
-            "Executando",
-            None,
-            None,
-            None,
-        ),
+        "turn/started" => {
+            let thread_id = text_at(params, "threadId")?;
+            responses.remove(thread_id);
+            (
+                HookEventKind::Running,
+                thread_id,
+                "Executando",
+                None,
+                None,
+                None,
+                None,
+            )
+        }
         "turn/completed" => {
+            let thread_id = text_at(params, "threadId")?;
             let status = params
                 .get("turn")
                 .and_then(|turn| text_at(turn, "status"))
@@ -559,12 +578,16 @@ fn notification_event(
             } else {
                 (HookEventKind::Completed, "Tarefa finalizada")
             };
-            (event, text_at(params, "threadId")?, label, None, None, None)
+            let last_response = responses
+                .remove(thread_id)
+                .or_else(|| response_from_turn(params));
+            (event, thread_id, label, None, None, None, last_response)
         }
         "thread/closed" => (
             HookEventKind::SessionEnded,
             text_at(params, "threadId")?,
             "Sessão encerrada",
+            None,
             None,
             None,
             None,
@@ -593,8 +616,56 @@ fn notification_event(
                 .unwrap_or_else(direct_profile),
         ),
         permission: None,
+        last_response,
         wait_for_decision: false,
     })
+}
+
+fn remember_response(value: &Value, method: &str, responses: &mut HashMap<String, String>) {
+    if method != "item/completed" {
+        return;
+    }
+    let Some(params) = value.get("params") else {
+        return;
+    };
+    let Some(thread_id) = text_at(params, "threadId") else {
+        return;
+    };
+    let Some(item) = params.get("item") else {
+        return;
+    };
+    if text_at(item, "type") != Some("agentMessage") {
+        return;
+    }
+    let Some(text) = text_at(item, "text").and_then(response_text) else {
+        return;
+    };
+    responses.insert(thread_id.to_string(), text);
+}
+
+fn response_from_turn(params: &Value) -> Option<String> {
+    params
+        .get("turn")?
+        .get("items")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|item| text_at(item, "type") == Some("agentMessage"))
+        .and_then(|item| text_at(item, "text"))
+        .and_then(response_text)
+}
+
+fn response_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 32 * 1024;
+    let mut response = value.chars().take(LIMIT).collect::<String>();
+    if value.chars().count() > LIMIT {
+        response.push('…');
+    }
+    Some(response)
 }
 
 fn direct_profile() -> PermissionProfile {
@@ -725,5 +796,34 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn completed_turn_carries_the_last_agent_message() {
+        let mut responses = HashMap::new();
+        remember_response(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": { "type": "agentMessage", "text": "Resposta final" }
+                }
+            }),
+            "item/completed",
+            &mut responses,
+        );
+        let event = notification_event(
+            &json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thread-1", "turn": { "status": "completed" } }
+            }),
+            "turn/completed",
+            &HashMap::new(),
+            &mut responses,
+        )
+        .expect("evento concluído");
+
+        assert_eq!(event.last_response.as_deref(), Some("Resposta final"));
+        assert!(responses.is_empty());
     }
 }

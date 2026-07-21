@@ -66,10 +66,11 @@ impl Store {
     }
 
     pub fn save_session(&self, session: &AgentSession) -> Result<(), String> {
-        // Solicitações são mantidas apenas em memória e apagadas após a decisão.
+        // Solicitações, diretórios e respostas são mantidos apenas em memória.
         let mut sanitized = session.clone();
         sanitized.pending_permission = None;
         sanitized.working_directory = None;
+        sanitized.last_response = None;
         let payload = serde_json::to_string(&sanitized).map_err(|error| error.to_string())?;
         self.connection
             .execute(
@@ -215,12 +216,14 @@ mod tests {
                 risk: "high".into(),
                 requested_at: "0".into(),
             }),
+            last_response: Some("resposta que nao pode ser salva".into()),
         };
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].pending_permission.is_none());
         assert!(loaded[0].working_directory.is_none());
+        assert!(loaded[0].last_response.is_none());
     }
 
     #[test]

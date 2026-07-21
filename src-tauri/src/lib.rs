@@ -107,9 +107,14 @@ fn submit_prompt(
         browser.request_prompt(session.id.clone(), prompt.to_string())?;
         return browser.request_focus(session.id);
     }
-    if session.agent == domain::AgentKind::Codex && session.permission_profile.can_respond_from_lume
-    {
-        let profile = session.permission_profile.clone();
+    if session.agent == domain::AgentKind::Codex {
+        let mut profile = session.permission_profile.clone();
+        profile.can_respond_from_lume = true;
+        profile.available_actions = vec![
+            PermissionAction::AllowOnce,
+            PermissionAction::AllowSession,
+            PermissionAction::Deny,
+        ];
         let thread_id = session
             .native_session_id
             .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
@@ -215,9 +220,10 @@ fn open_terminal_window(
 
 #[tauri::command]
 fn list_terminal_windows(
+    app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
 ) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
-    terminals.list()
+    terminals.list(&app)
 }
 
 #[tauri::command]
@@ -229,11 +235,12 @@ fn get_terminal_window_state(
 }
 
 #[tauri::command]
-fn close_terminal_window(app: AppHandle, label: String) -> Result<(), String> {
-    app.get_webview_window(&label)
-        .ok_or_else(|| "Mini terminal não encontrado".to_string())?
-        .close()
-        .map_err(|error| error.to_string())?;
+fn close_terminal_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<(), String> {
+    terminals.close(&app, &label)?;
     let _ = app.emit("lume://terminal-windows-changed", ());
     Ok(())
 }

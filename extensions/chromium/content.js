@@ -7,6 +7,7 @@
       : "codex";
   let lastState = "";
   let lastPath = "";
+  let lastResponseSignature = "";
   let timer;
 
   const visible = (element) => {
@@ -77,6 +78,20 @@
       .trim()
       .slice(0, 100) || "Sessão web";
 
+  const finalResponse = () => {
+    const selectors = provider === "codex"
+      ? ['[data-message-author-role="assistant"]']
+      : provider === "claude"
+        ? ['[data-testid="assistant-message"]', '.font-claude-response']
+        : ['model-response .markdown', 'model-response', '.model-response-text'];
+    const candidates = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
+    const response = candidates
+      .filter((element) => element.textContent?.trim())
+      .at(-1)
+      ?.textContent?.trim();
+    return response?.slice(0, 32768);
+  };
+
   const submitPrompt = async (text) => {
     const candidates = [
       ...document.querySelectorAll(
@@ -126,9 +141,12 @@
   const report = (force = false) => {
     const state = detectState();
     const path = location.pathname;
-    if (!force && state === lastState && path === lastPath) return;
+    const lastResponse = state === "completed" ? finalResponse() : undefined;
+    const responseSignature = lastResponse ? hash(lastResponse) : "";
+    if (!force && state === lastState && path === lastPath && responseSignature === lastResponseSignature) return;
     lastState = state;
     lastPath = path;
+    lastResponseSignature = responseSignature;
     void chrome.runtime.sendMessage({
       type: "lume:event",
       event: {
@@ -137,6 +155,7 @@
         title: cleanTitle(),
         origin: location.origin,
         state,
+        lastResponse,
       },
     }).then((response) => {
       if (response?.prompt) void submitPrompt(response.prompt);

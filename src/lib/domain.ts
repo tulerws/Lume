@@ -53,6 +53,7 @@ export interface AgentSession {
   workingDirectory?: string;
   permissionProfile: PermissionProfile;
   pendingPermission?: PermissionRequest;
+  lastResponse?: string;
 }
 
 export interface HistoryEntry {

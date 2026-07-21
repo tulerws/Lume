@@ -32,6 +32,7 @@ struct SessionMetadata {
     id: String,
     cwd: Option<String>,
     started_at: Option<String>,
+    source: SessionSource,
 }
 
 #[derive(Debug)]
@@ -58,7 +59,11 @@ struct RecordPayload {
     #[serde(default)]
     originator: Option<String>,
     #[serde(default)]
-    source: Option<String>,
+    source: Option<Value>,
+    #[serde(default)]
+    parent_thread_id: Option<String>,
+    #[serde(default)]
+    thread_source: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -67,6 +72,8 @@ struct RecordPayload {
     approval_policy: Option<String>,
     #[serde(default)]
     sandbox_policy: Option<Value>,
+    #[serde(default)]
+    last_agent_message: Option<String>,
 }
 
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
@@ -259,16 +266,20 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
         if record.kind != "event_msg" {
             continue;
         }
-        let (kind, label) = match record.payload.r#type.as_deref() {
-            Some("task_started") => (HookEventKind::Running, "Executando no VS Code"),
-            Some("task_complete") => (HookEventKind::Completed, "Tarefa finalizada"),
-            Some("turn_aborted") => (HookEventKind::Completed, "Tarefa interrompida"),
+        let (kind, label, last_response) = match record.payload.r#type.as_deref() {
+            Some("task_started") => (HookEventKind::Running, "Rodando", None),
+            Some("task_complete") => (
+                HookEventKind::Completed,
+                "Tarefa finalizada",
+                record.payload.last_agent_message.as_deref(),
+            ),
+            Some("turn_aborted") => (HookEventKind::Completed, "Tarefa interrompida", None),
             Some("stream_error" | "task_failed") => {
-                (HookEventKind::Failed, "Tarefa encerrada com erro")
+                (HookEventKind::Failed, "Tarefa encerrada com erro", None)
             }
             _ => continue,
         };
-        if let Some(event) = event_for(file, kind, label) {
+        if let Some(event) = event_for(file, kind, label, last_response) {
             events.push(event);
         }
     }
@@ -276,14 +287,15 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
 }
 
 fn session_started_event(file: &ObservedFile) -> Option<HookEvent> {
-    event_for(
-        file,
-        HookEventKind::SessionStarted,
-        "Esperando ação no VS Code",
-    )
+    event_for(file, HookEventKind::SessionStarted, "Esperando ação", None)
 }
 
-fn event_for(file: &ObservedFile, event: HookEventKind, label: &str) -> Option<HookEvent> {
+fn event_for(
+    file: &ObservedFile,
+    event: HookEventKind,
+    label: &str,
+    last_response: Option<&str>,
+) -> Option<HookEvent> {
     let session = file.session.as_ref()?;
     let project = session
         .cwd
@@ -297,17 +309,31 @@ fn event_for(file: &ObservedFile, event: HookEventKind, label: &str) -> Option<H
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
         project,
-        source: Some(SessionSource::Vscode),
+        source: Some(session.source.clone()),
         source_app: None,
         status_label: Some(label.into()),
         started_at: session.started_at.clone(),
         process_id: None,
         native_session_id: Some(session.id.clone()),
         working_directory: session.cwd.clone(),
-        permission_profile: Some(file.profile.clone().unwrap_or_else(default_vscode_profile)),
+        permission_profile: Some(file.profile.clone().unwrap_or_else(default_profile)),
         permission: None,
+        last_response: last_response.and_then(response_text),
         wait_for_decision: false,
     })
+}
+
+fn response_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 32 * 1024;
+    let mut response = value.chars().take(LIMIT).collect::<String>();
+    if value.chars().count() > LIMIT {
+        response.push('…');
+    }
+    Some(response)
 }
 
 fn read_session_metadata(path: &Path) -> Option<SessionMetadata> {
@@ -321,15 +347,30 @@ fn read_session_metadata(path: &Path) -> Option<SessionMetadata> {
 
 fn session_metadata(record: &CodexRecord) -> Option<SessionMetadata> {
     if record.kind != "session_meta"
-        || (record.payload.source.as_deref() != Some("vscode")
-            && record.payload.originator.as_deref() != Some("codex_vscode"))
+        || record.payload.parent_thread_id.is_some()
+        || record.payload.thread_source.as_deref() == Some("subagent")
+        || record
+            .payload
+            .source
+            .as_ref()
+            .and_then(|source| source.get("subagent"))
+            .is_some()
     {
         return None;
     }
+    let source = match (
+        record.payload.originator.as_deref(),
+        record.payload.source.as_ref().and_then(Value::as_str),
+    ) {
+        (Some("codex_vscode"), _) | (_, Some("vscode")) => SessionSource::Vscode,
+        (Some("codex-tui" | "codex_cli_rs"), _) | (_, Some("cli")) => SessionSource::Cli,
+        _ => return None,
+    };
     Some(SessionMetadata {
         id: record.payload.id.clone()?,
         cwd: record.payload.cwd.clone(),
         started_at: record.payload.timestamp.clone(),
+        source,
     })
 }
 
@@ -397,17 +438,17 @@ fn profile_from_context(payload: &RecordPayload) -> PermissionProfile {
         approval_policy: payload
             .approval_policy
             .clone()
-            .unwrap_or_else(|| "Gerenciada pelo VS Code".into()),
+            .unwrap_or_else(|| "Gerenciada na origem".into()),
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
 }
 
-fn default_vscode_profile() -> PermissionProfile {
+fn default_profile() -> PermissionProfile {
     PermissionProfile {
         mode: AccessMode::Custom,
         label: "Permissões da sessão".into(),
-        approval_policy: "Gerenciada pelo VS Code".into(),
+        approval_policy: "Gerenciada na origem".into(),
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
@@ -460,16 +501,26 @@ mod tests {
     }
 
     #[test]
-    fn identifies_only_codex_vscode_sessions() {
+    fn identifies_root_codex_sessions_without_creating_subagent_duplicates() {
         let vscode = record(
             r#"{"type":"session_meta","payload":{"id":"chat-1","originator":"codex_vscode","source":"vscode","cwd":"/work/lume"}}"#,
         );
         let cli = record(
             r#"{"type":"session_meta","payload":{"id":"chat-2","originator":"codex-tui","source":"cli","cwd":"/work/lume"}}"#,
         );
+        let subagent = record(
+            r#"{"type":"session_meta","payload":{"id":"chat-3","originator":"codex-tui","source":{"subagent":{"other":"guardian"}},"parent_thread_id":"chat-2","thread_source":"subagent","cwd":"/work/lume"}}"#,
+        );
 
-        assert_eq!(session_metadata(&vscode).expect("VS Code").id, "chat-1");
-        assert!(session_metadata(&cli).is_none());
+        assert_eq!(
+            session_metadata(&vscode).expect("VS Code").source,
+            SessionSource::Vscode
+        );
+        assert_eq!(
+            session_metadata(&cli).expect("CLI").source,
+            SessionSource::Cli
+        );
+        assert!(session_metadata(&subagent).is_none());
     }
 
     #[test]
@@ -480,13 +531,14 @@ mod tests {
                 id: "chat-1".into(),
                 cwd: Some("/work/lume".into()),
                 started_at: None,
+                source: SessionSource::Vscode,
             }),
             profile: None,
         };
         let records = vec![
             record(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#),
             record(
-                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"conteudo sensivel ignorado"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Resposta pronta"}}"#,
             ),
         ];
 
@@ -497,6 +549,7 @@ mod tests {
         assert!(matches!(&events[1].event, HookEventKind::Completed));
         assert_eq!(events[0].source, Some(SessionSource::Vscode));
         assert_eq!(events[0].native_session_id.as_deref(), Some("chat-1"));
+        assert_eq!(events[1].last_response.as_deref(), Some("Resposta pronta"));
     }
 
     #[test]

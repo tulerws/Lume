@@ -72,7 +72,12 @@ pub fn publish_event(
     app: &AppHandle,
     event: HookEvent,
 ) -> Result<Option<String>, String> {
-    let notification = notification_for(&event);
+    let previous_status = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == event.session_id)
+        .map(|session| session.status);
+    let notification = notification_for(&event, previous_status.as_ref());
     let permission_id = state.ingest(event)?;
     let _ = app.emit("lume://sessions-changed", ());
     if let Some((title, body)) = notification {
@@ -81,7 +86,13 @@ pub fn publish_event(
     Ok(permission_id)
 }
 
-fn notification_for(event: &HookEvent) -> Option<(String, String)> {
+fn notification_for(
+    event: &HookEvent,
+    previous_status: Option<&crate::domain::SessionStatus>,
+) -> Option<(String, String)> {
+    if !crate::domain::should_notify(&event.event, previous_status) {
+        return None;
+    }
     let agent = event
         .agent_label
         .clone()
@@ -94,9 +105,7 @@ fn notification_for(event: &HookEvent) -> Option<(String, String)> {
     let project = event.project.as_deref().unwrap_or("sessão local");
     let title = match event.event {
         crate::domain::HookEventKind::PermissionRequest => "Lume · Permissão necessária",
-        crate::domain::HookEventKind::Completed | crate::domain::HookEventKind::SessionEnded => {
-            "Lume · Tarefa finalizada"
-        }
+        crate::domain::HookEventKind::Completed => "Lume · Tarefa finalizada",
         crate::domain::HookEventKind::Failed => "Lume · Erro na sessão",
         _ => return None,
     };

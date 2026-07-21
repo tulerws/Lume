@@ -87,6 +87,8 @@ pub struct AgentSession {
     pub working_directory: Option<String>,
     pub permission_profile: PermissionProfile,
     pub pending_permission: Option<PermissionRequest>,
+    #[serde(default)]
+    pub last_response: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -141,6 +143,18 @@ pub enum HookEventKind {
     SessionEnded,
 }
 
+pub fn should_notify(event: &HookEventKind, previous: Option<&SessionStatus>) -> bool {
+    match event {
+        HookEventKind::PermissionRequest => previous != Some(&SessionStatus::PermissionRequired),
+        HookEventKind::Completed => matches!(
+            previous,
+            Some(SessionStatus::Running | SessionStatus::PermissionRequired)
+        ),
+        HookEventKind::Failed => previous.is_some() && previous != Some(&SessionStatus::Failed),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookEvent {
@@ -160,7 +174,35 @@ pub struct HookEvent {
     pub permission_profile: Option<PermissionProfile>,
     pub permission: Option<PermissionRequest>,
     #[serde(default)]
+    pub last_response: Option<String>,
+    #[serde(default)]
     pub wait_for_decision: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_only_fire_on_meaningful_task_transitions() {
+        assert!(should_notify(
+            &HookEventKind::Completed,
+            Some(&SessionStatus::Running)
+        ));
+        assert!(!should_notify(
+            &HookEventKind::Completed,
+            Some(&SessionStatus::Completed)
+        ));
+        assert!(should_notify(
+            &HookEventKind::PermissionRequest,
+            Some(&SessionStatus::Running)
+        ));
+        assert!(!should_notify(
+            &HookEventKind::PermissionRequest,
+            Some(&SessionStatus::PermissionRequired)
+        ));
+        assert!(!should_notify(&HookEventKind::SessionEnded, None));
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

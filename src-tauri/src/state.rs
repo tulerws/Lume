@@ -28,6 +28,7 @@ impl AppState {
         for session in &mut sessions {
             session.pending_permission = None;
             session.working_directory = None;
+            session.last_response = None;
             if matches!(
                 session.status,
                 SessionStatus::Running
@@ -259,6 +260,7 @@ impl AppState {
                 session.status = SessionStatus::Running;
                 session.status_label = event.status_label.unwrap_or_else(|| "Executando".into());
                 session.pending_permission = None;
+                session.last_response = None;
                 None
             }
             HookEventKind::PermissionRequest => {
@@ -596,6 +598,7 @@ impl AppState {
                 working_directory: process.working_directory,
                 permission_profile: default_profile(&process.agent),
                 pending_permission: None,
+                last_response: None,
             };
             snapshots.push(session.clone());
             sessions.push(session);
@@ -694,6 +697,7 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .clone()
             .unwrap_or_else(|| default_profile(&event.agent)),
         pending_permission: None,
+        last_response: event.last_response.clone(),
     }
 }
 
@@ -723,6 +727,9 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
         if profile.can_respond_from_lume || !session.permission_profile.can_respond_from_lume {
             session.permission_profile = profile.clone();
         }
+    }
+    if let Some(response) = &event.last_response {
+        session.last_response = Some(response.clone());
     }
 }
 
@@ -909,6 +916,7 @@ mod tests {
             working_directory: Some("/work/lume".into()),
             permission_profile: None,
             permission: None,
+            last_response: None,
             wait_for_decision: false,
         }
     }
@@ -1114,6 +1122,7 @@ mod tests {
                     working_directory: Some("/work/lume".into()),
                     permission_profile: None,
                     permission: None,
+                    last_response: None,
                     wait_for_decision: false,
                 })
                 .expect("chat do VS Code");

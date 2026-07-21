@@ -5,10 +5,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{
-    webview::PageLoadEvent, AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
-    WindowEvent,
-};
+use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use crate::{domain::AgentSession, overlay};
 
@@ -83,15 +80,9 @@ impl TerminalWindows {
                     placement.y = y;
                 }
             }
-            let existing_window = window.clone();
-            let selected_monitor = monitor_id.map(str::to_string);
-            window
-                .run_on_main_thread(move || {
-                    let _ = overlay::move_to(&existing_window, x, y, selected_monitor.as_deref());
-                    let _ = existing_window.show();
-                    let _ = existing_window.set_focus();
-                })
-                .map_err(|error| error.to_string())?;
+            let _ = overlay::move_to(&window, x, y, monitor_id);
+            window.show().map_err(|error| error.to_string())?;
+            let _ = window.set_focus();
             return Ok(label);
         }
 
@@ -139,12 +130,6 @@ impl TerminalWindows {
                 .always_on_top(true)
                 .resizable(true)
                 .visible(cfg!(target_os = "windows"))
-                .on_page_load(|window, payload| {
-                    if matches!(payload.event(), PageLoadEvent::Finished) {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                })
                 .build()
             {
                 Ok(window) => window,
@@ -170,41 +155,31 @@ impl TerminalWindows {
             _ => {}
         });
 
-        let layer_window = window.clone();
-        let selected_monitor = monitor_id.map(str::to_string);
-        window
-            .run_on_main_thread(move || {
-                let layered = overlay::configure(
-                    &layer_window,
-                    show_over_fullscreen,
-                    selected_monitor.as_deref(),
-                    Some(placement.x),
-                    Some(placement.y),
-                );
-                if !layered {
-                    let _ = overlay::move_to(
-                        &layer_window,
-                        placement.x,
-                        placement.y,
-                        selected_monitor.as_deref(),
-                    );
-                }
-                let _ = layer_window.show();
-                let _ = layer_window.set_focus();
-            })
-            .map_err(|error| {
-                self.remove(&label);
-                let _ = window.close();
-                error.to_string()
-            })?;
+        let layered = overlay::configure(
+            &window,
+            show_over_fullscreen,
+            monitor_id,
+            Some(placement.x),
+            Some(placement.y),
+        );
+        if !layered {
+            let _ = overlay::move_to(&window, placement.x, placement.y, monitor_id);
+        }
+        window.show().map_err(|error| {
+            self.remove(&label);
+            let _ = window.close();
+            error.to_string()
+        })?;
+        let _ = window.set_focus();
         Ok(label)
     }
 
-    pub fn list(&self) -> Result<Vec<TerminalWindowState>, String> {
-        let placements = self
+    pub fn list(&self, app: &AppHandle) -> Result<Vec<TerminalWindowState>, String> {
+        let mut placements = self
             .placements
             .lock()
             .map_err(|_| "Não foi possível acessar os mini terminais".to_string())?;
+        placements.retain(|label, _| app.get_webview_window(label).is_some());
         Ok(placements.values().map(Placement::state).collect())
     }
 
@@ -215,6 +190,15 @@ impl TerminalWindows {
             .get(label)
             .map(Placement::state)
             .ok_or_else(|| "Mini terminal não encontrado".to_string())
+    }
+
+    pub fn close(&self, app: &AppHandle, label: &str) -> Result<(), String> {
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        window.close().map_err(|error| error.to_string())?;
+        self.remove(label);
+        Ok(())
     }
 
     pub fn move_window(

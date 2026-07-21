@@ -99,6 +99,12 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     } else {
         None
     };
+    let last_response = matches!(
+        &event,
+        HookEventKind::Completed | HookEventKind::SessionEnded
+    )
+    .then(|| hook_response(raw))
+    .flatten();
 
     Some(HookEvent {
         event,
@@ -115,6 +121,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         working_directory: cwd,
         permission_profile,
         permission,
+        last_response,
         wait_for_decision: direct_response,
     })
 }
@@ -344,6 +351,14 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
 
 fn string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn hook_response(value: &Value) -> Option<String> {
+    ["last_assistant_message", "prompt_response", "response"]
+        .into_iter()
+        .find_map(|key| string(value, key))
+        .map(|response| truncate(response.trim(), 32 * 1024))
+        .filter(|response| !response.is_empty())
 }
 
 fn project_name(path: &str) -> Option<String> {

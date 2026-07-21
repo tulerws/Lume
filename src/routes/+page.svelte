@@ -111,7 +111,7 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.3");
+  let appVersion = $state("0.3.4");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("As atualizações são verificadas automaticamente.");
@@ -324,9 +324,14 @@
     if (withSound && preferences.soundEnabled) {
       const previous = new Map(sessions.map((session) => [session.id, session.status]));
       for (const session of next) {
-        if (previous.get(session.id) === session.status) continue;
-        if (session.status === "completed") playTone("completed");
-        if (session.status === "failed") playTone("failed");
+        const previousStatus = previous.get(session.id);
+        if (previousStatus === session.status) continue;
+        if (session.status === "permission_required") playTone("permission");
+        if (
+          session.status === "completed" &&
+          (previousStatus === "running" || previousStatus === "permission_required")
+        ) playTone("completed");
+        if (session.status === "failed" && previousStatus) playTone("failed");
       }
     }
     sessions = next;
@@ -590,7 +595,6 @@
     return (
       session.source === "web" ||
       (session.agent === "codex" &&
-        session.permissionProfile.canRespondFromLume &&
         Boolean(session.nativeSessionId))
     );
   }
@@ -614,7 +618,7 @@
       if (isTauri) await submitPrompt(session.id, prompt);
       sessions = sessions.map((item) =>
         item.id === session.id
-          ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume" }
+          ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined }
           : item,
       );
       composerPrompt = "";
@@ -630,7 +634,7 @@
     terminalWindows = await loadTerminalWindows();
   }
 
-  async function showTerminal(session: AgentSession) {
+  async function openTerminal(session: AgentSession) {
     if (openingTerminal) return;
     openingTerminal = session.id;
     terminalMessage = null;
@@ -815,7 +819,7 @@
     }
   }
 
-  function playTone(kind: "completed" | "failed") {
+  function playTone(kind: "completed" | "failed" | "permission") {
     try {
       const AudioContextClass = window.AudioContext;
       const context = new AudioContextClass();
@@ -825,14 +829,18 @@
       gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.42);
       gain.connect(context.destination);
 
-      const notes = kind === "completed" ? [620, 820] : [330, 250];
+      const notes = kind === "completed"
+        ? [620, 820]
+        : kind === "permission"
+          ? [520, 690, 520]
+          : [330, 250];
       notes.forEach((frequency, index) => {
         const oscillator = context.createOscillator();
         oscillator.type = "sine";
         oscillator.frequency.value = frequency;
         oscillator.connect(gain);
-        oscillator.start(context.currentTime + index * 0.1);
-        oscillator.stop(context.currentTime + 0.3 + index * 0.1);
+        oscillator.start(context.currentTime + index * 0.09);
+        oscillator.stop(context.currentTime + 0.25 + index * 0.09);
       });
       setTimeout(() => void context.close(), 600);
     } catch {
@@ -1007,6 +1015,13 @@
                       <small>{session.permissionProfile.approvalPolicy}</small>
                     </div>
 
+                    {#if session.lastResponse}
+                      <div class="final-response">
+                        <span class="eyebrow">Resposta final</span>
+                        <p>{session.lastResponse}</p>
+                      </div>
+                    {/if}
+
                     {#if session.pendingPermission}
                       <div class="permission-block risk-{session.pendingPermission.risk}">
                         <span class="eyebrow">Permissão solicitada</span>
@@ -1098,12 +1113,12 @@
                     {sourceLabel(session)}
                   </span>
                   <button
-                    class:opened={terminalIsOpen(session)}
-                    disabled={openingTerminal !== null}
+                    disabled={openingTerminal !== null || terminalIsOpen(session)}
                     type="button"
-                    onclick={() => showTerminal(session)}
+                    title={terminalIsOpen(session) ? "Feche o terminal pelo X para abri-lo novamente" : "Abrir terminal separado"}
+                    onclick={() => openTerminal(session)}
                   >
-                    {openingTerminal === session.id ? "Abrindo…" : terminalIsOpen(session) ? "Mostrar" : "Abrir"}
+                    {openingTerminal === session.id ? "Abrindo…" : "Abrir"}
                   </button>
                 </div>
               {:else}
@@ -1647,6 +1662,10 @@
   .inline-error { margin: 1px 0 0; color: #a54c4c; font-size: 9px; }
   .integration-note { margin: 0; color: #7c8983; font-size: 10px; line-height: 1.45; }
 
+  .final-response { margin: 0 0 10px; padding: 9px 10px; border: 1px solid rgba(78, 105, 93, 0.1); border-radius: 10px; background: rgba(73, 102, 89, 0.035); }
+  .final-response .eyebrow { display: block; margin-bottom: 5px; color: #668075; font-size: 8px; font-weight: 780; letter-spacing: 0.055em; text-transform: uppercase; }
+  .final-response p { max-height: 150px; margin: 0; overflow-y: auto; color: #43524c; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; scrollbar-width: thin; }
+
   .continue-trigger { margin-top: 9px; padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #557266; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
   .continue-trigger svg { width: 13px; height: 13px; transition: transform 150ms ease; }
   .continue-trigger:hover svg,
@@ -1672,7 +1691,6 @@
   .terminal-picker-copy small { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .terminal-picker-row > button { min-width: 52px; height: 28px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 9px; color: #4d6f61; background: rgba(255, 255, 255, 0.38); font-size: 9px; font-weight: 720; cursor: pointer; transition: transform 140ms ease, background 140ms ease; }
   .terminal-picker-row > button:hover:not(:disabled) { transform: translateY(-1px); background: white; }
-  .terminal-picker-row > button.opened { color: #73827b; background: transparent; }
   .terminal-picker-row > button:disabled { opacity: 0.5; cursor: default; }
   .board-empty { margin: 22px 0; color: #89938f; font-size: 9px; line-height: 1.45; }
   .board-message { margin: 1px 0 4px; color: #5f756b; font-size: 9px; }
@@ -1817,6 +1835,9 @@
     .permission-actions button,
     .field-row select,
     .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+    .final-response { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
+    .final-response .eyebrow { color: #8ca69a; }
+    .final-response p { color: #c2d0c9; }
     .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
     .board-intro,
     .terminal-picker-row,

@@ -52,7 +52,6 @@
       session &&
         (session.source === "web" ||
           (session.agent === "codex" &&
-            session.permissionProfile.canRespondFromLume &&
             session.nativeSessionId)),
     ),
   );
@@ -230,7 +229,7 @@
     try {
       await submitPrompt(session.id, prompt.trim());
       prompt = "";
-      session = { ...session, status: "running", statusLabel: "Prompt enviado pelo Lume" };
+      session = { ...session, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined };
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
@@ -301,6 +300,12 @@
       <div class="terminal-output">
         <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
         <p class="status status-{session.status}"><span>&gt;</span> {session.statusLabel}</p>
+        {#if session.lastResponse}
+          <div class="final-response">
+            <strong>Resposta final</strong>
+            <p>{session.lastResponse}</p>
+          </div>
+        {/if}
         {#if session.pendingPermission}
           <div class="permission">
             <strong>{session.pendingPermission.summary}</strong>
@@ -358,7 +363,7 @@
 </main>
 
 <style>
-  .terminal-window { width: 100%; height: 100%; padding: 0 8px 10px 0; }
+  .terminal-window { width: 100%; height: 100%; }
   .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.97); box-shadow: 0 10px 34px rgba(20, 36, 29, 0.2); backdrop-filter: blur(24px) saturate(120%); }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
@@ -381,6 +386,9 @@
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
   .status-completed, .status-completed span { color: #7d8782; }
   .status-failed, .status-failed span { color: #ad4f4f; }
+  .final-response { margin: 8px 0; padding: 8px 9px; border: 1px solid rgba(74, 102, 89, 0.1); border-radius: 8px; background: rgba(67, 99, 84, 0.035); }
+  .final-response strong { display: block; margin-bottom: 5px; color: #648075; font: 760 8px Inter, sans-serif; letter-spacing: 0.05em; text-transform: uppercase; }
+  .final-response p { max-height: 180px; margin: 0; overflow-y: auto; color: #475750; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; scrollbar-width: thin; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 9px/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
@@ -396,11 +404,17 @@
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .message { margin: -4px 11px 6px; color: #ad4f4f; font-size: 8px; }
-  .resize-handle { position: absolute; z-index: 6; width: 13px; height: 13px; padding: 0; border: 0; outline: 0; background: transparent; touch-action: none; }
+  .resize-handle { position: absolute; z-index: 20; width: 18px; height: 18px; padding: 0; border: 0; outline: 0; background: transparent; touch-action: none; }
+  .resize-handle::after { position: absolute; width: 6px; height: 6px; content: ""; opacity: 0; transition: opacity 120ms ease; }
+  .resize-handle:hover::after, .terminal-card.resizing .resize-handle::after { opacity: 0.7; }
   .resize-nw { top: 0; left: 0; cursor: nwse-resize; }
+  .resize-nw::after { top: 3px; left: 3px; border-top: 1px solid #668276; border-left: 1px solid #668276; }
   .resize-ne { top: 0; right: 0; cursor: nesw-resize; }
+  .resize-ne::after { top: 3px; right: 3px; border-top: 1px solid #668276; border-right: 1px solid #668276; }
   .resize-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+  .resize-sw::after { bottom: 3px; left: 3px; border-bottom: 1px solid #668276; border-left: 1px solid #668276; }
   .resize-se { right: 0; bottom: 0; cursor: nwse-resize; }
+  .resize-se::after { right: 3px; bottom: 3px; border-right: 1px solid #668276; border-bottom: 1px solid #668276; }
   .loading { align-items: center; justify-content: center; gap: 9px; color: #78857f; font-size: 9px; }
 
   @media (prefers-color-scheme: dark) {
@@ -411,6 +425,9 @@
     .agent-icon, .source-badge { background: rgba(205, 222, 213, 0.07); }
     .source-badge { color: #a7b5ae; }
     .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
+    .final-response { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
+    .final-response strong { color: #91a89d; }
+    .final-response p { color: #c3d0ca; }
     textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
     .permission strong { color: #dfc6ac; }
     .permission code, .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }
