@@ -1,6 +1,6 @@
 # Lume
 
-Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Windows e Linux. A cápsula fica no topo da tela, sinaliza trabalho, permissões, conclusão e erro, e expande para uma lista contínua de sessões — sem painéis cheios de cards.
+Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Windows e Linux. A cápsula fica no topo da tela, sinaliza trabalho, permissões, conclusão e erro, e expande para uma lista contínua de sessões.
 
 ## O que já funciona
 
@@ -16,7 +16,6 @@ Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Win
 - Whiteboard para acoplar sessões e enviar uma direção compartilhada;
 - continuação por prompt no Codex aberto pelo Lume e nos chats web conectados;
 - comportamento padrão abaixo de vídeos e jogos em tela cheia;
-- tema claro/escuro, movimento reduzido e microinterações fluidas.
 
 ## Rodar em desenvolvimento
 
