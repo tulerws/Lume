@@ -142,7 +142,7 @@
   .sleep-pixels { fill: #828b87; animation: sleep-float 2.4s steps(3, end) infinite; }
   .motion-pixels { fill: #6695bd; animation: dust 600ms steps(2, end) infinite; }
   .state-pixels { transform-origin: center; }
-  .success { fill: #5b9d79; animation: sparkle 1.25s steps(2, end) infinite; }
+  .success { fill: #858f8b; animation: sparkle 1.25s steps(2, end) infinite; }
   .failure { fill: #bd625f; animation: alert-pop 1.3s steps(2, end) infinite; }
   .attention { fill: #c88336; animation: alert-pop 900ms steps(2, end) infinite; }
   .waiting { fill: #6386ad; animation: question-bob 1.5s steps(2, end) infinite; }
@@ -156,11 +156,11 @@
   .status-running .feet { animation: feet-run 260ms steps(2, end) infinite; transform-origin: center; }
   .status-permission_required { --mascot-color: #cb8b45; }
   .status-permission_required .dino { animation: listen 1s steps(2, end) infinite; }
-  .status-completed { --mascot-color: #65a480; }
-  .status-completed .dino { animation: celebrate 1.5s steps(2, end) infinite; }
+  .status-completed { --mascot-color: #8b9490; }
+  .status-completed .dino { animation: settle 1.5s steps(2, end) infinite; }
   .status-failed { --mascot-color: #bd6965; }
   .status-failed .dino { animation: shake 1.4s steps(2, end) infinite; }
-  .status-waiting_for_input { --mascot-color: #758ead; }
+  .status-waiting_for_input { --mascot-color: #c79a42; }
   .status-waiting_for_input .dino { animation: listen 1.7s steps(2, end) infinite; }
 
   .phase-waking { --mascot-color: #63a57d; }

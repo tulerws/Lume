@@ -243,7 +243,13 @@ impl AppState {
         session.updated_at = now;
 
         let permission_id = match event.event {
-            HookEventKind::SessionStarted | HookEventKind::Running => {
+            HookEventKind::SessionStarted => {
+                session.status = SessionStatus::WaitingForInput;
+                session.status_label = "Esperando ação".into();
+                session.pending_permission = None;
+                None
+            }
+            HookEventKind::Running => {
                 session.status = SessionStatus::Running;
                 session.status_label = event.status_label.unwrap_or_else(|| "Executando".into());
                 session.pending_permission = None;
@@ -492,8 +498,8 @@ impl AppState {
                     refreshed = true;
                 }
                 if is_provisional_process(session) && session.status == SessionStatus::Completed {
-                    session.status = SessionStatus::Running;
-                    session.status_label = "Processo detectado".into();
+                    session.status = SessionStatus::WaitingForInput;
+                    session.status_label = "Esperando ação".into();
                     refreshed = true;
                 }
                 if refreshed {
@@ -524,8 +530,8 @@ impl AppState {
                 project,
                 source: process.source,
                 source_app: None,
-                status: SessionStatus::Running,
-                status_label: "Processo detectado".into(),
+                status: SessionStatus::WaitingForInput,
+                status_label: "Esperando ação".into(),
                 started_at: now.to_string(),
                 updated_at: now,
                 process_id: Some(process.process_id),
@@ -619,8 +625,8 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
         project,
         source: event.source.clone().unwrap_or(SessionSource::Cli),
         source_app: event.source_app.clone(),
-        status: SessionStatus::Running,
-        status_label: "Detectado".into(),
+        status: SessionStatus::WaitingForInput,
+        status_label: "Esperando ação".into(),
         started_at: event.started_at.clone().unwrap_or_else(|| now.to_string()),
         updated_at: now,
         process_id: event.process_id,
@@ -811,6 +817,19 @@ mod tests {
             .expect("persistência");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].id, "claude:session-1");
+    }
+
+    #[test]
+    fn discovered_process_waits_for_action_instead_of_appearing_to_run() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("descoberta");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::WaitingForInput);
+        assert_eq!(sessions[0].status_label, "Esperando ação");
     }
 
     #[test]

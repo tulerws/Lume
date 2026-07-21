@@ -68,6 +68,7 @@
   const compactSize = { width: 78, height: 46 };
   const expandedWidth = 392;
   const expandedMaxHeight = 560;
+  const edgeAnchorThreshold = 18;
 
   let expanded = $state(!isTauri);
   let contentVisible = $state(!isTauri);
@@ -457,6 +458,12 @@
       };
       requestAnimationFrame((now) => void frame(now));
     });
+    await Promise.allSettled([
+      currentWindow.setSize(new LogicalSize(to.width, to.height)),
+      moveOverlay(toPosition.x, toPosition.y, false),
+    ]);
+    overlayPosition = { ...toPosition };
+    morphProgress = opening ? 1 : 0;
   }
 
   function clampOverlayPosition(
@@ -480,10 +487,11 @@
     const targetHeight = target.height * monitorBounds.scale;
     const rightDistance = monitorBounds.width - compactPosition.x - compactWidth;
     const bottomDistance = monitorBounds.height - compactPosition.y - compactHeight;
-    const x = rightDistance < compactPosition.x
+    const edgeThreshold = edgeAnchorThreshold * monitorBounds.scale;
+    const x = rightDistance <= edgeThreshold
       ? compactPosition.x - (targetWidth - compactWidth)
       : compactPosition.x;
-    const y = bottomDistance < compactPosition.y
+    const y = bottomDistance <= edgeThreshold
       ? compactPosition.y - (targetHeight - compactHeight)
       : compactPosition.y;
     return clampOverlayPosition(x, y, target);
@@ -499,10 +507,11 @@
     const sourceHeight = source.height * monitorBounds.scale;
     const rightDistance = monitorBounds.width - expandedPosition.x - sourceWidth;
     const bottomDistance = monitorBounds.height - expandedPosition.y - sourceHeight;
-    const x = rightDistance < expandedPosition.x
+    const edgeThreshold = edgeAnchorThreshold * monitorBounds.scale;
+    const x = rightDistance <= edgeThreshold
       ? expandedPosition.x + (sourceWidth - compactWidth)
       : expandedPosition.x;
-    const y = bottomDistance < expandedPosition.y
+    const y = bottomDistance <= edgeThreshold
       ? expandedPosition.y + (sourceHeight - compactHeight)
       : expandedPosition.y;
     return clampOverlayPosition(x, y, compactSize);
@@ -1594,9 +1603,11 @@
   .running-dots i:nth-child(3) { animation-delay: 240ms; }
   .status-line.status-permission_required { color: #a46522; }
   .status-line.status-permission_required > i { background: #cb8235; box-shadow: 0 0 0 3px rgba(203, 130, 53, 0.1); }
-  .status-line.status-completed > i { background: #78a18f; }
+  .status-line.status-completed { color: #77817d; }
+  .status-line.status-completed > i { background: #89928e; }
   .status-line.status-failed > i { background: #b95454; }
-  .status-line.status-waiting_for_input > i { background: #6681a4; }
+  .status-line.status-waiting_for_input { color: #a87925; }
+  .status-line.status-waiting_for_input > i { background: #c99a3f; }
 
   @keyframes status-dot-bounce {
     0%, 60%, 100% { opacity: 0.48; transform: translateY(1px); }

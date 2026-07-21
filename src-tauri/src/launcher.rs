@@ -143,21 +143,36 @@ fn launch_terminal(
 ) -> Result<(), String> {
     if command_available("wt.exe") {
         Command::new("wt.exe")
-            .arg("-d")
-            .arg(&payload.working_directory)
-            .arg(&payload.command)
-            .args(&payload.arguments)
+            .args(windows_terminal_arguments(&payload))
             .spawn()
             .map_err(|error| error.to_string())?;
     } else {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         Command::new("cmd.exe")
-            .args(["/C", "start", "", "cmd.exe", "/K", &payload.command])
+            .args(["/D", "/K", &payload.command])
             .args(&payload.arguments)
             .current_dir(&payload.working_directory)
+            .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Não foi possível abrir o Prompt de Comando: {error}"))?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_terminal_arguments(payload: &TerminalPayload) -> Vec<String> {
+    let mut arguments = vec![
+        "-w".into(),
+        "-1".into(),
+        "new-tab".into(),
+        "-d".into(),
+        payload.working_directory.clone(),
+        payload.command.clone(),
+    ];
+    arguments.extend(payload.arguments.iter().cloned());
+    arguments
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -180,7 +195,7 @@ fn launch_vscode(payload: &TerminalPayload, agent: &IntegrationKind) -> Result<(
         "args": payload.arguments,
     });
     let encoded = percent_encode(&request.to_string());
-    Command::new("code")
+    crate::integrations::code_command()
         .arg("--reuse-window")
         .arg(format!("vscode://tulerws.lume/session?payload={encoded}"))
         .spawn()
@@ -211,7 +226,10 @@ fn desktop_escape(path: &Path) -> String {
 
 #[cfg(target_os = "windows")]
 fn command_available(command: &str) -> bool {
-    Command::new(command).arg("--version").output().is_ok()
+    Command::new("where.exe")
+        .arg(command)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 #[cfg(test)]
@@ -249,5 +267,14 @@ mod tests {
         );
         assert_eq!(payload.command, "claude");
         assert_eq!(payload.arguments, vec!["--resume", "session-id"]);
+    }
+
+    #[test]
+    fn windows_terminal_always_opens_a_new_window_in_the_project() {
+        let payload = payload_for(&request(IntegrationKind::Codex, false, None), None);
+        assert_eq!(
+            windows_terminal_arguments(&payload),
+            vec!["-w", "-1", "new-tab", "-d", "/work/project", "codex"]
+        );
     }
 }

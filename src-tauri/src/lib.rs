@@ -25,6 +25,14 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_opener::OpenerExt;
 
+fn reveal_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[tauri::command]
 fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String> {
     state.sessions()
@@ -57,7 +65,7 @@ fn open_session_source(
             let directory = session
                 .working_directory
                 .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
-            std::process::Command::new("code")
+            integrations::code_command()
                 .args(["--reuse-window", &directory])
                 .spawn()
                 .map_err(|error| format!("Não foi possível abrir o VS Code: {error}"))?;
@@ -342,10 +350,7 @@ fn launch_session(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            reveal_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -407,23 +412,11 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        reveal_main_window(tray.app_handle());
                     }
                 })
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => reveal_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })

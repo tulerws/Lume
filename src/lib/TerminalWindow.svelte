@@ -376,8 +376,10 @@
   .terminal-output p { margin: 0 0 6px; line-height: 1.45; }
   .terminal-output p > span { color: #36a269; font-weight: 800; }
   .terminal-output i { color: #8a9690; font-style: normal; }
-  .status-running span { color: #3d9870; }
+  .status-running, .status-running span { color: #4e7faf; }
   .status-permission_required, .status-permission_required span { color: #b06b25; }
+  .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
+  .status-completed, .status-completed span { color: #7d8782; }
   .status-failed, .status-failed span { color: #ad4f4f; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 9px/1.35 Inter, sans-serif; }

@@ -16,6 +16,7 @@ const TERMINAL_MIN_HEIGHT: i32 = 240;
 const TERMINAL_MAX_WIDTH: i32 = 760;
 const TERMINAL_MAX_HEIGHT: i32 = 640;
 const DOCK_DISTANCE: i32 = 34;
+const SCREEN_MARGIN: i32 = 12;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,8 +72,23 @@ impl TerminalWindows {
     ) -> Result<String, String> {
         let label = terminal_label(&session.id);
         if let Some(window) = app.get_webview_window(&label) {
-            window.show().map_err(|error| error.to_string())?;
-            window.set_focus().map_err(|error| error.to_string())?;
+            let current = self.state(&label)?;
+            let (x, y) = initial_position(app, monitor_id, current.x, current.y);
+            if let Ok(mut placements) = self.placements.lock() {
+                if let Some(placement) = placements.get_mut(&label) {
+                    placement.x = x;
+                    placement.y = y;
+                }
+            }
+            let existing_window = window.clone();
+            let selected_monitor = monitor_id.map(str::to_string);
+            window
+                .run_on_main_thread(move || {
+                    let _ = overlay::move_to(&existing_window, x, y, selected_monitor.as_deref());
+                    let _ = existing_window.show();
+                    let _ = existing_window.set_focus();
+                })
+                .map_err(|error| error.to_string())?;
             return Ok(label);
         }
 
@@ -82,11 +98,17 @@ impl TerminalWindows {
             .map_err(|_| "Não foi possível acessar os mini terminais".to_string())?
             .len() as i32
             * 22;
+        let (x, y) = initial_position(
+            app,
+            monitor_id,
+            origin_x + 96 + offset,
+            origin_y + 64 + offset,
+        );
         let placement = Placement {
             label: label.clone(),
             session_id: session.id.clone(),
-            x: (origin_x + 96 + offset).max(12),
-            y: (origin_y + 64 + offset).max(12),
+            x,
+            y,
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
             group: None,
@@ -113,7 +135,7 @@ impl TerminalWindows {
                 .transparent(true)
                 .always_on_top(true)
                 .resizable(true)
-                .visible(false)
+                .visible(cfg!(target_os = "windows"))
                 .build()
             {
                 Ok(window) => window,
@@ -161,7 +183,11 @@ impl TerminalWindows {
                 let _ = layer_window.show();
                 let _ = layer_window.set_focus();
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                self.remove(&label);
+                let _ = window.close();
+                error.to_string()
+            })?;
         Ok(label)
     }
 
@@ -313,6 +339,52 @@ impl TerminalWindows {
             entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
         }
     }
+}
+
+fn initial_position(
+    app: &AppHandle,
+    monitor_id: Option<&str>,
+    desired_x: i32,
+    desired_y: i32,
+) -> (i32, i32) {
+    let Some(main) = app.get_webview_window("main") else {
+        return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
+    };
+    let Ok(monitors) = main.available_monitors() else {
+        return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
+    };
+    let monitor = monitor_id
+        .and_then(|id| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name().is_some_and(|name| name == id))
+        })
+        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
+        .or_else(|| monitors.first());
+    let Some(monitor) = monitor else {
+        return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
+    };
+    clamp_to_monitor(
+        desired_x,
+        desired_y,
+        monitor.size().width as i32,
+        monitor.size().height as i32,
+        monitor.scale_factor(),
+    )
+}
+
+fn clamp_to_monitor(
+    x: i32,
+    y: i32,
+    monitor_width: i32,
+    monitor_height: i32,
+    scale: f64,
+) -> (i32, i32) {
+    let physical_width = (f64::from(TERMINAL_WIDTH) * scale).round() as i32;
+    let physical_height = (f64::from(TERMINAL_HEIGHT) * scale).round() as i32;
+    let max_x = (monitor_width - physical_width - SCREEN_MARGIN).max(SCREEN_MARGIN);
+    let max_y = (monitor_height - physical_height - SCREEN_MARGIN).max(SCREEN_MARGIN);
+    (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
 }
 
 fn terminal_label(session_id: &str) -> String {
@@ -476,5 +548,19 @@ mod tests {
         let (_, dx, dy) = snap(&top, &bottom).expect("encaixe vertical");
         assert_eq!(top.x + dx, bottom.x);
         assert_eq!(top.y + dy + top.height, bottom.y);
+    }
+
+    #[test]
+    fn terminal_opened_near_the_edge_stays_inside_the_monitor() {
+        let (x, y) = clamp_to_monitor(1_920, 1_080, 1_920, 1_080, 1.0);
+        assert_eq!(x, 1_572);
+        assert_eq!(y, 782);
+    }
+
+    #[test]
+    fn terminal_clamp_accounts_for_windows_display_scaling() {
+        let (x, y) = clamp_to_monitor(1_900, 1_050, 1_920, 1_080, 1.25);
+        assert_eq!(x, 1_488);
+        assert_eq!(y, 710);
     }
 }

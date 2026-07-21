@@ -1,5 +1,8 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -111,7 +114,7 @@ pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Res
 pub fn vscode_status() -> CompanionStatus {
     let installed = command_available("code");
     let configured = installed
-        && Command::new("code")
+        && code_command()
             .arg("--list-extensions")
             .output()
             .ok()
@@ -134,7 +137,7 @@ pub fn vscode_status() -> CompanionStatus {
 }
 
 pub fn configure_vscode(enabled: bool, vsix_path: &std::path::Path) -> Result<(), String> {
-    let mut command = Command::new("code");
+    let mut command = code_command();
     if enabled {
         if !vsix_path.exists() {
             return Err("O companion do VS Code não foi incluído no aplicativo".into());
@@ -353,8 +356,32 @@ fn powershell_command(executable: &str, provider: &str) -> String {
     format!("& '{}' hook {provider}", executable.replace('\'', "''"))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_available(command: &str) -> bool {
     Command::new(command).arg("--version").output().is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn command_available(command: &str) -> bool {
+    Command::new("where.exe")
+        .arg(command)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn code_command() -> Command {
+    Command::new("code")
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn code_command() -> Command {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new("cmd.exe");
+    command
+        .args(["/D", "/S", "/C", "code"])
+        .creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(test)]
