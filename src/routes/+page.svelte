@@ -65,12 +65,14 @@
   const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
   const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
   const compactSize = { width: 78, height: 46 };
-  const expandedSize = { width: 392, height: 560 };
+  const expandedWidth = 392;
+  const expandedMaxHeight = 560;
 
   let expanded = $state(!isTauri);
   let contentVisible = $state(!isTauri);
   let morphing = $state<"opening" | "closing" | null>(null);
   let morphProgress = $state(isTauri ? 0 : 1);
+  let expandedHeight = $state(expandedMaxHeight);
   let view = $state<View>("sessions");
   let sessions = $state<AgentSession[]>(isTauri ? [] : structuredClone(demoSessions));
   let history = $state<HistoryEntry[]>([]);
@@ -119,6 +121,47 @@
     originY: number;
   } | null = null;
   let moveFrame: number | null = null;
+
+  function currentExpandedSize() {
+    return { width: expandedWidth, height: expandedHeight };
+  }
+
+  function observePanelSize(node: HTMLElement) {
+    let resizeFrame: number | null = null;
+
+    const syncHeight = (resizeWindow: boolean) => {
+      const nextHeight = Math.min(
+        expandedMaxHeight,
+        Math.max(compactSize.height, Math.ceil(node.offsetHeight + 16)),
+      );
+      if (nextHeight === expandedHeight) return;
+      expandedHeight = nextHeight;
+      if (resizeWindow && isTauri && expanded && !morphing) {
+        void getCurrentWindow()
+          .setSize(new LogicalSize(expandedWidth, nextHeight))
+          .catch(() => undefined);
+      }
+    };
+
+    const observer = new ResizeObserver(() => {
+      if (!expanded || morphing) return;
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        syncHeight(true);
+      });
+    });
+
+    observer.observe(node);
+    syncHeight(false);
+
+    return {
+      destroy() {
+        observer.disconnect();
+        if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      },
+    };
+  }
 
   const activeCount = $derived(
     sessions.filter((session) =>
@@ -293,7 +336,7 @@
     if (!isTauri) return;
     try {
       const currentWindow = getCurrentWindow();
-      const target = expanded ? expandedSize : compactSize;
+      const target = expanded ? currentExpandedSize() : compactSize;
       await currentWindow.setSize(new LogicalSize(target.width, target.height));
 
       const found = await availableMonitors();
@@ -351,8 +394,8 @@
   }
 
   async function animateWindowSize(opening: boolean) {
-    const from = opening ? compactSize : expandedSize;
-    const to = opening ? expandedSize : compactSize;
+    const from = opening ? compactSize : currentExpandedSize();
+    const to = opening ? currentExpandedSize() : compactSize;
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const duration = reducedMotion ? 1 : opening ? 360 : 320;
     if (!isTauri) {
@@ -390,7 +433,7 @@
   function clampOverlayPosition(
     x: number,
     y: number,
-    target = expanded ? expandedSize : compactSize,
+    target = expanded ? currentExpandedSize() : compactSize,
   ) {
     return {
       x: Math.max(0, Math.min(x, monitorBounds.width - target.width * monitorBounds.scale)),
@@ -795,7 +838,7 @@
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section class:content-visible={contentVisible} class:morphing class="panel">
+    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class="panel">
       <header
         role="banner"
         class:dragging
@@ -1329,7 +1372,8 @@
   .panel {
     position: relative;
     width: 100%;
-    height: 100%;
+    height: auto;
+    max-height: 544px;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1426,7 +1470,7 @@
     stroke-width: 1.65;
   }
 
-  .panel-content { position: relative; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+  .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
   .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 250px; padding: 10px 11px; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
@@ -1439,12 +1483,20 @@
   .launcher-popover .launcher-error { color: #a54c4c; }
   .session-list,
   .history-list,
-  .settings { position: absolute; inset: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
+  .settings { max-height: 431px; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
 
   .session-list::-webkit-scrollbar,
   .history-list::-webkit-scrollbar,
   .settings::-webkit-scrollbar,
-  .terminal-picker::-webkit-scrollbar { width: 5px; }
+  .terminal-picker::-webkit-scrollbar { width: 5px; background: transparent; }
+  .session-list::-webkit-scrollbar-button,
+  .history-list::-webkit-scrollbar-button,
+  .settings::-webkit-scrollbar-button,
+  .terminal-picker::-webkit-scrollbar-button { width: 0; height: 0; display: none; }
+  .session-list::-webkit-scrollbar-track,
+  .history-list::-webkit-scrollbar-track,
+  .settings::-webkit-scrollbar-track,
+  .terminal-picker::-webkit-scrollbar-track { background: transparent; }
   .session-list::-webkit-scrollbar-thumb,
   .history-list::-webkit-scrollbar-thumb,
   .settings::-webkit-scrollbar-thumb,
@@ -1565,7 +1617,7 @@
   .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer button:disabled { opacity: 0.35; cursor: default; }
 
-  .whiteboard { position: absolute; inset: 0; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
+  .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .board-intro .eyebrow { display: block; margin-bottom: 4px; color: #7a8c84; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
   .board-intro strong { color: #2d3a35; font-size: 12px; }
