@@ -5,7 +5,10 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{
+    webview::PageLoadEvent, AppHandle, Emitter, LogicalSize, Manager, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 
 use crate::{domain::AgentSession, overlay};
 
@@ -39,6 +42,7 @@ struct Placement {
     width: i32,
     height: i32,
     group: Option<String>,
+    ready: bool,
 }
 
 impl Placement {
@@ -68,22 +72,35 @@ impl TerminalWindows {
         monitor_id: Option<&str>,
         origin_x: i32,
         origin_y: i32,
-        show_over_fullscreen: bool,
+        _show_over_fullscreen: bool,
     ) -> Result<String, String> {
         let label = terminal_label(&session.id);
         if let Some(window) = app.get_webview_window(&label) {
-            let current = self.state(&label)?;
-            let (x, y) = initial_position(app, monitor_id, current.x, current.y);
-            if let Ok(mut placements) = self.placements.lock() {
-                if let Some(placement) = placements.get_mut(&label) {
-                    placement.x = x;
-                    placement.y = y;
+            let ready = self
+                .placements
+                .lock()
+                .ok()
+                .and_then(|placements| placements.get(&label).map(|placement| placement.ready))
+                .unwrap_or(false);
+            if !ready {
+                let _ = window.close();
+                self.remove(&label);
+                return Err(
+                    "O mini terminal anterior não carregou; clique em Abrir novamente".into(),
+                );
+            } else {
+                let current = self.state(&label)?;
+                let (x, y) = initial_position(app, monitor_id, current.x, current.y);
+                if let Ok(mut placements) = self.placements.lock() {
+                    if let Some(placement) = placements.get_mut(&label) {
+                        placement.x = x;
+                        placement.y = y;
+                    }
                 }
+                window.show().map_err(|error| error.to_string())?;
+                let _ = window.set_focus();
+                return Ok(label);
             }
-            let _ = overlay::move_to(&window, x, y, monitor_id);
-            window.show().map_err(|error| error.to_string())?;
-            let _ = window.set_focus();
-            return Ok(label);
         }
 
         let offset = self
@@ -106,6 +123,7 @@ impl TerminalWindows {
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
             group: None,
+            ready: false,
         };
 
         self.placements
@@ -113,10 +131,13 @@ impl TerminalWindows {
             .map_err(|_| "Não foi possível guardar o mini terminal".to_string())?
             .insert(label.clone(), placement.clone());
 
+        let ready_registry = self.clone();
+        let ready_label = label.clone();
         let window =
             match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("Lume · {}", session.agent_label))
                 .inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
+                .position(f64::from(x), f64::from(y))
                 .min_inner_size(
                     f64::from(TERMINAL_MIN_WIDTH),
                     f64::from(TERMINAL_MIN_HEIGHT),
@@ -129,7 +150,15 @@ impl TerminalWindows {
                 .transparent(true)
                 .always_on_top(true)
                 .resizable(true)
-                .visible(cfg!(target_os = "windows"))
+                .visible(true)
+                .on_page_load(move |window, payload| {
+                    if matches!(payload.event(), PageLoadEvent::Finished) {
+                        ready_registry.mark_ready(&ready_label);
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("lume://terminal-windows-changed", ());
+                    }
+                })
                 .build()
             {
                 Ok(window) => window,
@@ -155,16 +184,6 @@ impl TerminalWindows {
             _ => {}
         });
 
-        let layered = overlay::configure(
-            &window,
-            show_over_fullscreen,
-            monitor_id,
-            Some(placement.x),
-            Some(placement.y),
-        );
-        if !layered {
-            let _ = overlay::move_to(&window, placement.x, placement.y, monitor_id);
-        }
         window.show().map_err(|error| {
             self.remove(&label);
             let _ = window.close();
@@ -175,12 +194,21 @@ impl TerminalWindows {
     }
 
     pub fn list(&self, app: &AppHandle) -> Result<Vec<TerminalWindowState>, String> {
-        let mut placements = self
+        let placements = self
             .placements
             .lock()
             .map_err(|_| "Não foi possível acessar os mini terminais".to_string())?;
-        placements.retain(|label, _| app.get_webview_window(label).is_some());
-        Ok(placements.values().map(Placement::state).collect())
+        Ok(placements
+            .values()
+            .filter(|placement| {
+                placement.ready
+                    && app
+                        .get_webview_window(&placement.label)
+                        .and_then(|window| window.is_visible().ok())
+                        .unwrap_or(false)
+            })
+            .map(Placement::state)
+            .collect())
     }
 
     pub fn state(&self, label: &str) -> Result<TerminalWindowState, String> {
@@ -330,6 +358,14 @@ impl TerminalWindows {
         if let Some(entry) = placements.get_mut(label) {
             entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
             entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+        }
+    }
+
+    fn mark_ready(&self, label: &str) {
+        if let Ok(mut placements) = self.placements.lock() {
+            if let Some(placement) = placements.get_mut(label) {
+                placement.ready = true;
+            }
         }
     }
 }
@@ -522,6 +558,7 @@ mod tests {
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
             group: None,
+            ready: true,
         }
     }
 

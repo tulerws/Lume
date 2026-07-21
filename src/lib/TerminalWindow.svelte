@@ -12,7 +12,6 @@
     loadTerminalWindowState,
     moveTerminalWindow,
     openSessionSource,
-    resizeTerminalWindow,
     submitPrompt,
     undockTerminalWindow,
   } from "$lib/lume";
@@ -26,25 +25,13 @@
   let message = $state<string | null>(null);
   let sending = $state(false);
   let dragging = $state(false);
-  let resizing = $state(false);
   let moveFrame: number | null = null;
-  let resizeFrame: number | null = null;
   let dragState: {
     pointerId: number;
     startX: number;
     startY: number;
     originX: number;
     originY: number;
-  } | null = null;
-  let resizeState: {
-    pointerId: number;
-    direction: ResizeDirection;
-    startX: number;
-    startY: number;
-    originX: number;
-    originY: number;
-    originWidth: number;
-    originHeight: number;
   } | null = null;
 
   const canSubmit = $derived(
@@ -72,7 +59,6 @@
       disposed = true;
       stopListening?.();
       if (moveFrame !== null) cancelAnimationFrame(moveFrame);
-      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
     };
   });
 
@@ -146,70 +132,14 @@
     windowState = await undockTerminalWindow(label);
   }
 
-  function beginResize(event: PointerEvent, direction: ResizeDirection) {
-    if (!windowState || event.button !== 0) return;
+  async function beginResize(event: PointerEvent, direction: ResizeDirection) {
+    if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    const target = event.currentTarget as HTMLElement;
-    target.setPointerCapture(event.pointerId);
-    resizeState = {
-      pointerId: event.pointerId,
-      direction,
-      startX: event.screenX,
-      startY: event.screenY,
-      originX: windowState.x,
-      originY: windowState.y,
-      originWidth: windowState.width,
-      originHeight: windowState.height,
-    };
-    resizing = true;
-  }
-
-  function resizedPlacement(event: PointerEvent) {
-    if (!resizeState) return null;
-    const dx = event.screenX - resizeState.startX;
-    const dy = event.screenY - resizeState.startY;
-    const fromWest = resizeState.direction.endsWith("West");
-    const fromNorth = resizeState.direction.startsWith("North");
-    const width = Math.min(760, Math.max(300, resizeState.originWidth + (fromWest ? -dx : dx)));
-    const height = Math.min(640, Math.max(240, resizeState.originHeight + (fromNorth ? -dy : dy)));
-    return {
-      x: fromWest ? resizeState.originX + resizeState.originWidth - width : resizeState.originX,
-      y: fromNorth ? resizeState.originY + resizeState.originHeight - height : resizeState.originY,
-      width,
-      height,
-    };
-  }
-
-  function resize(event: PointerEvent) {
-    if (!resizeState || event.pointerId !== resizeState.pointerId) return;
-    const next = resizedPlacement(event);
-    if (!next) return;
-    if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
-    resizeFrame = requestAnimationFrame(() => {
-      resizeFrame = null;
-      void resizeTerminalWindow(label, next.x, next.y, next.width, next.height).then(
-        (state) => (windowState = state),
-      ).catch((error) => (message = String(error).replace(/^Error:\s*/, "")));
-    });
-  }
-
-  async function endResize(event: PointerEvent) {
-    if (!resizeState || event.pointerId !== resizeState.pointerId) return;
-    const target = event.currentTarget as HTMLElement;
-    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
-    const next = resizedPlacement(event);
-    resizeState = null;
-    if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
-    resizeFrame = null;
     try {
-      if (next) {
-        windowState = await resizeTerminalWindow(label, next.x, next.y, next.width, next.height);
-      }
+      await currentWindow.startResizeDragging(direction);
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
-    } finally {
-      resizing = false;
     }
   }
 
@@ -269,7 +199,7 @@
 
 <main class="terminal-window">
   {#if session}
-    <section class:dragging class:resizing class="terminal-card">
+    <section class:dragging class="terminal-card">
       <header
         role="banner"
         onpointerdown={beginDrag}
@@ -352,10 +282,10 @@
         {/if}
       </form>
       {#if message}<p class="message">{message}</p>{/if}
-      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior esquerdo" onpointerdown={(event) => beginResize(event, "NorthWest")} onpointermove={resize} onpointerup={endResize} onpointercancel={endResize}></button>
-      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior direito" onpointerdown={(event) => beginResize(event, "NorthEast")} onpointermove={resize} onpointerup={endResize} onpointercancel={endResize}></button>
-      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior esquerdo" onpointerdown={(event) => beginResize(event, "SouthWest")} onpointermove={resize} onpointerup={endResize} onpointercancel={endResize}></button>
-      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior direito" onpointerdown={(event) => beginResize(event, "SouthEast")} onpointermove={resize} onpointerup={endResize} onpointercancel={endResize}></button>
+      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior esquerdo" onpointerdown={(event) => void beginResize(event, "NorthWest")}></button>
+      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior direito" onpointerdown={(event) => void beginResize(event, "NorthEast")}></button>
+      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior esquerdo" onpointerdown={(event) => void beginResize(event, "SouthWest")}></button>
+      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior direito" onpointerdown={(event) => void beginResize(event, "SouthEast")}></button>
     </section>
   {:else}
     <section class="terminal-card loading"><LumeLogo size={34} /><span>Conectando à sessão…</span></section>
@@ -406,7 +336,7 @@
   .message { margin: -4px 11px 6px; color: #ad4f4f; font-size: 8px; }
   .resize-handle { position: absolute; z-index: 20; width: 18px; height: 18px; padding: 0; border: 0; outline: 0; background: transparent; touch-action: none; }
   .resize-handle::after { position: absolute; width: 6px; height: 6px; content: ""; opacity: 0; transition: opacity 120ms ease; }
-  .resize-handle:hover::after, .terminal-card.resizing .resize-handle::after { opacity: 0.7; }
+  .resize-handle:hover::after { opacity: 0.7; }
   .resize-nw { top: 0; left: 0; cursor: nwse-resize; }
   .resize-nw::after { top: 3px; left: 3px; border-top: 1px solid #668276; border-left: 1px solid #668276; }
   .resize-ne { top: 0; right: 0; cursor: nesw-resize; }
