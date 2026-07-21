@@ -419,6 +419,7 @@ impl AppState {
             .iter()
             .map(|process| process.process_id)
             .collect::<std::collections::HashSet<_>>();
+        let discovered = coalesce_discovered_processes(discovered);
         let mut sessions = self
             .sessions
             .lock()
@@ -428,6 +429,13 @@ impl AppState {
         let mut history = Vec::new();
         let mut cancelled_permissions = Vec::new();
         let mut removed_sessions = Vec::new();
+
+        let duplicate_provisional_ids = duplicate_provisional_ids(&sessions, &active_pids);
+        if !duplicate_provisional_ids.is_empty() {
+            sessions.retain(|session| !duplicate_provisional_ids.contains(&session.id));
+            removed_sessions.extend(duplicate_provisional_ids);
+            changed = true;
+        }
 
         for process in discovered {
             let contextual_chat_ids = process
@@ -509,6 +517,20 @@ impl AppState {
                 }
             }
             if matched_process {
+                continue;
+            }
+            if let Some(session) = sessions.iter_mut().find(|session| {
+                is_provisional_process(session)
+                    && session.agent == process.agent
+                    && session.source == process.source
+                    && session.working_directory == process.working_directory
+            }) {
+                session.process_id = Some(process.process_id);
+                session.status = SessionStatus::WaitingForInput;
+                session.status_label = "Esperando ação".into();
+                session.updated_at = now;
+                snapshots.push(session.clone());
+                changed = true;
                 continue;
             }
             let project = process
@@ -719,6 +741,72 @@ fn is_provisional_process(session: &AgentSession) -> bool {
     session.id.starts_with("process:") && session.native_session_id.is_none()
 }
 
+fn same_provisional_context(left: &AgentSession, right: &AgentSession) -> bool {
+    is_provisional_process(left)
+        && is_provisional_process(right)
+        && left.agent == right.agent
+        && left.source == right.source
+        && left.working_directory == right.working_directory
+}
+
+fn duplicate_provisional_ids(
+    sessions: &[AgentSession],
+    active_pids: &std::collections::HashSet<u32>,
+) -> std::collections::HashSet<String> {
+    let mut survivors = Vec::<&AgentSession>::new();
+    let mut duplicates = std::collections::HashSet::new();
+    for session in sessions
+        .iter()
+        .filter(|session| is_provisional_process(session))
+    {
+        let Some(index) = survivors
+            .iter()
+            .position(|survivor| same_provisional_context(survivor, session))
+        else {
+            survivors.push(session);
+            continue;
+        };
+        let survivor = survivors[index];
+        let survivor_rank = (
+            survivor
+                .process_id
+                .is_some_and(|pid| active_pids.contains(&pid)),
+            survivor.status != SessionStatus::Completed,
+        );
+        let candidate_rank = (
+            session
+                .process_id
+                .is_some_and(|pid| active_pids.contains(&pid)),
+            session.status != SessionStatus::Completed,
+        );
+        if candidate_rank > survivor_rank {
+            duplicates.insert(survivor.id.clone());
+            survivors[index] = session;
+        } else {
+            duplicates.insert(session.id.clone());
+        }
+    }
+    duplicates
+}
+
+fn coalesce_discovered_processes(discovered: Vec<DiscoveredProcess>) -> Vec<DiscoveredProcess> {
+    let mut unique = Vec::<DiscoveredProcess>::new();
+    for process in discovered {
+        if let Some(existing) = unique.iter_mut().find(|existing| {
+            existing.agent == process.agent
+                && existing.source == process.source
+                && existing.working_directory == process.working_directory
+        }) {
+            if process.process_id < existing.process_id {
+                *existing = process;
+            }
+        } else {
+            unique.push(process);
+        }
+    }
+    unique
+}
+
 fn prefer_session(candidate: &AgentSession, current: &AgentSession) -> bool {
     (
         candidate.permission_profile.can_respond_from_lume,
@@ -830,6 +918,75 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::WaitingForInput);
         assert_eq!(sessions[0].status_label, "Esperando ação");
+    }
+
+    #[test]
+    fn sibling_processes_in_the_same_context_create_one_provisional_session() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242), discovered(4343)])
+            .expect("descoberta");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].process_id, Some(4242));
+    }
+
+    #[test]
+    fn provisional_session_survives_a_process_id_change_without_duplication() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("primeira descoberta");
+        let original_id = state.sessions().expect("sessões")[0].id.clone();
+
+        state
+            .reconcile_processes(vec![discovered(4343)])
+            .expect("redetecção");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, original_id);
+        assert_eq!(sessions[0].process_id, Some(4343));
+        assert_eq!(sessions[0].status, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn reconciliation_removes_provisional_duplicates_already_in_the_store() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("descoberta");
+        let mut duplicate = state.sessions().expect("sessões")[0].clone();
+        duplicate.id = "process:claude:4343".into();
+        duplicate.process_id = Some(4343);
+        state
+            .sessions
+            .lock()
+            .expect("estado em memória")
+            .push(duplicate.clone());
+        state
+            .store
+            .lock()
+            .expect("store")
+            .save_session(&duplicate)
+            .expect("persistência");
+
+        state
+            .reconcile_processes(vec![discovered(4343)])
+            .expect("limpeza");
+
+        assert_eq!(state.sessions().expect("sessões").len(), 1);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .expect("store")
+                .load_sessions()
+                .expect("persistência")
+                .len(),
+            1
+        );
     }
 
     #[test]
