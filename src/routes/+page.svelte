@@ -108,6 +108,8 @@
   let overlayReady = $state(false);
   let monitorBounds = $state({ width: 1920, height: 1080, scale: 1 });
   let dragging = $state(false);
+  let mascotAwake = $state(false);
+  let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
   let appVersion = $state("0.3.1");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
@@ -236,6 +238,7 @@
       stopTerminalListening?.();
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
+      if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
       if (pendingUpdate) void pendingUpdate.close();
     };
   });
@@ -520,6 +523,16 @@
       originY: overlayPosition.y,
     };
     dragging = false;
+  }
+
+  function wakeMascot() {
+    if (shellStatus !== "idle") return;
+    mascotAwake = true;
+    if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
+    mascotSleepTimer = setTimeout(() => {
+      mascotAwake = false;
+      mascotSleepTimer = undefined;
+    }, 1_600);
   }
 
   function moveOverlayDrag(event: PointerEvent) {
@@ -878,6 +891,7 @@
   class:expanded
   class="overlay-shell"
   style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
+  onpointermove={wakeMascot}
   aria-label="Lume, monitor de agentes"
 >
   {#if !expanded}
@@ -892,7 +906,7 @@
       onpointercancel={(event) => endOverlayDrag(event, true)}
       aria-label="Abrir Lume, {activeCount} agentes ativos"
     >
-      <LumeMascot status={shellStatus} size={30} />
+      <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={30} />
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
@@ -906,20 +920,13 @@
         onpointerup={endOverlayDrag}
         onpointercancel={endOverlayDrag}
       >
-        {#if view === "sessions"}
-          <div class="brand-lockup">
-            <LumeMascot status={shellStatus} size={32} />
-            <div>
-              <strong>Lume</strong>
-              <span>{activeCount === 1 ? "1 sessão ativa" : `${activeCount} sessões ativas`}</span>
-            </div>
+        <div class="brand-lockup">
+          <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={32} />
+          <div>
+            <strong>Lume</strong>
+            <span>{activeCount === 1 ? "1 agente ativo" : `${activeCount} agentes ativos`}</span>
           </div>
-        {:else}
-          <button class="back-button" type="button" onclick={() => openView("sessions")}>
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 5-5 5 5 5" /></svg>
-            <span>{view === "board" ? "Whiteboard" : view === "history" ? "Histórico" : "Configurações"}</span>
-          </button>
-        {/if}
+        </div>
         <div class="header-actions">
           {#if view === "sessions"}
             <button class:active={launcherOpen} class="add-button" type="button" onclick={toggleLauncher} aria-label="Abrir ou retomar sessão">
@@ -1428,7 +1435,6 @@
   .panel footer,
   .panel .brand-lockup > div,
   .panel .header-actions,
-  .panel .back-button,
   .panel .launcher-popover {
     transition: opacity 150ms ease, transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
   }
@@ -1436,7 +1442,6 @@
   .panel:not(.content-visible) footer,
   .panel:not(.content-visible) .brand-lockup > div,
   .panel:not(.content-visible) .header-actions,
-  .panel:not(.content-visible) .back-button,
   .panel:not(.content-visible) .launcher-popover {
     opacity: 0;
     pointer-events: none;
@@ -1462,25 +1467,12 @@
   .brand-lockup strong { color: #202d28; font-size: 13px; letter-spacing: -0.01em; }
   .brand-lockup div span { color: #75817c; font-size: 10px; }
 
-  .back-button,
   .add-button,
   .collapse-button {
     border: 0;
     color: #697872;
     background: transparent;
     cursor: pointer;
-  }
-
-  .back-button {
-    height: 32px;
-    padding: 0 6px 0 2px;
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    border-radius: 9px;
-    color: #2e3c36;
-    font-size: 12px;
-    font-weight: 680;
   }
 
   .collapse-button {
@@ -1496,7 +1488,6 @@
   .add-button:hover,
   .add-button.active { color: #486d5e; background: rgba(80, 103, 94, 0.07); }
 
-  .back-button:hover,
   .add-button:hover,
   .collapse-button:hover { background: rgba(80, 103, 94, 0.07); }
 
@@ -1781,7 +1772,6 @@
     .panel,
     .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
     .brand-lockup strong,
-    .back-button,
     .session-title-row strong,
     .board-intro strong,
     .terminal-picker-copy strong,
