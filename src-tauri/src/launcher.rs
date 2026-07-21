@@ -6,7 +6,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{integrations::IntegrationKind, state::now_millis};
+use crate::integrations::IntegrationKind;
+#[cfg(target_os = "linux")]
+use crate::state::now_millis;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +200,7 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn desktop_escape(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
