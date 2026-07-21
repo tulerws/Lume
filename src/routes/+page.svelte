@@ -16,6 +16,7 @@
   } from "@tauri-apps/api/window";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
+  import LumeMascot from "$lib/LumeMascot.svelte";
   import TerminalWindow from "$lib/TerminalWindow.svelte";
   import type {
     AgentKind,
@@ -103,10 +104,11 @@
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
   let overlayPosition = $state({ x: 0, y: 12 });
+  let compactAnchorPosition: { x: number; y: number } | null = null;
   let overlayReady = $state(false);
   let monitorBounds = $state({ width: 1920, height: 1080, scale: 1 });
   let dragging = $state(false);
-  let appVersion = $state("0.3.0");
+  let appVersion = $state("0.3.1");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("As atualizações são verificadas automaticamente.");
@@ -135,11 +137,18 @@
         Math.max(compactSize.height, Math.ceil(node.offsetHeight + 16)),
       );
       if (nextHeight === expandedHeight) return;
+      const previousSize = currentExpandedSize();
+      const anchor = compactAnchorPosition ?? compactPositionFromExpanded(overlayPosition, previousSize);
       expandedHeight = nextHeight;
       if (resizeWindow && isTauri && expanded && !morphing) {
-        void getCurrentWindow()
-          .setSize(new LogicalSize(expandedWidth, nextHeight))
-          .catch(() => undefined);
+        compactAnchorPosition = anchor;
+        const target = currentExpandedSize();
+        const position = expandedPositionFromCompact(anchor, target);
+        overlayPosition = position;
+        void Promise.all([
+          getCurrentWindow().setSize(new LogicalSize(target.width, target.height)),
+          moveOverlay(position.x, position.y, false),
+        ]).catch(() => undefined);
       }
     };
 
@@ -374,6 +383,7 @@
     }
     if (morphing) return;
     if (!expanded) {
+      compactAnchorPosition = { ...overlayPosition };
       morphing = "opening";
       expanded = true;
       contentVisible = false;
@@ -387,6 +397,7 @@
     contentVisible = false;
     await animateWindowSize(false);
     expanded = false;
+    compactAnchorPosition = null;
     morphing = null;
     selectedId = null;
     view = "sessions";
@@ -394,8 +405,17 @@
   }
 
   async function animateWindowSize(opening: boolean) {
-    const from = opening ? compactSize : currentExpandedSize();
-    const to = opening ? currentExpandedSize() : compactSize;
+    const expandedTarget = currentExpandedSize();
+    const compactTargetPosition = compactAnchorPosition ??
+      compactPositionFromExpanded(overlayPosition, expandedTarget);
+    const expandedTargetPosition = expandedPositionFromCompact(
+      compactTargetPosition,
+      expandedTarget,
+    );
+    const from = opening ? compactSize : expandedTarget;
+    const to = opening ? expandedTarget : compactSize;
+    const fromPosition = opening ? compactTargetPosition : expandedTargetPosition;
+    const toPosition = opening ? expandedTargetPosition : compactTargetPosition;
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const duration = reducedMotion ? 1 : opening ? 360 : 320;
     if (!isTauri) {
@@ -414,8 +434,14 @@
         if (opening && eased > 0.48) contentVisible = true;
         const width = Math.round(from.width + (to.width - from.width) * eased);
         const height = Math.round(from.height + (to.height - from.height) * eased);
+        const x = Math.round(fromPosition.x + (toPosition.x - fromPosition.x) * eased);
+        const y = Math.round(fromPosition.y + (toPosition.y - fromPosition.y) * eased);
         try {
-          await currentWindow.setSize(new LogicalSize(width, height));
+          await Promise.all([
+            currentWindow.setSize(new LogicalSize(width, height)),
+            moveOverlay(x, y, false),
+          ]);
+          overlayPosition = { x, y };
         } catch {
           resolve();
           return;
@@ -439,6 +465,44 @@
       x: Math.max(0, Math.min(x, monitorBounds.width - target.width * monitorBounds.scale)),
       y: Math.max(0, Math.min(y, monitorBounds.height - target.height * monitorBounds.scale)),
     };
+  }
+
+  function expandedPositionFromCompact(
+    compactPosition: { x: number; y: number },
+    target = currentExpandedSize(),
+  ) {
+    const compactWidth = compactSize.width * monitorBounds.scale;
+    const compactHeight = compactSize.height * monitorBounds.scale;
+    const targetWidth = target.width * monitorBounds.scale;
+    const targetHeight = target.height * monitorBounds.scale;
+    const rightDistance = monitorBounds.width - compactPosition.x - compactWidth;
+    const bottomDistance = monitorBounds.height - compactPosition.y - compactHeight;
+    const x = rightDistance < compactPosition.x
+      ? compactPosition.x - (targetWidth - compactWidth)
+      : compactPosition.x;
+    const y = bottomDistance < compactPosition.y
+      ? compactPosition.y - (targetHeight - compactHeight)
+      : compactPosition.y;
+    return clampOverlayPosition(x, y, target);
+  }
+
+  function compactPositionFromExpanded(
+    expandedPosition: { x: number; y: number },
+    source = currentExpandedSize(),
+  ) {
+    const compactWidth = compactSize.width * monitorBounds.scale;
+    const compactHeight = compactSize.height * monitorBounds.scale;
+    const sourceWidth = source.width * monitorBounds.scale;
+    const sourceHeight = source.height * monitorBounds.scale;
+    const rightDistance = monitorBounds.width - expandedPosition.x - sourceWidth;
+    const bottomDistance = monitorBounds.height - expandedPosition.y - sourceHeight;
+    const x = rightDistance < expandedPosition.x
+      ? expandedPosition.x + (sourceWidth - compactWidth)
+      : expandedPosition.x;
+    const y = bottomDistance < expandedPosition.y
+      ? expandedPosition.y + (sourceHeight - compactHeight)
+      : expandedPosition.y;
+    return clampOverlayPosition(x, y, compactSize);
   }
 
   function beginOverlayDrag(event: PointerEvent, compact = false) {
@@ -480,12 +544,17 @@
     dragState = null;
     if (!dragging) return;
     if (compact) suppressCompactToggle = true;
+    const persistedPosition = expanded
+      ? compactPositionFromExpanded(overlayPosition)
+      : overlayPosition;
+    compactAnchorPosition = expanded ? persistedPosition : null;
     preferences = {
       ...preferences,
-      overlayX: Math.round(overlayPosition.x),
-      overlayY: Math.round(overlayPosition.y),
+      overlayX: Math.round(persistedPosition.x),
+      overlayY: Math.round(persistedPosition.y),
     };
-    await moveOverlay(overlayPosition.x, overlayPosition.y, true);
+    await savePreferences(preferences);
+    await moveOverlay(overlayPosition.x, overlayPosition.y, false);
     dragging = false;
   }
 
@@ -823,18 +892,7 @@
       onpointercancel={(event) => endOverlayDrag(event, true)}
       aria-label="Abrir Lume, {activeCount} agentes ativos"
     >
-      <span class="lume-brand-icon status-{shellStatus}" aria-hidden="true">
-        <LumeLogo size={28} />
-        <span class="logo-state">
-        {#if shellStatus === "completed"}
-          <svg class="status-glyph" viewBox="0 0 20 20"><path d="m5.5 10.2 3 3 6-6.2" /></svg>
-        {:else if shellStatus === "failed"}
-          <svg class="status-glyph" viewBox="0 0 20 20"><path d="M10 5.2v6.2M10 14.7h.01" /></svg>
-        {:else}
-          <i></i>
-        {/if}
-        </span>
-      </span>
+      <LumeMascot status={shellStatus} size={30} />
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
@@ -850,7 +908,7 @@
       >
         {#if view === "sessions"}
           <div class="brand-lockup">
-            <LumeLogo size={31} />
+            <LumeMascot status={shellStatus} size={32} />
             <div>
               <strong>Lume</strong>
               <span>{activeCount === 1 ? "1 sessão ativa" : `${activeCount} sessões ativas`}</span>
@@ -1333,28 +1391,10 @@
   .lume-orb:active { transform: scale(0.97); }
   .lume-orb.dragging { cursor: grabbing; transform: scale(0.985); }
 
-  .lume-brand-icon { position: relative; width: 28px; height: 28px; flex: 0 0 auto; }
-  .logo-state { position: absolute; right: -3px; bottom: -2px; width: 12px; height: 12px; display: grid; place-items: center; border: 2px solid rgba(249, 251, 250, 0.96); border-radius: 50%; color: white; background: currentColor; }
-  .logo-state i { width: 4px; height: 4px; border-radius: 50%; background: white; }
-  .logo-state .status-glyph { width: 9px; height: 9px; stroke: white; stroke-width: 2.4; }
-  .status-permission_required .logo-state { background: #ae6b24; }
-  .status-failed .logo-state { background: #a84d4d; }
-  .status-completed .logo-state { background: #678476; }
-  .status-running .logo-state { background: #4f7f6c; }
-  .status-waiting_for_input .logo-state { background: #627f9d; }
-  .status-idle .logo-state { background: #829089; }
   .status-permission_required { color: #ae6b24; }
   .status-failed { color: #a84d4d; }
   .status-completed { color: #708079; }
   .status-idle { color: #829089; }
-
-  .status-permission_required.lume-orb .lume-brand-icon {
-    animation: attention 1.8s ease-in-out infinite;
-  }
-
-  @keyframes attention {
-    50% { box-shadow: 0 0 0 5px rgba(183, 111, 36, 0.12); }
-  }
 
   .agent-count {
     min-width: 19px;

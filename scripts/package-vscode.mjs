@@ -8,10 +8,10 @@ const extension = resolve(root, "extensions/vscode");
 const output = resolve(root, "src-tauri/resources/lume-vscode.vsix");
 mkdirSync(dirname(output), { recursive: true });
 
-const executable = resolve(root, "node_modules/.bin/vsce");
+const executable = resolve(root, "node_modules/@vscode/vsce/vsce");
 const result = spawnSync(
-  executable,
-  ["package", "--no-dependencies", "--skip-license", "--out", output],
+  process.execPath,
+  [executable, "package", "--no-dependencies", "--skip-license", "--out", output],
   { cwd: extension, stdio: "inherit" },
 );
 process.exit(result.status ?? 1);
