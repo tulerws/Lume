@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,4 +33,3 @@ jobs:
       - run: npm run build:vscode
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-
