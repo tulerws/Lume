@@ -298,7 +298,16 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
             .with_cmd(UpdateKind::Always)
             .without_tasks(),
     );
-    let Some(mut pid) = get_current_pid().ok() else {
+    let Some(current_pid) = get_current_pid().ok() else {
+        return (None, SessionSource::Cli);
+    };
+    // O processo atual é `lume hook <provider>` e contém o nome do agente nos
+    // próprios argumentos. A busca precisa começar no processo pai para não
+    // associar o chat ao PID efêmero do hook.
+    let Some(mut pid) = system
+        .process(current_pid)
+        .and_then(|process| process.parent())
+    else {
         return (None, SessionSource::Cli);
     };
     let mut agent_pid = None;

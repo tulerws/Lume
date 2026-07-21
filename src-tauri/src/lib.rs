@@ -20,7 +20,7 @@ use state::AppState;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_opener::OpenerExt;
@@ -220,6 +220,16 @@ fn get_terminal_window_state(
 }
 
 #[tauri::command]
+fn close_terminal_window(app: AppHandle, label: String) -> Result<(), String> {
+    app.get_webview_window(&label)
+        .ok_or_else(|| "Mini terminal não encontrado".to_string())?
+        .close()
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("lume://terminal-windows-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 fn move_terminal_window(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -231,6 +241,21 @@ fn move_terminal_window(
 ) -> Result<terminal_windows::TerminalWindowState, String> {
     let monitor_id = state.preferences()?.monitor_id;
     terminals.move_window(&app, &label, x, y, finalize, monitor_id.as_deref())
+}
+
+#[tauri::command]
+fn resize_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.resize_window(&app, &label, x, y, width, height, monitor_id.as_deref())
 }
 
 #[tauri::command]
@@ -325,6 +350,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -419,7 +446,9 @@ pub fn run() {
             open_terminal_window,
             list_terminal_windows,
             get_terminal_window_state,
+            close_terminal_window,
             move_terminal_window,
+            resize_terminal_window,
             undock_terminal_window,
             integration_statuses,
             configure_integration,

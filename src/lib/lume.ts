@@ -67,6 +67,10 @@ export async function loadTerminalWindowState(label: string): Promise<TerminalWi
   return invoke<TerminalWindowState>("get_terminal_window_state", { label });
 }
 
+export async function closeTerminalWindow(label: string): Promise<void> {
+  await invoke("close_terminal_window", { label });
+}
+
 export async function moveTerminalWindow(
   label: string,
   x: number,
@@ -78,6 +82,22 @@ export async function moveTerminalWindow(
     x: Math.round(x),
     y: Math.round(y),
     finalize,
+  });
+}
+
+export async function resizeTerminalWindow(
+  label: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<TerminalWindowState> {
+  return invoke<TerminalWindowState>("resize_terminal_window", {
+    label,
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.round(width),
+    height: Math.round(height),
   });
 }
 

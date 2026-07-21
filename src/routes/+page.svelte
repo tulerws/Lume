@@ -3,8 +3,11 @@
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
   import { fade, fly, slide } from "svelte/transition";
+  import { getVersion } from "@tauri-apps/api/app";
   import { listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { relaunch } from "@tauri-apps/plugin-process";
+  import { check, type Update } from "@tauri-apps/plugin-updater";
   import {
     availableMonitors,
     getCurrentWindow,
@@ -49,6 +52,14 @@
   type View = "sessions" | "board" | "history" | "settings";
   type ShellStatus = SessionStatus | "idle";
   type MonitorOption = { id: string; label: string };
+  type UpdateState =
+    | "idle"
+    | "checking"
+    | "up_to_date"
+    | "available"
+    | "downloading"
+    | "ready"
+    | "error";
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
@@ -93,6 +104,12 @@
   let overlayReady = $state(false);
   let monitorBounds = $state({ width: 1920, height: 1080, scale: 1 });
   let dragging = $state(false);
+  let appVersion = $state("0.3.0");
+  let updateState = $state<UpdateState>("idle");
+  let availableVersion = $state<string | null>(null);
+  let updateDetail = $state("As atualizações são verificadas automaticamente.");
+  let updateProgress = $state<number | null>(null);
+  let pendingUpdate: Update | null = null;
   let suppressCompactToggle = false;
   let dragState: {
     pointerId: number;
@@ -126,7 +143,12 @@
     if (isTerminalWindow) return;
     let disposed = false;
     let stopListening: (() => void) | undefined;
+    let stopTerminalListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
+    let updateTimer: ReturnType<typeof setInterval> | undefined;
+
+    void initializeUpdater();
+    updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
 
     void (async () => {
       const [nextSessions, nextPreferences, nextIntegrations, nextVscodeStatus] = await Promise.all([
@@ -149,6 +171,9 @@
         stopListening = await listen("lume://sessions-changed", () => {
           void refreshSessions(true);
         });
+        stopTerminalListening = await listen("lume://terminal-windows-changed", () => {
+          void refreshTerminalWindows();
+        });
         pollTimer = setInterval(() => void refreshSessions(false), 5_000);
       }
     })();
@@ -156,9 +181,87 @@
     return () => {
       disposed = true;
       stopListening?.();
+      stopTerminalListening?.();
       if (pollTimer) clearInterval(pollTimer);
+      if (updateTimer) clearInterval(updateTimer);
+      if (pendingUpdate) void pendingUpdate.close();
     };
   });
+
+  async function initializeUpdater() {
+    if (!isTauri) {
+      updateState = "up_to_date";
+      return;
+    }
+
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // Mantém a versão do pacote como fallback.
+    }
+    await checkForUpdates();
+  }
+
+  async function checkForUpdates() {
+    if (
+      !isTauri ||
+      updateState === "checking" ||
+      updateState === "available" ||
+      updateState === "downloading" ||
+      updateState === "ready"
+    ) return;
+    updateState = "checking";
+    updateDetail = "Procurando uma nova versão…";
+    updateProgress = null;
+
+    try {
+      const nextUpdate = await check({ timeout: 15_000 });
+      if (pendingUpdate && pendingUpdate !== nextUpdate) await pendingUpdate.close();
+      pendingUpdate = nextUpdate;
+      availableVersion = nextUpdate?.version ?? null;
+      if (nextUpdate) {
+        updateState = "available";
+        updateDetail = `A versão ${nextUpdate.version} está pronta para baixar.`;
+      } else {
+        updateState = "up_to_date";
+        updateDetail = "Você está usando a versão mais recente.";
+      }
+    } catch {
+      updateState = "error";
+      updateDetail = "Não foi possível verificar agora. Tente novamente em instantes.";
+    }
+  }
+
+  async function installAvailableUpdate() {
+    if (!pendingUpdate || updateState === "downloading") return;
+    updateState = "downloading";
+    updateDetail = "Baixando e preparando a atualização…";
+    updateProgress = 0;
+    let downloaded = 0;
+    let total: number | undefined;
+
+    try {
+      await pendingUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength;
+          return;
+        }
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          updateProgress = total ? Math.min(99, Math.round((downloaded / total) * 100)) : null;
+          return;
+        }
+        updateProgress = 100;
+      });
+      updateState = "ready";
+      updateDetail = "Atualização instalada. Reiniciando o Lume…";
+      await relaunch();
+    } catch {
+      updateState = "error";
+      updateDetail = "A atualização não pôde ser instalada. Tente novamente.";
+      updateProgress = null;
+    }
+  }
 
   async function refreshSessions(withSound: boolean) {
     const next = await loadSessions();
@@ -707,7 +810,7 @@
             <LumeLogo size={31} />
             <div>
               <strong>Lume</strong>
-              <span>{activeCount === 1 ? "1 agente ativo" : `${activeCount} agentes ativos`}</span>
+              <span>{activeCount === 1 ? "1 sessão ativa" : `${activeCount} sessões ativas`}</span>
             </div>
           </div>
         {:else}
@@ -852,7 +955,7 @@
             {:else}
               <div class="empty-state" transition:fade>
                 <span class="quiet-orbit" aria-hidden="true"><i></i></span>
-                <strong>Nenhum agente ativo</strong>
+                <strong>Nenhuma sessão ativa</strong>
                 <p>Novas sessões aparecerão aqui automaticamente.</p>
               </div>
             {/each}
@@ -861,7 +964,7 @@
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="board-intro">
               <span class="eyebrow">Terminais flutuantes</span>
-              <strong>Um espaço separado para cada agente</strong>
+              <strong>Um espaço separado para cada chat</strong>
               <p>Abra mini terminais independentes e aproxime um do outro para acoplá-los.</p>
             </div>
 
@@ -893,7 +996,7 @@
             {#if terminalMessage}<p class="board-message" transition:fade>{terminalMessage}</p>{/if}
             <div class="dock-guide">
               <svg viewBox="0 0 32 20" aria-hidden="true"><rect x="2" y="3" width="12" height="14" rx="3" /><rect x="18" y="3" width="12" height="14" rx="3" /><path d="M14 10h4" /></svg>
-              <span>Cada janela tem seu próprio prompt. Arraste duas pelas bordas para formar um conjunto.</span>
+              <span>Cada janela tem seu próprio prompt. Acople pelas laterais ou por cima e por baixo.</span>
             </div>
           </div>
         {:else if view === "history"}
@@ -1046,6 +1149,43 @@
                 {/each}
               </div>
             </div>
+            <div class="settings-section-label preferences-label">Sobre</div>
+            <div class="update-card" aria-live="polite">
+              <div class="update-main">
+                <LumeLogo size={30} />
+                <div class="update-copy">
+                  <strong>Lume</strong>
+                  <span>Versão {appVersion}</span>
+                </div>
+                {#if updateState === "available"}
+                  <button class="update-available" type="button" onclick={installAvailableUpdate}>
+                    Atualizar para {availableVersion}
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    disabled={updateState === "checking" || updateState === "downloading" || updateState === "ready"}
+                    onclick={checkForUpdates}
+                  >
+                    {updateState === "checking"
+                      ? "Verificando…"
+                      : updateState === "downloading"
+                        ? updateProgress === null
+                          ? "Baixando…"
+                          : `${updateProgress}%`
+                        : updateState === "ready"
+                          ? "Reiniciando…"
+                          : "Verificar"}
+                  </button>
+                {/if}
+              </div>
+              <p class:error={updateState === "error"}>{updateDetail}</p>
+              {#if updateState === "downloading" || updateState === "ready"}
+                <div class:indeterminate={updateProgress === null} class="update-progress" aria-hidden="true">
+                  <span style:width={`${updateProgress ?? 24}%`}></span>
+                </div>
+              {/if}
+            </div>
             <span class:visible={savingSettings} class="save-state">Salvando…</span>
           </div>
         {/if}
@@ -1088,6 +1228,7 @@
         </button>
         <button
           class:active={view === "settings"}
+          class:has-update={updateState === "available"}
           type="button"
           onclick={() => openView("settings")}
           aria-label="Configurações"
@@ -1219,6 +1360,7 @@
   }
 
   .panel-header {
+    flex: 0 0 auto;
     min-height: 61px;
     padding: 12px 13px 10px 16px;
     display: flex;
@@ -1284,7 +1426,7 @@
     stroke-width: 1.65;
   }
 
-  .panel-content { min-height: 0; flex: 1; overflow: hidden; }
+  .panel-content { position: relative; min-height: 0; flex: 1 1 auto; overflow: hidden; }
   .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 250px; padding: 10px 11px; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
@@ -1297,7 +1439,16 @@
   .launcher-popover .launcher-error { color: #a54c4c; }
   .session-list,
   .history-list,
-  .settings { height: 100%; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
+  .settings { position: absolute; inset: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
+
+  .session-list::-webkit-scrollbar,
+  .history-list::-webkit-scrollbar,
+  .settings::-webkit-scrollbar,
+  .terminal-picker::-webkit-scrollbar { width: 5px; }
+  .session-list::-webkit-scrollbar-thumb,
+  .history-list::-webkit-scrollbar-thumb,
+  .settings::-webkit-scrollbar-thumb,
+  .terminal-picker::-webkit-scrollbar-thumb { border-radius: 999px; background: #cad2ce; }
 
   .session-list { padding: 5px 14px 8px; }
 
@@ -1414,12 +1565,12 @@
   .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer button:disabled { opacity: 0.35; cursor: default; }
 
-  .whiteboard { height: 100%; padding: 7px 16px 15px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
+  .whiteboard { position: absolute; inset: 0; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .board-intro .eyebrow { display: block; margin-bottom: 4px; color: #7a8c84; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
   .board-intro strong { color: #2d3a35; font-size: 12px; }
   .board-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; line-height: 1.45; }
-  .terminal-picker { padding: 9px 0 6px; }
+  .terminal-picker { min-height: 0; padding: 9px 0 6px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
   .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
   .terminal-picker-row:last-child { border-bottom: 0; }
   .terminal-picker-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -1493,10 +1644,28 @@
   .segmented { padding: 2px; display: grid; grid-template-columns: repeat(3, 1fr); border-radius: 9px; background: rgba(83, 104, 95, 0.07); }
   .segmented button { height: 29px; border: 0; border-radius: 7px; color: #74817b; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease; }
   .segmented button.active { color: #35473f; background: rgba(255, 255, 255, 0.82); box-shadow: 0 1px 4px rgba(37, 53, 46, 0.1); }
+  .update-card { padding: 12px; border: 1px solid rgba(92, 111, 103, 0.11); border-radius: 13px; background: rgba(84, 111, 99, 0.035); }
+  .update-main { display: flex; align-items: center; gap: 9px; }
+  .update-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .update-copy strong { color: #35423d; font-size: 10px; }
+  .update-copy span,
+  .update-card p { color: #89938f; font-size: 9px; }
+  .update-card p { margin: 9px 0 0; line-height: 1.4; }
+  .update-card p.error { color: #a34f4f; }
+  .update-main button { min-width: 63px; height: 27px; padding: 0 8px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 8px; color: #577064; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: background 150ms ease, transform 150ms ease; }
+  .update-main button.update-available { color: #f7fbf9; border-color: #527c6c; background: #527c6c; }
+  .update-main button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(82, 112, 99, 0.09); }
+  .update-main button.update-available:hover { background: #476f60; }
+  .update-main button:disabled { cursor: default; opacity: 0.58; }
+  .update-progress { height: 2px; margin-top: 9px; overflow: hidden; border-radius: 999px; background: rgba(82, 112, 99, 0.1); }
+  .update-progress span { height: 100%; display: block; border-radius: inherit; background: #5f8ac7; transition: width 180ms ease; }
+  .update-progress.indeterminate span { animation: update-slide 1.15s ease-in-out infinite alternate; }
+  @keyframes update-slide { from { transform: translateX(-70%); } to { transform: translateX(320%); } }
   .save-state { display: block; color: #87928d; font-size: 9px; text-align: right; opacity: 0; transition: opacity 120ms ease; }
   .save-state.visible { opacity: 1; }
 
   footer {
+    flex: 0 0 auto;
     min-height: 52px;
     padding: 6px 10px 8px;
     display: grid;
@@ -1508,6 +1677,8 @@
   footer button:hover { color: #52615a; background: rgba(76, 100, 90, 0.045); }
   footer button.active { color: #476c5d; }
   footer button svg { width: 15px; height: 15px; }
+  footer button.has-update { position: relative; }
+  footer button.has-update::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #5f8ac7; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -1527,6 +1698,7 @@
     .integration-row strong,
     .field-row strong,
     .launch-setting strong { color: #e3ebe7; }
+    .update-copy strong { color: #e3ebe7; }
     .launcher-row strong { color: #dfe8e3; }
     .panel-header,
     footer,
@@ -1542,6 +1714,8 @@
     .history-row span,
     .settings-feedback { color: #adbab4; }
     .settings-feedback.error { color: #d68d8d; }
+    .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+    .update-card p.error { color: #d68d8d; }
     .access-profile span,
     .empty-state strong { color: #c5d0cb; }
     code,

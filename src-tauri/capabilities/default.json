@@ -11,6 +11,8 @@
     "core:window:allow-set-size",
     "core:window:allow-available-monitors",
     "dialog:allow-open",
-    "opener:default"
+    "opener:default",
+    "process:allow-restart",
+    "updater:default"
   ]
 }

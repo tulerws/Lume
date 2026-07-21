@@ -71,14 +71,11 @@ fn scan() -> Vec<DiscoveredProcess> {
 
     candidates
         .into_iter()
-        // Launchers commonly spawn the real Node/native process. Keep the leaf only.
+        // Launchers podem ter processos intermediários que não carregam o nome
+        // do agente. Mantém somente o descendente detectado mais específico.
         .filter(|(pid, _, agent)| {
             !agents_by_pid.iter().any(|(child_pid, child_agent)| {
-                child_agent == agent
-                    && system
-                        .process(*child_pid)
-                        .and_then(|process| process.parent())
-                        == Some(*pid)
+                child_agent == agent && process_descends_from(&system, *child_pid, *pid)
             })
         })
         .filter_map(|(pid, _, agent)| {
@@ -91,6 +88,19 @@ fn scan() -> Vec<DiscoveredProcess> {
             })
         })
         .collect()
+}
+
+fn process_descends_from(system: &System, mut child: sysinfo::Pid, ancestor: sysinfo::Pid) -> bool {
+    for _ in 0..12 {
+        let Some(parent) = system.process(child).and_then(|process| process.parent()) else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
+        child = parent;
+    }
+    false
 }
 
 fn source_for(system: &System, mut pid: sysinfo::Pid) -> SessionSource {

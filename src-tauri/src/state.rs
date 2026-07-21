@@ -54,7 +54,7 @@ impl AppState {
     }
 
     pub fn sessions(&self) -> Result<Vec<AgentSession>, String> {
-        let mut sessions = self
+        let sessions = self
             .sessions
             .lock()
             .map_err(|_| "Não foi possível acessar as sessões".to_string())?
@@ -69,6 +69,65 @@ impl AppState {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let mut deduplicated = Vec::<AgentSession>::new();
+        for session in sessions {
+            let duplicate = session.native_session_id.as_ref().and_then(|native_id| {
+                deduplicated.iter().position(|existing| {
+                    existing.agent == session.agent
+                        && existing.native_session_id.as_ref() == Some(native_id)
+                })
+            });
+            if let Some(index) = duplicate {
+                if prefer_session(&session, &deduplicated[index]) {
+                    deduplicated[index] = session;
+                }
+            } else {
+                deduplicated.push(session);
+            }
+        }
+        let native_processes = deduplicated
+            .iter()
+            .filter(|session| !is_provisional_process(session))
+            .filter_map(|session| session.process_id.map(|pid| (session.agent.clone(), pid)))
+            .collect::<Vec<_>>();
+        let native_contexts = deduplicated
+            .iter()
+            .filter(|session| !is_provisional_process(session))
+            .filter(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Running
+                        | SessionStatus::PermissionRequired
+                        | SessionStatus::WaitingForInput
+                )
+            })
+            .filter_map(|session| {
+                session.working_directory.as_ref().map(|directory| {
+                    (
+                        session.agent.clone(),
+                        session.source.clone(),
+                        directory.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        deduplicated.retain(|session| {
+            !is_provisional_process(session)
+                || (!session.process_id.is_some_and(|pid| {
+                    native_processes
+                        .iter()
+                        .any(|(agent, native_pid)| agent == &session.agent && *native_pid == pid)
+                }) && !session.working_directory.as_ref().is_some_and(|directory| {
+                    native_contexts
+                        .iter()
+                        .any(|(agent, source, native_directory)| {
+                            agent == &session.agent
+                                && source == &session.source
+                                && native_directory == directory
+                        })
+                }))
+        });
+        let mut sessions = deduplicated;
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
         Ok(sessions)
     }
@@ -108,9 +167,37 @@ impl AppState {
             .sessions
             .lock()
             .map_err(|_| "Não foi possível atualizar as sessões".to_string())?;
-        let exact_session_exists = sessions
+        let native_ids = event
+            .native_session_id
+            .as_ref()
+            .map(|native_id| {
+                sessions
+                    .iter()
+                    .filter(|session| {
+                        session.agent == event.agent
+                            && session.native_session_id.as_ref() == Some(native_id)
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let existing_session_id = native_ids
             .iter()
-            .any(|session| session.id == event.session_id);
+            .filter_map(|id| sessions.iter().find(|session| &session.id == id))
+            .max_by_key(|session| {
+                (
+                    session.permission_profile.can_respond_from_lume,
+                    session.id == event.session_id,
+                    session.updated_at,
+                )
+            })
+            .map(|session| session.id.clone())
+            .or_else(|| {
+                sessions
+                    .iter()
+                    .find(|session| session.id == event.session_id)
+                    .map(|session| session.id.clone())
+            });
         let provisional_ids = event
             .process_id
             .map(|process_id| {
@@ -126,8 +213,12 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        if exact_session_exists {
-            sessions.retain(|session| !provisional_ids.contains(&session.id));
+        let target_session_id = if let Some(existing_id) = existing_session_id {
+            sessions.retain(|session| {
+                session.id == existing_id
+                    || (!provisional_ids.contains(&session.id) && !native_ids.contains(&session.id))
+            });
+            existing_id
         } else if let Some(provisional_id) = provisional_ids.first() {
             if let Some(session) = sessions
                 .iter_mut()
@@ -138,12 +229,14 @@ impl AppState {
             sessions.retain(|session| {
                 session.id == event.session_id || !provisional_ids.contains(&session.id)
             });
+            event.session_id.clone()
         } else {
             sessions.push(session_from_event(&event, now));
-        }
+            event.session_id.clone()
+        };
         let session = sessions
             .iter_mut()
-            .find(|session| session.id == event.session_id)
+            .find(|session| session.id == target_session_id)
             .expect("a sessão acabou de ser inserida");
 
         apply_metadata(session, &event);
@@ -199,7 +292,14 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível persistir a sessão".to_string())?;
         for provisional_id in provisional_ids {
-            store.delete_session(&provisional_id)?;
+            if provisional_id != snapshot.id {
+                store.delete_session(&provisional_id)?;
+            }
+        }
+        for native_id in native_ids {
+            if native_id != snapshot.id {
+                store.delete_session(&native_id)?;
+            }
         }
         store.save_session(&snapshot)?;
         if let Some(entry) = history {
@@ -321,22 +421,77 @@ impl AppState {
         let mut snapshots = Vec::new();
         let mut history = Vec::new();
         let mut cancelled_permissions = Vec::new();
+        let mut removed_sessions = Vec::new();
 
         for process in discovered {
-            if let Some(session) = sessions
+            let contextual_chat_ids = process
+                .working_directory
+                .as_ref()
+                .map(|directory| {
+                    sessions
+                        .iter()
+                        .filter(|session| !is_provisional_process(session))
+                        .filter(|session| {
+                            session.agent == process.agent
+                                && session.source == process.source
+                                && session.working_directory.as_ref() == Some(directory)
+                                && matches!(
+                                    session.status,
+                                    SessionStatus::Running
+                                        | SessionStatus::PermissionRequired
+                                        | SessionStatus::WaitingForInput
+                                )
+                                && session.process_id.is_none_or(|pid| {
+                                    pid == process.process_id || !active_pids.contains(&pid)
+                                })
+                        })
+                        .map(|session| session.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !contextual_chat_ids.is_empty() {
+                let provisional_ids = sessions
+                    .iter()
+                    .filter(|session| {
+                        is_provisional_process(session)
+                            && session.process_id == Some(process.process_id)
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>();
+                if !provisional_ids.is_empty() {
+                    sessions.retain(|session| !provisional_ids.contains(&session.id));
+                    removed_sessions.extend(provisional_ids);
+                    changed = true;
+                }
+                for session in sessions
+                    .iter_mut()
+                    .filter(|session| contextual_chat_ids.contains(&session.id))
+                {
+                    if session.process_id != Some(process.process_id) {
+                        session.process_id = Some(process.process_id);
+                        session.updated_at = now;
+                        snapshots.push(session.clone());
+                        changed = true;
+                    }
+                }
+                continue;
+            }
+            let mut matched_process = false;
+            for session in sessions
                 .iter_mut()
-                .find(|session| session.process_id == Some(process.process_id))
+                .filter(|session| session.process_id == Some(process.process_id))
             {
+                matched_process = true;
                 let mut refreshed = false;
                 if session.working_directory != process.working_directory {
-                    session.working_directory = process.working_directory;
+                    session.working_directory = process.working_directory.clone();
                     refreshed = true;
                 }
                 if session.source != process.source {
-                    session.source = process.source;
+                    session.source = process.source.clone();
                     refreshed = true;
                 }
-                if session.status == SessionStatus::Completed {
+                if is_provisional_process(session) && session.status == SessionStatus::Completed {
                     session.status = SessionStatus::Running;
                     session.status_label = "Processo detectado".into();
                     refreshed = true;
@@ -346,6 +501,8 @@ impl AppState {
                     snapshots.push(session.clone());
                     changed = true;
                 }
+            }
+            if matched_process {
                 continue;
             }
             let project = process
@@ -431,6 +588,9 @@ impl AppState {
             for session in snapshots {
                 store.save_session(&session)?;
             }
+            for session_id in removed_sessions {
+                store.delete_session(&session_id)?;
+            }
             for entry in history {
                 store.add_history(&entry)?;
             }
@@ -497,7 +657,9 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
         session.working_directory = Some(working_directory.clone());
     }
     if let Some(profile) = &event.permission_profile {
-        session.permission_profile = profile.clone();
+        if profile.can_respond_from_lume || !session.permission_profile.can_respond_from_lume {
+            session.permission_profile = profile.clone();
+        }
     }
 }
 
@@ -545,6 +707,22 @@ fn history_for_event(
         summary: summary.into(),
         created_at: now,
     })
+}
+
+fn is_provisional_process(session: &AgentSession) -> bool {
+    session.id.starts_with("process:") && session.native_session_id.is_none()
+}
+
+fn prefer_session(candidate: &AgentSession, current: &AgentSession) -> bool {
+    (
+        candidate.permission_profile.can_respond_from_lume,
+        !is_provisional_process(candidate),
+        candidate.updated_at,
+    ) > (
+        current.permission_profile.can_respond_from_lume,
+        !is_provisional_process(current),
+        current.updated_at,
+    )
 }
 
 fn status_priority(status: &SessionStatus) -> u8 {
@@ -633,6 +811,88 @@ mod tests {
             .expect("persistência");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].id, "claude:session-1");
+    }
+
+    #[test]
+    fn integrations_with_the_same_native_chat_become_one_session() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut direct = started_event("claude-direct:chat-1", 4242);
+        direct.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::Custom,
+            label: "Integração direta".into(),
+            approval_policy: "Perguntar".into(),
+            can_respond_from_lume: true,
+            available_actions: vec![PermissionAction::AllowOnce],
+        });
+        state.ingest(direct).expect("integração direta");
+
+        let mut hook = started_event("claude-hook:chat-1", 4242);
+        hook.event = HookEventKind::Completed;
+        hook.status_label = Some("Finalizado pelo hook".into());
+        hook.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::Custom,
+            label: "Somente observação".into(),
+            approval_policy: "Abrir origem".into(),
+            can_respond_from_lume: false,
+            available_actions: vec![PermissionAction::OpenSource],
+        });
+        state.ingest(hook).expect("hook");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude-direct:chat-1");
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert!(sessions[0].permission_profile.can_respond_from_lume);
+    }
+
+    #[test]
+    fn one_agent_process_can_keep_multiple_native_chats() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut first = started_event("claude:chat-1", 4242);
+        first.native_session_id = Some("native-chat-1".into());
+        state.ingest(first).expect("primeiro chat");
+        let mut second = started_event("claude:chat-2", 4242);
+        second.native_session_id = Some("native-chat-2".into());
+        state.ingest(second).expect("segundo chat");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn provisional_process_is_hidden_when_an_active_chat_has_the_same_context() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:chat-with-old-pid", 9999))
+            .expect("chat");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("descoberta");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:chat-with-old-pid");
+    }
+
+    #[test]
+    fn process_scan_does_not_reopen_a_completed_chat() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:completed-chat", 4242))
+            .expect("início");
+        let mut completed = started_event("claude:completed-chat", 4242);
+        completed.event = HookEventKind::Completed;
+        completed.status_label = Some("Finalizado".into());
+        state.ingest(completed).expect("conclusão");
+
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("redetecção");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].status_label, "Finalizado");
     }
 
     #[test]

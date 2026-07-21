@@ -5,12 +5,16 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use crate::{domain::AgentSession, overlay};
 
 const TERMINAL_WIDTH: i32 = 336;
 const TERMINAL_HEIGHT: i32 = 286;
+const TERMINAL_MIN_WIDTH: i32 = 300;
+const TERMINAL_MIN_HEIGHT: i32 = 240;
+const TERMINAL_MAX_WIDTH: i32 = 760;
+const TERMINAL_MAX_HEIGHT: i32 = 640;
 const DOCK_DISTANCE: i32 = 34;
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,12 +101,18 @@ impl TerminalWindows {
             match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("Lume · {}", session.agent_label))
                 .inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
-                .min_inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
-                .max_inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
+                .min_inner_size(
+                    f64::from(TERMINAL_MIN_WIDTH),
+                    f64::from(TERMINAL_MIN_HEIGHT),
+                )
+                .max_inner_size(
+                    f64::from(TERMINAL_MAX_WIDTH),
+                    f64::from(TERMINAL_MAX_HEIGHT),
+                )
                 .decorations(false)
                 .transparent(true)
                 .always_on_top(true)
-                .resizable(false)
+                .resizable(true)
                 .visible(false)
                 .build()
             {
@@ -115,10 +125,18 @@ impl TerminalWindows {
 
         let registry = self.clone();
         let cleanup_label = label.clone();
-        window.on_window_event(move |event| {
-            if matches!(event, WindowEvent::Destroyed) {
-                registry.remove(&cleanup_label);
+        let event_window = window.clone();
+        window.on_window_event(move |event| match event {
+            WindowEvent::Destroyed => registry.remove(&cleanup_label),
+            WindowEvent::Resized(size) => {
+                let scale = event_window.scale_factor().unwrap_or(1.0);
+                registry.resize(
+                    &cleanup_label,
+                    (f64::from(size.width) / scale).round() as i32,
+                    (f64::from(size.height) / scale).round() as i32,
+                );
             }
+            _ => {}
         });
 
         let layer_window = window.clone();
@@ -228,6 +246,54 @@ impl TerminalWindows {
             .ok_or_else(|| "Mini terminal não encontrado".to_string())
     }
 
+    pub fn resize_window(
+        &self,
+        app: &AppHandle,
+        label: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        monitor_id: Option<&str>,
+    ) -> Result<TerminalWindowState, String> {
+        let state = {
+            let mut placements = self
+                .placements
+                .lock()
+                .map_err(|_| "Não foi possível redimensionar o mini terminal".to_string())?;
+            let old_group = placements.get(label).and_then(|entry| entry.group.clone());
+            let entry = placements
+                .get_mut(label)
+                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+            entry.x = x;
+            entry.y = y;
+            entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+            entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+            entry.group = None;
+            let state = entry.state();
+            if let Some(group) = old_group {
+                clear_single_member_group(&mut placements, &group);
+            }
+            state
+        };
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        let target = state.clone();
+        let monitor = monitor_id.map(str::to_string);
+        let resize_window = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let _ = resize_window.set_size(LogicalSize::new(
+                    f64::from(target.width),
+                    f64::from(target.height),
+                ));
+                let _ = overlay::move_to(&resize_window, target.x, target.y, monitor.as_deref());
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(state)
+    }
+
     fn remove(&self, label: &str) {
         let Ok(mut placements) = self.placements.lock() else {
             return;
@@ -235,6 +301,16 @@ impl TerminalWindows {
         let group = placements.remove(label).and_then(|entry| entry.group);
         if let Some(group) = group {
             clear_single_member_group(&mut placements, &group);
+        }
+    }
+
+    fn resize(&self, label: &str, width: i32, height: i32) {
+        let Ok(mut placements) = self.placements.lock() else {
+            return;
+        };
+        if let Some(entry) = placements.get_mut(label) {
+            entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+            entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
         }
     }
 }
@@ -391,5 +467,14 @@ mod tests {
         let (_, dx, dy) = snap(&left, &right).expect("encaixe");
         assert_eq!(left.x + dx + left.width, right.x);
         assert_eq!(left.y + dy, right.y);
+    }
+
+    #[test]
+    fn nearby_terminals_snap_one_above_the_other() {
+        let top = placement("top", 40, 20);
+        let bottom = placement("bottom", 48, 298);
+        let (_, dx, dy) = snap(&top, &bottom).expect("encaixe vertical");
+        assert_eq!(top.x + dx, bottom.x);
+        assert_eq!(top.y + dy + top.height, bottom.y);
     }
 }

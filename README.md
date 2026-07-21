@@ -60,7 +60,11 @@ Para instalar o Companion web, abra **Ajustes → Navegadores → Abrir pasta**,
 npm run tauri build
 ```
 
-No Linux, os pacotes ficam em `src-tauri/target/release/bundle`. O workflow **Instaladores** gera `.deb`, AppImage e instalador NSIS para Windows, manualmente ou em tags `v*`.
+No Linux, os pacotes ficam em `src-tauri/target/release/bundle`. O workflow **Instaladores** gera `.deb`, AppImage e instalador NSIS para Windows, cria a GitHub Release e publica o `latest.json` usado pelo atualizador.
+
+Antes da próxima release, cadastre a chave privada de assinatura em **Settings → Secrets and variables → Actions** com o nome `TAURI_SIGNING_PRIVATE_KEY`. A chave pública já fica no aplicativo; a privada nunca deve entrar no repositório. Em cada nova versão, atualize o número em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`, então execute o workflow ou publique uma tag `v*`.
+
+A versão 0.3.0 precisa ser instalada manualmente uma vez porque as versões anteriores ainda não contêm o atualizador. Depois disso, o Lume verifica novas versões ao iniciar e oferece a instalação em **Ajustes → Sobre**. No Linux, o AppImage é substituído no próprio local e o `.deb` pode pedir a autenticação do sistema durante a instalação.
 
 O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Wayland, instale esse pacote no sistema para obter posicionamento nativo por monitor e o comportamento correto diante de tela cheia.
 
