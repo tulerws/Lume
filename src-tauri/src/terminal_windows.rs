@@ -5,7 +5,10 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{
+    webview::PageLoadEvent, AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
+    WindowEvent,
+};
 
 use crate::{domain::AgentSession, overlay};
 
@@ -136,6 +139,12 @@ impl TerminalWindows {
                 .always_on_top(true)
                 .resizable(true)
                 .visible(cfg!(target_os = "windows"))
+                .on_page_load(|window, payload| {
+                    if matches!(payload.event(), PageLoadEvent::Finished) {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                })
                 .build()
             {
                 Ok(window) => window,

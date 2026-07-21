@@ -25,7 +25,7 @@ pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
                     let _ = app.emit("lume://sessions-changed", ());
                 }
             }
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(2));
         })
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -57,7 +57,7 @@ fn scan() -> Vec<DiscoveredProcess> {
                 .join(" ")
                 .to_lowercase();
             let name = process.name().to_string_lossy().to_lowercase();
-            if command.contains("app-server") || command.contains("--remote ws://127.0.0.1:43131") {
+            if is_lume_codex_process(&command) {
                 return None;
             }
             let agent = detect_agent(&name, &command)?;
@@ -88,6 +88,10 @@ fn scan() -> Vec<DiscoveredProcess> {
             })
         })
         .collect()
+}
+
+fn is_lume_codex_process(command: &str) -> bool {
+    command.contains("127.0.0.1:43130") || command.contains("--remote ws://127.0.0.1:43131")
 }
 
 fn process_descends_from(system: &System, mut child: sysinfo::Pid, ancestor: sysinfo::Pid) -> bool {
@@ -150,5 +154,27 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
         Some(AgentKind::Gemini)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vscode_codex_app_server_is_not_ignored() {
+        assert!(!is_lume_codex_process(
+            "/home/user/.vscode/extensions/openai.chatgpt/bin/codex app-server"
+        ));
+    }
+
+    #[test]
+    fn lume_codex_bridge_processes_are_ignored() {
+        assert!(is_lume_codex_process(
+            "codex app-server --listen ws://127.0.0.1:43130"
+        ));
+        assert!(is_lume_codex_process(
+            "codex --remote ws://127.0.0.1:43131 resume chat"
+        ));
     }
 }

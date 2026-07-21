@@ -1,6 +1,7 @@
 mod adapters;
 mod browser_server;
 mod codex_bridge;
+mod codex_sessions;
 mod discovery;
 mod domain;
 mod event_server;
@@ -372,6 +373,7 @@ pub fn run() {
             let codex_bridge =
                 codex_bridge::CodexBridge::start(state.clone(), app.handle().clone())?;
             app.manage(codex_bridge);
+            codex_sessions::start(state.clone(), app.handle().clone())?;
             event_server::start(state.clone(), app.handle().clone())?;
             let browser_control = browser_server::BrowserControl::default();
             browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;

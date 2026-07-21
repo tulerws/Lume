@@ -111,7 +111,7 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.2");
+  let appVersion = $state("0.3.3");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("As atualizações são verificadas automaticamente.");

@@ -111,6 +111,12 @@ impl AppState {
                 })
             })
             .collect::<Vec<_>>();
+        let native_vscode_agents = deduplicated
+            .iter()
+            .filter(|session| !is_provisional_process(session))
+            .filter(|session| session.source == SessionSource::Vscode)
+            .map(|session| session.agent.clone())
+            .collect::<Vec<_>>();
         deduplicated.retain(|session| {
             !is_provisional_process(session)
                 || (!session.process_id.is_some_and(|pid| {
@@ -125,7 +131,8 @@ impl AppState {
                                 && source == &session.source
                                 && native_directory == directory
                         })
-                }))
+                }) && !(session.source == SessionSource::Vscode
+                    && native_vscode_agents.contains(&session.agent)))
         });
         let mut sessions = deduplicated;
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
@@ -198,20 +205,19 @@ impl AppState {
                     .find(|session| session.id == event.session_id)
                     .map(|session| session.id.clone())
             });
-        let provisional_ids = event
-            .process_id
-            .map(|process_id| {
-                sessions
-                    .iter()
-                    .filter(|session| {
-                        session.id.starts_with("process:")
-                            && session.process_id == Some(process_id)
-                            && session.agent == event.agent
-                    })
-                    .map(|session| session.id.clone())
-                    .collect::<Vec<_>>()
+        let provisional_ids = sessions
+            .iter()
+            .filter(|session| {
+                is_provisional_process(session)
+                    && session.agent == event.agent
+                    && (event
+                        .process_id
+                        .is_some_and(|process_id| session.process_id == Some(process_id))
+                        || (event.source == Some(SessionSource::Vscode)
+                            && session.source == SessionSource::Vscode))
             })
-            .unwrap_or_default();
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
 
         let target_session_id = if let Some(existing_id) = existing_session_id {
             sessions.retain(|session| {
@@ -438,6 +444,35 @@ impl AppState {
         }
 
         for process in discovered {
+            let has_recent_native_vscode_chat = process.source == SessionSource::Vscode
+                && sessions.iter().any(|session| {
+                    !is_provisional_process(session)
+                        && session.agent == process.agent
+                        && session.source == SessionSource::Vscode
+                        && (matches!(
+                            session.status,
+                            SessionStatus::Running
+                                | SessionStatus::PermissionRequired
+                                | SessionStatus::WaitingForInput
+                        ) || now - session.updated_at < 10 * 60 * 1_000)
+                });
+            if has_recent_native_vscode_chat {
+                let provisional_ids = sessions
+                    .iter()
+                    .filter(|session| {
+                        is_provisional_process(session)
+                            && session.agent == process.agent
+                            && session.source == SessionSource::Vscode
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>();
+                if !provisional_ids.is_empty() {
+                    sessions.retain(|session| !provisional_ids.contains(&session.id));
+                    removed_sessions.extend(provisional_ids);
+                    changed = true;
+                }
+                continue;
+            }
             let contextual_chat_ids = process
                 .working_directory
                 .as_ref()
@@ -1048,6 +1083,68 @@ mod tests {
         let sessions = state.sessions().expect("sessões");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "claude:chat-with-old-pid");
+    }
+
+    #[test]
+    fn vscode_chat_hides_its_host_process_without_hiding_other_chats() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                process_id: 5252,
+                working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
+                source: SessionSource::Vscode,
+            }])
+            .expect("processo do VS Code");
+
+        for chat in ["chat-1", "chat-2"] {
+            state
+                .ingest(HookEvent {
+                    event: HookEventKind::Running,
+                    session_id: format!("codex-app-server:{chat}"),
+                    agent: AgentKind::Codex,
+                    agent_label: Some("Codex".into()),
+                    project: Some("lume".into()),
+                    source: Some(SessionSource::Vscode),
+                    source_app: None,
+                    status_label: Some("Executando no VS Code".into()),
+                    started_at: None,
+                    process_id: None,
+                    native_session_id: Some(chat.into()),
+                    working_directory: Some("/work/lume".into()),
+                    permission_profile: None,
+                    permission: None,
+                    wait_for_decision: false,
+                })
+                .expect("chat do VS Code");
+        }
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                process_id: 5252,
+                working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
+                source: SessionSource::Vscode,
+            }])
+            .expect("nova varredura");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|session| !is_provisional_process(session)));
+        assert!(sessions
+            .iter()
+            .all(|session| session.source == SessionSource::Vscode));
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .expect("store")
+                .load_sessions()
+                .expect("persistência")
+                .len(),
+            2
+        );
     }
 
     #[test]
