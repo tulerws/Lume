@@ -10,6 +10,7 @@ export const demoSessions: AgentSession[] = [
     status: "running",
     statusLabel: "Implementando a interface",
     startedAt: "2026-07-20T15:32:00-03:00",
+    updatedAt: Date.now(),
     permissionProfile: {
       mode: "workspace_write",
       label: "Acesso ao projeto",
@@ -27,6 +28,7 @@ export const demoSessions: AgentSession[] = [
     status: "permission_required",
     statusLabel: "Aguardando permissão",
     startedAt: "2026-07-20T15:28:00-03:00",
+    updatedAt: Date.now() - 12_000,
     permissionProfile: {
       mode: "read_only",
       label: "Somente leitura",
@@ -52,6 +54,7 @@ export const demoSessions: AgentSession[] = [
     status: "completed",
     statusLabel: "Finalizado há 2 min",
     startedAt: "2026-07-20T15:18:00-03:00",
+    updatedAt: Date.now() - 120_000,
     permissionProfile: {
       mode: "full_access",
       label: "Sem acesso local",
@@ -70,7 +73,7 @@ export const demoHistory: HistoryEntry[] = [
     project: "Pesquisa de referências",
     event: "completed",
     summary: "Sessão finalizada",
-    createdAt: "2026-07-20T15:34:00-03:00",
+    createdAt: Date.now() - 120_000,
   },
   {
     id: "history-2",
@@ -79,6 +82,6 @@ export const demoHistory: HistoryEntry[] = [
     project: "auth-service",
     event: "permission_allowed",
     summary: "Permissão concedida uma vez",
-    createdAt: "2026-07-20T14:58:00-03:00",
+    createdAt: Date.now() - 38 * 60_000,
   },
 ];

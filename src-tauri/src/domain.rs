@@ -1,39 +1,44 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     Codex,
     Claude,
     Gemini,
+    Unknown,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSource {
     Cli,
     Vscode,
     Web,
+    Desktop,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Running,
     PermissionRequired,
+    WaitingForInput,
     Completed,
     Failed,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
     FullAccess,
     WorkspaceWrite,
     ReadOnly,
+    Plan,
+    Custom,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionAction {
     AllowOnce,
@@ -42,7 +47,7 @@ pub enum PermissionAction {
     OpenSource,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionProfile {
     pub mode: AccessMode,
@@ -52,7 +57,7 @@ pub struct PermissionProfile {
     pub available_actions: Vec<PermissionAction>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRequest {
     pub id: String,
@@ -63,7 +68,7 @@ pub struct PermissionRequest {
     pub requested_at: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
     pub id: String,
@@ -74,78 +79,86 @@ pub struct AgentSession {
     pub status: SessionStatus,
     pub status_label: String,
     pub started_at: String,
+    pub updated_at: i64,
+    pub process_id: Option<u32>,
+    pub native_session_id: Option<String>,
+    pub working_directory: Option<String>,
     pub permission_profile: PermissionProfile,
     pub pending_permission: Option<PermissionRequest>,
 }
 
-impl AgentSession {
-    pub fn demo_sessions() -> Vec<Self> {
-        vec![
-            Self {
-                id: "codex-lume".into(),
-                agent: AgentKind::Codex,
-                agent_label: "Codex".into(),
-                project: "Lume".into(),
-                source: SessionSource::Vscode,
-                status: SessionStatus::Running,
-                status_label: "Implementando a interface".into(),
-                started_at: "2026-07-20T15:32:00-03:00".into(),
-                permission_profile: PermissionProfile {
-                    mode: AccessMode::WorkspaceWrite,
-                    label: "Acesso ao projeto".into(),
-                    approval_policy: "Pede confirmação fora do workspace".into(),
-                    can_respond_from_lume: true,
-                    available_actions: vec![PermissionAction::AllowOnce, PermissionAction::Deny],
-                },
-                pending_permission: None,
-            },
-            Self {
-                id: "claude-api".into(),
-                agent: AgentKind::Claude,
-                agent_label: "Claude".into(),
-                project: "vibeservice-api".into(),
-                source: SessionSource::Cli,
-                status: SessionStatus::PermissionRequired,
-                status_label: "Aguardando permissão".into(),
-                started_at: "2026-07-20T15:28:00-03:00".into(),
-                permission_profile: PermissionProfile {
-                    mode: AccessMode::ReadOnly,
-                    label: "Somente leitura".into(),
-                    approval_policy: "Confirma alterações e comandos".into(),
-                    can_respond_from_lume: true,
-                    available_actions: vec![
-                        PermissionAction::AllowOnce,
-                        PermissionAction::AllowSession,
-                        PermissionAction::Deny,
-                    ],
-                },
-                pending_permission: Some(PermissionRequest {
-                    id: "permission-claude-1".into(),
-                    kind: "command".into(),
-                    summary: "Executar a suíte de testes do projeto".into(),
-                    resource: "npm test".into(),
-                    risk: "low".into(),
-                    requested_at: "2026-07-20T15:35:00-03:00".into(),
-                }),
-            },
-            Self {
-                id: "gemini-web".into(),
-                agent: AgentKind::Gemini,
-                agent_label: "Gemini".into(),
-                project: "Pesquisa de referências".into(),
-                source: SessionSource::Web,
-                status: SessionStatus::Completed,
-                status_label: "Finalizado há 2 min".into(),
-                started_at: "2026-07-20T15:18:00-03:00".into(),
-                permission_profile: PermissionProfile {
-                    mode: AccessMode::FullAccess,
-                    label: "Sem acesso local".into(),
-                    approval_policy: "Monitoramento da aba".into(),
-                    can_respond_from_lume: false,
-                    available_actions: vec![PermissionAction::OpenSource],
-                },
-                pending_permission: None,
-            },
-        ]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: String,
+    pub session_id: String,
+    pub agent_label: String,
+    pub project: String,
+    pub event: String,
+    pub summary: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    pub sound_enabled: bool,
+    pub autostart: bool,
+    pub monitor_id: Option<String>,
+    pub show_over_fullscreen: bool,
+    pub history_retention_days: u16,
+    pub launch_target: String,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            sound_enabled: true,
+            autostart: true,
+            monitor_id: None,
+            show_over_fullscreen: false,
+            history_retention_days: 30,
+            launch_target: "auto".into(),
+        }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEventKind {
+    SessionStarted,
+    Running,
+    PermissionRequest,
+    WaitingForInput,
+    Completed,
+    Failed,
+    SessionEnded,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookEvent {
+    pub event: HookEventKind,
+    pub session_id: String,
+    pub agent: AgentKind,
+    pub agent_label: Option<String>,
+    pub project: Option<String>,
+    pub source: Option<SessionSource>,
+    pub status_label: Option<String>,
+    pub started_at: Option<String>,
+    pub process_id: Option<u32>,
+    pub native_session_id: Option<String>,
+    pub working_directory: Option<String>,
+    pub permission_profile: Option<PermissionProfile>,
+    pub permission: Option<PermissionRequest>,
+    #[serde(default)]
+    pub wait_for_decision: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookResponse {
+    pub ok: bool,
+    pub action: Option<PermissionAction>,
+    pub message: Option<String>,
 }

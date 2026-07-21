@@ -11,8 +11,8 @@ Lume acompanha sessões de agentes de IA que já estejam abertas ou que tenham s
 - Por padrão, a cápsula não aparece sobre vídeos ou jogos em tela cheia.
 - Uma preferência permite manter a sobreposição visível em tela cheia.
 - Ao expandir, a cápsula mostra todos os agentes, cada sessão, projeto, origem e estado.
-- Sons sutis de conclusão e erro são habilitados individualmente e podem ser desativados.
-- A bandeja permite mostrar o painel, pausar alertas, abrir preferências e sair.
+- Sons sutis de conclusão e erro podem ser desativados.
+- A bandeja permite mostrar ou ocultar o painel e sair.
 - Sessões podem ser abertas ou retomadas no terminal ou VS Code habitual.
 
 ## Estados normalizados

@@ -1,14 +1,28 @@
+mod adapters;
+mod browser_server;
+mod codex_bridge;
+mod discovery;
 mod domain;
+mod event_server;
+mod integrations;
+mod launcher;
+mod overlay;
 mod state;
+mod store;
 
-use domain::{AgentSession, PermissionAction};
+use std::io::Read;
+
+use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences};
+use integrations::{CompanionStatus, IntegrationKind, IntegrationStatus};
+use launcher::LaunchRequest;
 use state::AppState;
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-    Manager, State,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
 fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String> {
@@ -25,16 +39,193 @@ fn resolve_permission(
     state.resolve_permission(&session_id, &permission_id, action)
 }
 
+#[tauri::command]
+fn open_session_source(
+    state: State<'_, AppState>,
+    browser: State<'_, browser_server::BrowserControl>,
+    session_id: String,
+) -> Result<(), String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+    match session.source {
+        domain::SessionSource::Web => browser.request_focus(session.id),
+        domain::SessionSource::Vscode => {
+            let directory = session
+                .working_directory
+                .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
+            std::process::Command::new("code")
+                .args(["--reuse-window", &directory])
+                .spawn()
+                .map_err(|error| format!("Não foi possível abrir o VS Code: {error}"))?;
+            Ok(())
+        }
+        _ => Err("O sistema não permite focar com segurança esta janela de terminal".into()),
+    }
+}
+
+#[tauri::command]
+fn list_history(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<HistoryEntry>, String> {
+    state.history(limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
+    state.preferences()
+}
+
+#[tauri::command]
+fn set_preferences(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    preferences: Preferences,
+) -> Result<(), String> {
+    if preferences.autostart {
+        app.autolaunch()
+            .enable()
+            .map_err(|error| error.to_string())?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|error| error.to_string())?;
+    }
+    state.save_preferences(&preferences)?;
+    if let Some(window) = app.get_webview_window("main") {
+        let show_over_fullscreen = preferences.show_over_fullscreen;
+        let monitor_id = preferences.monitor_id.clone();
+        let window_for_layer = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            let _ = overlay::configure(
+                &window_for_layer,
+                show_over_fullscreen,
+                monitor_id.as_deref(),
+            );
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(integrations::statuses(&executable.to_string_lossy()))
+}
+
+#[tauri::command]
+fn configure_integration(kind: IntegrationKind, enabled: bool) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    integrations::configure(&kind, &executable.to_string_lossy(), enabled)
+}
+
+#[tauri::command]
+fn vscode_status() -> CompanionStatus {
+    integrations::vscode_status()
+}
+
+#[tauri::command]
+fn configure_vscode(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let bundled = app
+        .path()
+        .resolve("lume-vscode.vsix", tauri::path::BaseDirectory::Resource)
+        .map_err(|error| error.to_string())?;
+    let development =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/lume-vscode.vsix");
+    let vsix = if bundled.exists() {
+        bundled
+    } else {
+        development
+    };
+    integrations::configure_vscode(enabled, &vsix)
+}
+
+#[tauri::command]
+fn reveal_browser_companion(app: AppHandle) -> Result<String, String> {
+    let bundled = app
+        .path()
+        .resolve("chromium", tauri::path::BaseDirectory::Resource)
+        .map_err(|error| error.to_string())?;
+    let development =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../extensions/chromium");
+    let directory = if bundled.exists() {
+        bundled
+    } else {
+        development
+    };
+    app.opener()
+        .open_path(directory.to_string_lossy(), None::<String>)
+        .map_err(|error| error.to_string())?;
+    Ok(directory.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn launch_session(
+    app: AppHandle,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    request: LaunchRequest,
+) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let codex_remote = if request.agent == IntegrationKind::Codex {
+        bridge.ensure_server()?;
+        Some(codex_bridge::PROXY_URL)
+    } else {
+        None
+    };
+    launcher::launch(request, &executable, &app_data_dir, codex_remote)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState::default())
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
         ))
         .setup(|app| {
+            let database_path = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())?
+                .join("lume.sqlite3");
+            let state = AppState::new(&database_path)?;
+            app.manage(state.clone());
+            let codex_bridge =
+                codex_bridge::CodexBridge::start(state.clone(), app.handle().clone())?;
+            app.manage(codex_bridge);
+            event_server::start(state.clone(), app.handle().clone())?;
+            let browser_control = browser_server::BrowserControl::default();
+            browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;
+            app.manage(browser_control);
+            discovery::start(state.clone(), app.handle().clone())?;
+            overlay::start_fullscreen_guard(state.clone(), app.handle().clone())?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let preferences = state.preferences()?;
+                let _ = overlay::configure(
+                    &window,
+                    preferences.show_over_fullscreen,
+                    preferences.monitor_id.as_deref(),
+                );
+                window.show()?;
+            }
+
             let show = MenuItem::with_id(app, "show", "Mostrar Lume", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -48,6 +239,23 @@ pub fn run() {
                 .tooltip("Lume — monitor de agentes")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
@@ -60,11 +268,61 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Inicialização automática é o padrão e poderá ser desativada nas preferências.
-            let _ = app.autolaunch().enable();
+            if state.preferences()?.autostart {
+                let _ = app.autolaunch().enable();
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_sessions, resolve_permission])
+        .invoke_handler(tauri::generate_handler![
+            list_sessions,
+            resolve_permission,
+            open_session_source,
+            list_history,
+            get_preferences,
+            set_preferences,
+            integration_statuses,
+            configure_integration,
+            vscode_status,
+            configure_vscode,
+            reveal_browser_companion,
+            launch_session
+        ])
         .run(tauri::generate_context!())
         .expect("erro ao executar o Lume");
+}
+
+pub fn run_ingest_client() -> i32 {
+    let mut payload = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut payload) {
+        eprintln!("Não foi possível ler o evento: {error}");
+        return 2;
+    }
+    match event_server::send_event(&payload) {
+        Ok(response) => match serde_json::to_string(&response) {
+            Ok(json) => {
+                println!("{json}");
+                if response.ok {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(error) => {
+                eprintln!("Não foi possível responder ao hook: {error}");
+                2
+            }
+        },
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+pub fn run_hook_client(provider: &str) -> i32 {
+    adapters::run_hook(provider)
+}
+
+pub fn run_terminal_payload(path: &str) -> i32 {
+    launcher::run_terminal_payload(path)
 }

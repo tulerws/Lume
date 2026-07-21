@@ -1,55 +1,67 @@
 # Lume
 
-Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Windows e Linux. Ela reúne sessões em andamento, pedidos de permissão, conclusões e erros sem exigir que o usuário vigie cada terminal, IDE ou aba.
+Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Windows e Linux. A cápsula fica no topo da tela, sinaliza trabalho, permissões, conclusão e erro, e expande para uma lista contínua de sessões — sem painéis cheios de cards.
 
-## Estado atual
+## O que já funciona
 
-O repositório contém a primeira base funcional:
+- descoberta de processos Codex, Claude e Gemini já abertos;
+- hooks preservando as configurações existentes de cada agente;
+- permissão direta do Claude e de sessões Codex abertas pelo Lume;
+- perfil de acesso e ações válidas por conversa;
+- abertura e retomada no terminal ou no terminal integrado do VS Code;
+- Companion para VS Code e para Chrome, Edge e Brave;
+- histórico local sanitizado, sons opcionais, bandeja e autostart;
+- monitor configurável e sobreposição Wayland por `gtk-layer-shell`;
+- comportamento padrão abaixo de vídeos e jogos em tela cheia;
+- tema claro/escuro, movimento reduzido e microinterações fluidas.
 
-- cápsula recolhida com contador de agentes;
-- painel expandido com sessões separadas por agente e projeto;
-- perfil de acesso individual por sessão;
-- ações de permissão derivadas das capacidades do chat, sem botões globais presumidos;
-- descarte do conteúdo sensível após a decisão;
-- bandeja e inicialização automática preparadas no núcleo Tauri;
-- tema claro e escuro;
-- dados demonstrativos enquanto os adaptadores reais são conectados.
+## Rodar em desenvolvimento
 
-## Arquitetura
+Requisitos: Node.js 22+, Rust estável e as dependências do Tauri.
 
-- **Tauri 2 + Rust:** janela, bandeja, autostart, descoberta de processos e IPC local.
-- **Svelte 5 + TypeScript:** cápsula, lista de sessões, permissões e preferências.
-- **Adaptadores:** Codex, Claude, Gemini, VS Code e extensão Chromium.
-- **Persistência local:** o histórico guardará apenas agente, projeto, evento, horário e resumo sanitizado. Comandos, caminhos e payloads completos existirão somente enquanto a permissão estiver pendente.
+No Pop!_OS/Ubuntu:
 
-Cada adaptador normaliza a configuração da sessão em um `PermissionProfile`. A interface renderiza apenas `availableActions`, permitindo que duas conversas do mesmo agente tenham políticas diferentes, como acesso total e somente leitura.
+```bash
+sudo apt-get update
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libgtk-layer-shell0 build-essential curl wget file libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config
+```
 
-## Desenvolvimento
+Depois:
 
 ```bash
 npm install
 npm run check
-npm run build
 npm run tauri dev
 ```
 
-O build desktop no Linux requer Rust e as dependências WebKitGTK do Tauri. Consulte os [pré-requisitos oficiais](https://v2.tauri.app/start/prerequisites/).
+O Lume aparece no topo do monitor principal e também cria um ícone na bandeja. Em **Ajustes**, conecte os agentes instalados, o VS Code e abra a pasta do Companion web.
 
-No Pop!_OS 24.04, instale os pacotes de desenvolvimento com:
+## Conectar as origens
+
+| Origem | Sessões existentes | Permissão na cápsula |
+| --- | --- | --- |
+| Claude CLI | Hooks | Sim |
+| Codex CLI/VS Code externos | Processos + hooks | Observação |
+| Codex aberto pelo Lume | App Server local | Sim |
+| Gemini CLI | Processos + hooks | Observação |
+| ChatGPT, Claude e Gemini web | Companion Chromium | Abrir a aba correta |
+
+O Lume só mostra botões que a sessão atual suporta. No Gemini e em sessões externas do Codex, a origem continua responsável pela decisão; o Lume não simula uma autorização que a integração não oferece.
+
+Para instalar o Companion web, abra **Ajustes → Navegadores → Abrir pasta**, acesse `chrome://extensions` (ou a página equivalente do Edge/Brave), ative o modo de desenvolvedor e carregue a pasta sem compactação. O Companion envia apenas agente, estado, título sanitizado, origem e um hash local do caminho.
+
+## Build e instaladores
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config
+npm run tauri build
 ```
 
-As decisões de produto já confirmadas estão em [`docs/PRODUCT.md`](docs/PRODUCT.md).
+No Linux, os pacotes ficam em `src-tauri/target/release/bundle`. O workflow **Instaladores** gera `.deb`, AppImage e instalador NSIS para Windows, manualmente ou em tags `v*`.
 
-## Próximas entregas
+O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Wayland, instale esse pacote no sistema para obter posicionamento nativo por monitor e o comportamento correto diante de tela cheia.
 
-1. Persistência local e preferências de monitor, tela cheia, som e retenção.
-2. Adaptador Claude por hooks, incluindo resposta a `PermissionRequest`.
-3. Adaptador Codex por hooks e app-server.
-4. Adaptador Gemini por hooks e ACP.
-5. Extensão para Chrome, Edge e Brave.
-6. Integração com VS Code e retomada de sessões recentes.
-7. Backend Wayland `layer-shell` para posicionamento confiável no GNOME/Pop!_OS.
+## Privacidade
+
+Tudo permanece na máquina. Os serviços escutam somente em `127.0.0.1:43119`, `127.0.0.1:43120`, `127.0.0.1:43130` e `127.0.0.1:43131`. Comandos, caminhos e payloads de uma permissão existem em memória apenas enquanto a decisão está pendente; o SQLite recebe somente a sessão sanitizada e resumos do histórico.
+
+Mais detalhes em [Produto](docs/PRODUCT.md) e [Privacidade](docs/PRIVACY.md).

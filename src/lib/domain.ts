@@ -46,6 +46,10 @@ export interface AgentSession {
   status: SessionStatus;
   statusLabel: string;
   startedAt: string;
+  updatedAt: number;
+  processId?: number;
+  nativeSessionId?: string;
+  workingDirectory?: string;
   permissionProfile: PermissionProfile;
   pendingPermission?: PermissionRequest;
 }
@@ -57,5 +61,29 @@ export interface HistoryEntry {
   project: string;
   event: "completed" | "failed" | "permission_allowed" | "permission_denied";
   summary: string;
-  createdAt: string;
+  createdAt: number;
+}
+
+export interface Preferences {
+  soundEnabled: boolean;
+  autostart: boolean;
+  monitorId?: string;
+  showOverFullscreen: boolean;
+  historyRetentionDays: number;
+  launchTarget: "auto" | "terminal" | "vscode";
+}
+
+export interface IntegrationStatus {
+  kind: "codex" | "claude" | "gemini";
+  label: string;
+  installed: boolean;
+  configured: boolean;
+  directPermissions: boolean;
+  detail: string;
+}
+
+export interface CompanionStatus {
+  installed: boolean;
+  configured: boolean;
+  detail: string;
 }

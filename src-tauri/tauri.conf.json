@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:vscode && npm run build",
     "frontendDist": "../build"
   },
   "app": {
@@ -24,7 +24,8 @@
         "transparent": true,
         "alwaysOnTop": true,
         "shadow": false,
-        "skipTaskbar": true
+        "skipTaskbar": true,
+        "visible": false
       }
     ],
     "security": {
@@ -34,6 +35,17 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "resources/lume-vscode.vsix": "lume-vscode.vsix",
+      "../extensions/chromium/": "chromium/"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libgtk-layer-shell0"
+        ]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

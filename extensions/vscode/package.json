@@ -1,0 +1,23 @@
+{
+  "name": "lume",
+  "displayName": "Lume Companion",
+  "description": "Abre sessões locais de agentes no terminal integrado do VS Code.",
+  "version": "0.1.0",
+  "publisher": "tulerws",
+  "repository": "https://github.com/tulerws/Lume",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onUri"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "lume.openSession",
+        "title": "Lume: Abrir sessão de agente"
+      }
+    ]
+  }
+}
