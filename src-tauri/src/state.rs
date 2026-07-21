@@ -14,11 +14,14 @@ use crate::{
     store::Store,
 };
 
+const PROCESS_MISSING_SCAN_LIMIT: u8 = 3;
+
 #[derive(Clone)]
 pub struct AppState {
     sessions: Arc<Mutex<Vec<AgentSession>>>,
     store: Arc<Mutex<Store>>,
     decisions: Arc<(Mutex<HashMap<String, PermissionAction>>, Condvar)>,
+    missing_process_scans: Arc<Mutex<HashMap<String, u8>>>,
 }
 
 impl AppState {
@@ -51,6 +54,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(sessions)),
             store: Arc::new(Mutex::new(store)),
             decisions: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+            missing_process_scans: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -248,6 +252,10 @@ impl AppState {
 
         apply_metadata(session, &event);
         session.updated_at = now;
+        self.missing_process_scans
+            .lock()
+            .map_err(|_| "Não foi possível atualizar a presença da sessão".to_string())?
+            .remove(&target_session_id);
 
         let permission_id = match event.event {
             HookEventKind::SessionStarted => {
@@ -432,6 +440,10 @@ impl AppState {
             .sessions
             .lock()
             .map_err(|_| "Não foi possível atualizar os processos".to_string())?;
+        let mut missing_process_scans = self
+            .missing_process_scans
+            .lock()
+            .map_err(|_| "Não foi possível atualizar a presença dos processos".to_string())?;
         let mut changed = false;
         let mut snapshots = Vec::new();
         let mut history = Vec::new();
@@ -605,6 +617,16 @@ impl AppState {
             changed = true;
         }
 
+        for session in sessions.iter().filter(|session| {
+            session
+                .process_id
+                .is_some_and(|pid| active_pids.contains(&pid))
+        }) {
+            missing_process_scans.remove(&session.id);
+        }
+        missing_process_scans
+            .retain(|session_id, _| sessions.iter().any(|session| &session.id == session_id));
+
         for session in sessions.iter_mut().filter(|session| {
             matches!(
                 session.status,
@@ -615,6 +637,14 @@ impl AppState {
                 .process_id
                 .is_some_and(|pid| !active_pids.contains(&pid))
         }) {
+            let missing_scans = missing_process_scans
+                .entry(session.id.clone())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+            if *missing_scans < PROCESS_MISSING_SCAN_LIMIT {
+                continue;
+            }
+            missing_process_scans.remove(&session.id);
             session.status = SessionStatus::Completed;
             session.status_label = "Processo encerrado".into();
             if let Some(permission) = session.pending_permission.take() {
@@ -995,6 +1025,30 @@ mod tests {
     }
 
     #[test]
+    fn transient_process_gap_keeps_the_same_session_active() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:session-gap", 4242))
+            .expect("hook");
+
+        for _ in 0..PROCESS_MISSING_SCAN_LIMIT - 1 {
+            state
+                .reconcile_processes(Vec::new())
+                .expect("ausência transitória");
+        }
+        state
+            .reconcile_processes(vec![discovered(4343)])
+            .expect("redetecção");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:session-gap");
+        assert_eq!(sessions[0].process_id, Some(4343));
+        assert_eq!(sessions[0].status, SessionStatus::WaitingForInput);
+        assert!(state.history(10).expect("histórico").is_empty());
+    }
+
+    #[test]
     fn reconciliation_removes_provisional_duplicates_already_in_the_store() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -1184,9 +1238,11 @@ mod tests {
             .ingest(started_event("claude:session-2", 4343))
             .expect("hook");
 
-        state
-            .reconcile_processes(Vec::new())
-            .expect("reconciliação");
+        for _ in 0..PROCESS_MISSING_SCAN_LIMIT {
+            state
+                .reconcile_processes(Vec::new())
+                .expect("reconciliação");
+        }
 
         let sessions = state.sessions().expect("sessões");
         assert_eq!(sessions.len(), 1);
@@ -1221,9 +1277,11 @@ mod tests {
         });
         state.ingest(event).expect("permissão");
 
-        state
-            .reconcile_processes(Vec::new())
-            .expect("reconciliação");
+        for _ in 0..PROCESS_MISSING_SCAN_LIMIT {
+            state
+                .reconcile_processes(Vec::new())
+                .expect("reconciliação");
+        }
 
         assert_eq!(
             state

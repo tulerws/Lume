@@ -71,11 +71,12 @@ fn scan() -> Vec<DiscoveredProcess> {
 
     candidates
         .into_iter()
-        // Launchers podem ter processos intermediários que não carregam o nome
-        // do agente. Mantém somente o descendente detectado mais específico.
+        // Mantém o processo detectado mais próximo da raiz. Um comando executado
+        // pelo agente pode conter "codex", "claude" ou "gemini" nos argumentos;
+        // escolher esse descendente efêmero faria a sessão trocar de PID.
         .filter(|(pid, _, agent)| {
-            !agents_by_pid.iter().any(|(child_pid, child_agent)| {
-                child_agent == agent && process_descends_from(&system, *child_pid, *pid)
+            !agents_by_pid.iter().any(|(ancestor_pid, ancestor_agent)| {
+                ancestor_agent == agent && process_descends_from(&system, *pid, *ancestor_pid)
             })
         })
         .filter_map(|(pid, _, agent)| {
