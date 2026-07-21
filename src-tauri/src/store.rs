@@ -82,6 +82,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        self.connection
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn add_history(&self, entry: &HistoryEntry) -> Result<(), String> {
         self.connection
             .execute(

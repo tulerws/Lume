@@ -28,6 +28,15 @@ impl AppState {
         for session in &mut sessions {
             session.pending_permission = None;
             session.working_directory = None;
+            if matches!(
+                session.status,
+                SessionStatus::Running
+                    | SessionStatus::PermissionRequired
+                    | SessionStatus::WaitingForInput
+            ) {
+                session.status = SessionStatus::Completed;
+                session.status_label = "Aguardando redetecção".into();
+            }
             store.save_session(session)?;
         }
         // O banco é pequeno; a limpeza física na inicialização também remove
@@ -99,11 +108,37 @@ impl AppState {
             .sessions
             .lock()
             .map_err(|_| "Não foi possível atualizar as sessões".to_string())?;
-        let index = sessions
+        let exact_session_exists = sessions
             .iter()
-            .position(|session| session.id == event.session_id);
+            .any(|session| session.id == event.session_id);
+        let provisional_ids = event
+            .process_id
+            .map(|process_id| {
+                sessions
+                    .iter()
+                    .filter(|session| {
+                        session.id.starts_with("process:")
+                            && session.process_id == Some(process_id)
+                            && session.agent == event.agent
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        if index.is_none() {
+        if exact_session_exists {
+            sessions.retain(|session| !provisional_ids.contains(&session.id));
+        } else if let Some(provisional_id) = provisional_ids.first() {
+            if let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.id == *provisional_id)
+            {
+                session.id = event.session_id.clone();
+            }
+            sessions.retain(|session| {
+                session.id == event.session_id || !provisional_ids.contains(&session.id)
+            });
+        } else {
             sessions.push(session_from_event(&event, now));
         }
         let session = sessions
@@ -163,6 +198,9 @@ impl AppState {
             .store
             .lock()
             .map_err(|_| "Não foi possível persistir a sessão".to_string())?;
+        for provisional_id in provisional_ids {
+            store.delete_session(&provisional_id)?;
+        }
         store.save_session(&snapshot)?;
         if let Some(entry) = history {
             store.add_history(&entry)?;
@@ -282,6 +320,7 @@ impl AppState {
         let mut changed = false;
         let mut snapshots = Vec::new();
         let mut history = Vec::new();
+        let mut cancelled_permissions = Vec::new();
 
         for process in discovered {
             if let Some(session) = sessions
@@ -343,14 +382,20 @@ impl AppState {
         }
 
         for session in sessions.iter_mut().filter(|session| {
-            session.id.starts_with("process:")
-                && matches!(session.status, SessionStatus::Running)
-                && session
-                    .process_id
-                    .is_some_and(|pid| !active_pids.contains(&pid))
+            matches!(
+                session.status,
+                SessionStatus::Running
+                    | SessionStatus::PermissionRequired
+                    | SessionStatus::WaitingForInput
+            ) && session
+                .process_id
+                .is_some_and(|pid| !active_pids.contains(&pid))
         }) {
             session.status = SessionStatus::Completed;
             session.status_label = "Processo encerrado".into();
+            if let Some(permission) = session.pending_permission.take() {
+                cancelled_permissions.push(permission.id);
+            }
             session.updated_at = now;
             snapshots.push(session.clone());
             history.push(HistoryEntry {
@@ -365,6 +410,17 @@ impl AppState {
             changed = true;
         }
         drop(sessions);
+
+        if !cancelled_permissions.is_empty() {
+            let (decisions, decision_changed) = &*self.decisions;
+            let mut values = decisions
+                .lock()
+                .map_err(|_| "Não foi possível cancelar as permissões pendentes".to_string())?;
+            for permission_id in cancelled_permissions {
+                values.insert(permission_id, PermissionAction::Deny);
+            }
+            decision_changed.notify_all();
+        }
 
         if changed {
             let store = self
@@ -509,4 +565,150 @@ pub fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::PermissionRequest;
+
+    fn discovered(process_id: u32) -> DiscoveredProcess {
+        DiscoveredProcess {
+            agent: AgentKind::Claude,
+            process_id,
+            working_directory: Some("/work/lume".into()),
+            source: SessionSource::Cli,
+        }
+    }
+
+    fn started_event(session_id: &str, process_id: u32) -> HookEvent {
+        HookEvent {
+            event: HookEventKind::SessionStarted,
+            session_id: session_id.into(),
+            agent: AgentKind::Claude,
+            agent_label: None,
+            project: Some("lume".into()),
+            source: Some(SessionSource::Cli),
+            status_label: Some("Sessão detectada".into()),
+            started_at: None,
+            process_id: Some(process_id),
+            native_session_id: Some("native-session".into()),
+            working_directory: Some("/work/lume".into()),
+            permission_profile: None,
+            permission: None,
+            wait_for_decision: false,
+        }
+    }
+
+    #[test]
+    fn hook_event_reuses_the_provisional_process_session() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("descoberta");
+
+        state
+            .ingest(started_event("claude:session-1", 4242))
+            .expect("hook");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:session-1");
+        assert_eq!(
+            sessions[0].native_session_id.as_deref(),
+            Some("native-session")
+        );
+
+        let persisted = state
+            .store
+            .lock()
+            .expect("store")
+            .load_sessions()
+            .expect("persistência");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, "claude:session-1");
+    }
+
+    #[test]
+    fn disappearing_process_completes_a_hook_backed_session() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:session-2", 4343))
+            .expect("hook");
+
+        state
+            .reconcile_processes(Vec::new())
+            .expect("reconciliação");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].status_label, "Processo encerrado");
+
+        let history = state.history(10).expect("histórico");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].session_id, "claude:session-2");
+        assert_eq!(history[0].event, "completed");
+    }
+
+    #[test]
+    fn disappearing_process_releases_a_pending_permission_as_denied() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("claude:permission-session", 4545);
+        event.event = HookEventKind::PermissionRequest;
+        event.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::WorkspaceWrite,
+            label: "Acesso ao projeto".into(),
+            approval_policy: "Perguntar".into(),
+            can_respond_from_lume: true,
+            available_actions: vec![PermissionAction::AllowOnce, PermissionAction::Deny],
+        });
+        event.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "cargo test".into(),
+            risk: "medium".into(),
+            requested_at: "agora".into(),
+        });
+        state.ingest(event).expect("permissão");
+
+        state
+            .reconcile_processes(Vec::new())
+            .expect("reconciliação");
+
+        assert_eq!(
+            state
+                .wait_for_decision("permission-1", Duration::ZERO)
+                .expect("decisão"),
+            Some(PermissionAction::Deny)
+        );
+    }
+
+    #[test]
+    fn restart_does_not_restore_a_stale_active_state() {
+        let database_path = std::env::temp_dir().join(format!(
+            "lume-restart-state-{}-{}.sqlite3",
+            std::process::id(),
+            now_millis()
+        ));
+        {
+            let state = AppState::new(&database_path).expect("estado inicial");
+            state
+                .ingest(started_event("claude:stale-session", 4444))
+                .expect("hook");
+        }
+
+        let restarted = AppState::new(&database_path).expect("reinício");
+        let sessions = restarted.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].status_label, "Aguardando redetecção");
+        assert!(sessions[0].pending_permission.is_none());
+        drop(restarted);
+
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
 }

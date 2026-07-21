@@ -46,7 +46,7 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
             "CLI não encontrada".into()
         } else if configured {
             if kind == IntegrationKind::Codex {
-                "Hooks externos e decisões pelo Lume conectados".into()
+                "Hook instalado; confirme a confiança em /hooks".into()
             } else if direct_permissions {
                 "Monitoramento e decisões conectados".into()
             } else {
@@ -174,6 +174,11 @@ fn add_handler(
     } else {
         10
     };
+    let status_message = if event == "PermissionRequest" {
+        "Aguardando decisão no Lume"
+    } else {
+        "Sincronizando com o Lume"
+    };
     let handler = match kind {
         IntegrationKind::Claude => json!({
             "type": "command",
@@ -181,7 +186,7 @@ fn add_handler(
             "command": executable,
             "args": ["hook", provider],
             "timeout": timeout,
-            "statusMessage": "Aguardando decisão no Lume"
+            "statusMessage": status_message
         }),
         IntegrationKind::Gemini => json!({
             "type": "command",

@@ -40,6 +40,7 @@
   } from "$lib/lume";
 
   type View = "sessions" | "history" | "settings";
+  type ShellStatus = SessionStatus | "idle";
   type MonitorOption = { id: string; label: string };
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -65,6 +66,8 @@
   let launching = $state<IntegrationStatus["kind"] | null>(null);
   let launchError = $state<string | null>(null);
   let browserCompanionPath = $state<string | null>(null);
+  let settingsMessage = $state<string | null>(null);
+  let settingsMessageIsError = $state(false);
 
   const activeCount = $derived(
     sessions.filter((session) =>
@@ -72,7 +75,8 @@
     ).length,
   );
 
-  const shellStatus = $derived.by<SessionStatus>(() => {
+  const shellStatus = $derived.by<ShellStatus>(() => {
+    if (sessions.length === 0) return "idle";
     if (sessions.some((session) => session.status === "permission_required")) {
       return "permission_required";
     }
@@ -233,6 +237,7 @@
     launcherOpen = false;
     if (nextView === "history") history = await loadHistory();
     if (nextView === "settings") {
+      settingsMessage = null;
       [integrations, vscodeStatus] = await Promise.all([
         loadIntegrationStatuses(),
         loadVscodeStatus(),
@@ -280,10 +285,21 @@
 
   async function toggleIntegration(integration: IntegrationStatus) {
     if (!integration.installed) return;
+    const enabling = !integration.configured;
     configuringIntegration = integration.kind;
+    settingsMessage = null;
     try {
-      await configureIntegration(integration.kind, !integration.configured);
+      await configureIntegration(integration.kind, enabling);
       integrations = await loadIntegrationStatuses();
+      settingsMessageIsError = false;
+      settingsMessage = enabling
+        ? integration.kind === "codex"
+          ? "Codex conectado. Abra /hooks no Codex e confie no hook Lume uma vez."
+          : `${integration.label} conectado ao Lume.`
+        : `${integration.label} desconectado.`;
+    } catch (error) {
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       configuringIntegration = null;
     }
@@ -291,10 +307,19 @@
 
   async function toggleVscode() {
     if (!vscodeStatus.installed) return;
+    const enabling = !vscodeStatus.configured;
     configuringVscode = true;
+    settingsMessage = null;
     try {
-      await configureVscode(!vscodeStatus.configured);
+      await configureVscode(enabling);
       vscodeStatus = await loadVscodeStatus();
+      settingsMessageIsError = false;
+      settingsMessage = enabling
+        ? "Companion instalado no VS Code."
+        : "Companion removido do VS Code.";
+    } catch (error) {
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       configuringVscode = false;
     }
@@ -318,8 +343,10 @@
     try {
       await savePreferences(preferences);
       if (key === "monitorId") await positionWindow();
-    } catch {
+    } catch (error) {
       preferences = previous;
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       savingSettings = false;
     }
@@ -581,6 +608,11 @@
                 </button>
               </div>
             {/each}
+            {#if settingsMessage}
+              <p class:error={settingsMessageIsError} class="settings-feedback" transition:fade>
+                {settingsMessage}
+              </p>
+            {/if}
             <div class="settings-section-label preferences-label">Interface</div>
             <div class="integration-row">
               <span class="agent-avatar agent-vscode">V</span>
@@ -801,6 +833,7 @@
   .status-permission_required { color: #ae6b24; }
   .status-failed { color: #a84d4d; }
   .status-completed { color: #708079; }
+  .status-idle { color: #829089; }
 
   .status-permission_required.lume-orb .lume-mark {
     animation: attention 1.8s ease-in-out infinite;
@@ -1036,6 +1069,8 @@
   .integration-row strong { color: #35423d; font-size: 10px; }
   .integration-row div span { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .integration-row button { min-width: 63px; height: 27px; padding: 0 8px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 8px; color: #577064; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: background 150ms ease, color 150ms ease, transform 150ms ease; }
+  .settings-feedback { margin: -2px 16px 9px; color: #65736c; font-size: 9px; line-height: 1.45; }
+  .settings-feedback.error { color: #a34f4f; }
   .integration-row button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(82, 112, 99, 0.06); }
   .integration-row button.connected { border-color: transparent; color: #6d7e76; }
   .integration-row button:disabled { cursor: default; opacity: 0.5; }
@@ -1108,7 +1143,9 @@
     .session-row:hover,
     .session-row.selected { background: rgba(198, 218, 208, 0.045); }
     .project-name,
-    .history-row span { color: #adbab4; }
+    .history-row span,
+    .settings-feedback { color: #adbab4; }
+    .settings-feedback.error { color: #d68d8d; }
     .access-profile span,
     .empty-state strong { color: #c5d0cb; }
     code,

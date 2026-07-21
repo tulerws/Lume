@@ -159,7 +159,7 @@ pub fn configure(
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return linux::configure(window, show_over_fullscreen, monitor_id);
+        linux::configure(window, show_over_fullscreen, monitor_id)
     }
     #[cfg(not(target_os = "linux"))]
     {
