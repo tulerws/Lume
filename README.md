@@ -79,10 +79,7 @@ A versão 0.3.0 precisa ser instalada manualmente uma vez porque as versões ant
 
 O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Wayland, instale esse pacote no sistema para obter posicionamento nativo por monitor e o comportamento correto diante de tela cheia.
 
-Em algumas combinações de Wayland com GPU NVIDIA, o WebKitGTK pode encerrar antes de abrir a
-janela com `Error 71 (Protocol error)`. Como alternativa pontual, inicie o mesmo executável com
-`WEBKIT_DISABLE_DMABUF_RENDERER=1`. Esse modo pode reduzir o desempenho gráfico e, por isso, o
-Lume não o ativa globalmente.
+No Wayland, o renderizador DMABUF do WebKitGTK pode derrubar a conexão com `Error 71 (Protocol error)` antes de a janela abrir, em algumas combinações de compositor e GPU (por exemplo, KWin com NVIDIA), por causa da sincronização explícita. Por isso o Lume desativa esse renderizador automaticamente **apenas no Wayland**; no X11 o DMABUF continua ativo. Quem já define `WEBKIT_DISABLE_DMABUF_RENDERER` no ambiente mantém sua própria escolha.
 
 ## Detectores externos
 
