@@ -15,7 +15,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            bundles: deb,appimage
+            bundles: deb,rpm,appimage
           - os: windows-latest
             bundles: nsis
     runs-on: ${{ matrix.os }}
