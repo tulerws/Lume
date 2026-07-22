@@ -49,7 +49,7 @@ const englishDisplayText = new Map<string, string>([
   ["Monitoramento e decisões conectados", "Monitoring and decisions connected"],
   ["Necessário para abrir sessões no editor", "Required to open sessions in the editor"],
   ["CLI não encontrada", "CLI not found"],
-  ["Hook instalado; confirme a confiança em /hooks", "Hook installed; confirm trust in /hooks"],
+  ["Hook conectado; /hooks está disponível no Codex CLI", "Hook connected; /hooks is available in Codex CLI"],
   ["Monitoramento conectado", "Monitoring connected"],
   ["Disponível para conectar", "Available to connect"],
   ["Companion conectado", "Companion connected"],

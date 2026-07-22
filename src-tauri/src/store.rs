@@ -241,6 +241,7 @@ mod tests {
                 mode: AccessMode::Custom,
                 label: "Sessão".into(),
                 approval_policy: "on-request".into(),
+                approvals_reviewer: None,
                 can_respond_from_lume: true,
                 available_actions: vec![PermissionAction::Deny],
             },

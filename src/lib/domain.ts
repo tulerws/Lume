@@ -24,6 +24,7 @@ export interface PermissionProfile {
   mode: AccessMode;
   label: string;
   approvalPolicy: string;
+  approvalsReviewer?: "user" | "auto_review" | string;
   canRespondFromLume: boolean;
   availableActions: PermissionAction[];
 }

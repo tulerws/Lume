@@ -287,6 +287,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
             mode: AccessMode::Custom,
             label: "Sessão web".into(),
             approval_policy: "Ações permanecem na página original".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: false,
             available_actions: vec![PermissionAction::OpenSource],
         }),

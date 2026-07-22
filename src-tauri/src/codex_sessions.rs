@@ -69,6 +69,8 @@ struct RecordPayload {
     #[serde(default)]
     approval_policy: Option<String>,
     #[serde(default)]
+    approvals_reviewer: Option<String>,
+    #[serde(default)]
     sandbox_policy: Option<Value>,
     #[serde(default)]
     last_agent_message: Option<String>,
@@ -390,6 +392,7 @@ fn profile_from_context(payload: &RecordPayload) -> PermissionProfile {
             .approval_policy
             .clone()
             .unwrap_or_else(|| "Gerenciada na origem".into()),
+        approvals_reviewer: payload.approvals_reviewer.clone(),
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
@@ -400,6 +403,7 @@ fn default_profile() -> PermissionProfile {
         mode: AccessMode::Custom,
         label: "Permissões da sessão".into(),
         approval_policy: "Gerenciada na origem".into(),
+        approvals_reviewer: None,
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
@@ -498,12 +502,13 @@ mod tests {
     #[test]
     fn reads_the_permission_profile_without_prompt_content() {
         let context = record(
-            r#"{"type":"turn_context","payload":{"cwd":"/work/lume","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"user_message":"nao deve ser guardada"}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/work/lume","approval_policy":"on-request","approvals_reviewer":"auto_review","sandbox_policy":{"type":"workspace-write"},"user_message":"nao deve ser guardada"}}"#,
         );
         let profile = profile_from_context(&context.payload);
 
         assert_eq!(profile.mode, AccessMode::WorkspaceWrite);
         assert_eq!(profile.approval_policy, "on-request");
+        assert_eq!(profile.approvals_reviewer.as_deref(), Some("auto_review"));
         assert!(!profile.can_respond_from_lume);
     }
 }

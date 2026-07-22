@@ -143,7 +143,7 @@ fn submit_prompt(
     } else {
         preferences.launch_target
     };
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -233,6 +233,9 @@ fn set_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<(), String> {
+    let previous = state.preferences()?;
+    let overlay_configuration_changed = previous.monitor_id != preferences.monitor_id
+        || previous.show_over_fullscreen != preferences.show_over_fullscreen;
     if preferences.autostart {
         app.autolaunch()
             .enable()
@@ -243,7 +246,10 @@ fn set_preferences(
             .map_err(|error| error.to_string())?;
     }
     state.save_preferences(&preferences)?;
-    if let Some(window) = app.get_webview_window("main") {
+    if overlay_configuration_changed {
+        let Some(window) = app.get_webview_window("main") else {
+            return Ok(());
+        };
         let show_over_fullscreen = preferences.show_over_fullscreen;
         let monitor_id = preferences.monitor_id.clone();
         let window_for_layer = window.clone();
@@ -400,7 +406,7 @@ fn restore_terminal_layout(
 
 #[tauri::command]
 fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     Ok(integrations::statuses(&executable.to_string_lossy()))
 }
 
@@ -409,7 +415,7 @@ fn diagnose_integration(
     kind: IntegrationKind,
     state: State<'_, AppState>,
 ) -> Result<IntegrationDiagnostic, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     let last_event_at = state
         .sessions()?
         .into_iter()
@@ -428,7 +434,7 @@ fn diagnose_integration(
 
 #[tauri::command]
 fn configure_integration(kind: IntegrationKind, enabled: bool) -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     integrations::configure(&kind, &executable.to_string_lossy(), enabled)
 }
 
@@ -516,7 +522,7 @@ fn launch_session(
     bridge: State<'_, codex_bridge::CodexBridge>,
     request: LaunchRequest,
 ) -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -568,6 +574,9 @@ pub fn run() {
                 Some(Modifiers::CONTROL | Modifiers::SHIFT),
                 Code::Space,
             ));
+            if let Ok(executable) = integrations::lume_executable() {
+                integrations::refresh_connected(&executable.to_string_lossy());
+            }
             let database_path = app
                 .path()
                 .app_data_dir()
@@ -589,13 +598,25 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let preferences = state.preferences()?;
-                let _ = overlay::configure(
+                let configured = overlay::configure(
                     &window,
                     preferences.show_over_fullscreen,
                     preferences.monitor_id.as_deref(),
                     preferences.overlay_x,
                     preferences.overlay_y,
                 );
+                if !configured {
+                    if let Ok((default_x, default_y)) =
+                        overlay::default_position(&window, preferences.monitor_id.as_deref())
+                    {
+                        let _ = overlay::move_to(
+                            &window,
+                            preferences.overlay_x.unwrap_or(default_x),
+                            preferences.overlay_y.unwrap_or(default_y),
+                            preferences.monitor_id.as_deref(),
+                        );
+                    }
+                }
                 window.show()?;
             }
 

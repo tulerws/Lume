@@ -55,6 +55,8 @@ pub struct PermissionProfile {
     pub mode: AccessMode,
     pub label: String,
     pub approval_policy: String,
+    #[serde(default)]
+    pub approvals_reviewer: Option<String>,
     pub can_respond_from_lume: bool,
     pub available_actions: Vec<PermissionAction>,
 }

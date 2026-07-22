@@ -78,6 +78,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
                 "SessionStart",
                 "UserPromptSubmit",
                 "PermissionRequest",
+                "PostToolUse",
                 "Stop",
             ],
         }),
@@ -90,6 +91,8 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
                 "SessionStart",
                 "UserPromptSubmit",
                 "PermissionRequest",
+                "PostToolUse",
+                "PostToolUseFailure",
                 "Notification",
                 "Stop",
                 "StopFailure",
@@ -105,6 +108,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
                 "SessionStart",
                 "BeforeAgent",
                 "Notification",
+                "AfterTool",
                 "AfterAgent",
                 "SessionEnd",
             ],
@@ -215,6 +219,19 @@ mod tests {
             .expect("plugin Claude");
         assert!(claude.direct_permissions());
         assert!(claude.hook_events().contains(&"PermissionRequest"));
+        assert!(claude.hook_events().contains(&"PostToolUse"));
+
+        let codex = plugins
+            .iter()
+            .find(|plugin| plugin.kind() == IntegrationKind::Codex)
+            .expect("plugin Codex");
+        assert!(codex.hook_events().contains(&"PostToolUse"));
+
+        let gemini = plugins
+            .iter()
+            .find(|plugin| plugin.kind() == IntegrationKind::Gemini)
+            .expect("plugin Gemini");
+        assert!(gemini.hook_events().contains(&"AfterTool"));
     }
 
     #[test]

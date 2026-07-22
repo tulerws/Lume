@@ -19,7 +19,7 @@ const TERMINAL_MIN_WIDTH: i32 = 300;
 const TERMINAL_MIN_HEIGHT: i32 = 240;
 const TERMINAL_MAX_WIDTH: i32 = 760;
 const TERMINAL_MAX_HEIGHT: i32 = 640;
-const DOCK_DISTANCE: i32 = 46;
+const DOCK_DISTANCE: i32 = 84;
 const SCREEN_MARGIN: i32 = 12;
 const DOCK_ANIMATION_STEPS: i32 = 9;
 const MAX_REASONABLE_COORDINATE: i32 = 65_536;
@@ -268,12 +268,25 @@ impl TerminalWindows {
                     return;
                 }
                 let scale = event_window.scale_factor().unwrap_or(1.0);
+                let position = relative_window_position(&event_window);
                 registry.resize(
                     &cleanup_label,
+                    position,
                     (f64::from(size.width) / scale).round() as i32,
                     (f64::from(size.height) / scale).round() as i32,
                     scale,
                 );
+            }
+            WindowEvent::Moved(_) => {
+                if registry.is_settling(&cleanup_label) {
+                    return;
+                }
+                let Some((x, y)) = relative_window_position(&event_window) else {
+                    return;
+                };
+                if let Ok(preview) = registry.observe_native_position(&cleanup_label, x, y) {
+                    emit_dock_preview(event_window.app_handle(), &cleanup_label, preview);
+                }
             }
             _ => {}
         });
@@ -594,15 +607,52 @@ impl TerminalWindows {
         }
     }
 
-    fn resize(&self, label: &str, width: i32, height: i32, scale: f64) {
+    fn resize(
+        &self,
+        label: &str,
+        position: Option<(i32, i32)>,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) {
         let Ok(mut placements) = self.placements.lock() else {
             return;
         };
         if let Some(entry) = placements.get_mut(label) {
+            if let Some((x, y)) = position {
+                entry.x = x;
+                entry.y = y;
+            }
             entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
             entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
             entry.scale = scale.max(1.0);
         }
+    }
+
+    fn observe_native_position(
+        &self,
+        label: &str,
+        x: i32,
+        y: i32,
+    ) -> Result<Option<DockPreview>, String> {
+        validate_coordinates(x, y)?;
+        let mut placements = self
+            .placements
+            .lock()
+            .map_err(|_| "Não foi possível detectar o acoplamento".to_string())?;
+        {
+            let current = placements
+                .get_mut(label)
+                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+            current.x = x;
+            current.y = y;
+        }
+        let current = placements
+            .get(label)
+            .cloned()
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        let moving_labels = group_labels(&placements, &current);
+        Ok(dock_candidate(&placements, label, &moving_labels).map(|plan| plan.preview()))
     }
 
     fn is_settling(&self, label: &str) -> bool {
@@ -619,6 +669,20 @@ impl TerminalWindows {
             }
         }
     }
+}
+
+fn relative_window_position(window: &tauri::WebviewWindow) -> Option<(i32, i32)> {
+    let position = window.outer_position().ok()?;
+    let monitor_position = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| *monitor.position())
+        .unwrap_or_default();
+    Some((
+        position.x - monitor_position.x,
+        position.y - monitor_position.y,
+    ))
 }
 
 fn initial_position(
@@ -1082,6 +1146,51 @@ mod tests {
         assert_eq!(preview.target_label, "left");
         assert_eq!(preview.side, DockSide::Right);
         assert_eq!(preview.x, 465);
+    }
+
+    #[test]
+    fn native_move_emits_preview_without_waiting_for_frontend_sync() {
+        let registry = TerminalWindows::default();
+        let left = placement("left", 20, 40);
+        let right = placement("right", 500, 48);
+        registry
+            .placements
+            .lock()
+            .expect("posições")
+            .extend([(left.label.clone(), left), (right.label.clone(), right)]);
+
+        let preview = registry
+            .observe_native_position("left", 92, 40)
+            .expect("movimento")
+            .expect("highlight");
+
+        assert_eq!(preview.target_label, "right");
+        assert_eq!(preview.side, DockSide::Left);
+    }
+
+    #[test]
+    fn resized_terminal_keeps_its_new_native_position() {
+        let registry = TerminalWindows::default();
+        let terminal = placement("terminal", 20, 40);
+        registry
+            .placements
+            .lock()
+            .expect("posições")
+            .insert(terminal.label.clone(), terminal);
+
+        registry.resize("terminal", Some((130, 150)), 420, 310, 1.0);
+        let state = registry.state("terminal").expect("terminal");
+
+        assert_eq!((state.x, state.y), (130, 150));
+        assert_eq!((state.width, state.height), (420, 310));
+    }
+
+    #[test]
+    fn docking_preview_appears_with_a_comfortable_visual_gap() {
+        let left = placement("left", 20, 40);
+        let right = placement("right", 430, 48);
+        let plan = snap(&left, &right).expect("candidato");
+        assert!(plan.score <= DOCK_DISTANCE);
     }
 
     #[test]

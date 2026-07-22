@@ -101,7 +101,8 @@
         }
       });
       stopMoved = await currentWindow.onMoved(({ payload }) => {
-        if (!dragging || settling) return;
+        if (settling) return;
+        dragging = true;
         dragMoved = true;
         queueNativeMove(payload.x, payload.y);
       });
@@ -148,7 +149,7 @@
     dragFinalizeTimer = setTimeout(() => {
       finalizeRequested = true;
       void flushNativeMoves();
-    }, 220);
+    }, 520);
     void flushNativeMoves();
   }
 
@@ -425,9 +426,10 @@
   .terminal-card.dragging > header { cursor: grabbing; }
   .terminal-card.resizing { user-select: none; }
   .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.5); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.24), 0 0 0 2px rgba(75, 157, 120, 0.08); transform: scale(0.992); }
+  .terminal-card.dock-target { border-color: rgba(65, 151, 111, 0.7); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.22), 0 0 0 3px rgba(75, 157, 120, 0.14); }
   .terminal-card.settling { border-color: rgba(69, 139, 108, 0.42); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.2); }
-  .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.48); border-radius: 13px; background: rgba(76, 161, 121, 0.035); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.38); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
-  .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.56); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.2), rgba(77, 164, 121, 0.07)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.1); }
+  .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.62); border-radius: 13px; background: rgba(76, 161, 121, 0.075); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.48); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
+  .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.68); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.32), rgba(77, 164, 121, 0.12)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.14); }
   .dock-silhouette span { position: absolute; z-index: 1; padding: 3px 6px; border-radius: 999px; color: #39755a; background: rgba(232, 246, 239, 0.9); font-size: 7px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
   .dock-left .dock-silhouette::before, .dock-right .dock-silhouette::before { top: 12%; bottom: 12%; width: 31%; }
   .dock-left .dock-silhouette::before { left: 7px; }
@@ -498,6 +500,7 @@
   .terminal-window.dark { color-scheme: dark; }
   .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
   .terminal-window.dark .terminal-card.dock-moving,
+  .terminal-window.dark .terminal-card.dock-target,
   .terminal-window.dark .terminal-card.settling { border-color: rgba(91, 186, 143, 0.5); box-shadow: 0 12px 38px rgba(8, 21, 15, 0.48), 0 0 0 2px rgba(91, 186, 143, 0.08); }
   .terminal-window.dark .dock-silhouette { border-color: rgba(96, 193, 149, 0.5); background: rgba(72, 157, 116, 0.06); box-shadow: inset 0 0 0 1px rgba(154, 220, 188, 0.08); }
   .terminal-window.dark .dock-silhouette::before { border-color: rgba(99, 197, 152, 0.52); background: linear-gradient(135deg, rgba(79, 174, 128, 0.22), rgba(69, 149, 111, 0.08)); }

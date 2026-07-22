@@ -356,6 +356,14 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível atualizar a presença da sessão".to_string())?
             .remove(&target_session_id);
+        let superseded_permission_id = (!matches!(&event.event, HookEventKind::PermissionRequest))
+            .then(|| {
+                session
+                    .pending_permission
+                    .as_ref()
+                    .map(|permission| permission.id.clone())
+            })
+            .flatten();
 
         let permission_id = match event.event {
             HookEventKind::SessionStarted => {
@@ -422,6 +430,15 @@ impl AppState {
                 .remove(&target_session_id);
         }
         drop(sessions);
+
+        if let Some(permission_id) = superseded_permission_id {
+            let (decisions, decision_changed) = &*self.decisions;
+            decisions
+                .lock()
+                .map_err(|_| "Não foi possível liberar a permissão antiga".to_string())?
+                .insert(permission_id, PermissionAction::Deny);
+            decision_changed.notify_all();
+        }
 
         let store = self
             .store
@@ -1035,6 +1052,11 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(profile) = &event.permission_profile {
         if profile.can_respond_from_lume || !session.permission_profile.can_respond_from_lume {
             session.permission_profile = profile.clone();
+        } else {
+            session.permission_profile.mode = profile.mode.clone();
+            session.permission_profile.label = profile.label.clone();
+            session.permission_profile.approval_policy = profile.approval_policy.clone();
+            session.permission_profile.approvals_reviewer = profile.approvals_reviewer.clone();
         }
     }
     if let Some(response) = &event.last_response {
@@ -1048,6 +1070,7 @@ fn default_profile(agent: &AgentKind) -> PermissionProfile {
             mode: AccessMode::Custom,
             label: "Permissões da sessão".into(),
             approval_policy: "Ações disponíveis conforme o hook".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![
                 PermissionAction::AllowOnce,
@@ -1059,6 +1082,7 @@ fn default_profile(agent: &AgentKind) -> PermissionProfile {
             mode: AccessMode::Custom,
             label: "Monitoramento local".into(),
             approval_policy: "A resposta depende da origem".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: false,
             available_actions: vec![PermissionAction::OpenSource],
         },
@@ -1560,6 +1584,7 @@ mod tests {
             mode: AccessMode::Custom,
             label: "Integração direta".into(),
             approval_policy: "Perguntar".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![PermissionAction::AllowOnce],
         });
@@ -1569,9 +1594,10 @@ mod tests {
         hook.event = HookEventKind::Completed;
         hook.status_label = Some("Finalizado pelo hook".into());
         hook.permission_profile = Some(PermissionProfile {
-            mode: AccessMode::Custom,
+            mode: AccessMode::ReadOnly,
             label: "Somente observação".into(),
             approval_policy: "Abrir origem".into(),
+            approvals_reviewer: Some("auto_review".into()),
             can_respond_from_lume: false,
             available_actions: vec![PermissionAction::OpenSource],
         });
@@ -1582,6 +1608,11 @@ mod tests {
         assert_eq!(sessions[0].id, "claude-direct:chat-1");
         assert_eq!(sessions[0].status, SessionStatus::Completed);
         assert!(sessions[0].permission_profile.can_respond_from_lume);
+        assert_eq!(sessions[0].permission_profile.mode, AccessMode::ReadOnly);
+        assert_eq!(
+            sessions[0].permission_profile.approvals_reviewer.as_deref(),
+            Some("auto_review")
+        );
     }
 
     #[test]
@@ -1763,6 +1794,36 @@ mod tests {
     }
 
     #[test]
+    fn later_running_event_clears_a_stale_permission() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut permission = started_event("codex:chat-1", 4242);
+        permission.event = HookEventKind::PermissionRequest;
+        permission.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "npm test".into(),
+            risk: "medium".into(),
+            requested_at: "1".into(),
+        });
+        state.ingest(permission).expect("permissão");
+
+        let mut running = started_event("codex:chat-1", 4242);
+        running.event = HookEventKind::Running;
+        state.ingest(running).expect("execução");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::Running);
+        assert!(session.pending_permission.is_none());
+        assert_eq!(
+            state
+                .wait_for_decision("permission-1", Duration::ZERO)
+                .expect("decisão"),
+            Some(PermissionAction::Deny)
+        );
+    }
+
+    #[test]
     fn disappearing_process_releases_a_pending_permission_as_denied() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let mut event = started_event("claude:permission-session", 4545);
@@ -1771,6 +1832,7 @@ mod tests {
             mode: AccessMode::WorkspaceWrite,
             label: "Acesso ao projeto".into(),
             approval_policy: "Perguntar".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![PermissionAction::AllowOnce, PermissionAction::Deny],
         });

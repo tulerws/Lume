@@ -1546,6 +1546,12 @@
                         <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
                         {sourceLabel(session)}
                       </span>
+                      {#if session.permissionProfile.approvalsReviewer === "auto_review" && session.permissionProfile.mode !== "full_access"}
+                        <span class="access-badge auto-review">{tr("Approve for me", "Aprovar por mim")}</span>
+                      {/if}
+                      {#if session.permissionProfile.mode === "full_access"}
+                        <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
+                      {/if}
                     </span>
                     <span class="project-name">{session.project}</span>
                     <span class="status-line status-{session.status}">
@@ -1571,11 +1577,6 @@
                 {#if selectedId === session.id}
                   {@const capabilities = sessionCapabilities(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
-                    <div class="access-profile">
-                      <span>{shown(session.permissionProfile.label)}</span>
-                      <small>{shown(session.permissionProfile.approvalPolicy)}</small>
-                    </div>
-
                     <div class="capability-bar">
                       {#if capabilities.canOpenSource}
                         <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
@@ -2274,7 +2275,6 @@
     border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
-    backdrop-filter: blur(28px) saturate(125%);
   }
 
   .panel-content,
@@ -2282,7 +2282,7 @@
   .panel .brand-lockup > div,
   .panel .header-actions,
   .panel .launcher-popover {
-    transition: opacity 150ms ease, transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+    transition: opacity 150ms ease;
   }
   .panel:not(.content-visible) .panel-content,
   .panel:not(.content-visible) footer,
@@ -2291,7 +2291,6 @@
   .panel:not(.content-visible) .launcher-popover {
     opacity: 0;
     pointer-events: none;
-    transform: translateY(-4px) scale(0.985);
   }
 
   .panel-header {
@@ -2441,9 +2440,12 @@
   .agent-unknown { color: #48534f; background: #e2e7e4; }
 
   .session-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
-  .session-title-row { display: flex; align-items: center; gap: 6px; }
+  .session-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
   .session-title-row strong { color: #27342f; font-size: 11px; }
   .source-label { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 8px; font-weight: 720; letter-spacing: 0.045em; line-height: 1.25; text-transform: uppercase; }
+  .access-badge { padding: 2px 5px; border: 1px solid transparent; border-radius: 999px; font-size: 7px; font-weight: 760; letter-spacing: 0.025em; line-height: 1.25; white-space: nowrap; }
+  .access-badge.auto-review { border-color: rgba(80, 120, 170, 0.12); color: #5579a3; background: rgba(80, 120, 170, 0.08); }
+  .access-badge.full-access { border-color: rgba(177, 115, 65, 0.13); color: #9b663d; background: rgba(177, 115, 65, 0.09); }
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
@@ -2473,9 +2475,6 @@
   .selected .chevron { transform: rotate(90deg); }
 
   .session-details { padding: 0 2px 13px 43px; }
-  .access-profile { margin: -2px 0 10px; display: grid; gap: 1px; }
-  .access-profile span { color: #46554f; font-size: 10px; font-weight: 700; }
-  .access-profile small { color: #89938f; font-size: 9px; }
   .capability-bar { margin: -2px 0 9px; display: flex; align-items: center; gap: 5px; }
   .capability-bar button { height: 24px; padding: 0 7px; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 7px; color: #63786e; background: rgba(77, 105, 92, 0.035); font-size: 8px; font-weight: 700; cursor: pointer; }
   .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
@@ -2740,7 +2739,6 @@
   .overlay-shell.dark .result-card > p { color: #aebdb5; }
   .overlay-shell.dark .result-actions button,
   .overlay-shell.dark .capability-bar button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-  .overlay-shell.dark .access-profile span,
   .overlay-shell.dark .empty-state strong { color: #c5d0cb; }
   .overlay-shell.dark code,
   .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
@@ -2755,6 +2753,8 @@
   .overlay-shell.dark .final-response p,
   .overlay-shell.dark .response-preview span { color: #c2d0c9; }
   .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
+  .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
+  .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }
   .overlay-shell.dark .board-intro,
   .overlay-shell.dark .terminal-picker-row,
   .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }

@@ -52,6 +52,13 @@ pub struct IntegrationDiagnostic {
     pub last_event_at: Option<i64>,
 }
 
+pub fn lume_executable() -> Result<PathBuf, String> {
+    if let Some(app_image) = env::var_os("APPIMAGE").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(app_image));
+    }
+    std::env::current_exe().map_err(|error| error.to_string())
+}
+
 pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
     crate::agent_plugins::catalog()
         .into_iter()
@@ -65,7 +72,7 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
                 "CLI não encontrada".into()
             } else if configured {
                 if kind == IntegrationKind::Codex {
-                    "Hook instalado; confirme a confiança em /hooks".into()
+                    "Hook conectado; /hooks está disponível no Codex CLI".into()
                 } else if plugin.direct_permissions() {
                     "Monitoramento e decisões conectados".into()
                 } else {
@@ -175,6 +182,9 @@ pub fn diagnose(
 }
 
 pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Result<(), String> {
+    if enabled && *kind == IntegrationKind::Codex {
+        ensure_codex_hooks_enabled()?;
+    }
     let path =
         config_path(kind).ok_or_else(|| "Diretório do usuário não encontrado".to_string())?;
     let mut root = read_config(&path)?;
@@ -211,6 +221,21 @@ pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Res
     }
     let payload = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{payload}\n")).map_err(|error| error.to_string())
+}
+
+pub fn refresh_connected(executable: &str) {
+    for plugin in crate::agent_plugins::catalog() {
+        let kind = plugin.kind();
+        let Some(path) = config_path(&kind) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        if has_lume_handler(&content, &kind) {
+            let _ = configure(&kind, executable, true);
+        }
+    }
 }
 
 pub fn vscode_status() -> CompanionStatus {
@@ -384,6 +409,71 @@ fn config_path(kind: &IntegrationKind) -> Option<PathBuf> {
     Some(PathBuf::from(user_home).join(directory))
 }
 
+fn codex_user_config_path() -> Option<PathBuf> {
+    let user_home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(PathBuf::from(user_home).join(".codex/config.toml"))
+}
+
+fn ensure_codex_hooks_enabled() -> Result<(), String> {
+    let path = codex_user_config_path()
+        .ok_or_else(|| "Diretório de configuração do Codex não encontrado".to_string())?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(updated) = config_with_hooks_enabled(&content)? else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("lume-backup.toml");
+        if !backup.exists() {
+            fs::copy(&path, &backup).map_err(|error| error.to_string())?;
+        }
+    }
+    fs::write(path, updated).map_err(|error| error.to_string())
+}
+
+fn config_with_hooks_enabled(content: &str) -> Result<Option<String>, String> {
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(features_index) = lines.iter().position(|line| line.trim() == "[features]") {
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(features_index + 1)
+            .find(|(_, line)| line.trim().starts_with('['))
+            .map(|(index, _)| index)
+            .unwrap_or(lines.len());
+        if let Some(line) = lines[features_index + 1..section_end].iter().find(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "hooks")
+        }) {
+            let value = line
+                .split_once('=')
+                .map(|(_, value)| value.split('#').next().unwrap_or_default().trim())
+                .unwrap_or_default();
+            return match value {
+                "true" => Ok(None),
+                "false" => Err(
+                    "Os hooks estão desativados em ~/.codex/config.toml; ative features.hooks para conectar o Lume"
+                        .into(),
+                ),
+                _ => Err("A opção features.hooks do Codex não é válida".into()),
+            };
+        }
+        lines.insert(features_index + 1, "hooks = true".into());
+    } else {
+        if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.extend(["[features]".into(), "hooks = true".into()]);
+    }
+    Ok(Some(format!("{}\n", lines.join("\n"))))
+}
+
 fn provider(kind: &IntegrationKind) -> &'static str {
     match kind {
         IntegrationKind::Codex => "codex",
@@ -421,7 +511,46 @@ fn configured_content(content: &str, kind: &IntegrationKind, executable: &str) -
                                                 == Some(provider(kind))
                                     },
                                 );
-                            exec_form || command.contains(&marker(kind, executable))
+                            let shell_form = command.contains(executable)
+                                && command.contains(&format!(" hook {}", provider(kind)));
+                            let windows_form = handler
+                                .get("commandWindows")
+                                .and_then(Value::as_str)
+                                .is_some_and(|command| {
+                                    command.contains(executable)
+                                        && command.contains(&format!(" hook {}", provider(kind)))
+                                });
+                            exec_form || shell_form || windows_form
+                        })
+                    })
+            })
+        })
+    })
+}
+
+fn has_lume_handler(content: &str, kind: &IntegrationKind) -> bool {
+    let Ok(root) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    let provider_suffix = format!(" hook {}", provider(kind));
+    hooks.values().any(|groups| {
+        groups.as_array().is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| {
+                        handlers.iter().any(|handler| {
+                            handler.get("name").and_then(Value::as_str) == Some("Lume")
+                                || handler.get("statusMessage").and_then(Value::as_str)
+                                    == Some("Lume monitor")
+                                || handler
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|command| command.contains(&provider_suffix))
                         })
                     })
             })
@@ -518,5 +647,67 @@ mod tests {
             &IntegrationKind::Claude,
             "/opt/Lume App/lume"
         ));
+    }
+
+    #[test]
+    fn recognizes_connected_lume_hooks_from_an_older_executable() {
+        let root = json!({
+            "hooks": {
+                "PermissionRequest": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "name": "Lume",
+                        "command": "/old/Lume/lume",
+                        "args": ["hook", "claude"]
+                    }]
+                }]
+            }
+        });
+
+        assert!(has_lume_handler(
+            &root.to_string(),
+            &IntegrationKind::Claude
+        ));
+    }
+
+    #[test]
+    fn quoted_codex_command_is_recognized_as_connected() {
+        let root = json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"/usr/bin/lume\" hook codex",
+                        "statusMessage": "Lume monitor"
+                    }]
+                }]
+            }
+        });
+
+        assert!(configured_content(
+            &root.to_string(),
+            &IntegrationKind::Codex,
+            "/usr/bin/lume"
+        ));
+    }
+
+    #[test]
+    fn enables_codex_hooks_without_replacing_other_features() {
+        let content = "model = \"gpt\"\n[features]\nmemories = true\n\n[projects.test]\ntrust_level = \"trusted\"\n";
+        let updated = config_with_hooks_enabled(content)
+            .expect("configuração válida")
+            .expect("mudança necessária");
+        assert!(updated.contains("[features]\nhooks = true\nmemories = true"));
+        assert!(updated.contains("[projects.test]"));
+        assert!(config_with_hooks_enabled(&updated)
+            .expect("configuração válida")
+            .is_none());
+    }
+
+    #[test]
+    fn respects_an_explicit_codex_hooks_disable() {
+        let result = config_with_hooks_enabled("[features]\nhooks = false\n");
+        assert!(result.is_err());
     }
 }
