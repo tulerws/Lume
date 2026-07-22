@@ -15,6 +15,10 @@ Lume acompanha sessões de agentes de IA que já estejam abertas ou que tenham s
 - A bandeja permite mostrar ou ocultar o painel e sair.
 - Sessões podem ser abertas ou retomadas no terminal ou VS Code habitual.
 - O Whiteboard abre cada sessão em seu próprio mini terminal; janelas próximas podem ser acopladas e movidas como um conjunto.
+- O Whiteboard permite nomear, salvar e restaurar layouts para as sessões abertas correspondentes.
+- Perfis por projeto podem definir destino, monitor, posição da cápsula, permissões de novas sessões, layout e agentes preferidos.
+- `Ctrl+Shift+Space` abre uma paleta global para navegar entre telas, sessões e ações.
+- Detectores externos declarativos podem ser instalados por manifesto JSON e entram em vigor sem reiniciar.
 
 ## Estados normalizados
 

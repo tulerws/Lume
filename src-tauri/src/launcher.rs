@@ -6,9 +6,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::integrations::IntegrationKind;
 #[cfg(target_os = "linux")]
 use crate::state::now_millis;
+use crate::{domain::AccessMode, integrations::IntegrationKind};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +20,10 @@ pub struct LaunchRequest {
     pub target: String,
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<AccessMode>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -91,6 +95,7 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         IntegrationKind::Claude => ("claude".to_string(), Vec::new()),
         IntegrationKind::Gemini => ("gemini".to_string(), Vec::new()),
     };
+    apply_permission_profile(request, &mut arguments);
     if request.resume {
         match request.agent {
             IntegrationKind::Codex => {
@@ -119,6 +124,48 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         command,
         arguments,
         working_directory: request.working_directory.clone(),
+    }
+}
+
+fn apply_permission_profile(request: &LaunchRequest, arguments: &mut Vec<String>) {
+    match request.agent {
+        IntegrationKind::Codex => {
+            if let Some(mode) = request.permission_mode.as_ref() {
+                let sandbox = match mode {
+                    AccessMode::ReadOnly | AccessMode::Plan => Some("read-only"),
+                    AccessMode::WorkspaceWrite => Some("workspace-write"),
+                    AccessMode::FullAccess => Some("danger-full-access"),
+                    AccessMode::Custom => None,
+                };
+                if let Some(sandbox) = sandbox {
+                    arguments.extend(["--sandbox".into(), sandbox.into()]);
+                }
+            }
+            if matches!(
+                request.approval_policy.as_deref(),
+                Some("untrusted" | "on-request" | "never")
+            ) {
+                arguments.extend([
+                    "--ask-for-approval".into(),
+                    request.approval_policy.clone().unwrap_or_default(),
+                ]);
+            }
+        }
+        IntegrationKind::Claude => {
+            let mode = match request.permission_mode.as_ref() {
+                Some(AccessMode::Plan | AccessMode::ReadOnly) => Some("plan"),
+                Some(AccessMode::WorkspaceWrite) => Some("acceptEdits"),
+                Some(AccessMode::FullAccess) => Some("bypassPermissions"),
+                Some(AccessMode::Custom) | None => None,
+            };
+            if let Some(mode) = mode {
+                if mode == "bypassPermissions" {
+                    arguments.push("--allow-dangerously-skip-permissions".into());
+                }
+                arguments.extend(["--permission-mode".into(), mode.into()]);
+            }
+        }
+        IntegrationKind::Gemini => {}
     }
 }
 
@@ -261,6 +308,8 @@ mod tests {
             resume_id: resume_id.map(str::to_string),
             target: "auto".into(),
             initial_prompt: None,
+            permission_mode: None,
+            approval_policy: None,
         }
     }
 
@@ -304,6 +353,23 @@ mod tests {
         assert_eq!(
             windows_terminal_arguments(&payload),
             vec!["-w", "-1", "new-tab", "-d", "/work/project", "codex"]
+        );
+    }
+
+    #[test]
+    fn codex_project_profile_applies_sandbox_and_approval_policy() {
+        let mut request = request(IntegrationKind::Codex, false, None);
+        request.permission_mode = Some(AccessMode::WorkspaceWrite);
+        request.approval_policy = Some("on-request".into());
+        let payload = payload_for(&request, None);
+        assert_eq!(
+            payload.arguments,
+            vec![
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request"
+            ]
         );
     }
 }

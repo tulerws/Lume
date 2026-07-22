@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     webview::PageLoadEvent, AppHandle, Emitter, LogicalSize, Manager, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
@@ -61,6 +61,18 @@ pub struct TerminalWindowState {
     pub width: i32,
     pub height: i32,
     pub docked: bool,
+    pub group_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredTerminalPlacement {
+    pub session_id: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub group_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +83,7 @@ struct Placement {
     y: i32,
     width: i32,
     height: i32,
+    scale: f64,
     group: Option<String>,
     ready: bool,
 }
@@ -124,6 +137,7 @@ impl Placement {
             width: self.width,
             height: self.height,
             docked: self.group.is_some(),
+            group_id: self.group.clone(),
         }
     }
 }
@@ -192,6 +206,7 @@ impl TerminalWindows {
             y,
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
+            scale: selected_monitor_scale(app, monitor_id),
             group: None,
             ready: false,
         };
@@ -257,6 +272,7 @@ impl TerminalWindows {
                     &cleanup_label,
                     (f64::from(size.width) / scale).round() as i32,
                     (f64::from(size.height) / scale).round() as i32,
+                    scale,
                 );
             }
             _ => {}
@@ -380,6 +396,9 @@ impl TerminalWindows {
                     monitor_scale,
                 );
             }
+            if let Some(current) = placements.get_mut(label) {
+                current.scale = monitor_scale;
+            }
             update_placements(&mut placements, label, x, y, finalize)?
         };
         emit_dock_preview(app, label, update.preview.clone());
@@ -468,6 +487,55 @@ impl TerminalWindows {
             .ok_or_else(|| "Mini terminal não encontrado".to_string())
     }
 
+    pub fn restore_layout(
+        &self,
+        app: &AppHandle,
+        entries: Vec<RestoredTerminalPlacement>,
+        monitor_id: Option<&str>,
+    ) -> Result<Vec<TerminalWindowState>, String> {
+        let states = {
+            let mut placements = self
+                .placements
+                .lock()
+                .map_err(|_| "Não foi possível restaurar o layout".to_string())?;
+            for entry in entries {
+                validate_coordinates(entry.x, entry.y)?;
+                let Some(placement) = placements
+                    .values_mut()
+                    .find(|placement| placement.session_id == entry.session_id)
+                else {
+                    continue;
+                };
+                placement.x = entry.x;
+                placement.y = entry.y;
+                placement.width = entry.width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+                placement.height = entry.height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+                placement.group = entry.group_id;
+            }
+            placements
+                .values()
+                .map(Placement::state)
+                .collect::<Vec<_>>()
+        };
+
+        for state in &states {
+            let Some(window) = app.get_webview_window(&state.label) else {
+                continue;
+            };
+            let target = state.clone();
+            let monitor = monitor_id.map(str::to_string);
+            let layout_window = window.clone();
+            let _ = window.run_on_main_thread(move || {
+                let _ = layout_window.set_size(LogicalSize::new(
+                    f64::from(target.width),
+                    f64::from(target.height),
+                ));
+                let _ = overlay::move_to(&layout_window, target.x, target.y, monitor.as_deref());
+            });
+        }
+        Ok(states)
+    }
+
     pub fn resize_window(
         &self,
         app: &AppHandle,
@@ -526,13 +594,14 @@ impl TerminalWindows {
         }
     }
 
-    fn resize(&self, label: &str, width: i32, height: i32) {
+    fn resize(&self, label: &str, width: i32, height: i32, scale: f64) {
         let Ok(mut placements) = self.placements.lock() else {
             return;
         };
         if let Some(entry) = placements.get_mut(label) {
             entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
             entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+            entry.scale = scale.max(1.0);
         }
     }
 
@@ -582,6 +651,25 @@ fn initial_position(
         monitor.size().height as i32,
         monitor.scale_factor(),
     )
+}
+
+fn selected_monitor_scale(app: &AppHandle, monitor_id: Option<&str>) -> f64 {
+    let Some(main) = app.get_webview_window("main") else {
+        return 1.0;
+    };
+    let Ok(monitors) = main.available_monitors() else {
+        return 1.0;
+    };
+    monitor_id
+        .and_then(|id| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name().is_some_and(|name| name == id))
+        })
+        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
+        .or_else(|| monitors.first())
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0)
 }
 
 fn clamp_to_monitor(
@@ -756,26 +844,30 @@ fn dock_candidate(
 }
 
 fn snap(current: &Placement, other: &Placement) -> Option<DockPlan> {
+    let current_width = physical_width(current);
+    let current_height = physical_height(current);
+    let other_width = physical_width(other);
+    let other_height = physical_height(other);
     let vertical_overlap =
-        (current.y + current.height).min(other.y + other.height) - current.y.max(other.y);
+        (current.y + current_height).min(other.y + other_height) - current.y.max(other.y);
     let horizontal_overlap =
-        (current.x + current.width).min(other.x + other.width) - current.x.max(other.x);
+        (current.x + current_width).min(other.x + other_width) - current.x.max(other.x);
     let mut candidates = Vec::new();
     if vertical_overlap > 48 {
         candidates.push(DockPlan {
-            score: (current.x + current.width - other.x).abs(),
+            score: (current.x + current_width - other.x).abs(),
             other_label: other.label.clone(),
             side: DockSide::Left,
-            x: other.x - current.width,
+            x: other.x - current_width,
             y: other.y,
             width: current.width,
             height: other.height,
         });
         candidates.push(DockPlan {
-            score: (current.x - (other.x + other.width)).abs(),
+            score: (current.x - (other.x + other_width)).abs(),
             other_label: other.label.clone(),
             side: DockSide::Right,
-            x: other.x + other.width,
+            x: other.x + other_width,
             y: other.y,
             width: current.width,
             height: other.height,
@@ -783,25 +875,33 @@ fn snap(current: &Placement, other: &Placement) -> Option<DockPlan> {
     }
     if horizontal_overlap > 48 {
         candidates.push(DockPlan {
-            score: (current.y + current.height - other.y).abs(),
+            score: (current.y + current_height - other.y).abs(),
             other_label: other.label.clone(),
             side: DockSide::Top,
             x: other.x,
-            y: other.y - current.height,
+            y: other.y - current_height,
             width: other.width,
             height: current.height,
         });
         candidates.push(DockPlan {
-            score: (current.y - (other.y + other.height)).abs(),
+            score: (current.y - (other.y + other_height)).abs(),
             other_label: other.label.clone(),
             side: DockSide::Bottom,
             x: other.x,
-            y: other.y + other.height,
+            y: other.y + other_height,
             width: other.width,
             height: current.height,
         });
     }
     candidates.into_iter().min_by_key(|plan| plan.score)
+}
+
+fn physical_width(placement: &Placement) -> i32 {
+    (f64::from(placement.width) * placement.scale).round() as i32
+}
+
+fn physical_height(placement: &Placement) -> i32 {
+    (f64::from(placement.height) * placement.scale).round() as i32
 }
 
 fn merge_groups(
@@ -862,6 +962,7 @@ fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWi
         width: interpolate(transition.from.width, transition.to.width),
         height: interpolate(transition.from.height, transition.to.height),
         docked: transition.to.docked,
+        group_id: transition.to.group_id.clone(),
     }
 }
 
@@ -902,6 +1003,7 @@ mod tests {
             y,
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
+            scale: 1.0,
             group: None,
             ready: true,
         }
@@ -963,6 +1065,23 @@ mod tests {
         assert_eq!(update.current.width, bottom.width);
         assert_eq!(update.current.x, bottom.x);
         assert_eq!(update.current.y + update.current.height, bottom.y);
+    }
+
+    #[test]
+    fn scaled_terminals_detect_the_visual_gap_and_offer_a_preview() {
+        let mut left = placement("left", 45, 100);
+        left.scale = 1.25;
+        let mut right = placement("right", 472, 106);
+        right.scale = 1.25;
+        let mut placements =
+            HashMap::from([(left.label.clone(), left), (right.label.clone(), right)]);
+
+        let update = update_placements(&mut placements, "right", 472, 106, false).expect("prévia");
+        let preview = update.preview.expect("highlight de acoplamento");
+
+        assert_eq!(preview.target_label, "left");
+        assert_eq!(preview.side, DockSide::Right);
+        assert_eq!(preview.x, 465);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "lume"
-version = "0.3.9"
+version = "0.4.0"
 description = "Monitor local e discreto para agentes de IA no Windows e Linux"
 authors = ["tulerws"]
 edition = "2021"
@@ -26,6 +26,7 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2.10"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }

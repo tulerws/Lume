@@ -14,6 +14,11 @@ Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Win
 - monitor configurável e sobreposição Wayland por `gtk-layer-shell`;
 - cápsula arrastável com posição salva entre reinicializações;
 - Whiteboard com um mini terminal flutuante por sessão e acoplamento entre janelas;
+- layouts nomeados do Whiteboard, restaurados para as sessões abertas correspondentes;
+- perfis por projeto com destino, monitor, posição, permissões, layout e agentes preferidos;
+- respostas finais com arquivos/verificações reportados e opção explícita de salvar como nota;
+- detectores externos instaláveis por manifesto JSON, sem executar código de terceiros;
+- paleta de comandos global em `Ctrl+Shift+Space`;
 - continuação por prompt no Codex aberto pelo Lume e nos chats web conectados;
 - comportamento padrão abaixo de vídeos e jogos em tela cheia;
 
@@ -68,8 +73,12 @@ A versão 0.3.0 precisa ser instalada manualmente uma vez porque as versões ant
 
 O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Wayland, instale esse pacote no sistema para obter posicionamento nativo por monitor e o comportamento correto diante de tela cheia.
 
+## Detectores externos
+
+Em **Ajustes → Detectores externos**, instale um manifesto JSON para acompanhar outra CLI. O formato está em [`docs/external-plugin.example.json`](docs/external-plugin.example.json). O manifesto só declara nomes e tokens de processo usados na detecção; ele não carrega bibliotecas nem executa comandos no Lume. Alterações passam a valer na próxima varredura, sem reiniciar o aplicativo.
+
 ## Privacidade
 
-Tudo permanece na máquina. Os serviços escutam somente em `127.0.0.1:43119`, `127.0.0.1:43120`, `127.0.0.1:43130` e `127.0.0.1:43131`. Comandos, caminhos e payloads de uma permissão existem em memória apenas enquanto a decisão está pendente; o SQLite recebe somente a sessão sanitizada e resumos do histórico.
+Tudo permanece na máquina. Os serviços escutam somente em `127.0.0.1:43119`, `127.0.0.1:43120`, `127.0.0.1:43130` e `127.0.0.1:43131`. Sessões e respostas finais ficam apenas em memória. O SQLite recebe preferências, resumos sanitizados do histórico e somente as respostas que o usuário escolher explicitamente salvar como nota.
 
 Mais detalhes em [Produto](docs/PRODUCT.md) e [Privacidade](docs/PRIVACY.md).

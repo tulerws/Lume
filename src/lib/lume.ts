@@ -7,7 +7,11 @@ import type {
   IntegrationStatus,
   PermissionAction,
   Preferences,
+  ResultNote,
+  RestoredTerminalPlacement,
+  ExternalAgentPlugin,
   TerminalWindowState,
+  WhiteboardLayout,
 } from "$lib/domain";
 import { demoHistory, demoSessions } from "$lib/demo";
 
@@ -24,6 +28,8 @@ export const defaultPreferences: Preferences = {
   historyRetentionDays: 30,
   launchTarget: "auto",
   projectProfiles: {},
+  whiteboardLayouts: [],
+  globalShortcut: "Ctrl+Shift+Space",
 };
 
 export async function loadSessions(): Promise<AgentSession[]> {
@@ -127,12 +133,35 @@ export async function undockTerminalWindow(label: string): Promise<TerminalWindo
   return invoke<TerminalWindowState>("undock_terminal_window", { label });
 }
 
+export async function restoreTerminalLayout(
+  entries: RestoredTerminalPlacement[],
+): Promise<TerminalWindowState[]> {
+  return invoke<TerminalWindowState[]>("restore_terminal_layout", { entries });
+}
+
 export async function loadHistory(): Promise<HistoryEntry[]> {
   try {
     return await invoke<HistoryEntry[]>("list_history", { limit: 100 });
   } catch {
     return inDesktop() ? [] : structuredClone(demoHistory);
   }
+}
+
+export async function loadResultNotes(): Promise<ResultNote[]> {
+  if (!inDesktop()) return [];
+  return invoke<ResultNote[]>("list_result_notes", { limit: 100 });
+}
+
+export async function saveResultNote(
+  sessionId: string,
+  resultId: string,
+  title: string,
+): Promise<ResultNote> {
+  return invoke<ResultNote>("save_result_note", { sessionId, resultId, title });
+}
+
+export async function deleteResultNote(id: string): Promise<void> {
+  await invoke("delete_result_note", { id });
 }
 
 export async function loadPreferences(): Promise<Preferences> {
@@ -178,9 +207,20 @@ export async function launchAgentSession(
   resume: boolean,
   resumeId: string | undefined,
   target: Preferences["launchTarget"],
+  permissionMode?: Preferences["projectProfiles"][string]["permissionMode"],
+  approvalPolicy?: Preferences["projectProfiles"][string]["approvalPolicy"],
 ): Promise<void> {
   await invoke("launch_session", {
-    request: { agent, workingDirectory, resume, resumeId, target, initialPrompt: undefined },
+    request: {
+      agent,
+      workingDirectory,
+      resume,
+      resumeId,
+      target,
+      initialPrompt: undefined,
+      permissionMode,
+      approvalPolicy,
+    },
   });
 }
 
@@ -197,4 +237,21 @@ export async function configureVscode(enabled: boolean): Promise<void> {
 
 export async function revealBrowserCompanion(): Promise<string> {
   return invoke<string>("reveal_browser_companion");
+}
+
+export async function loadExternalPlugins(): Promise<ExternalAgentPlugin[]> {
+  if (!inDesktop()) return [];
+  return invoke<ExternalAgentPlugin[]>("list_external_plugins");
+}
+
+export async function installExternalPlugin(path: string): Promise<ExternalAgentPlugin> {
+  return invoke<ExternalAgentPlugin>("install_external_plugin", { path });
+}
+
+export async function removeExternalPlugin(id: string): Promise<void> {
+  await invoke("remove_external_plugin", { id });
+}
+
+export async function revealPluginDirectory(): Promise<string> {
+  return invoke<string>("reveal_plugin_directory");
 }

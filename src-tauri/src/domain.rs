@@ -76,6 +76,23 @@ pub struct SessionResult {
     pub id: String,
     pub response: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub tests: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultNote {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub agent_label: String,
+    pub project: String,
+    pub files: Vec<String>,
+    pub tests: Vec<String>,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -116,11 +133,57 @@ pub struct HistoryEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct ProjectProfile {
     pub label: String,
     pub sound_enabled: bool,
     pub launch_target: Option<String>,
+    pub monitor_id: Option<String>,
+    pub overlay_x: Option<i32>,
+    pub overlay_y: Option<i32>,
+    pub permission_mode: Option<AccessMode>,
+    pub approval_policy: Option<String>,
+    pub whiteboard_layout_id: Option<String>,
+    pub preferred_agents: Vec<String>,
+}
+
+impl Default for ProjectProfile {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            sound_enabled: true,
+            launch_target: None,
+            monitor_id: None,
+            overlay_x: None,
+            overlay_y: None,
+            permission_mode: None,
+            approval_policy: None,
+            whiteboard_layout_id: None,
+            preferred_agents: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhiteboardLayoutTerminal {
+    pub agent: AgentKind,
+    pub agent_label: String,
+    pub project: String,
+    pub source: SessionSource,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub group_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhiteboardLayout {
+    pub id: String,
+    pub name: String,
+    pub terminals: Vec<WhiteboardLayoutTerminal>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,6 +200,8 @@ pub struct Preferences {
     pub history_retention_days: u16,
     pub launch_target: String,
     pub project_profiles: HashMap<String, ProjectProfile>,
+    pub whiteboard_layouts: Vec<WhiteboardLayout>,
+    pub global_shortcut: String,
 }
 
 impl Default for Preferences {
@@ -153,6 +218,8 @@ impl Default for Preferences {
             history_retention_days: 30,
             launch_target: "auto".into(),
             project_profiles: HashMap::new(),
+            whiteboard_layouts: Vec::new(),
+            global_shortcut: "Ctrl+Shift+Space".into(),
         }
     }
 }

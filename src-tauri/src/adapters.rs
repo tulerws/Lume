@@ -327,7 +327,11 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        if agent_pid.is_none() && command.contains(provider) {
+        // Hooks de Codex/Gemini podem passar por um shell efêmero cujo comando
+        // também contém o provider. Continua subindo para guardar o processo
+        // estável mais externo da sessão, em vez do wrapper que termina logo
+        // após enviar o evento ao Lume.
+        if command.contains(provider) {
             agent_pid = Some(pid.as_u32());
         }
         if name == "code"

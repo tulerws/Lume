@@ -29,6 +29,7 @@ enum BrowserState {
     WaitingForInput,
     Completed,
     Failed,
+    Closed,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +256,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
         ),
         BrowserState::Completed => (HookEventKind::Completed, "Finalizado", None),
         BrowserState::Failed => (HookEventKind::Failed, "Erro na página", None),
+        BrowserState::Closed => (HookEventKind::SessionEnded, "Sessão fechada", None),
         BrowserState::PermissionRequired => (
             HookEventKind::PermissionRequest,
             "Aguardando confirmação na página",
@@ -346,5 +348,21 @@ mod tests {
             Some("Continue")
         );
         assert!(control.take_prompt("web:codex:hash-only").is_none());
+    }
+
+    #[test]
+    fn closed_browser_tab_becomes_a_session_end_event() {
+        let event = map_event(BrowserEvent {
+            provider: "codex".into(),
+            session_id: "closed-tab".into(),
+            title: "Projeto".into(),
+            origin: "https://chatgpt.com".into(),
+            browser: Some("chrome".into()),
+            state: BrowserState::Closed,
+            last_response: None,
+        })
+        .expect("aba fechada");
+
+        assert!(matches!(event.event, HookEventKind::SessionEnded));
     }
 }

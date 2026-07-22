@@ -61,6 +61,19 @@ export interface SessionResult {
   id: string;
   response: string;
   createdAt: number;
+  files: string[];
+  tests: string[];
+}
+
+export interface ResultNote {
+  id: string;
+  title: string;
+  body: string;
+  agentLabel: string;
+  project: string;
+  files: string[];
+  tests: string[];
+  createdAt: number;
 }
 
 export interface HistoryEntry {
@@ -85,12 +98,39 @@ export interface Preferences {
   historyRetentionDays: number;
   launchTarget: "auto" | "terminal" | "vscode";
   projectProfiles: Record<string, ProjectProfile>;
+  whiteboardLayouts: WhiteboardLayout[];
+  globalShortcut: string;
 }
 
 export interface ProjectProfile {
   label: string;
   soundEnabled: boolean;
   launchTarget?: Preferences["launchTarget"];
+  monitorId?: string;
+  overlayX?: number;
+  overlayY?: number;
+  permissionMode?: AccessMode;
+  approvalPolicy?: "untrusted" | "on-request" | "never";
+  whiteboardLayoutId?: string;
+  preferredAgents: AgentKind[];
+}
+
+export interface WhiteboardLayoutTerminal {
+  agent: AgentKind;
+  agentLabel: string;
+  project: string;
+  source: AgentSession["source"];
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  groupId?: string;
+}
+
+export interface WhiteboardLayout {
+  id: string;
+  name: string;
+  terminals: WhiteboardLayoutTerminal[];
 }
 
 export interface IntegrationStatus {
@@ -131,6 +171,25 @@ export interface TerminalWindowState {
   width: number;
   height: number;
   docked: boolean;
+  groupId?: string;
+}
+
+export interface RestoredTerminalPlacement {
+  sessionId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  groupId?: string;
+}
+
+export interface ExternalAgentPlugin {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  executable: string;
+  processNames: string[];
+  commandTokens: string[];
 }
 
 export type DockSide = "left" | "right" | "top" | "bottom";

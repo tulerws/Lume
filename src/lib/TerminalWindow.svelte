@@ -457,7 +457,7 @@
   .status-running, .status-running span { color: #4e7faf; }
   .status-permission_required, .status-permission_required span { color: #b06b25; }
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
-  .status-completed, .status-completed span { color: #7d8782; }
+  .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
   .final-response { margin: 8px 0; padding: 8px 9px; border: 1px solid rgba(74, 102, 89, 0.1); border-radius: 8px; background: rgba(67, 99, 84, 0.035); }
   .final-response strong { display: block; margin-bottom: 5px; color: #648075; font: 760 8px Inter, sans-serif; letter-spacing: 0.05em; text-transform: uppercase; }

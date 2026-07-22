@@ -156,7 +156,7 @@
   .status-running .feet { animation: feet-run 260ms steps(2, end) infinite; transform-origin: center; }
   .status-permission_required { --mascot-color: #cb8b45; }
   .status-permission_required .dino { animation: listen 1s steps(2, end) infinite; }
-  .status-completed { --mascot-color: #8b9490; }
+  .status-completed { --mascot-color: #63a57d; }
   .status-completed .dino { animation: settle 1.5s steps(2, end) infinite; }
   .status-failed { --mascot-color: #bd6965; }
   .status-failed .dino { animation: shake 1.4s steps(2, end) infinite; }

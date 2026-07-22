@@ -62,6 +62,8 @@ export const demoSessions: AgentSession[] = [
       id: "gemini-result-1",
       response: "I found the relevant references and grouped them by implementation approach.",
       createdAt: Date.now() - 120_000,
+      files: ["references.md"],
+      tests: [],
     }],
     permissionProfile: {
       mode: "full_access",
