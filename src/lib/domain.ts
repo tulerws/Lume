@@ -67,6 +67,7 @@ export interface HistoryEntry {
 }
 
 export interface Preferences {
+  language: "en" | "pt-BR";
   soundEnabled: boolean;
   autostart: boolean;
   monitorId?: string;

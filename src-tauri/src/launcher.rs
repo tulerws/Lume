@@ -18,6 +18,8 @@ pub struct LaunchRequest {
     pub resume: bool,
     pub resume_id: Option<String>,
     pub target: String,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,7 +59,14 @@ pub fn run_terminal_payload(path: &str) -> i32 {
         }
     };
     let _ = fs::remove_file(path);
-    match Command::new(&payload.command)
+    let mut command = match crate::executables::command(&payload.command) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    match command
         .args(&payload.arguments)
         .current_dir(&payload.working_directory)
         .status()
@@ -97,6 +106,14 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
                 }
             }
         }
+    }
+    if let Some(prompt) = request
+        .initial_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        arguments.push(prompt.to_string());
     }
     TerminalPayload {
         command,
@@ -243,6 +260,7 @@ mod tests {
             resume,
             resume_id: resume_id.map(str::to_string),
             target: "auto".into(),
+            initial_prompt: None,
         }
     }
 
@@ -267,6 +285,17 @@ mod tests {
         );
         assert_eq!(payload.command, "claude");
         assert_eq!(payload.arguments, vec!["--resume", "session-id"]);
+    }
+
+    #[test]
+    fn resumed_claude_session_receives_its_prompt() {
+        let mut request = request(IntegrationKind::Claude, true, Some("session-id"));
+        request.initial_prompt = Some("Continue a tarefa".into());
+        let payload = payload_for(&request, None);
+        assert_eq!(
+            payload.arguments,
+            vec!["--resume", "session-id", "Continue a tarefa"]
+        );
     }
 
     #[test]

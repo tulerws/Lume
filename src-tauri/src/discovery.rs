@@ -1,6 +1,8 @@
 use std::{collections::HashMap, thread, time::Duration};
 
-use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{
+    get_current_pid, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind,
+};
 use tauri::{AppHandle, Emitter};
 
 use crate::{
@@ -156,6 +158,74 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
     } else {
         None
     }
+}
+
+pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> Result<(), String> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let target_pid = Pid::from_u32(process_id);
+    let Some(target) = system.process(target_pid) else {
+        return Ok(());
+    };
+    let command = target
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let name = target.name().to_string_lossy().to_lowercase();
+    if detect_agent(&name, &command).as_ref() != Some(expected_agent) {
+        return Err("O PID da sessão não pertence mais ao agente esperado".into());
+    }
+    if get_current_pid().ok().is_some_and(|own_pid| {
+        own_pid == target_pid || process_descends_from(&system, own_pid, target_pid)
+    }) {
+        return Err(
+            "O Lume está sendo executado dentro desse processo e não pode encerrá-lo".into(),
+        );
+    }
+
+    let mut targets = system
+        .processes()
+        .keys()
+        .copied()
+        .filter(|pid| *pid == target_pid || process_descends_from(&system, *pid, target_pid))
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|pid| std::cmp::Reverse(process_depth(&system, *pid)));
+    let mut terminated_root = false;
+    for pid in targets {
+        let Some(process) = system.process(pid) else {
+            continue;
+        };
+        let terminated = process.kill_with(Signal::Term).unwrap_or(false) || process.kill();
+        if pid == target_pid {
+            terminated_root = terminated;
+        }
+    }
+    if terminated_root {
+        Ok(())
+    } else {
+        Err("O sistema recusou o encerramento do agente".into())
+    }
+}
+
+fn process_depth(system: &System, mut pid: Pid) -> usize {
+    let mut depth = 0;
+    for _ in 0..32 {
+        let Some(parent) = system.process(pid).and_then(|process| process.parent()) else {
+            break;
+        };
+        depth += 1;
+        pid = parent;
+    }
+    depth
 }
 
 #[cfg(test)]

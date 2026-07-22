@@ -33,7 +33,7 @@ pub struct CodexBridge {
 impl CodexBridge {
     pub fn start(state: AppState, app: AppHandle) -> Result<Self, String> {
         let listener = TcpListener::bind(PROXY_ADDRESS)
-            .map_err(|error| format!("Não foi possível iniciar a ponte do Codex: {error}"))?;
+            .map_err(|error| format!("Could not start the Codex bridge: {error}"))?;
         thread::Builder::new()
             .name("lume-codex-proxy".into())
             .spawn(move || {
@@ -59,9 +59,9 @@ impl CodexBridge {
         if server_available() {
             return Ok(());
         }
-        let mut process = command_for_server()
+        let mut process = command_for_server()?
             .spawn()
-            .map_err(|error| format!("Não foi possível iniciar `codex app-server`: {error}"))?;
+            .map_err(|error| format!("Could not start `codex app-server`: {error}"))?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if server_available() {
@@ -119,8 +119,8 @@ impl Drop for CodexBridge {
     }
 }
 
-fn command_for_server() -> Command {
-    let mut command = Command::new("codex");
+fn command_for_server() -> Result<Command, String> {
+    let mut command = crate::executables::command("codex")?;
     command
         .args(["app-server", "--listen", SERVER_URL])
         .stdin(Stdio::null())
@@ -131,7 +131,7 @@ fn command_for_server() -> Command {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    command
+    Ok(command)
 }
 
 fn server_available() -> bool {

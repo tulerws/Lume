@@ -234,5 +234,6 @@ mod tests {
         .expect("preferências antigas");
         assert!(preferences.overlay_x.is_none());
         assert!(preferences.overlay_y.is_none());
+        assert_eq!(preferences.language, "en");
     }
 }

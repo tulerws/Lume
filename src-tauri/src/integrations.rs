@@ -41,7 +41,7 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
     ]
     .into_iter()
     .map(|(kind, label, command, direct_permissions)| {
-        let installed = command_available(command);
+        let installed = crate::executables::available(command);
         let configured = config_path(&kind)
             .and_then(|path| fs::read_to_string(path).ok())
             .is_some_and(|content| configured_content(&content, &kind, executable));

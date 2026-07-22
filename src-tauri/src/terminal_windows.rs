@@ -274,6 +274,73 @@ impl TerminalWindows {
         Ok(current)
     }
 
+    pub fn sync_native_position(
+        &self,
+        app: &AppHandle,
+        label: &str,
+        physical_x: i32,
+        physical_y: i32,
+        finalize: bool,
+        monitor_id: Option<&str>,
+    ) -> Result<TerminalWindowState, String> {
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        let monitor_position = window
+            .current_monitor()
+            .map_err(|error| error.to_string())?
+            .map(|monitor| *monitor.position())
+            .unwrap_or_default();
+        let x = physical_x - monitor_position.x;
+        let y = physical_y - monitor_position.y;
+
+        let (states, current, snapped) = {
+            let mut placements = self
+                .placements
+                .lock()
+                .map_err(|_| "Não foi possível sincronizar o mini terminal".to_string())?;
+            let current = placements
+                .get(label)
+                .cloned()
+                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+            let moving_labels = group_labels(&placements, &current);
+            let dx = x - current.x;
+            let dy = y - current.y;
+            if dx == 0 && dy == 0 && !finalize {
+                return Ok(current.state());
+            }
+            shift(&mut placements, &moving_labels, dx, dy);
+
+            let mut snapped = false;
+            if finalize {
+                if let Some((other_label, snap_x, snap_y)) =
+                    dock_candidate(&placements, label, &moving_labels)
+                {
+                    shift(&mut placements, &moving_labels, snap_x, snap_y);
+                    merge_groups(&mut placements, &moving_labels, &other_label);
+                    snapped = true;
+                }
+            }
+            let current = placements
+                .get(label)
+                .map(Placement::state)
+                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+            let states = placements
+                .values()
+                .filter(|placement| {
+                    moving_labels.contains(&placement.label)
+                        && (placement.label != label || snapped)
+                })
+                .map(Placement::state)
+                .collect::<Vec<_>>();
+            (states, current, snapped)
+        };
+        if !states.is_empty() || snapped {
+            move_native_windows(app, &states, monitor_id);
+        }
+        Ok(current)
+    }
+
     pub fn undock(&self, label: &str) -> Result<TerminalWindowState, String> {
         let mut placements = self
             .placements

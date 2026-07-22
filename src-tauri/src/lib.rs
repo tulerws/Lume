@@ -5,6 +5,7 @@ mod codex_sessions;
 mod discovery;
 mod domain;
 mod event_server;
+mod executables;
 mod integrations;
 mod launcher;
 mod overlay;
@@ -120,7 +121,70 @@ fn submit_prompt(
             .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
         return bridge.submit_prompt(&thread_id, prompt, profile, state.inner().clone(), app);
     }
-    Err("Esta origem não oferece envio direto; abra a sessão original".into())
+    let agent = match session.agent {
+        domain::AgentKind::Claude => IntegrationKind::Claude,
+        domain::AgentKind::Gemini => IntegrationKind::Gemini,
+        domain::AgentKind::Codex => unreachable!(),
+        domain::AgentKind::Unknown => {
+            return Err("Este agente não oferece retomada direta pelo Lume".into());
+        }
+    };
+    let resume_id = session
+        .native_session_id
+        .ok_or_else(|| "A sessão não informou um identificador para retomada".to_string())?;
+    let working_directory = session
+        .working_directory
+        .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
+    let preferences = state.preferences()?;
+    let target = if session.source == domain::SessionSource::Vscode {
+        "vscode".to_string()
+    } else {
+        preferences.launch_target
+    };
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    launcher::launch(
+        LaunchRequest {
+            agent,
+            working_directory,
+            resume: true,
+            resume_id: Some(resume_id),
+            target,
+            initial_prompt: Some(prompt.to_string()),
+        },
+        &executable,
+        &app_data_dir,
+        None,
+    )
+}
+
+#[tauri::command]
+fn terminate_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+    if session.source != domain::SessionSource::Cli {
+        return Err(
+            "Esta integração não possui um processo isolado; o Lume não fechará o editor ou navegador inteiro"
+                .into(),
+        );
+    }
+    let process_id = session
+        .process_id
+        .ok_or_else(|| "A sessão não possui um processo associado".to_string())?;
+    discovery::terminate_agent_process(process_id, &session.agent)?;
+    state.mark_process_terminated(process_id)?;
+    let _ = app.emit("lume://sessions-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -257,6 +321,20 @@ fn move_terminal_window(
 ) -> Result<terminal_windows::TerminalWindowState, String> {
     let monitor_id = state.preferences()?.monitor_id;
     terminals.move_window(&app, &label, x, y, finalize, monitor_id.as_deref())
+}
+
+#[tauri::command]
+fn sync_terminal_window_position(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    x: i32,
+    y: i32,
+    finalize: bool,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.sync_native_position(&app, &label, x, y, finalize, monitor_id.as_deref())
 }
 
 #[tauri::command]
@@ -441,6 +519,7 @@ pub fn run() {
             resolve_permission,
             open_session_source,
             submit_prompt,
+            terminate_session,
             list_history,
             get_preferences,
             set_preferences,
@@ -450,6 +529,7 @@ pub fn run() {
             get_terminal_window_state,
             close_terminal_window,
             move_terminal_window,
+            sync_terminal_window_position,
             resize_terminal_window,
             undock_terminal_window,
             integration_statuses,

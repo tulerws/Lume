@@ -106,6 +106,7 @@ pub struct HistoryEntry {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
+    pub language: String,
     pub sound_enabled: bool,
     pub autostart: bool,
     pub monitor_id: Option<String>,
@@ -119,6 +120,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            language: "en".into(),
             sound_enabled: true,
             autostart: true,
             monitor_id: None,

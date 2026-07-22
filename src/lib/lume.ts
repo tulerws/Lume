@@ -13,6 +13,7 @@ import { demoHistory, demoSessions } from "$lib/demo";
 const inDesktop = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export const defaultPreferences: Preferences = {
+  language: "en",
   soundEnabled: true,
   autostart: true,
   overlayX: undefined,
@@ -54,6 +55,10 @@ export async function submitPrompt(sessionId: string, prompt: string): Promise<v
   await invoke("submit_prompt", { sessionId, prompt });
 }
 
+export async function terminateSession(sessionId: string): Promise<void> {
+  await invoke("terminate_session", { sessionId });
+}
+
 export async function openTerminalWindow(sessionId: string): Promise<string> {
   return invoke<string>("open_terminal_window", { sessionId });
 }
@@ -78,6 +83,20 @@ export async function moveTerminalWindow(
   finalize: boolean,
 ): Promise<TerminalWindowState> {
   return invoke<TerminalWindowState>("move_terminal_window", {
+    label,
+    x: Math.round(x),
+    y: Math.round(y),
+    finalize,
+  });
+}
+
+export async function syncTerminalWindowPosition(
+  label: string,
+  x: number,
+  y: number,
+  finalize: boolean,
+): Promise<TerminalWindowState> {
+  return invoke<TerminalWindowState>("sync_terminal_window_position", {
     label,
     x: Math.round(x),
     y: Math.round(y),
@@ -152,7 +171,7 @@ export async function launchAgentSession(
   target: Preferences["launchTarget"],
 ): Promise<void> {
   await invoke("launch_session", {
-    request: { agent, workingDirectory, resume, resumeId, target },
+    request: { agent, workingDirectory, resume, resumeId, target, initialPrompt: undefined },
   });
 }
 

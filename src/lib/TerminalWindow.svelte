@@ -5,14 +5,17 @@
   import type { AgentSession, PermissionAction, TerminalWindowState } from "$lib/domain";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
+  import { displayText, localize, type Language } from "$lib/i18n";
   import {
     closeTerminalWindow,
     decidePermission,
+    loadPreferences,
     loadSessions,
     loadTerminalWindowState,
-    moveTerminalWindow,
     openSessionSource,
     submitPrompt,
+    syncTerminalWindowPosition,
+    terminateSession,
     undockTerminalWindow,
   } from "$lib/lume";
 
@@ -25,21 +28,21 @@
   let message = $state<string | null>(null);
   let sending = $state(false);
   let dragging = $state(false);
-  let moveFrame: number | null = null;
-  let dragState: {
-    pointerId: number;
-    startX: number;
-    startY: number;
-    originX: number;
-    originY: number;
-  } | null = null;
+  let dragMoved = false;
+  let dragFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let terminateConfirm = $state(false);
+  let terminating = $state(false);
+  let language = $state<Language>("en");
+
+  function tr(english: string, portuguese: string) {
+    return localize(language, english, portuguese);
+  }
 
   const canSubmit = $derived(
     Boolean(
       session &&
         (session.source === "web" ||
-          (session.agent === "codex" &&
-            session.nativeSessionId)),
+          (session.agent !== "unknown" && session.nativeSessionId)),
     ),
   );
   const readyForPrompt = $derived(
@@ -49,16 +52,41 @@
   onMount(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;
+    let stopMoved: (() => void) | undefined;
     void (async () => {
-      windowState = await loadTerminalWindowState(label);
+      const [nextWindowState, nextPreferences] = await Promise.all([
+        loadTerminalWindowState(label),
+        loadPreferences(),
+      ]);
+      windowState = nextWindowState;
+      language = nextPreferences.language;
       await refresh();
       if (disposed) return;
       stopListening = await listen("lume://sessions-changed", () => void refresh());
+      stopMoved = await currentWindow.onMoved(({ payload }) => {
+        if (!dragging) return;
+        dragMoved = true;
+        if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
+        void syncTerminalWindowPosition(label, payload.x, payload.y, false).then((next) => {
+          windowState = next;
+        }).catch((error) => {
+          message = String(error).replace(/^Error:\s*/, "");
+        });
+        dragFinalizeTimer = setTimeout(() => {
+          dragging = false;
+          void syncTerminalWindowPosition(label, payload.x, payload.y, true).then((next) => {
+            windowState = next;
+          }).catch((error) => {
+            message = String(error).replace(/^Error:\s*/, "");
+          });
+        }, 320);
+      });
     })();
     return () => {
       disposed = true;
       stopListening?.();
-      if (moveFrame !== null) cancelAnimationFrame(moveFrame);
+      stopMoved?.();
+      if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
     };
   });
 
@@ -74,7 +102,7 @@
       if (item.sourceApp === "brave") return "Brave";
       return "Web";
     }
-    return { cli: "CLI", vscode: "VS Code", desktop: "Desktop" }[item.source] ?? "Origem";
+    return { cli: "CLI", vscode: "VS Code", desktop: "Desktop" }[item.source] ?? tr("Source", "Origem");
   }
 
   function sourceIcon(item: AgentSession) {
@@ -84,48 +112,20 @@
     return "unknown" as const;
   }
 
-  function beginDrag(event: PointerEvent) {
+  async function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
     if ((event.target as HTMLElement).closest("button, textarea")) return;
-    const target = event.currentTarget as HTMLElement;
-    target.setPointerCapture(event.pointerId);
-    dragState = {
-      pointerId: event.pointerId,
-      startX: event.screenX,
-      startY: event.screenY,
-      originX: windowState.x,
-      originY: windowState.y,
-    };
-    dragging = false;
-  }
-
-  function drag(event: PointerEvent) {
-    if (!dragState || event.pointerId !== dragState.pointerId) return;
-    const dx = event.screenX - dragState.startX;
-    const dy = event.screenY - dragState.startY;
-    if (!dragging && Math.hypot(dx, dy) < 3) return;
     dragging = true;
-    const x = dragState.originX + dx;
-    const y = dragState.originY + dy;
-    if (moveFrame !== null) cancelAnimationFrame(moveFrame);
-    moveFrame = requestAnimationFrame(() => {
-      moveFrame = null;
-      void moveTerminalWindow(label, x, y, false).then((next) => (windowState = next));
-    });
-  }
-
-  async function endDrag(event: PointerEvent) {
-    if (!dragState || event.pointerId !== dragState.pointerId) return;
-    const target = event.currentTarget as HTMLElement;
-    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
-    const dx = event.screenX - dragState.startX;
-    const dy = event.screenY - dragState.startY;
-    const x = dragState.originX + dx;
-    const y = dragState.originY + dy;
-    dragState = null;
-    if (!dragging) return;
-    windowState = await moveTerminalWindow(label, x, y, true);
-    dragging = false;
+    dragMoved = false;
+    try {
+      await currentWindow.startDragging();
+      setTimeout(() => {
+        if (!dragMoved) dragging = false;
+      }, 600);
+    } catch (error) {
+      dragging = false;
+      message = String(error).replace(/^Error:\s*/, "");
+    }
   }
 
   async function detach() {
@@ -152,6 +152,21 @@
     }
   }
 
+  async function terminateAgent() {
+    if (!session?.processId || session.source !== "cli" || terminating) return;
+    terminating = true;
+    message = null;
+    try {
+      await terminateSession(session.id);
+      terminateConfirm = false;
+      await refresh();
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      terminating = false;
+    }
+  }
+
   async function sendPrompt() {
     if (!session || !prompt.trim() || sending || !canSubmit || !readyForPrompt) return;
     sending = true;
@@ -159,7 +174,7 @@
     try {
       await submitPrompt(session.id, prompt.trim());
       prompt = "";
-      session = { ...session, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined };
+      session = { ...session, status: "running", statusLabel: "Prompt sent by Lume", lastResponse: undefined };
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
@@ -189,10 +204,10 @@
 
   function actionLabel(action: PermissionAction) {
     return {
-      allow_once: "Permitir",
-      allow_session: "Na sessão",
-      deny: "Recusar",
-      open_source: "Abrir origem",
+      allow_once: tr("Allow", "Permitir"),
+      allow_session: tr("For session", "Na sessão"),
+      deny: tr("Deny", "Recusar"),
+      open_source: tr("Open source", "Abrir origem"),
     }[action];
   }
 </script>
@@ -202,10 +217,7 @@
     <section class:dragging class="terminal-card">
       <header
         role="banner"
-        onpointerdown={beginDrag}
-        onpointermove={drag}
-        onpointerup={endDrag}
-        onpointercancel={endDrag}
+        onpointerdown={(event) => void beginDrag(event)}
       >
         <LumeLogo size={25} />
         <span class="agent-icon"><BrandIcon name={session.agent} size={16} /></span>
@@ -218,27 +230,32 @@
           {sourceLabel(session)}
         </span>
         {#if windowState?.docked}
-          <button class="dock-button" type="button" onclick={detach} aria-label="Desacoplar terminal" title="Desacoplar">
+          <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
             <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
           </button>
         {/if}
-        <button class="close-button" type="button" onclick={closeTerminal} aria-label="Fechar terminal">
+        {#if session.source === "cli" && session.processId}
+          <button class="terminate-button" type="button" onclick={() => (terminateConfirm = !terminateConfirm)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
+            <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+          </button>
+        {/if}
+        <button class="close-button" type="button" onclick={closeTerminal} aria-label={tr("Close terminal", "Fechar terminal")}>
           <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
         </button>
       </header>
 
       <div class="terminal-output">
         <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
-        <p class="status status-{session.status}"><span>&gt;</span> {session.statusLabel}</p>
+        <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
         {#if session.lastResponse}
           <div class="final-response">
-            <strong>Resposta final</strong>
+            <strong>{tr("Final response", "Resposta final")}</strong>
             <p>{session.lastResponse}</p>
           </div>
         {/if}
         {#if session.pendingPermission}
           <div class="permission">
-            <strong>{session.pendingPermission.summary}</strong>
+            <strong>{displayText(language, session.pendingPermission.summary)}</strong>
             <code>{session.pendingPermission.resource}</code>
             <div>
               {#each session.permissionProfile.availableActions as action}
@@ -249,11 +266,20 @@
             </div>
           </div>
         {:else if !canSubmit}
-          <p class="hint">Esta origem é acompanhada aqui, mas o envio continua nela.</p>
+          <p class="hint">{tr("This source is monitored here, but prompts are sent from the source.", "Esta origem é acompanhada aqui, mas o envio continua nela.")}</p>
         {:else if windowState?.docked}
-          <p class="hint docked">Acoplado · arraste este terminal para mover o conjunto.</p>
+          <p class="hint docked">{tr("Docked · drag this terminal to move the group.", "Acoplado · arraste este terminal para mover o conjunto.")}</p>
         {:else}
-          <p class="hint">Aproxime de outro mini terminal para acoplar.</p>
+          <p class="hint">{tr("Move it close to another mini terminal to dock.", "Aproxime de outro mini terminal para acoplar.")}</p>
+        {/if}
+        {#if terminateConfirm}
+          <div class="terminate-confirm">
+            <span>{tr("Stop this agent and its commands?", "Encerrar este agente e os comandos dele?")}</span>
+            <div>
+              <button type="button" onclick={() => (terminateConfirm = false)}>{tr("Cancel", "Cancelar")}</button>
+              <button class="danger" disabled={terminating} type="button" onclick={() => void terminateAgent()}>{terminating ? tr("Stopping…", "Encerrando…") : tr("Stop", "Encerrar")}</button>
+            </div>
+          </div>
         {/if}
       </div>
 
@@ -268,27 +294,27 @@
           bind:value={prompt}
           disabled={!canSubmit || !readyForPrompt || sending}
           rows="2"
-          aria-label="Prompt para {session.agentLabel}"
-          placeholder={!canSubmit ? "Envio indisponível nesta origem" : readyForPrompt ? `Prompt para ${session.agentLabel}…` : "Agente em execução…"}
+          aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
+          placeholder={!canSubmit ? tr("Prompt unavailable for this source", "Envio indisponível nesta origem") : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
         ></textarea>
         {#if canSubmit}
-          <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label="Enviar prompt">
+          <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label={tr("Send prompt", "Enviar prompt")}>
             <svg viewBox="0 0 20 20"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
           </button>
         {:else}
-          <button type="button" onclick={openOrigin} aria-label="Abrir origem">
+          <button type="button" onclick={openOrigin} aria-label={tr("Open source", "Abrir origem")}>
             <svg viewBox="0 0 20 20"><path d="M7 5h8v8M14.5 5.5 6 14" /></svg>
           </button>
         {/if}
       </form>
       {#if message}<p class="message">{message}</p>{/if}
-      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior esquerdo" onpointerdown={(event) => void beginResize(event, "NorthWest")}></button>
-      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label="Redimensionar pelo canto superior direito" onpointerdown={(event) => void beginResize(event, "NorthEast")}></button>
-      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior esquerdo" onpointerdown={(event) => void beginResize(event, "SouthWest")}></button>
-      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label="Redimensionar pelo canto inferior direito" onpointerdown={(event) => void beginResize(event, "SouthEast")}></button>
+      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")}></button>
+      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")}></button>
+      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")}></button>
+      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")}></button>
     </section>
   {:else}
-    <section class="terminal-card loading"><LumeLogo size={34} /><span>Conectando à sessão…</span></section>
+    <section class="terminal-card loading"><LumeLogo size={34} /><span>{tr("Connecting to session…", "Conectando à sessão…")}</span></section>
   {/if}
 </main>
 
@@ -306,6 +332,7 @@
   header button { width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   .dock-button { color: #4a7564; }
+  .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .terminal-output { min-height: 0; flex: 1; padding: 10px 12px 7px; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 9px; }
   .terminal-output p { margin: 0 0 6px; line-height: 1.45; }
@@ -327,6 +354,11 @@
   .permission button.danger { color: #a64d4d; }
   .hint { color: #89948f; font-size: 8px; }
   .hint.docked { color: #4f7566; }
+  .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 8px/1.35 Inter, sans-serif; }
+  .terminate-confirm > span { min-width: 0; flex: 1; color: #7d5d58; }
+  .terminate-confirm > div { display: flex; gap: 4px; }
+  .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 7px Inter, sans-serif; cursor: pointer; }
+  .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: 9px/1.4 Inter, sans-serif; }
   textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }

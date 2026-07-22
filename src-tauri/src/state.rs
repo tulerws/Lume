@@ -169,6 +169,69 @@ impl AppState {
         store.purge_history(cutoff)
     }
 
+    pub fn mark_process_terminated(&self, process_id: u32) -> Result<bool, String> {
+        let now = now_millis();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível encerrar as sessões".to_string())?;
+        let mut snapshots = Vec::new();
+        let mut history = Vec::new();
+        let mut cancelled_permissions = Vec::new();
+        for session in sessions
+            .iter_mut()
+            .filter(|session| session.process_id == Some(process_id))
+        {
+            session.status = SessionStatus::Completed;
+            session.status_label = "Encerrado pelo Lume".into();
+            session.process_id = None;
+            session.updated_at = now;
+            if let Some(permission) = session.pending_permission.take() {
+                cancelled_permissions.push(permission.id);
+            }
+            snapshots.push(session.clone());
+            history.push(HistoryEntry {
+                id: format!("{}-{}-terminated", now, session.id),
+                session_id: session.id.clone(),
+                agent_label: session.agent_label.clone(),
+                project: session.project.clone(),
+                event: "completed".into(),
+                summary: "Agente encerrado pelo Lume".into(),
+                created_at: now,
+            });
+        }
+        drop(sessions);
+        if snapshots.is_empty() {
+            return Ok(false);
+        }
+        self.missing_process_scans
+            .lock()
+            .map_err(|_| "Não foi possível limpar a presença do processo".to_string())?
+            .retain(|session_id, _| !snapshots.iter().any(|session| &session.id == session_id));
+
+        if !cancelled_permissions.is_empty() {
+            let (decisions, decision_changed) = &*self.decisions;
+            let mut values = decisions
+                .lock()
+                .map_err(|_| "Não foi possível cancelar as permissões pendentes".to_string())?;
+            for permission_id in cancelled_permissions {
+                values.insert(permission_id, PermissionAction::Deny);
+            }
+            decision_changed.notify_all();
+        }
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Não foi possível persistir o encerramento".to_string())?;
+        for session in snapshots {
+            store.save_session(&session)?;
+        }
+        for entry in history {
+            store.add_history(&entry)?;
+        }
+        Ok(true)
+    }
+
     pub fn ingest(&self, event: HookEvent) -> Result<Option<String>, String> {
         if event.session_id.trim().is_empty() {
             return Err("O evento não informou uma sessão".into());
@@ -628,12 +691,7 @@ impl AppState {
             .retain(|session_id, _| sessions.iter().any(|session| &session.id == session_id));
 
         for session in sessions.iter_mut().filter(|session| {
-            matches!(
-                session.status,
-                SessionStatus::Running
-                    | SessionStatus::PermissionRequired
-                    | SessionStatus::WaitingForInput
-            ) && session
+            session
                 .process_id
                 .is_some_and(|pid| !active_pids.contains(&pid))
         }) {
@@ -645,6 +703,16 @@ impl AppState {
                 continue;
             }
             missing_process_scans.remove(&session.id);
+            session.process_id = None;
+            if matches!(
+                session.status,
+                SessionStatus::Completed | SessionStatus::Failed
+            ) {
+                session.updated_at = now;
+                snapshots.push(session.clone());
+                changed = true;
+                continue;
+            }
             session.status = SessionStatus::Completed;
             session.status_label = "Processo encerrado".into();
             if let Some(permission) = session.pending_permission.take() {
@@ -1130,6 +1198,28 @@ mod tests {
 
         let sessions = state.sessions().expect("sessões");
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn terminating_a_process_completes_all_of_its_chats() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut first = started_event("claude:chat-1", 4242);
+        first.native_session_id = Some("native-chat-1".into());
+        state.ingest(first).expect("primeiro chat");
+        let mut second = started_event("claude:chat-2", 4242);
+        second.native_session_id = Some("native-chat-2".into());
+        state.ingest(second).expect("segundo chat");
+
+        assert!(state.mark_process_terminated(4242).expect("encerramento"));
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| {
+            session.status == SessionStatus::Completed
+                && session.status_label == "Encerrado pelo Lume"
+                && session.process_id.is_none()
+        }));
+        assert_eq!(state.history(10).expect("histórico").len(), 2);
     }
 
     #[test]

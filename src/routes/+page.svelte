@@ -18,6 +18,7 @@
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
   import TerminalWindow from "$lib/TerminalWindow.svelte";
+  import { displayText, localize } from "$lib/i18n";
   import type {
     AgentKind,
     AgentSession,
@@ -48,6 +49,7 @@
     launchAgentSession,
     savePreferences,
     submitPrompt,
+    terminateSession,
   } from "$lib/lume";
 
   type View = "sessions" | "board" | "history" | "settings";
@@ -101,6 +103,9 @@
   let composerPrompt = $state("");
   let composerMessage = $state<string | null>(null);
   let composerSending = $state(false);
+  let terminateConfirmId = $state<string | null>(null);
+  let terminatingSessionId = $state<string | null>(null);
+  let sessionActionMessage = $state<string | null>(null);
   let terminalWindows = $state<TerminalWindowState[]>([]);
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
@@ -111,10 +116,10 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.6");
+  let appVersion = $state("0.3.7");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
-  let updateDetail = $state("As atualizações são verificadas automaticamente.");
+  let updateDetail = $state("Updates are checked automatically.");
   let updateProgress = $state<number | null>(null);
   let pendingUpdate: Update | null = null;
   let suppressCompactToggle = false;
@@ -126,6 +131,14 @@
     originY: number;
   } | null = null;
   let moveFrame: number | null = null;
+
+  function tr(english: string, portuguese: string) {
+    return localize(preferences.language, english, portuguese);
+  }
+
+  function shown(value: string) {
+    return displayText(preferences.language, value);
+  }
 
   function currentExpandedSize() {
     return { width: expandedWidth, height: expandedHeight };
@@ -202,7 +215,6 @@
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
 
-    void initializeUpdater();
     updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
 
     void (async () => {
@@ -215,6 +227,7 @@
       if (disposed) return;
       sessions = nextSessions;
       preferences = nextPreferences;
+      void initializeUpdater();
       integrations = nextIntegrations;
       vscodeStatus = nextVscodeStatus;
       selectedId =
@@ -253,7 +266,7 @@
     try {
       appVersion = await getVersion();
     } catch {
-      // Mantém a versão do pacote como fallback.
+      // Keep the package version as fallback.
     }
     await checkForUpdates();
   }
@@ -267,7 +280,7 @@
       updateState === "ready"
     ) return;
     updateState = "checking";
-    updateDetail = "Procurando uma nova versão…";
+    updateDetail = tr("Checking for a new version…", "Procurando uma nova versão…");
     updateProgress = null;
 
     try {
@@ -277,21 +290,27 @@
       availableVersion = nextUpdate?.version ?? null;
       if (nextUpdate) {
         updateState = "available";
-        updateDetail = `A versão ${nextUpdate.version} está pronta para baixar.`;
+        updateDetail = tr(
+          `Version ${nextUpdate.version} is ready to download.`,
+          `A versão ${nextUpdate.version} está pronta para baixar.`,
+        );
       } else {
         updateState = "up_to_date";
-        updateDetail = "Você está usando a versão mais recente.";
+        updateDetail = tr("You are using the latest version.", "Você está usando a versão mais recente.");
       }
     } catch {
       updateState = "error";
-      updateDetail = "Não foi possível verificar agora. Tente novamente em instantes.";
+      updateDetail = tr(
+        "Could not check for updates right now. Try again shortly.",
+        "Não foi possível verificar agora. Tente novamente em instantes.",
+      );
     }
   }
 
   async function installAvailableUpdate() {
     if (!pendingUpdate || updateState === "downloading") return;
     updateState = "downloading";
-    updateDetail = "Baixando e preparando a atualização…";
+    updateDetail = tr("Downloading and preparing the update…", "Baixando e preparando a atualização…");
     updateProgress = 0;
     let downloaded = 0;
     let total: number | undefined;
@@ -310,11 +329,14 @@
         updateProgress = 100;
       });
       updateState = "ready";
-      updateDetail = "Atualização instalada. Reiniciando o Lume…";
+      updateDetail = tr("Update installed. Restarting Lume…", "Atualização instalada. Reiniciando o Lume…");
       await relaunch();
     } catch {
       updateState = "error";
-      updateDetail = "A atualização não pôde ser instalada. Tente novamente.";
+      updateDetail = tr(
+        "The update could not be installed. Try again.",
+        "A atualização não pôde ser instalada. Tente novamente.",
+      );
       updateProgress = null;
     }
   }
@@ -589,13 +611,14 @@
     selectedId = selectedId === session.id ? null : session.id;
     if (selectedId !== session.id) composerSessionId = null;
     permissionError = null;
+    terminateConfirmId = null;
+    sessionActionMessage = null;
   }
 
   function canSubmitToSession(session: AgentSession) {
     return (
       session.source === "web" ||
-      (session.agent === "codex" &&
-        Boolean(session.nativeSessionId))
+      (session.agent !== "unknown" && Boolean(session.nativeSessionId))
     );
   }
 
@@ -627,6 +650,30 @@
       composerMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       composerSending = false;
+    }
+  }
+
+  function canTerminateSession(session: AgentSession) {
+    return session.source === "cli" && Boolean(session.processId);
+  }
+
+  async function terminateAgent(session: AgentSession) {
+    if (!canTerminateSession(session) || terminatingSessionId) return;
+    if (terminateConfirmId !== session.id) {
+      terminateConfirmId = session.id;
+      sessionActionMessage = null;
+      return;
+    }
+    terminatingSessionId = session.id;
+    sessionActionMessage = null;
+    try {
+      if (isTauri) await terminateSession(session.id);
+      terminateConfirmId = null;
+      await refreshSessions(false);
+    } catch (error) {
+      sessionActionMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      terminatingSessionId = null;
     }
   }
 
@@ -680,8 +727,7 @@
             ? {
                 ...item,
                 status: "running",
-                statusLabel:
-                  action === "deny" ? "Permissão recusada" : "Continuando a tarefa",
+                statusLabel: action === "deny" ? "Permission denied" : "Continuing task",
                 pendingPermission: undefined,
               }
             : item,
@@ -728,7 +774,9 @@
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: resume ? "Projeto da sessão a retomar" : "Projeto da nova sessão",
+      title: resume
+        ? tr("Project of the session to resume", "Projeto da sessão a retomar")
+        : tr("Project for the new session", "Projeto da nova sessão"),
     });
     if (!selected || Array.isArray(selected)) return;
 
@@ -761,9 +809,12 @@
       settingsMessageIsError = false;
       settingsMessage = enabling
         ? integration.kind === "codex"
-          ? "Codex conectado. Abra /hooks no Codex e confie no hook Lume uma vez."
-          : `${integration.label} conectado ao Lume.`
-        : `${integration.label} desconectado.`;
+          ? tr(
+              "Codex connected. Open /hooks in Codex and trust the Lume hook once.",
+              "Codex conectado. Abra /hooks no Codex e confie no hook Lume uma vez.",
+            )
+          : tr(`${integration.label} connected to Lume.`, `${integration.label} conectado ao Lume.`)
+        : tr(`${integration.label} disconnected.`, `${integration.label} desconectado.`);
     } catch (error) {
       settingsMessageIsError = true;
       settingsMessage = String(error).replace(/^Error:\s*/, "");
@@ -782,8 +833,8 @@
       vscodeStatus = await loadVscodeStatus();
       settingsMessageIsError = false;
       settingsMessage = enabling
-        ? "Companion instalado no VS Code."
-        : "Companion removido do VS Code.";
+        ? tr("Companion installed in VS Code.", "Companion instalado no VS Code.")
+        : tr("Companion removed from VS Code.", "Companion removido do VS Code.");
     } catch (error) {
       settingsMessageIsError = true;
       settingsMessage = String(error).replace(/^Error:\s*/, "");
@@ -796,7 +847,10 @@
     try {
       browserCompanionPath = await revealBrowserCompanion();
     } catch {
-      browserCompanionPath = "Não foi possível abrir a pasta da extensão.";
+      browserCompanionPath = tr(
+        "Could not open the extension folder.",
+        "Não foi possível abrir a pasta da extensão.",
+      );
     }
   }
 
@@ -806,6 +860,13 @@
   ) {
     const previous = preferences;
     preferences = { ...preferences, [key]: value };
+    if (key === "language") {
+      if (updateState === "up_to_date") {
+        updateDetail = tr("You are using the latest version.", "Você está usando a versão mais recente.");
+      } else if (updateState === "idle") {
+        updateDetail = tr("Updates are checked automatically.", "As atualizações são verificadas automaticamente.");
+      }
+    }
     savingSettings = true;
     try {
       await savePreferences(preferences);
@@ -844,16 +905,16 @@
       });
       setTimeout(() => void context.close(), 600);
     } catch {
-      // Áudio é opcional e pode estar bloqueado até a primeira interação.
+      // Audio is optional and may be blocked until the first interaction.
     }
   }
 
   function actionLabel(action: PermissionAction) {
     return {
-      allow_once: "Permitir uma vez",
-      allow_session: "Nesta sessão",
-      deny: "Recusar",
-      open_source: "Abrir origem",
+      allow_once: tr("Allow once", "Permitir uma vez"),
+      allow_session: tr("For this session", "Nesta sessão"),
+      deny: tr("Deny", "Recusar"),
+      open_source: tr("Open source", "Abrir origem"),
     }[action];
   }
 
@@ -876,29 +937,29 @@
 
   function relativeTime(timestamp: number) {
     const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1_000));
-    if (seconds < 60) return "agora";
+    if (seconds < 60) return tr("now", "agora");
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `há ${minutes} min`;
+    if (minutes < 60) return tr(`${minutes} min ago`, `há ${minutes} min`);
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `há ${hours} h`;
-    return new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "short" }).format(
+    if (hours < 24) return tr(`${hours} hr ago`, `há ${hours} h`);
+    return new Intl.DateTimeFormat(preferences.language === "pt-BR" ? "pt-BR" : "en", { day: "2-digit", month: "short" }).format(
       timestamp,
     );
   }
 
   function eventLabel(event: HistoryEntry["event"]) {
     return {
-      completed: "Finalizado",
-      failed: "Erro",
-      permission_allowed: "Permitido",
-      permission_denied: "Recusado",
+      completed: tr("Completed", "Finalizado"),
+      failed: tr("Error", "Erro"),
+      permission_allowed: tr("Allowed", "Permitido"),
+      permission_denied: tr("Denied", "Recusado"),
     }[event];
   }
 </script>
 
 <svelte:head>
   <title>Lume</title>
-  <meta name="description" content="Monitor local e discreto para sessões de agentes de IA." />
+  <meta name="description" content="A discreet local monitor for AI agent sessions." />
 </svelte:head>
 
 {#if isTerminalWindow}
@@ -909,7 +970,7 @@
   class="overlay-shell"
   style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
   onpointermove={wakeMascot}
-  aria-label="Lume, monitor de agentes"
+  aria-label={tr("Lume, agent monitor", "Lume, monitor de agentes")}
 >
   {#if !expanded}
     <button
@@ -921,7 +982,7 @@
       onpointermove={moveOverlayDrag}
       onpointerup={(event) => endOverlayDrag(event, true)}
       onpointercancel={(event) => endOverlayDrag(event, true)}
-      aria-label="Abrir Lume, {activeCount} agentes ativos"
+      aria-label={tr(`Open Lume, ${activeCount} active agents`, `Abrir Lume, ${activeCount} agentes ativos`)}
     >
       <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={30} />
       <span class="agent-count">{activeCount}</span>
@@ -941,16 +1002,16 @@
           <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={32} />
           <div>
             <strong>Lume</strong>
-            <span>{activeCount === 1 ? "1 agente ativo" : `${activeCount} agentes ativos`}</span>
+            <span>{activeCount === 1 ? tr("1 active agent", "1 agente ativo") : tr(`${activeCount} active agents`, `${activeCount} agentes ativos`)}</span>
           </div>
         </div>
         <div class="header-actions">
           {#if view === "sessions"}
-            <button class:active={launcherOpen} class="add-button" type="button" onclick={toggleLauncher} aria-label="Abrir ou retomar sessão">
+            <button class:active={launcherOpen} class="add-button" type="button" onclick={toggleLauncher} aria-label={tr("Open or resume session", "Abrir ou retomar sessão")}>
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 5v10M5 10h10" /></svg>
             </button>
           {/if}
-          <button class="collapse-button" type="button" onclick={toggleExpanded} aria-label="Recolher">
+          <button class="collapse-button" type="button" onclick={toggleExpanded} aria-label={tr("Collapse", "Recolher")}>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 8 4.5 4 4.5-4" /></svg>
           </button>
         </div>
@@ -958,16 +1019,16 @@
 
       {#if launcherOpen}
         <div class="launcher-popover" transition:fly={{ y: -5, duration: 170, easing: cubicOut }}>
-          <span class="launcher-title">Abrir sessão</span>
+          <span class="launcher-title">{tr("Open session", "Abrir sessão")}</span>
           {#each integrations.filter((integration) => integration.installed) as integration}
             <div class="launcher-row">
               <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
               <strong>{integration.label}</strong>
-              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, false)}>Nova</button>
-              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, true)}>Retomar</button>
+              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, false)}>{tr("New", "Nova")}</button>
+              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, true)}>{tr("Resume", "Retomar")}</button>
             </div>
           {:else}
-            <p>Nenhuma CLI compatível foi encontrada.</p>
+            <p>{tr("No compatible CLI was found.", "Nenhuma CLI compatível foi encontrada.")}</p>
           {/each}
           {#if launchError}<p class="launcher-error">{launchError}</p>{/if}
         </div>
@@ -1000,7 +1061,7 @@
                       {:else}
                         <i></i>
                       {/if}
-                      {session.statusLabel}
+                      {shown(session.statusLabel)}
                     </span>
                   </span>
                   <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true">
@@ -1011,21 +1072,21 @@
                 {#if selectedId === session.id}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
                     <div class="access-profile">
-                      <span>{session.permissionProfile.label}</span>
-                      <small>{session.permissionProfile.approvalPolicy}</small>
+                      <span>{shown(session.permissionProfile.label)}</span>
+                      <small>{shown(session.permissionProfile.approvalPolicy)}</small>
                     </div>
 
                     {#if session.lastResponse}
                       <div class="final-response">
-                        <span class="eyebrow">Resposta final</span>
+                        <span class="eyebrow">{tr("Final response", "Resposta final")}</span>
                         <p>{session.lastResponse}</p>
                       </div>
                     {/if}
 
                     {#if session.pendingPermission}
                       <div class="permission-block risk-{session.pendingPermission.risk}">
-                        <span class="eyebrow">Permissão solicitada</span>
-                        <strong>{session.pendingPermission.summary}</strong>
+                        <span class="eyebrow">{tr("Permission requested", "Permissão solicitada")}</span>
+                        <strong>{shown(session.pendingPermission.summary)}</strong>
                         <code>{session.pendingPermission.resource}</code>
                         <div class="permission-actions">
                           {#each session.permissionProfile.availableActions as action}
@@ -1045,7 +1106,7 @@
                       </div>
                     {:else if !session.permissionProfile.canRespondFromLume}
                       <p class="integration-note">
-                        O Lume acompanha esta origem; as ações continuam nela.
+                        {tr("Lume monitors this source; actions continue there.", "O Lume acompanha esta origem; as ações continuam nela.")}
                       </p>
                     {/if}
 
@@ -1057,7 +1118,7 @@
                         onclick={() => toggleSessionComposer(session)}
                       >
                         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
-                        Continuar pelo Lume
+                        {session.status === "waiting_for_input" ? tr("Send prompt through Lume", "Enviar prompt pelo Lume") : tr("Continue through Lume", "Continuar pelo Lume")}
                       </button>
                       {#if composerSessionId === session.id}
                         <form
@@ -1070,15 +1131,35 @@
                         >
                           <textarea
                             bind:value={composerPrompt}
-                            aria-label="Novo prompt para {session.agentLabel}"
-                            placeholder="Digite o próximo prompt…"
+                            aria-label={tr(`New prompt for ${session.agentLabel}`, `Novo prompt para ${session.agentLabel}`)}
+                            placeholder={tr("Enter the next prompt…", "Digite o próximo prompt…")}
                             rows="2"
                           ></textarea>
-                          <button disabled={!composerPrompt.trim() || composerSending} type="submit" aria-label="Enviar prompt">
+                          <button disabled={!composerPrompt.trim() || composerSending} type="submit" aria-label={tr("Send prompt", "Enviar prompt")}>
                             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
                           </button>
                         </form>
                         {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
+                      {/if}
+                    {/if}
+
+                    {#if canTerminateSession(session)}
+                      <div class:confirming={terminateConfirmId === session.id} class="terminate-agent-control">
+                        {#if terminateConfirmId === session.id}
+                          <span>{tr("Stop the agent and its running commands?", "Encerrar o agente e os comandos em execução?")}</span>
+                          <button type="button" onclick={() => (terminateConfirmId = null)}>{tr("Cancel", "Cancelar")}</button>
+                          <button class="danger" disabled={terminatingSessionId === session.id} type="button" onclick={() => void terminateAgent(session)}>
+                            {terminatingSessionId === session.id ? tr("Stopping…", "Encerrando…") : tr("Stop", "Encerrar")}
+                          </button>
+                        {:else}
+                          <button type="button" onclick={() => void terminateAgent(session)}>
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+                            {tr("Stop agent", "Encerrar agente")}
+                          </button>
+                        {/if}
+                      </div>
+                      {#if sessionActionMessage && (terminateConfirmId === session.id || terminatingSessionId === session.id)}
+                        <p class="inline-error">{sessionActionMessage}</p>
                       {/if}
                     {/if}
                   </div>
@@ -1087,17 +1168,17 @@
             {:else}
               <div class="empty-state" transition:fade>
                 <span class="quiet-orbit" aria-hidden="true"><i></i></span>
-                <strong>Nenhuma sessão ativa</strong>
-                <p>Novas sessões aparecerão aqui automaticamente.</p>
+                <strong>{tr("No active sessions", "Nenhuma sessão ativa")}</strong>
+                <p>{tr("New sessions will appear here automatically.", "Novas sessões aparecerão aqui automaticamente.")}</p>
               </div>
             {/each}
           </div>
         {:else if view === "board"}
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="board-intro">
-              <span class="eyebrow">Terminais flutuantes</span>
-              <strong>Um espaço separado para cada chat</strong>
-              <p>Abra mini terminais independentes e aproxime um do outro para acoplá-los.</p>
+              <span class="eyebrow">{tr("Floating terminals", "Terminais flutuantes")}</span>
+              <strong>{tr("A separate space for each chat", "Um espaço separado para cada chat")}</strong>
+              <p>{tr("Open independent mini terminals and move them close to dock them.", "Abra mini terminais independentes e aproxime um do outro para acoplá-los.")}</p>
             </div>
 
             <div class="terminal-picker">
@@ -1115,20 +1196,20 @@
                   <button
                     disabled={openingTerminal !== null || terminalIsOpen(session)}
                     type="button"
-                    title={terminalIsOpen(session) ? "Feche o terminal pelo X para abri-lo novamente" : "Abrir terminal separado"}
+                    title={terminalIsOpen(session) ? tr("Close the terminal with X to open it again", "Feche o terminal pelo X para abri-lo novamente") : tr("Open separate terminal", "Abrir terminal separado")}
                     onclick={() => openTerminal(session)}
                   >
-                    {openingTerminal === session.id ? "Abrindo…" : "Abrir"}
+                    {openingTerminal === session.id ? tr("Opening…", "Abrindo…") : tr("Open", "Abrir")}
                   </button>
                 </div>
               {:else}
-                <p class="board-empty">As sessões aparecerão aqui quando forem detectadas.</p>
+                <p class="board-empty">{tr("Sessions will appear here when detected.", "As sessões aparecerão aqui quando forem detectadas.")}</p>
               {/each}
             </div>
             {#if terminalMessage}<p class="board-message" transition:fade>{terminalMessage}</p>{/if}
             <div class="dock-guide">
               <svg viewBox="0 0 32 20" aria-hidden="true"><rect x="2" y="3" width="12" height="14" rx="3" /><rect x="18" y="3" width="12" height="14" rx="3" /><path d="M14 10h4" /></svg>
-              <span>Cada janela tem seu próprio prompt. Acople pelas laterais ou por cima e por baixo.</span>
+              <span>{tr("Each window has its own prompt. Dock them side by side or above and below.", "Cada janela tem seu próprio prompt. Acople pelas laterais ou por cima e por baixo.")}</span>
             </div>
           </div>
         {:else if view === "history"}
@@ -1143,21 +1224,21 @@
               </div>
             {:else}
               <div class="empty-state">
-                <strong>Histórico vazio</strong>
-                <p>Conclusões, erros e decisões aparecerão aqui.</p>
+                <strong>{tr("No history yet", "Histórico vazio")}</strong>
+                <p>{tr("Completions, errors, and decisions will appear here.", "Conclusões, erros e decisões aparecerão aqui.")}</p>
               </div>
             {/each}
-            <p class="privacy-note">Comandos, caminhos e conteúdos de permissões não são guardados.</p>
+            <p class="privacy-note">{tr("Commands, paths, and permission contents are not stored.", "Comandos, caminhos e conteúdos de permissões não são guardados.")}</p>
           </div>
         {:else}
           <div class="settings" in:fade={{ duration: 150 }}>
-            <div class="settings-section-label">Agentes</div>
+            <div class="settings-section-label">{tr("Agents", "Agentes")}</div>
             {#each integrations as integration}
               <div class="integration-row">
                 <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
                 <div>
                   <strong>{integration.label}</strong>
-                  <span>{integration.detail}</span>
+                  <span>{shown(integration.detail)}</span>
                 </div>
                 <button
                   class:connected={integration.configured}
@@ -1168,8 +1249,8 @@
                   {configuringIntegration === integration.kind
                     ? "…"
                     : integration.configured
-                      ? "Conectado"
-                      : "Conectar"}
+                      ? tr("Connected", "Conectado")
+                      : tr("Connect", "Conectar")}
                 </button>
               </div>
             {/each}
@@ -1183,29 +1264,40 @@
               <span class="agent-avatar agent-vscode"><BrandIcon name="vscode" size={19} /></span>
               <div>
                 <strong>VS Code Companion</strong>
-                <span>{vscodeStatus.detail}</span>
+                <span>{shown(vscodeStatus.detail)}</span>
               </div>
               <button
                 class:connected={vscodeStatus.configured}
                 disabled={!vscodeStatus.installed || configuringVscode}
                 type="button"
                 onclick={toggleVscode}
-              >{configuringVscode ? "…" : vscodeStatus.configured ? "Conectado" : "Conectar"}</button>
+              >{configuringVscode ? "…" : vscodeStatus.configured ? tr("Connected", "Conectado") : tr("Connect", "Conectar")}</button>
             </div>
             <div class="integration-row browser-row">
               <span class="agent-avatar agent-browser"><BrandIcon name="browsers" size={21} /></span>
               <div>
-                <strong>Chrome, Edge e Brave</strong>
-                <span>Carregue a pasta como extensão descompactada.</span>
+                <strong>Chrome, Edge & Brave</strong>
+                <span>{tr("Load the folder as an unpacked extension.", "Carregue a pasta como extensão descompactada.")}</span>
               </div>
-              <button type="button" onclick={openBrowserCompanion}>Abrir pasta</button>
+              <button type="button" onclick={openBrowserCompanion}>{tr("Open folder", "Abrir pasta")}</button>
             </div>
             {#if browserCompanionPath}
               <p class="browser-path" transition:fade>{browserCompanionPath}</p>
             {/if}
-            <div class="settings-section-label preferences-label">Preferências</div>
+            <div class="settings-section-label preferences-label">{tr("Preferences", "Preferências")}</div>
+            <label class="field-row">
+              <span><strong>{tr("Language", "Idioma")}</strong><small>{tr("Lume interface language.", "Idioma da interface do Lume.")}</small></span>
+              <select
+                value={preferences.language}
+                onchange={(event) =>
+                  updatePreference("language", event.currentTarget.value as Preferences["language"])}
+              >
+                <option value="en">English</option>
+                <option value="pt-BR">Português</option>
+              </select>
+            </label>
             <div class="setting-row">
-              <div><strong>Iniciar com o sistema</strong><span>Lume fica disponível na bandeja.</span></div>
+              <div><strong>{tr("Start with the system", "Iniciar com o sistema")}</strong><span>{tr("Lume stays available in the system tray.", "Lume fica disponível na bandeja.")}</span></div>
               <label class="switch">
                 <input
                   type="checkbox"
@@ -1217,7 +1309,7 @@
               </label>
             </div>
             <div class="setting-row">
-              <div><strong>Sons sutis</strong><span>Apenas ao finalizar ou encontrar erro.</span></div>
+              <div><strong>{tr("Subtle sounds", "Sons sutis")}</strong><span>{tr("Only when a task finishes, fails, or requests permission.", "Apenas ao finalizar, encontrar erro ou pedir permissão.")}</span></div>
               <label class="switch">
                 <input
                   type="checkbox"
@@ -1229,7 +1321,7 @@
               </label>
             </div>
             <div class="setting-row">
-              <div><strong>Sobre tela cheia</strong><span>Desativado evita vídeos e jogos.</span></div>
+              <div><strong>{tr("Show over fullscreen", "Sobre tela cheia")}</strong><span>{tr("Keep disabled to avoid videos and games.", "Desativado evita vídeos e jogos.")}</span></div>
               <label class="switch">
                 <input
                   type="checkbox"
@@ -1241,20 +1333,20 @@
               </label>
             </div>
             <label class="field-row">
-              <span><strong>Monitor</strong><small>O principal é usado por padrão.</small></span>
+              <span><strong>{tr("Monitor", "Monitor")}</strong><small>{tr("The primary display is used by default.", "O principal é usado por padrão.")}</small></span>
               <select
                 value={preferences.monitorId ?? ""}
                 onchange={(event) =>
                   updatePreference("monitorId", event.currentTarget.value || undefined)}
               >
-                <option value="">Principal</option>
+                <option value="">{tr("Primary", "Principal")}</option>
                 {#each monitors as monitor}
                   <option value={monitor.id}>{monitor.label}</option>
                 {/each}
               </select>
             </label>
             <label class="field-row">
-              <span><strong>Histórico</strong><small>Resumos locais e sanitizados.</small></span>
+              <span><strong>{tr("History", "Histórico")}</strong><small>{tr("Local, sanitized summaries.", "Resumos locais e sanitizados.")}</small></span>
               <select
                 value={preferences.historyRetentionDays}
                 onchange={(event) =>
@@ -1263,14 +1355,14 @@
                     Number(event.currentTarget.value),
                   )}
               >
-                <option value={7}>7 dias</option>
-                <option value={30}>30 dias</option>
-                <option value={90}>90 dias</option>
+                <option value={7}>{tr("7 days", "7 dias")}</option>
+                <option value={30}>{tr("30 days", "30 dias")}</option>
+                <option value={90}>{tr("90 days", "90 dias")}</option>
               </select>
             </label>
             <div class="launch-setting">
-              <span><strong>Abrir sessões em</strong><small>Use sua ferramenta habitual.</small></span>
-              <div class="segmented" aria-label="Destino das sessões">
+              <span><strong>{tr("Open sessions in", "Abrir sessões em")}</strong><small>{tr("Use your usual tool.", "Use sua ferramenta habitual.")}</small></span>
+              <div class="segmented" aria-label={tr("Session destination", "Destino das sessões")}>
                 {#each [["auto", "Auto"], ["terminal", "Terminal"], ["vscode", "VS Code"]] as option}
                   <button
                     class:active={preferences.launchTarget === option[0]}
@@ -1281,17 +1373,17 @@
                 {/each}
               </div>
             </div>
-            <div class="settings-section-label preferences-label">Sobre</div>
+            <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
             <div class="update-card" aria-live="polite">
               <div class="update-main">
                 <LumeLogo size={30} />
                 <div class="update-copy">
                   <strong>Lume</strong>
-                  <span>Versão {appVersion}</span>
+                  <span>{tr("Version", "Versão")} {appVersion}</span>
                 </div>
                 {#if updateState === "available"}
                   <button class="update-available" type="button" onclick={installAvailableUpdate}>
-                    Atualizar para {availableVersion}
+                    {tr("Update to", "Atualizar para")} {availableVersion}
                   </button>
                 {:else}
                   <button
@@ -1300,14 +1392,14 @@
                     onclick={checkForUpdates}
                   >
                     {updateState === "checking"
-                      ? "Verificando…"
+                      ? tr("Checking…", "Verificando…")
                       : updateState === "downloading"
                         ? updateProgress === null
-                          ? "Baixando…"
+                          ? tr("Downloading…", "Baixando…")
                           : `${updateProgress}%`
                         : updateState === "ready"
-                          ? "Reiniciando…"
-                          : "Verificar"}
+                          ? tr("Restarting…", "Reiniciando…")
+                          : tr("Check", "Verificar")}
                   </button>
                 {/if}
               </div>
@@ -1318,7 +1410,7 @@
                 </div>
               {/if}
             </div>
-            <span class:visible={savingSettings} class="save-state">Salvando…</span>
+            <span class:visible={savingSettings} class="save-state">{tr("Saving…", "Salvando…")}</span>
           </div>
         {/if}
       </div>
@@ -1328,12 +1420,12 @@
           class:active={view === "sessions"}
           type="button"
           onclick={() => openView("sessions")}
-          aria-label="Sessões"
+          aria-label={tr("Sessions", "Sessões")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <circle cx="6" cy="10" r="2.5" /><circle cx="14" cy="10" r="2.5" />
           </svg>
-          <span>Sessões</span>
+          <span>{tr("Sessions", "Sessões")}</span>
         </button>
         <button
           class:active={view === "board"}
@@ -1345,31 +1437,31 @@
             <circle cx="5" cy="6" r="2" /><circle cx="15" cy="6" r="2" /><circle cx="10" cy="15" r="2" />
             <path d="m6.7 7 2.2 6M13.3 7l-2.2 6M7 6h6" />
           </svg>
-          <span>Mesa</span>
+          <span>{tr("Board", "Mesa")}</span>
         </button>
         <button
           class:active={view === "history"}
           type="button"
           onclick={() => openView("history")}
-          aria-label="Histórico"
+          aria-label={tr("History", "Histórico")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M4.5 5.5h11M4.5 10h11M4.5 14.5h7" />
           </svg>
-          <span>Histórico</span>
+          <span>{tr("History", "Histórico")}</span>
         </button>
         <button
           class:active={view === "settings"}
           class:has-update={updateState === "available"}
           type="button"
           onclick={() => openView("settings")}
-          aria-label="Configurações"
+          aria-label={tr("Settings", "Configurações")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <circle cx="10" cy="10" r="3" />
             <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4" />
           </svg>
-          <span>Ajustes</span>
+          <span>{tr("Settings", "Ajustes")}</span>
         </button>
       </footer>
     </section>
@@ -1677,6 +1769,14 @@
   .inline-composer button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
   .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer button:disabled { opacity: 0.35; cursor: default; }
+  .terminate-agent-control { margin-top: 11px; display: flex; align-items: center; gap: 6px; }
+  .terminate-agent-control > button { padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #9a5c59; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
+  .terminate-agent-control > button svg { width: 13px; height: 13px; }
+  .terminate-agent-control.confirming { padding: 7px 8px; border: 1px solid rgba(166, 77, 77, 0.13); border-radius: 9px; background: rgba(166, 77, 77, 0.035); }
+  .terminate-agent-control.confirming span { min-width: 0; flex: 1; color: #755b57; font-size: 9px; line-height: 1.35; }
+  .terminate-agent-control.confirming button { min-height: 24px; padding: 0 7px; border: 1px solid rgba(91, 107, 100, 0.13); border-radius: 7px; color: #627068; background: rgba(255, 255, 255, 0.42); font-size: 8px; font-weight: 700; cursor: pointer; }
+  .terminate-agent-control.confirming button.danger { border-color: rgba(166, 77, 77, 0.2); color: #a54c4c; }
+  .terminate-agent-control button:disabled { opacity: 0.45; cursor: default; }
 
   .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
