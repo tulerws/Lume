@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import type { AgentSession, PermissionAction, Preferences, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, TerminalWindowState } from "$lib/domain";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
@@ -30,6 +30,13 @@
   let dragging = $state(false);
   let dragMoved = false;
   let dragFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingMove: { x: number; y: number } | null = null;
+  let lastMove: { x: number; y: number } | null = null;
+  let moveSyncRunning = false;
+  let finalizeRequested = false;
+  let settling = $state(false);
+  let dockMovingLabel = $state<string | null>(null);
+  let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
   let terminateConfirm = $state(false);
   let terminating = $state(false);
   let language = $state<Language>("en");
@@ -60,6 +67,7 @@
     let stopListening: (() => void) | undefined;
     let stopMoved: (() => void) | undefined;
     let stopPreferences: (() => void) | undefined;
+    let stopDockPreview: (() => void) | undefined;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -81,23 +89,21 @@
         language = payload.language;
         darkMode = payload.darkMode;
       });
+      stopDockPreview = await listen<DockPreviewEvent>("lume://terminal-dock-preview", ({ payload }) => {
+        const relevant = payload.preview &&
+          (payload.movingLabel === label || payload.preview.targetLabel === label);
+        if (relevant) {
+          dockMovingLabel = payload.movingLabel;
+          dockPreview = payload.preview;
+        } else if (payload.movingLabel === dockMovingLabel || payload.movingLabel === label) {
+          dockMovingLabel = null;
+          dockPreview = null;
+        }
+      });
       stopMoved = await currentWindow.onMoved(({ payload }) => {
-        if (!dragging) return;
+        if (!dragging || settling) return;
         dragMoved = true;
-        if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
-        void syncTerminalWindowPosition(label, payload.x, payload.y, false).then((next) => {
-          windowState = next;
-        }).catch((error) => {
-          message = String(error).replace(/^Error:\s*/, "");
-        });
-        dragFinalizeTimer = setTimeout(() => {
-          dragging = false;
-          void syncTerminalWindowPosition(label, payload.x, payload.y, true).then((next) => {
-            windowState = next;
-          }).catch((error) => {
-            message = String(error).replace(/^Error:\s*/, "");
-          });
-        }, 320);
+        queueNativeMove(payload.x, payload.y);
       });
     })();
     return () => {
@@ -105,6 +111,7 @@
       stopListening?.();
       stopMoved?.();
       stopPreferences?.();
+      stopDockPreview?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
     };
@@ -132,11 +139,66 @@
     return "unknown" as const;
   }
 
+  function queueNativeMove(x: number, y: number) {
+    const next = { x, y };
+    pendingMove = next;
+    lastMove = next;
+    finalizeRequested = false;
+    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
+    dragFinalizeTimer = setTimeout(() => {
+      finalizeRequested = true;
+      void flushNativeMoves();
+    }, 220);
+    void flushNativeMoves();
+  }
+
+  async function flushNativeMoves() {
+    if (moveSyncRunning) return;
+    moveSyncRunning = true;
+    try {
+      while (pendingMove) {
+        const next = pendingMove;
+        pendingMove = null;
+        windowState = await syncTerminalWindowPosition(label, next.x, next.y, false);
+      }
+      if (finalizeRequested && lastMove) {
+        const finalPosition = lastMove;
+        finalizeRequested = false;
+        settling = true;
+        dragging = false;
+        dockPreview = null;
+        windowState = await syncTerminalWindowPosition(
+          label,
+          finalPosition.x,
+          finalPosition.y,
+          true,
+        );
+        setTimeout(() => {
+          settling = false;
+        }, 240);
+      }
+    } catch (error) {
+      dragging = false;
+      settling = false;
+      finalizeRequested = false;
+      pendingMove = null;
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      moveSyncRunning = false;
+      if (pendingMove || finalizeRequested) void flushNativeMoves();
+    }
+  }
+
   async function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
     if ((event.target as HTMLElement).closest("button, textarea")) return;
     dragging = true;
     dragMoved = false;
+    pendingMove = null;
+    lastMove = null;
+    finalizeRequested = false;
+    settling = false;
+    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
     try {
       await currentWindow.startDragging();
       setTimeout(() => {
@@ -156,6 +218,11 @@
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
+    dragging = false;
+    finalizeRequested = false;
+    pendingMove = null;
+    dockPreview = null;
+    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
     try {
       await currentWindow.startResizeDragging(direction);
     } catch (error) {
@@ -234,7 +301,20 @@
 
 <main class:dark={effectiveDark} class="terminal-window">
   {#if session}
-    <section class:dragging class="terminal-card">
+    <section
+      class:dragging
+      class:settling
+      class:dock-moving={dockMovingLabel === label && Boolean(dockPreview)}
+      class:dock-target={dockPreview?.targetLabel === label}
+      class:dock-left={dockPreview?.side === "left"}
+      class:dock-right={dockPreview?.side === "right"}
+      class:dock-top={dockPreview?.side === "top"}
+      class:dock-bottom={dockPreview?.side === "bottom"}
+      class="terminal-card"
+    >
+      {#if dockPreview?.targetLabel === label}
+        <div class="dock-silhouette" aria-hidden="true"><span>{tr("Dock", "Acoplar")}</span></div>
+      {/if}
       <header
         role="banner"
         onpointerdown={(event) => void beginDrag(event)}
@@ -340,10 +420,26 @@
 
 <style>
   .terminal-window { width: 100%; height: 100%; }
-  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.97); box-shadow: 0 10px 34px rgba(20, 36, 29, 0.2); backdrop-filter: blur(24px) saturate(120%); }
+  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.97); box-shadow: 0 10px 34px rgba(20, 36, 29, 0.2); backdrop-filter: blur(24px) saturate(120%); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
   .terminal-card.resizing { user-select: none; }
+  .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.5); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.24), 0 0 0 2px rgba(75, 157, 120, 0.08); transform: scale(0.992); }
+  .terminal-card.settling { border-color: rgba(69, 139, 108, 0.42); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.2); }
+  .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.48); border-radius: 13px; background: rgba(76, 161, 121, 0.035); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.38); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
+  .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.56); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.2), rgba(77, 164, 121, 0.07)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.1); }
+  .dock-silhouette span { position: absolute; z-index: 1; padding: 3px 6px; border-radius: 999px; color: #39755a; background: rgba(232, 246, 239, 0.9); font-size: 7px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+  .dock-left .dock-silhouette::before, .dock-right .dock-silhouette::before { top: 12%; bottom: 12%; width: 31%; }
+  .dock-left .dock-silhouette::before { left: 7px; }
+  .dock-right .dock-silhouette::before { right: 7px; }
+  .dock-left .dock-silhouette span { top: 50%; left: 12px; transform: translateY(-50%); }
+  .dock-right .dock-silhouette span { top: 50%; right: 12px; transform: translateY(-50%); }
+  .dock-top .dock-silhouette::before, .dock-bottom .dock-silhouette::before { right: 12%; left: 12%; height: 31%; }
+  .dock-top .dock-silhouette::before { top: 7px; }
+  .dock-bottom .dock-silhouette::before { bottom: 7px; }
+  .dock-top .dock-silhouette span { top: 12px; left: 50%; transform: translateX(-50%); }
+  .dock-bottom .dock-silhouette span { bottom: 12px; left: 50%; transform: translateX(-50%); }
+  @keyframes dock-breathe { from { opacity: 0.7; } to { opacity: 1; } }
   .agent-icon { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 8px; background: rgba(80, 105, 94, 0.06); }
   .identity { min-width: 0; flex: 1; display: grid; gap: 1px; }
   .identity strong { color: #26342e; font-size: 11px; }
@@ -401,6 +497,11 @@
 
   .terminal-window.dark { color-scheme: dark; }
   .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
+  .terminal-window.dark .terminal-card.dock-moving,
+  .terminal-window.dark .terminal-card.settling { border-color: rgba(91, 186, 143, 0.5); box-shadow: 0 12px 38px rgba(8, 21, 15, 0.48), 0 0 0 2px rgba(91, 186, 143, 0.08); }
+  .terminal-window.dark .dock-silhouette { border-color: rgba(96, 193, 149, 0.5); background: rgba(72, 157, 116, 0.06); box-shadow: inset 0 0 0 1px rgba(154, 220, 188, 0.08); }
+  .terminal-window.dark .dock-silhouette::before { border-color: rgba(99, 197, 152, 0.52); background: linear-gradient(135deg, rgba(79, 174, 128, 0.22), rgba(69, 149, 111, 0.08)); }
+  .terminal-window.dark .dock-silhouette span { color: #a8d9c2; background: rgba(27, 51, 40, 0.92); }
   .terminal-window.dark .terminal-card > header,
   .terminal-window.dark .terminal-composer { border-color: rgba(190, 209, 200, 0.09); }
   .terminal-window.dark .identity strong { color: #e2ebe6; }
@@ -417,4 +518,8 @@
   .terminal-window.dark .permission strong { color: #dfc6ac; }
   .terminal-window.dark .permission code,
   .terminal-window.dark .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }
+  @media (prefers-reduced-motion: reduce) {
+    .terminal-card { transition-duration: 0.01ms; }
+    .dock-silhouette { animation: none; }
+  }
 </style>

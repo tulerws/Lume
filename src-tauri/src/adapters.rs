@@ -153,11 +153,7 @@ fn permission_profile(
             "Somente leitura",
             "Alterações exigem permissão",
         ),
-        _ => (
-            AccessMode::Custom,
-            "Permissões da sessão",
-            "Segue a configuração desta conversa",
-        ),
+        _ => (AccessMode::Custom, "Permissões da sessão", ""),
     };
 
     let mut available_actions = if direct_response {

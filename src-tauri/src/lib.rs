@@ -470,6 +470,14 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let database_path = app
                 .path()

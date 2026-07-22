@@ -132,3 +132,17 @@ export interface TerminalWindowState {
   height: number;
   docked: boolean;
 }
+
+export type DockSide = "left" | "right" | "top" | "bottom";
+
+export interface DockPreviewEvent {
+  movingLabel: string;
+  preview: {
+    targetLabel: string;
+    side: DockSide;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
+}

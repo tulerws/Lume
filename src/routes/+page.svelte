@@ -122,7 +122,7 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.8");
+  let appVersion = $state("0.3.9");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("Updates are checked automatically.");
@@ -1223,7 +1223,6 @@
 
                     {#if session.pendingPermission}
                       <div class="permission-block risk-{session.pendingPermission.risk}">
-                        <span class="eyebrow">{tr("Permission requested", "Permissão solicitada")}</span>
                         <strong>{shown(session.pendingPermission.summary)}</strong>
                         <code>{session.pendingPermission.resource}</code>
                         <div class="permission-actions">
@@ -1975,7 +1974,6 @@
   .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
 
   .permission-block { padding-left: 11px; border-left: 2px solid #d49350; display: grid; gap: 6px; }
-  .permission-block .eyebrow { color: #a06323; font-size: 9px; font-weight: 780; letter-spacing: 0.05em; text-transform: uppercase; }
   .permission-block > strong { color: #4d3b2a; font-size: 11px; font-weight: 650; line-height: 1.4; }
   code { padding: 7px 8px; overflow: hidden; border-radius: 7px; color: #46524d; background: rgba(70, 82, 77, 0.055); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 

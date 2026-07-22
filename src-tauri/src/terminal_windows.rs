@@ -1,7 +1,8 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -18,8 +19,37 @@ const TERMINAL_MIN_WIDTH: i32 = 300;
 const TERMINAL_MIN_HEIGHT: i32 = 240;
 const TERMINAL_MAX_WIDTH: i32 = 760;
 const TERMINAL_MAX_HEIGHT: i32 = 640;
-const DOCK_DISTANCE: i32 = 34;
+const DOCK_DISTANCE: i32 = 46;
 const SCREEN_MARGIN: i32 = 12;
+const DOCK_ANIMATION_STEPS: i32 = 9;
+const MAX_REASONABLE_COORDINATE: i32 = 65_536;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockPreview {
+    pub target_label: String,
+    pub side: DockSide,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DockPreviewEvent {
+    moving_label: String,
+    preview: Option<DockPreview>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +75,45 @@ struct Placement {
     ready: bool,
 }
 
+#[derive(Clone, Debug)]
+struct DockPlan {
+    score: i32,
+    other_label: String,
+    side: DockSide,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl DockPlan {
+    fn preview(&self) -> DockPreview {
+        DockPreview {
+            target_label: self.other_label.clone(),
+            side: self.side,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WindowTransition {
+    from: TerminalWindowState,
+    to: TerminalWindowState,
+}
+
+#[derive(Debug)]
+struct MoveUpdate {
+    moving_labels: Vec<String>,
+    current: TerminalWindowState,
+    preview: Option<DockPreview>,
+    snapped: bool,
+    transitions: Vec<WindowTransition>,
+}
+
 impl Placement {
     fn state(&self) -> TerminalWindowState {
         TerminalWindowState {
@@ -62,6 +131,7 @@ impl Placement {
 #[derive(Clone, Default)]
 pub struct TerminalWindows {
     placements: Arc<Mutex<HashMap<String, Placement>>>,
+    settling: Arc<Mutex<HashSet<String>>>,
 }
 
 impl TerminalWindows {
@@ -149,6 +219,8 @@ impl TerminalWindows {
                 .decorations(false)
                 .transparent(true)
                 .always_on_top(true)
+                .skip_taskbar(true)
+                .shadow(false)
                 .resizable(true)
                 .visible(true)
                 .on_page_load(move |window, payload| {
@@ -172,8 +244,14 @@ impl TerminalWindows {
         let cleanup_label = label.clone();
         let event_window = window.clone();
         window.on_window_event(move |event| match event {
-            WindowEvent::Destroyed => registry.remove(&cleanup_label),
+            WindowEvent::Destroyed => {
+                emit_dock_preview(event_window.app_handle(), &cleanup_label, None);
+                registry.remove(&cleanup_label);
+            }
             WindowEvent::Resized(size) => {
+                if registry.is_settling(&cleanup_label) {
+                    return;
+                }
                 let scale = event_window.scale_factor().unwrap_or(1.0);
                 registry.resize(
                     &cleanup_label,
@@ -224,6 +302,7 @@ impl TerminalWindows {
         let window = app
             .get_webview_window(label)
             .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        emit_dock_preview(app, label, None);
         window.close().map_err(|error| error.to_string())?;
         self.remove(label);
         Ok(())
@@ -238,40 +317,22 @@ impl TerminalWindows {
         finalize: bool,
         monitor_id: Option<&str>,
     ) -> Result<TerminalWindowState, String> {
-        let (states, current) = {
+        validate_coordinates(x, y)?;
+        let update = {
             let mut placements = self
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível mover o mini terminal".to_string())?;
-            let current = placements
-                .get(label)
-                .cloned()
-                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-            let moving_labels = group_labels(&placements, &current);
-            let dx = x - current.x;
-            let dy = y - current.y;
-            shift(&mut placements, &moving_labels, dx, dy);
-
-            if finalize {
-                if let Some((other_label, snap_x, snap_y)) =
-                    dock_candidate(&placements, label, &moving_labels)
-                {
-                    shift(&mut placements, &moving_labels, snap_x, snap_y);
-                    merge_groups(&mut placements, &moving_labels, &other_label);
-                }
-            }
-            let current = placements
-                .get(label)
-                .map(Placement::state)
-                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-            let states = placements
-                .values()
-                .map(Placement::state)
-                .collect::<Vec<_>>();
-            (states, current)
+            update_placements(&mut placements, label, x, y, finalize)?
         };
-        move_native_windows(app, &states, monitor_id);
-        Ok(current)
+        emit_dock_preview(app, label, update.preview.clone());
+        if update.snapped {
+            self.animate_native_windows(app, update.transitions, monitor_id);
+        } else {
+            let states = self.states_for_labels(&update.moving_labels)?;
+            move_native_windows(app, &states, monitor_id, true);
+        }
+        Ok(update.current)
     }
 
     pub fn sync_native_position(
@@ -283,62 +344,109 @@ impl TerminalWindows {
         finalize: bool,
         monitor_id: Option<&str>,
     ) -> Result<TerminalWindowState, String> {
+        validate_coordinates(physical_x, physical_y)?;
         let window = app
             .get_webview_window(label)
             .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-        let monitor_position = window
+        let monitor = window
             .current_monitor()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let monitor_position = monitor
+            .as_ref()
             .map(|monitor| *monitor.position())
             .unwrap_or_default();
-        let x = physical_x - monitor_position.x;
-        let y = physical_y - monitor_position.y;
+        let monitor_size = monitor.as_ref().map(|monitor| *monitor.size());
+        let monitor_scale = monitor
+            .as_ref()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or(1.0);
+        let mut x = physical_x - monitor_position.x;
+        let mut y = physical_y - monitor_position.y;
+        validate_coordinates(x, y)?;
 
-        let (states, current, snapped) = {
+        let update = {
             let mut placements = self
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível sincronizar o mini terminal".to_string())?;
-            let current = placements
-                .get(label)
-                .cloned()
-                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-            let moving_labels = group_labels(&placements, &current);
-            let dx = x - current.x;
-            let dy = y - current.y;
-            if dx == 0 && dy == 0 && !finalize {
-                return Ok(current.state());
+            if let (Some(size), Some(current)) = (monitor_size, placements.get(label)) {
+                (x, y) = clamp_drag_to_monitor(
+                    x,
+                    y,
+                    current.width,
+                    current.height,
+                    size.width as i32,
+                    size.height as i32,
+                    monitor_scale,
+                );
             }
-            shift(&mut placements, &moving_labels, dx, dy);
-
-            let mut snapped = false;
-            if finalize {
-                if let Some((other_label, snap_x, snap_y)) =
-                    dock_candidate(&placements, label, &moving_labels)
-                {
-                    shift(&mut placements, &moving_labels, snap_x, snap_y);
-                    merge_groups(&mut placements, &moving_labels, &other_label);
-                    snapped = true;
-                }
-            }
-            let current = placements
-                .get(label)
-                .map(Placement::state)
-                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-            let states = placements
-                .values()
-                .filter(|placement| {
-                    moving_labels.contains(&placement.label)
-                        && (placement.label != label || snapped)
-                })
-                .map(Placement::state)
-                .collect::<Vec<_>>();
-            (states, current, snapped)
+            update_placements(&mut placements, label, x, y, finalize)?
         };
-        if !states.is_empty() || snapped {
-            move_native_windows(app, &states, monitor_id);
+        emit_dock_preview(app, label, update.preview.clone());
+        if update.snapped {
+            self.animate_native_windows(app, update.transitions, monitor_id);
+        } else if finalize || update.moving_labels.len() > 1 {
+            let states = self
+                .states_for_labels(&update.moving_labels)?
+                .into_iter()
+                .filter(|state| finalize || state.label != label)
+                .collect::<Vec<_>>();
+            move_native_windows(app, &states, monitor_id, false);
         }
-        Ok(current)
+        Ok(update.current)
+    }
+
+    fn states_for_labels(&self, labels: &[String]) -> Result<Vec<TerminalWindowState>, String> {
+        let placements = self
+            .placements
+            .lock()
+            .map_err(|_| "Não foi possível acessar os mini terminais".to_string())?;
+        Ok(placements
+            .values()
+            .filter(|placement| labels.contains(&placement.label))
+            .map(Placement::state)
+            .collect())
+    }
+
+    fn animate_native_windows(
+        &self,
+        app: &AppHandle,
+        transitions: Vec<WindowTransition>,
+        monitor_id: Option<&str>,
+    ) {
+        if transitions.is_empty() {
+            return;
+        }
+        if let Ok(mut settling) = self.settling.lock() {
+            settling.extend(
+                transitions
+                    .iter()
+                    .map(|transition| transition.to.label.clone()),
+            );
+        }
+        let settling = self.settling.clone();
+        let app = app.clone();
+        let monitor_id = monitor_id.map(str::to_string);
+        let _ = std::thread::Builder::new()
+            .name("lume-terminal-dock".into())
+            .spawn(move || {
+                for step in 1..=DOCK_ANIMATION_STEPS {
+                    let progress = f64::from(step) / f64::from(DOCK_ANIMATION_STEPS);
+                    let eased = 1.0 - (1.0 - progress).powi(3);
+                    let states = transitions
+                        .iter()
+                        .map(|transition| interpolate_state(transition, eased))
+                        .collect::<Vec<_>>();
+                    move_native_windows(&app, &states, monitor_id.as_deref(), true);
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                std::thread::sleep(Duration::from_millis(48));
+                if let Ok(mut settling) = settling.lock() {
+                    for transition in &transitions {
+                        settling.remove(&transition.to.label);
+                    }
+                }
+            });
     }
 
     pub fn undock(&self, label: &str) -> Result<TerminalWindowState, String> {
@@ -428,6 +536,13 @@ impl TerminalWindows {
         }
     }
 
+    fn is_settling(&self, label: &str) -> bool {
+        self.settling
+            .lock()
+            .map(|settling| settling.contains(label))
+            .unwrap_or(false)
+    }
+
     fn mark_ready(&self, label: &str) {
         if let Ok(mut placements) = self.placements.lock() {
             if let Some(placement) = placements.get_mut(label) {
@@ -483,6 +598,22 @@ fn clamp_to_monitor(
     (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
 }
 
+fn clamp_drag_to_monitor(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    monitor_width: i32,
+    monitor_height: i32,
+    scale: f64,
+) -> (i32, i32) {
+    let physical_width = (f64::from(width) * scale).round() as i32;
+    let physical_height = (f64::from(height) * scale).round() as i32;
+    let max_x = (monitor_width - physical_width - SCREEN_MARGIN).max(SCREEN_MARGIN);
+    let max_y = (monitor_height - physical_height - SCREEN_MARGIN).max(SCREEN_MARGIN);
+    (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
+}
+
 fn terminal_label(session_id: &str) -> String {
     let mut hasher = DefaultHasher::new();
     session_id.hash(&mut hasher);
@@ -509,56 +640,168 @@ fn shift(placements: &mut HashMap<String, Placement>, labels: &[String], dx: i32
     }
 }
 
+fn validate_coordinates(x: i32, y: i32) -> Result<(), String> {
+    if x.abs() > MAX_REASONABLE_COORDINATE || y.abs() > MAX_REASONABLE_COORDINATE {
+        return Err(
+            "O compositor enviou uma posição inválida; o terminal foi mantido visível".into(),
+        );
+    }
+    Ok(())
+}
+
+fn update_placements(
+    placements: &mut HashMap<String, Placement>,
+    label: &str,
+    x: i32,
+    y: i32,
+    finalize: bool,
+) -> Result<MoveUpdate, String> {
+    let current = placements
+        .get(label)
+        .cloned()
+        .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+    let moving_labels = group_labels(placements, &current);
+    shift(placements, &moving_labels, x - current.x, y - current.y);
+
+    let plan = dock_candidate(placements, label, &moving_labels);
+    let mut transitions = Vec::new();
+    let mut snapped = false;
+    if finalize {
+        if let Some(plan) = plan.as_ref() {
+            let from = states_by_label(placements, &moving_labels);
+            apply_dock_plan(placements, label, &moving_labels, plan);
+            merge_groups(placements, &moving_labels, &plan.other_label);
+            let to = states_by_label(placements, &moving_labels);
+            transitions = transitions_between(from, to);
+            snapped = true;
+        }
+    }
+
+    let current = placements
+        .get(label)
+        .map(Placement::state)
+        .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+    Ok(MoveUpdate {
+        moving_labels,
+        current,
+        preview: if finalize {
+            None
+        } else {
+            plan.map(|candidate| candidate.preview())
+        },
+        snapped,
+        transitions,
+    })
+}
+
+fn states_by_label(
+    placements: &HashMap<String, Placement>,
+    labels: &[String],
+) -> HashMap<String, TerminalWindowState> {
+    placements
+        .values()
+        .filter(|placement| labels.contains(&placement.label))
+        .map(|placement| (placement.label.clone(), placement.state()))
+        .collect()
+}
+
+fn transitions_between(
+    from: HashMap<String, TerminalWindowState>,
+    to: HashMap<String, TerminalWindowState>,
+) -> Vec<WindowTransition> {
+    to.into_iter()
+        .filter_map(|(label, to)| {
+            from.get(&label)
+                .cloned()
+                .map(|from| WindowTransition { from, to })
+        })
+        .collect()
+}
+
+fn apply_dock_plan(
+    placements: &mut HashMap<String, Placement>,
+    label: &str,
+    moving_labels: &[String],
+    plan: &DockPlan,
+) {
+    let Some(current) = placements.get(label).cloned() else {
+        return;
+    };
+    shift(
+        placements,
+        moving_labels,
+        plan.x - current.x,
+        plan.y - current.y,
+    );
+    if moving_labels.len() == 1 {
+        if let Some(entry) = placements.get_mut(label) {
+            entry.width = plan.width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+            entry.height = plan.height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+        }
+    }
+}
+
 fn dock_candidate(
     placements: &HashMap<String, Placement>,
     label: &str,
     moving_labels: &[String],
-) -> Option<(String, i32, i32)> {
+) -> Option<DockPlan> {
     let current = placements.get(label)?;
     placements
         .values()
         .filter(|other| !moving_labels.contains(&other.label))
-        .filter_map(|other| snap(current, other).map(|(score, dx, dy)| (score, other, dx, dy)))
-        .filter(|(score, _, _, _)| *score <= DOCK_DISTANCE)
-        .min_by_key(|(score, _, _, _)| *score)
-        .map(|(_, other, dx, dy)| (other.label.clone(), dx, dy))
+        .filter_map(|other| snap(current, other))
+        .filter(|plan| plan.score <= DOCK_DISTANCE)
+        .min_by_key(|plan| plan.score)
 }
 
-fn snap(current: &Placement, other: &Placement) -> Option<(i32, i32, i32)> {
+fn snap(current: &Placement, other: &Placement) -> Option<DockPlan> {
     let vertical_overlap =
         (current.y + current.height).min(other.y + other.height) - current.y.max(other.y);
     let horizontal_overlap =
         (current.x + current.width).min(other.x + other.width) - current.x.max(other.x);
     let mut candidates = Vec::new();
     if vertical_overlap > 48 {
-        let right_gap = (current.x + current.width - other.x).abs();
-        candidates.push((
-            right_gap,
-            other.x - (current.x + current.width),
-            other.y - current.y,
-        ));
-        let left_gap = (current.x - (other.x + other.width)).abs();
-        candidates.push((
-            left_gap,
-            other.x + other.width - current.x,
-            other.y - current.y,
-        ));
+        candidates.push(DockPlan {
+            score: (current.x + current.width - other.x).abs(),
+            other_label: other.label.clone(),
+            side: DockSide::Left,
+            x: other.x - current.width,
+            y: other.y,
+            width: current.width,
+            height: other.height,
+        });
+        candidates.push(DockPlan {
+            score: (current.x - (other.x + other.width)).abs(),
+            other_label: other.label.clone(),
+            side: DockSide::Right,
+            x: other.x + other.width,
+            y: other.y,
+            width: current.width,
+            height: other.height,
+        });
     }
     if horizontal_overlap > 48 {
-        let bottom_gap = (current.y + current.height - other.y).abs();
-        candidates.push((
-            bottom_gap,
-            other.x - current.x,
-            other.y - (current.y + current.height),
-        ));
-        let top_gap = (current.y - (other.y + other.height)).abs();
-        candidates.push((
-            top_gap,
-            other.x - current.x,
-            other.y + other.height - current.y,
-        ));
+        candidates.push(DockPlan {
+            score: (current.y + current.height - other.y).abs(),
+            other_label: other.label.clone(),
+            side: DockSide::Top,
+            x: other.x,
+            y: other.y - current.height,
+            width: other.width,
+            height: current.height,
+        });
+        candidates.push(DockPlan {
+            score: (current.y - (other.y + other.height)).abs(),
+            other_label: other.label.clone(),
+            side: DockSide::Bottom,
+            x: other.x,
+            y: other.y + other.height,
+            width: other.width,
+            height: current.height,
+        });
     }
-    candidates.into_iter().min_by_key(|(score, _, _)| *score)
+    candidates.into_iter().min_by_key(|plan| plan.score)
 }
 
 fn merge_groups(
@@ -598,7 +841,36 @@ fn clear_single_member_group(placements: &mut HashMap<String, Placement>, group:
     }
 }
 
-fn move_native_windows(app: &AppHandle, states: &[TerminalWindowState], monitor_id: Option<&str>) {
+fn emit_dock_preview(app: &AppHandle, moving_label: &str, preview: Option<DockPreview>) {
+    let _ = app.emit(
+        "lume://terminal-dock-preview",
+        DockPreviewEvent {
+            moving_label: moving_label.to_string(),
+            preview,
+        },
+    );
+}
+
+fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWindowState {
+    let interpolate =
+        |from: i32, to: i32| (f64::from(from) + f64::from(to - from) * progress).round() as i32;
+    TerminalWindowState {
+        label: transition.to.label.clone(),
+        session_id: transition.to.session_id.clone(),
+        x: interpolate(transition.from.x, transition.to.x),
+        y: interpolate(transition.from.y, transition.to.y),
+        width: interpolate(transition.from.width, transition.to.width),
+        height: interpolate(transition.from.height, transition.to.height),
+        docked: transition.to.docked,
+    }
+}
+
+fn move_native_windows(
+    app: &AppHandle,
+    states: &[TerminalWindowState],
+    monitor_id: Option<&str>,
+    resize: bool,
+) {
     for state in states {
         let Some(window) = app.get_webview_window(&state.label) else {
             continue;
@@ -607,6 +879,12 @@ fn move_native_windows(app: &AppHandle, states: &[TerminalWindowState], monitor_
         let monitor = monitor_id.map(str::to_string);
         let layer_window = window.clone();
         let _ = window.run_on_main_thread(move || {
+            if resize {
+                let _ = layer_window.set_size(LogicalSize::new(
+                    f64::from(target.width),
+                    f64::from(target.height),
+                ));
+            }
             let _ = overlay::move_to(&layer_window, target.x, target.y, monitor.as_deref());
         });
     }
@@ -633,18 +911,63 @@ mod tests {
     fn nearby_terminals_snap_side_by_side() {
         let left = placement("left", 20, 40);
         let right = placement("right", 350, 48);
-        let (_, dx, dy) = snap(&left, &right).expect("encaixe");
-        assert_eq!(left.x + dx + left.width, right.x);
-        assert_eq!(left.y + dy, right.y);
+        let plan = snap(&left, &right).expect("encaixe");
+        assert_eq!(plan.side, DockSide::Left);
+        assert_eq!(plan.x + plan.width, right.x);
+        assert_eq!(plan.y, right.y);
+        assert_eq!(plan.height, right.height);
     }
 
     #[test]
     fn nearby_terminals_snap_one_above_the_other() {
         let top = placement("top", 40, 20);
         let bottom = placement("bottom", 48, 298);
-        let (_, dx, dy) = snap(&top, &bottom).expect("encaixe vertical");
-        assert_eq!(top.x + dx, bottom.x);
-        assert_eq!(top.y + dy + top.height, bottom.y);
+        let plan = snap(&top, &bottom).expect("encaixe vertical");
+        assert_eq!(plan.side, DockSide::Top);
+        assert_eq!(plan.x, bottom.x);
+        assert_eq!(plan.y + plan.height, bottom.y);
+        assert_eq!(plan.width, bottom.width);
+    }
+
+    #[test]
+    fn horizontal_dock_matches_the_target_height() {
+        let mut left = placement("left", 20, 40);
+        left.height = 420;
+        let right = placement("right", 350, 48);
+        let mut placements = HashMap::from([
+            (left.label.clone(), left),
+            (right.label.clone(), right.clone()),
+        ]);
+
+        let update = update_placements(&mut placements, "left", 20, 40, true).expect("encaixe");
+
+        assert!(update.snapped);
+        assert_eq!(update.current.height, right.height);
+        assert_eq!(update.current.y, right.y);
+        assert_eq!(update.current.x + update.current.width, right.x);
+    }
+
+    #[test]
+    fn vertical_dock_matches_the_target_width() {
+        let mut top = placement("top", 40, 20);
+        top.width = 520;
+        let bottom = placement("bottom", 48, 298);
+        let mut placements = HashMap::from([
+            (top.label.clone(), top),
+            (bottom.label.clone(), bottom.clone()),
+        ]);
+
+        let update = update_placements(&mut placements, "top", 40, 20, true).expect("encaixe");
+
+        assert!(update.snapped);
+        assert_eq!(update.current.width, bottom.width);
+        assert_eq!(update.current.x, bottom.x);
+        assert_eq!(update.current.y + update.current.height, bottom.y);
+    }
+
+    #[test]
+    fn rejects_compositor_outlier_coordinates() {
+        assert!(validate_coordinates(100_000, 20).is_err());
     }
 
     #[test]
