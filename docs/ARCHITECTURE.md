@@ -253,6 +253,9 @@ O **mascote** (`LumeMascot.svelte`) reduz todas as sessões a um único estado v
 altura da cápsula é dinâmica (`ResizeObserver`). `src/lib/i18n.ts` traduz os rótulos de status
 em pt-BR emitidos pelo backend para inglês na exibição.
 
+Para um guia introdutório da interface — voltado a quem nunca usou Svelte, com o mapa de
+"quero mudar X, edito onde" — veja [Interface](FRONTEND.md).
+
 ## Persistência e privacidade
 
 O banco SQLite (`store.rs`) fica no diretório de dados do aplicativo e guarda apenas dados

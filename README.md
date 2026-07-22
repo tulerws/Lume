@@ -78,4 +78,4 @@ O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Way
 
 Tudo permanece na máquina. Os serviços escutam somente em `127.0.0.1:43119`, `127.0.0.1:43120`, `127.0.0.1:43130` e `127.0.0.1:43131`. Comandos, caminhos e payloads de uma permissão existem em memória apenas enquanto a decisão está pendente; o SQLite recebe somente a sessão sanitizada e resumos do histórico.
 
-Mais detalhes em [Produto](docs/PRODUCT.md), [Privacidade](docs/PRIVACY.md) e [Arquitetura](docs/ARCHITECTURE.md).
+Mais detalhes em [Produto](docs/PRODUCT.md), [Privacidade](docs/PRIVACY.md), [Arquitetura](docs/ARCHITECTURE.md) e [Interface](docs/FRONTEND.md).
