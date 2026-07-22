@@ -33,43 +33,145 @@ pub struct CompanionStatus {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticCheck {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationDiagnostic {
+    pub kind: IntegrationKind,
+    pub label: String,
+    pub healthy: bool,
+    pub checks: Vec<DiagnosticCheck>,
+    pub last_event_at: Option<i64>,
+}
+
 pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
-    [
-        (IntegrationKind::Codex, "Codex", "codex", true),
-        (IntegrationKind::Claude, "Claude", "claude", true),
-        (IntegrationKind::Gemini, "Gemini", "gemini", false),
-    ]
-    .into_iter()
-    .map(|(kind, label, command, direct_permissions)| {
-        let installed = crate::executables::available(command);
-        let configured = config_path(&kind)
-            .and_then(|path| fs::read_to_string(path).ok())
-            .is_some_and(|content| configured_content(&content, &kind, executable));
-        let detail = if !installed {
-            "CLI não encontrada".into()
-        } else if configured {
-            if kind == IntegrationKind::Codex {
-                "Hook instalado; confirme a confiança em /hooks".into()
-            } else if direct_permissions {
-                "Monitoramento e decisões conectados".into()
+    crate::agent_plugins::catalog()
+        .into_iter()
+        .map(|plugin| {
+            let kind = plugin.kind();
+            let installed = crate::executables::available(plugin.executable());
+            let configured = config_path(&kind)
+                .and_then(|path| fs::read_to_string(path).ok())
+                .is_some_and(|content| configured_content(&content, &kind, executable));
+            let detail = if !installed {
+                "CLI não encontrada".into()
+            } else if configured {
+                if kind == IntegrationKind::Codex {
+                    "Hook instalado; confirme a confiança em /hooks".into()
+                } else if plugin.direct_permissions() {
+                    "Monitoramento e decisões conectados".into()
+                } else {
+                    "Monitoramento conectado".into()
+                }
+            } else if kind == IntegrationKind::Codex {
+                "Decisões diretas ao abrir uma sessão pelo Lume".into()
             } else {
-                "Monitoramento conectado".into()
+                "Pronto para conectar".into()
+            };
+            IntegrationStatus {
+                kind,
+                label: plugin.label().into(),
+                installed,
+                configured,
+                direct_permissions: plugin.direct_permissions(),
+                detail,
             }
-        } else if kind == IntegrationKind::Codex {
-            "Decisões diretas ao abrir uma sessão pelo Lume".into()
+        })
+        .collect()
+}
+
+pub fn diagnose(
+    kind: &IntegrationKind,
+    executable: &str,
+    last_event_at: Option<i64>,
+) -> Result<IntegrationDiagnostic, String> {
+    let plugin =
+        crate::agent_plugins::find(kind).ok_or_else(|| "Integração não reconhecida".to_string())?;
+    let mut checks = Vec::new();
+    let executable_path = crate::executables::path(plugin.executable());
+    checks.push(DiagnosticCheck {
+        id: "cli".into(),
+        label: "CLI".into(),
+        status: if executable_path.is_some() {
+            "ok"
         } else {
-            "Pronto para conectar".into()
-        };
-        IntegrationStatus {
-            kind,
-            label: label.into(),
-            installed,
-            configured,
-            direct_permissions,
-            detail,
+            "error"
         }
+        .into(),
+        detail: executable_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{} não encontrado", plugin.executable())),
+    });
+
+    if executable_path.is_some() {
+        let version = crate::executables::command(plugin.executable())
+            .and_then(|mut command| {
+                command
+                    .arg("--version")
+                    .output()
+                    .map_err(|error| error.to_string())
+            })
+            .ok()
+            .and_then(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                (!stdout.is_empty())
+                    .then_some(stdout)
+                    .or((!stderr.is_empty()).then_some(stderr))
+            });
+        checks.push(DiagnosticCheck {
+            id: "version".into(),
+            label: "Versão".into(),
+            status: if version.is_some() { "ok" } else { "warning" }.into(),
+            detail: version.unwrap_or_else(|| "Não foi possível consultar a versão".into()),
+        });
+    }
+
+    let hook_path = config_path(kind);
+    let configured = hook_path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|content| configured_content(&content, kind, executable));
+    checks.push(DiagnosticCheck {
+        id: "hooks".into(),
+        label: "Monitoramento".into(),
+        status: if configured { "ok" } else { "warning" }.into(),
+        detail: if configured {
+            format!("{} eventos configurados", plugin.hook_events().len())
+        } else {
+            "Hook do Lume ainda não conectado".into()
+        },
+    });
+    checks.push(DiagnosticCheck {
+        id: "activity".into(),
+        label: "Último evento".into(),
+        status: if last_event_at.is_some() {
+            "ok"
+        } else {
+            "warning"
+        }
+        .into(),
+        detail: last_event_at
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_else(|| "Nenhum evento recebido nesta execução".into()),
+    });
+    let healthy = checks.iter().all(|check| check.status != "error");
+    Ok(IntegrationDiagnostic {
+        kind: plugin.kind(),
+        label: plugin.label().into(),
+        healthy,
+        checks,
+        last_event_at,
     })
-    .collect()
 }
 
 pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Result<(), String> {
@@ -267,30 +369,9 @@ fn read_config(path: &PathBuf) -> Result<Value, String> {
 }
 
 fn events(kind: &IntegrationKind) -> &'static [&'static str] {
-    match kind {
-        IntegrationKind::Codex => &[
-            "SessionStart",
-            "UserPromptSubmit",
-            "PermissionRequest",
-            "Stop",
-        ],
-        IntegrationKind::Claude => &[
-            "SessionStart",
-            "UserPromptSubmit",
-            "PermissionRequest",
-            "Notification",
-            "Stop",
-            "StopFailure",
-            "SessionEnd",
-        ],
-        IntegrationKind::Gemini => &[
-            "SessionStart",
-            "BeforeAgent",
-            "Notification",
-            "AfterAgent",
-            "SessionEnd",
-        ],
-    }
+    crate::agent_plugins::find(kind)
+        .map(|plugin| plugin.hook_events())
+        .unwrap_or_default()
 }
 
 fn config_path(kind: &IntegrationKind) -> Option<PathBuf> {

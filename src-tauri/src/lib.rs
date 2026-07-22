@@ -1,4 +1,5 @@
 mod adapters;
+mod agent_plugins;
 mod browser_server;
 mod codex_bridge;
 mod codex_sessions;
@@ -16,7 +17,7 @@ mod terminal_windows;
 use std::io::Read;
 
 use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences};
-use integrations::{CompanionStatus, IntegrationKind, IntegrationStatus};
+use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
 use state::AppState;
 use tauri::{
@@ -367,6 +368,28 @@ fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
 }
 
 #[tauri::command]
+fn diagnose_integration(
+    kind: IntegrationKind,
+    state: State<'_, AppState>,
+) -> Result<IntegrationDiagnostic, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let last_event_at = state
+        .sessions()?
+        .into_iter()
+        .filter(|session| {
+            matches!(
+                (&kind, &session.agent),
+                (IntegrationKind::Codex, domain::AgentKind::Codex)
+                    | (IntegrationKind::Claude, domain::AgentKind::Claude)
+                    | (IntegrationKind::Gemini, domain::AgentKind::Gemini)
+            )
+        })
+        .map(|session| session.updated_at)
+        .max();
+    integrations::diagnose(&kind, &executable.to_string_lossy(), last_event_at)
+}
+
+#[tauri::command]
 fn configure_integration(kind: IntegrationKind, enabled: bool) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     integrations::configure(&kind, &executable.to_string_lossy(), enabled)
@@ -533,6 +556,7 @@ pub fn run() {
             resize_terminal_window,
             undock_terminal_window,
             integration_statuses,
+            diagnose_integration,
             configure_integration,
             vscode_status,
             configure_vscode,

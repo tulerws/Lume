@@ -443,4 +443,20 @@ mod tests {
             vec![PermissionAction::AllowOnce, PermissionAction::Deny]
         );
     }
+
+    #[test]
+    fn completed_hook_carries_the_final_agent_response() {
+        let raw = json!({
+            "session_id": "claude-session",
+            "cwd": "/work/project",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Resposta final do agente"
+        });
+        let event = map_event("claude", &raw).expect("evento final do Claude");
+        assert!(matches!(event.event, HookEventKind::Completed));
+        assert_eq!(
+            event.last_response.as_deref(),
+            Some("Resposta final do agente")
+        );
+    }
 }

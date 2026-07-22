@@ -1,6 +1,6 @@
 {
   "name": "lume",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Monitor local e discreto para agentes de IA no Windows e Linux.",
   "type": "module",
   "scripts": {

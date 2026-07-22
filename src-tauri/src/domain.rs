@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -70,6 +72,14 @@ pub struct PermissionRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionResult {
+    pub id: String,
+    pub response: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSession {
     pub id: String,
     pub agent: AgentKind,
@@ -89,6 +99,8 @@ pub struct AgentSession {
     pub pending_permission: Option<PermissionRequest>,
     #[serde(default)]
     pub last_response: Option<String>,
+    #[serde(default)]
+    pub results: Vec<SessionResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -104,9 +116,18 @@ pub struct HistoryEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectProfile {
+    pub label: String,
+    pub sound_enabled: bool,
+    pub launch_target: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
     pub language: String,
+    pub dark_mode: Option<bool>,
     pub sound_enabled: bool,
     pub autostart: bool,
     pub monitor_id: Option<String>,
@@ -115,12 +136,14 @@ pub struct Preferences {
     pub show_over_fullscreen: bool,
     pub history_retention_days: u16,
     pub launch_target: String,
+    pub project_profiles: HashMap<String, ProjectProfile>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             language: "en".into(),
+            dark_mode: None,
             sound_enabled: true,
             autostart: true,
             monitor_id: None,
@@ -129,6 +152,7 @@ impl Default for Preferences {
             show_over_fullscreen: false,
             history_retention_days: 30,
             launch_target: "auto".into(),
+            project_profiles: HashMap::new(),
         }
     }
 }

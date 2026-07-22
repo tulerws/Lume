@@ -9,7 +9,8 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PermissionAction, PermissionProfile, Preferences, SessionSource, SessionStatus,
+        PermissionAction, PermissionProfile, Preferences, SessionResult, SessionSource,
+        SessionStatus,
     },
     store::Store,
 };
@@ -32,6 +33,7 @@ impl AppState {
             session.pending_permission = None;
             session.working_directory = None;
             session.last_response = None;
+            session.results.clear();
             if matches!(
                 session.status,
                 SessionStatus::Running
@@ -75,16 +77,16 @@ impl AppState {
             .cloned()
             .collect::<Vec<_>>();
         let mut deduplicated = Vec::<AgentSession>::new();
-        for session in sessions {
-            let duplicate = session.native_session_id.as_ref().and_then(|native_id| {
-                deduplicated.iter().position(|existing| {
-                    existing.agent == session.agent
-                        && existing.native_session_id.as_ref() == Some(native_id)
-                })
-            });
+        for mut session in sessions {
+            let duplicate = deduplicated
+                .iter()
+                .position(|existing| same_session_identity(existing, &session));
             if let Some(index) = duplicate {
                 if prefer_session(&session, &deduplicated[index]) {
+                    merge_results(&mut session, &deduplicated[index]);
                     deduplicated[index] = session;
+                } else {
+                    merge_results(&mut deduplicated[index], &session);
                 }
             } else {
                 deduplicated.push(session);
@@ -134,7 +136,7 @@ impl AppState {
                         .any(|(agent, source, native_directory)| {
                             agent == &session.agent
                                 && source == &session.source
-                                && native_directory == directory
+                                && same_directory(Some(native_directory), Some(directory))
                         })
                 }) && !(session.source == SessionSource::Vscode
                     && native_vscode_agents.contains(&session.agent)))
@@ -282,7 +284,12 @@ impl AppState {
                         .process_id
                         .is_some_and(|process_id| session.process_id == Some(process_id))
                         || (event.source == Some(SessionSource::Vscode)
-                            && session.source == SessionSource::Vscode))
+                            && session.source == SessionSource::Vscode
+                            && (event.working_directory.is_none()
+                                || same_directory(
+                                    session.working_directory.as_deref(),
+                                    event.working_directory.as_deref(),
+                                ))))
             })
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
@@ -367,6 +374,13 @@ impl AppState {
                 None
             }
         };
+
+        if matches!(
+            &event.event,
+            HookEventKind::Completed | HookEventKind::SessionEnded
+        ) {
+            remember_result(session, now);
+        }
 
         let snapshot = session.clone();
         let history = history_for_event(&snapshot, &event.event, now);
@@ -635,7 +649,10 @@ impl AppState {
                 is_provisional_process(session)
                     && session.agent == process.agent
                     && session.source == process.source
-                    && session.working_directory == process.working_directory
+                    && same_directory(
+                        session.working_directory.as_deref(),
+                        process.working_directory.as_deref(),
+                    )
             }) {
                 session.process_id = Some(process.process_id);
                 session.status = SessionStatus::WaitingForInput;
@@ -674,6 +691,7 @@ impl AppState {
                 permission_profile: default_profile(&process.agent),
                 pending_permission: None,
                 last_response: None,
+                results: Vec::new(),
             };
             snapshots.push(session.clone());
             sessions.push(session);
@@ -796,6 +814,49 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .unwrap_or_else(|| default_profile(&event.agent)),
         pending_permission: None,
         last_response: event.last_response.clone(),
+        results: Vec::new(),
+    }
+}
+
+fn remember_result(session: &mut AgentSession, now: i64) {
+    let Some(response) = session
+        .last_response
+        .as_deref()
+        .map(str::trim)
+        .filter(|response| !response.is_empty())
+    else {
+        return;
+    };
+    if session
+        .results
+        .last()
+        .is_some_and(|result| result.response == response)
+    {
+        return;
+    }
+    session.results.push(SessionResult {
+        id: format!("{}-result-{}", session.id, now),
+        response: response.to_string(),
+        created_at: now,
+    });
+    if session.results.len() > 12 {
+        session.results.drain(..session.results.len() - 12);
+    }
+}
+
+fn merge_results(target: &mut AgentSession, source: &AgentSession) {
+    for result in &source.results {
+        if !target
+            .results
+            .iter()
+            .any(|existing| existing.id == result.id)
+        {
+            target.results.push(result.clone());
+        }
+    }
+    target.results.sort_by_key(|result| result.created_at);
+    if target.results.len() > 12 {
+        target.results.drain(..target.results.len() - 12);
     }
 }
 
@@ -886,7 +947,44 @@ fn same_provisional_context(left: &AgentSession, right: &AgentSession) -> bool {
         && is_provisional_process(right)
         && left.agent == right.agent
         && left.source == right.source
-        && left.working_directory == right.working_directory
+        && (left.process_id.is_some() && left.process_id == right.process_id
+            || same_directory(
+                left.working_directory.as_deref(),
+                right.working_directory.as_deref(),
+            ))
+}
+
+fn same_session_identity(left: &AgentSession, right: &AgentSession) -> bool {
+    if left.agent != right.agent {
+        return false;
+    }
+    match (&left.native_session_id, &right.native_session_id) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        (None, None) => same_provisional_context(left, right),
+        _ => false,
+    }
+}
+
+fn same_directory(left: Option<&str>, right: Option<&str>) -> bool {
+    match (
+        left.and_then(normalize_directory),
+        right.and_then(normalize_directory),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn normalize_directory(directory: &str) -> Option<String> {
+    let normalized = directory.trim().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    return Some(normalized.to_ascii_lowercase());
+    #[cfg(not(target_os = "windows"))]
+    Some(normalized.to_string())
 }
 
 fn duplicate_provisional_ids(
@@ -935,7 +1033,11 @@ fn coalesce_discovered_processes(discovered: Vec<DiscoveredProcess>) -> Vec<Disc
         if let Some(existing) = unique.iter_mut().find(|existing| {
             existing.agent == process.agent
                 && existing.source == process.source
-                && existing.working_directory == process.working_directory
+                && (existing.process_id == process.process_id
+                    || same_directory(
+                        existing.working_directory.as_deref(),
+                        process.working_directory.as_deref(),
+                    ))
         }) {
             if process.process_id < existing.process_id {
                 *existing = process;
@@ -1017,6 +1119,38 @@ mod tests {
             last_response: None,
             wait_for_decision: false,
         }
+    }
+
+    #[test]
+    fn identity_normalizes_directory_separators_and_trailing_slashes() {
+        assert!(same_directory(Some("/work/lume/"), Some("/work/lume")));
+        assert!(same_directory(
+            Some("C:\\work\\lume\\"),
+            Some("C:/work/lume")
+        ));
+    }
+
+    #[test]
+    fn processes_without_context_are_not_merged_by_agent_name_alone() {
+        let mut first = discovered(4242);
+        first.working_directory = None;
+        let mut second = discovered(4343);
+        second.working_directory = None;
+        assert_eq!(coalesce_discovered_processes(vec![first, second]).len(), 2);
+    }
+
+    #[test]
+    fn completed_responses_are_kept_in_memory_per_chat_without_duplicates() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut completed = started_event("claude:results", 4242);
+        completed.event = HookEventKind::Completed;
+        completed.last_response = Some("Resposta final".into());
+        state.ingest(completed.clone()).expect("primeiro resultado");
+        state.ingest(completed).expect("evento repetido");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions[0].results.len(), 1);
+        assert_eq!(sessions[0].results[0].response, "Resposta final");
     }
 
     #[test]

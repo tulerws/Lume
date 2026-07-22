@@ -192,11 +192,9 @@
   @keyframes doze-off { from { transform: translateY(-1px); } to { transform: translateY(1px) scaleY(0.97); } }
   @keyframes sleep-in { from { opacity: 0; transform: translate(-2px, 2px); } to { opacity: 1; transform: none; } }
 
-  @media (prefers-color-scheme: dark) {
-    .mascot { color: #20322c; }
-    .belly { fill: rgba(255, 255, 255, 0.22); }
-    .eye-light { fill: #eaf2ee; }
-  }
+  :global(.dark) .mascot { color: #20322c; }
+  :global(.dark) .belly { fill: rgba(255, 255, 255, 0.22); }
+  :global(.dark) .eye-light { fill: #eaf2ee; }
 
   @media (prefers-reduced-motion: reduce) {
     .mascot *,

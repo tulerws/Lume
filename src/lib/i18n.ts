@@ -59,6 +59,12 @@ const englishDisplayText = new Map<string, string>([
   ["Companion disponível", "Companion available"],
   ["VS Code não encontrado", "VS Code not found"],
   ["Verificando…", "Checking…"],
+  ["Versão", "Version"],
+  ["Monitoramento", "Monitoring"],
+  ["Último evento", "Last event"],
+  ["Hook do Lume ainda não conectado", "Lume hook is not connected yet"],
+  ["Nenhum evento recebido nesta execução", "No event received in this run"],
+  ["Não foi possível consultar a versão", "Could not read the version"],
 ]);
 
 export function displayText(language: Language, value: string) {
@@ -68,6 +74,12 @@ export function displayText(language: Language, value: string) {
   if (value.startsWith("Finalizado há ")) return value.replace("Finalizado há ", "Completed ").replace(" min", " min ago");
   if (value.endsWith(" quer executar uma ação")) {
     return `${value.slice(0, -" quer executar uma ação".length)} wants to perform an action`;
+  }
+  if (/^\d+ eventos configurados$/.test(value)) {
+    return value.replace(" eventos configurados", " events configured");
+  }
+  if (value.endsWith(" não encontrado")) {
+    return `${value.slice(0, -" não encontrado".length)} not found`;
   }
   return value;
 }

@@ -3,6 +3,7 @@ import type {
   AgentSession,
   CompanionStatus,
   HistoryEntry,
+  IntegrationDiagnostic,
   IntegrationStatus,
   PermissionAction,
   Preferences,
@@ -14,6 +15,7 @@ const inDesktop = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" i
 
 export const defaultPreferences: Preferences = {
   language: "en",
+  darkMode: undefined,
   soundEnabled: true,
   autostart: true,
   overlayX: undefined,
@@ -21,6 +23,7 @@ export const defaultPreferences: Preferences = {
   showOverFullscreen: false,
   historyRetentionDays: 30,
   launchTarget: "auto",
+  projectProfiles: {},
 };
 
 export async function loadSessions(): Promise<AgentSession[]> {
@@ -161,6 +164,12 @@ export async function configureIntegration(
   enabled: boolean,
 ): Promise<void> {
   await invoke("configure_integration", { kind, enabled });
+}
+
+export async function diagnoseIntegration(
+  kind: IntegrationStatus["kind"],
+): Promise<IntegrationDiagnostic> {
+  return invoke<IntegrationDiagnostic>("diagnose_integration", { kind });
 }
 
 export async function launchAgentSession(

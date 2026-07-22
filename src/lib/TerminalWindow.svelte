@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import type { AgentSession, PermissionAction, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, PermissionAction, Preferences, TerminalWindowState } from "$lib/domain";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
@@ -33,6 +33,12 @@
   let terminateConfirm = $state(false);
   let terminating = $state(false);
   let language = $state<Language>("en");
+  let darkMode = $state<boolean | undefined>(undefined);
+  let systemDark = $state(false);
+  const effectiveDark = $derived(darkMode ?? systemDark);
+  $effect(() => {
+    document.documentElement.dataset.theme = effectiveDark ? "dark" : "light";
+  });
 
   function tr(english: string, portuguese: string) {
     return localize(language, english, portuguese);
@@ -53,6 +59,13 @@
     let disposed = false;
     let stopListening: (() => void) | undefined;
     let stopMoved: (() => void) | undefined;
+    let stopPreferences: (() => void) | undefined;
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
+      systemDark = event.matches;
+    };
+    syncSystemTheme(colorScheme);
+    colorScheme.addEventListener("change", syncSystemTheme);
     void (async () => {
       const [nextWindowState, nextPreferences] = await Promise.all([
         loadTerminalWindowState(label),
@@ -60,9 +73,14 @@
       ]);
       windowState = nextWindowState;
       language = nextPreferences.language;
+      darkMode = nextPreferences.darkMode;
       await refresh();
       if (disposed) return;
       stopListening = await listen("lume://sessions-changed", () => void refresh());
+      stopPreferences = await listen<Preferences>("lume://preferences-changed", ({ payload }) => {
+        language = payload.language;
+        darkMode = payload.darkMode;
+      });
       stopMoved = await currentWindow.onMoved(({ payload }) => {
         if (!dragging) return;
         dragMoved = true;
@@ -86,6 +104,8 @@
       disposed = true;
       stopListening?.();
       stopMoved?.();
+      stopPreferences?.();
+      colorScheme.removeEventListener("change", syncSystemTheme);
       if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
     };
   });
@@ -212,7 +232,7 @@
   }
 </script>
 
-<main class="terminal-window">
+<main class:dark={effectiveDark} class="terminal-window">
   {#if session}
     <section class:dragging class="terminal-card">
       <header
@@ -379,19 +399,22 @@
   .resize-se::after { right: 3px; bottom: 3px; border-right: 1px solid #668276; border-bottom: 1px solid #668276; }
   .loading { align-items: center; justify-content: center; gap: 9px; color: #78857f; font-size: 9px; }
 
-  @media (prefers-color-scheme: dark) {
-    .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
-    .terminal-card > header, .terminal-composer { border-color: rgba(190, 209, 200, 0.09); }
-    .identity strong { color: #e2ebe6; }
-    .identity small, .hint { color: #93a19a; }
-    .agent-icon, .source-badge { background: rgba(205, 222, 213, 0.07); }
-    .source-badge { color: #a7b5ae; }
-    .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
-    .final-response { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
-    .final-response strong { color: #91a89d; }
-    .final-response p { color: #c3d0ca; }
-    textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
-    .permission strong { color: #dfc6ac; }
-    .permission code, .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }
-  }
+  .terminal-window.dark { color-scheme: dark; }
+  .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
+  .terminal-window.dark .terminal-card > header,
+  .terminal-window.dark .terminal-composer { border-color: rgba(190, 209, 200, 0.09); }
+  .terminal-window.dark .identity strong { color: #e2ebe6; }
+  .terminal-window.dark .identity small,
+  .terminal-window.dark .hint { color: #93a19a; }
+  .terminal-window.dark .agent-icon,
+  .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
+  .terminal-window.dark .source-badge { color: #a7b5ae; }
+  .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
+  .terminal-window.dark .final-response { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
+  .terminal-window.dark .final-response strong { color: #91a89d; }
+  .terminal-window.dark .final-response p { color: #c3d0ca; }
+  .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
+  .terminal-window.dark .permission strong { color: #dfc6ac; }
+  .terminal-window.dark .permission code,
+  .terminal-window.dark .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }
 </style>

@@ -54,6 +54,13 @@ export interface AgentSession {
   permissionProfile: PermissionProfile;
   pendingPermission?: PermissionRequest;
   lastResponse?: string;
+  results: SessionResult[];
+}
+
+export interface SessionResult {
+  id: string;
+  response: string;
+  createdAt: number;
 }
 
 export interface HistoryEntry {
@@ -68,6 +75,7 @@ export interface HistoryEntry {
 
 export interface Preferences {
   language: "en" | "pt-BR";
+  darkMode?: boolean;
   soundEnabled: boolean;
   autostart: boolean;
   monitorId?: string;
@@ -76,6 +84,13 @@ export interface Preferences {
   showOverFullscreen: boolean;
   historyRetentionDays: number;
   launchTarget: "auto" | "terminal" | "vscode";
+  projectProfiles: Record<string, ProjectProfile>;
+}
+
+export interface ProjectProfile {
+  label: string;
+  soundEnabled: boolean;
+  launchTarget?: Preferences["launchTarget"];
 }
 
 export interface IntegrationStatus {
@@ -85,6 +100,21 @@ export interface IntegrationStatus {
   configured: boolean;
   directPermissions: boolean;
   detail: string;
+}
+
+export interface DiagnosticCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warning" | "error";
+  detail: string;
+}
+
+export interface IntegrationDiagnostic {
+  kind: IntegrationStatus["kind"];
+  label: string;
+  healthy: boolean;
+  checks: DiagnosticCheck[];
+  lastEventAt?: number;
 }
 
 export interface CompanionStatus {

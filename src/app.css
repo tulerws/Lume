@@ -33,9 +33,7 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #eef4f1;
-    color-scheme: dark;
-  }
+:root[data-theme="dark"] {
+  color: #eef4f1;
+  color-scheme: dark;
 }

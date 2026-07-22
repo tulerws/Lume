@@ -71,6 +71,7 @@ impl Store {
         sanitized.pending_permission = None;
         sanitized.working_directory = None;
         sanitized.last_response = None;
+        sanitized.results.clear();
         let payload = serde_json::to_string(&sanitized).map_err(|error| error.to_string())?;
         self.connection
             .execute(
@@ -217,6 +218,11 @@ mod tests {
                 requested_at: "0".into(),
             }),
             last_response: Some("resposta que nao pode ser salva".into()),
+            results: vec![crate::domain::SessionResult {
+                id: "result-1".into(),
+                response: "outra resposta sensível".into(),
+                created_at: 1,
+            }],
         };
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");
@@ -224,6 +230,7 @@ mod tests {
         assert!(loaded[0].pending_permission.is_none());
         assert!(loaded[0].working_directory.is_none());
         assert!(loaded[0].last_response.is_none());
+        assert!(loaded[0].results.is_empty());
     }
 
     #[test]
@@ -234,6 +241,8 @@ mod tests {
         .expect("preferências antigas");
         assert!(preferences.overlay_x.is_none());
         assert!(preferences.overlay_y.is_none());
+        assert!(preferences.dark_mode.is_none());
         assert_eq!(preferences.language, "en");
+        assert!(preferences.project_profiles.is_empty());
     }
 }

@@ -4,7 +4,7 @@
   import { cubicOut } from "svelte/easing";
   import { fade, fly, slide } from "svelte/transition";
   import { getVersion } from "@tauri-apps/api/app";
-  import { listen } from "@tauri-apps/api/event";
+  import { emit, listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -24,6 +24,7 @@
     AgentSession,
     CompanionStatus,
     HistoryEntry,
+    IntegrationDiagnostic,
     IntegrationStatus,
     PermissionAction,
     Preferences,
@@ -34,6 +35,7 @@
   import {
     configureIntegration,
     configureVscode,
+    diagnoseIntegration,
     decidePermission,
     defaultPreferences,
     loadHistory,
@@ -92,6 +94,8 @@
   let permissionError = $state<string | null>(null);
   let savingSettings = $state(false);
   let configuringIntegration = $state<IntegrationStatus["kind"] | null>(null);
+  let diagnosingIntegration = $state<IntegrationStatus["kind"] | null>(null);
+  let integrationDiagnostics = $state<Partial<Record<IntegrationStatus["kind"], IntegrationDiagnostic>>>({});
   let configuringVscode = $state(false);
   let launcherOpen = $state(false);
   let launching = $state<IntegrationStatus["kind"] | null>(null);
@@ -106,6 +110,8 @@
   let terminateConfirmId = $state<string | null>(null);
   let terminatingSessionId = $state<string | null>(null);
   let sessionActionMessage = $state<string | null>(null);
+  let copiedResultId = $state<string | null>(null);
+  let selectedProfileKey = $state<string | null>(null);
   let terminalWindows = $state<TerminalWindowState[]>([]);
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
@@ -116,7 +122,7 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.7");
+  let appVersion = $state("0.3.8");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("Updates are checked automatically.");
@@ -131,6 +137,7 @@
     originY: number;
   } | null = null;
   let moveFrame: number | null = null;
+  let systemDark = $state(false);
 
   function tr(english: string, portuguese: string) {
     return localize(preferences.language, english, portuguese);
@@ -188,10 +195,34 @@
     };
   }
 
+  const effectiveDark = $derived(preferences.darkMode ?? systemDark);
+  $effect(() => {
+    document.documentElement.dataset.theme = effectiveDark ? "dark" : "light";
+  });
   const activeCount = $derived(
     sessions.filter((session) =>
       ["running", "permission_required", "waiting_for_input"].includes(session.status),
     ).length,
+  );
+  const recentResults = $derived.by(() =>
+    sessions
+      .flatMap((session) => session.results.map((result) => ({ session, result })))
+      .sort((left, right) => right.result.createdAt - left.result.createdAt),
+  );
+  const detectedProjects = $derived.by(() => {
+    const projects = new Map<string, string>();
+    for (const session of sessions) {
+      projects.set(projectKey(session.workingDirectory ?? session.project), session.project);
+    }
+    return Array.from(projects, ([key, label]) => ({ key, label })).sort((left, right) =>
+      left.label.localeCompare(right.label),
+    );
+  });
+  const selectedProject = $derived(
+    detectedProjects.find((project) => project.key === selectedProfileKey),
+  );
+  const selectedProjectProfile = $derived(
+    selectedProfileKey ? preferences.projectProfiles[selectedProfileKey] : undefined,
   );
 
   const shellStatus = $derived.by<ShellStatus>(() => {
@@ -209,6 +240,12 @@
 
   onMount(() => {
     if (isTerminalWindow) return;
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
+      systemDark = event.matches;
+    };
+    syncSystemTheme(colorScheme);
+    colorScheme.addEventListener("change", syncSystemTheme);
     let disposed = false;
     let stopListening: (() => void) | undefined;
     let stopTerminalListening: (() => void) | undefined;
@@ -227,6 +264,7 @@
       if (disposed) return;
       sessions = nextSessions;
       preferences = nextPreferences;
+      selectedProfileKey = detectedProjects[0]?.key ?? null;
       void initializeUpdater();
       integrations = nextIntegrations;
       vscodeStatus = nextVscodeStatus;
@@ -250,6 +288,7 @@
       disposed = true;
       stopListening?.();
       stopTerminalListening?.();
+      colorScheme.removeEventListener("change", syncSystemTheme);
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
@@ -346,6 +385,7 @@
     if (withSound && preferences.soundEnabled) {
       const previous = new Map(sessions.map((session) => [session.id, session.status]));
       for (const session of next) {
+        if (!projectSoundEnabled(session)) continue;
         const previousStatus = previous.get(session.id);
         if (previousStatus === session.status) continue;
         if (session.status === "permission_required") playTone("permission");
@@ -616,10 +656,7 @@
   }
 
   function canSubmitToSession(session: AgentSession) {
-    return (
-      session.source === "web" ||
-      (session.agent !== "unknown" && Boolean(session.nativeSessionId))
-    );
+    return sessionCapabilities(session).canPrompt;
   }
 
   function canContinueSession(session: AgentSession) {
@@ -654,7 +691,41 @@
   }
 
   function canTerminateSession(session: AgentSession) {
-    return session.source === "cli" && Boolean(session.processId);
+    return sessionCapabilities(session).canTerminate;
+  }
+
+  function sessionCapabilities(session: AgentSession) {
+    return {
+      canPrompt:
+        session.source === "web" ||
+        (session.agent !== "unknown" && Boolean(session.nativeSessionId)),
+      canApprove: Boolean(
+        session.pendingPermission && session.permissionProfile.canRespondFromLume,
+      ),
+      canTerminate: session.source === "cli" && Boolean(session.processId),
+      canOpenSource: true,
+      canReadResults: session.results.length > 0 || Boolean(session.lastResponse),
+    };
+  }
+
+  async function copyResult(resultId: string, response: string) {
+    try {
+      await navigator.clipboard.writeText(response);
+      copiedResultId = resultId;
+      setTimeout(() => {
+        if (copiedResultId === resultId) copiedResultId = null;
+      }, 1_500);
+    } catch {
+      copiedResultId = null;
+    }
+  }
+
+  function continueFromResult(session: AgentSession) {
+    view = "sessions";
+    selectedId = session.id;
+    composerSessionId = session.id;
+    composerPrompt = "";
+    composerMessage = null;
   }
 
   async function terminateAgent(session: AgentSession) {
@@ -750,6 +821,7 @@
     if (nextView === "board") await refreshTerminalWindows();
     if (nextView === "history") history = await loadHistory();
     if (nextView === "settings") {
+      selectedProfileKey ??= detectedProjects[0]?.key ?? null;
       settingsMessage = null;
       [integrations, vscodeStatus] = await Promise.all([
         loadIntegrationStatuses(),
@@ -783,12 +855,13 @@
     launching = agent;
     launchError = null;
     try {
+      const profile = preferences.projectProfiles[projectKey(selected)];
       await launchAgentSession(
         agent,
         selected,
         resume,
         undefined,
-        preferences.launchTarget,
+        profile?.launchTarget ?? preferences.launchTarget,
       );
       launcherOpen = false;
     } catch (error) {
@@ -820,6 +893,22 @@
       settingsMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       configuringIntegration = null;
+    }
+  }
+
+  async function runIntegrationDiagnostic(integration: IntegrationStatus) {
+    diagnosingIntegration = integration.kind;
+    settingsMessage = null;
+    try {
+      integrationDiagnostics = {
+        ...integrationDiagnostics,
+        [integration.kind]: await diagnoseIntegration(integration.kind),
+      };
+    } catch (error) {
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      diagnosingIntegration = null;
     }
   }
 
@@ -870,6 +959,7 @@
     savingSettings = true;
     try {
       await savePreferences(preferences);
+      if (isTauri) void emit("lume://preferences-changed", preferences);
       if (key === "monitorId") await positionWindow();
     } catch (error) {
       preferences = previous;
@@ -878,6 +968,37 @@
     } finally {
       savingSettings = false;
     }
+  }
+
+  function projectKey(value: string) {
+    const normalized = value.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+    const identity = /^[a-z]:/i.test(normalized) ? normalized.toLowerCase() : normalized;
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return `project-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  }
+
+  function projectSoundEnabled(session: AgentSession) {
+    const profile = preferences.projectProfiles[projectKey(session.workingDirectory ?? session.project)];
+    return profile?.soundEnabled ?? true;
+  }
+
+  async function updateSelectedProjectProfile(
+    patch: Partial<Preferences["projectProfiles"][string]>,
+  ) {
+    if (!selectedProfileKey || !selectedProject) return;
+    const current = preferences.projectProfiles[selectedProfileKey] ?? {
+      label: selectedProject.label,
+      soundEnabled: true,
+      launchTarget: undefined,
+    };
+    await updatePreference("projectProfiles", {
+      ...preferences.projectProfiles,
+      [selectedProfileKey]: { ...current, ...patch },
+    });
   }
 
   function playTone(kind: "completed" | "failed" | "permission") {
@@ -967,6 +1088,7 @@
 {:else}
 <main
   class:expanded
+  class:dark={effectiveDark}
   class="overlay-shell"
   style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
   onpointermove={wakeMascot}
@@ -1063,6 +1185,12 @@
                       {/if}
                       {shown(session.statusLabel)}
                     </span>
+                    {#if session.lastResponse && selectedId !== session.id}
+                      <span class="response-preview">
+                        <b>{tr("Final response", "Resposta final")}</b>
+                        <span>{session.lastResponse}</span>
+                      </span>
+                    {/if}
                   </span>
                   <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true">
                     <path d="m8 5 5 5-5 5" />
@@ -1070,10 +1198,20 @@
                 </button>
 
                 {#if selectedId === session.id}
+                  {@const capabilities = sessionCapabilities(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
                     <div class="access-profile">
                       <span>{shown(session.permissionProfile.label)}</span>
                       <small>{shown(session.permissionProfile.approvalPolicy)}</small>
+                    </div>
+
+                    <div class="capability-bar">
+                      {#if capabilities.canOpenSource}
+                        <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
+                      {/if}
+                      {#if capabilities.canReadResults && session.lastResponse}
+                        <button type="button" onclick={() => copyResult(`${session.id}-latest`, session.lastResponse ?? "")}>{copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy result", "Copiar resultado")}</button>
+                      {/if}
                     </div>
 
                     {#if session.lastResponse}
@@ -1214,6 +1352,35 @@
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
+            <div class="results-intro">
+              <span class="eyebrow">{tr("Recent results", "Resultados recentes")}</span>
+              <strong>{tr("Final responses from your agents", "Respostas finais dos seus agentes")}</strong>
+              <p>{tr("Kept only while Lume is running.", "Mantidas apenas enquanto o Lume está aberto.")}</p>
+            </div>
+            <div class="results-list">
+              {#each recentResults as item (item.result.id)}
+                {@const capabilities = sessionCapabilities(item.session)}
+                <article class="result-card">
+                  <div class="result-heading">
+                    <span class="agent-avatar agent-{item.session.agent}"><BrandIcon name={item.session.agent} size={15} /></span>
+                    <span><strong>{item.session.agentLabel}</strong><small>{item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
+                  </div>
+                  <p>{item.result.response}</p>
+                  <div class="result-actions">
+                    <button type="button" onclick={() => copyResult(item.result.id, item.result.response)}>{copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}</button>
+                    {#if capabilities.canPrompt && canContinueSession(item.session)}
+                      <button type="button" onclick={() => continueFromResult(item.session)}>{tr("Continue", "Continuar")}</button>
+                    {/if}
+                    {#if capabilities.canOpenSource}
+                      <button type="button" onclick={() => openSessionSource(item.session.id)}>{tr("Open source", "Abrir origem")}</button>
+                    {/if}
+                  </div>
+                </article>
+              {:else}
+                <p class="results-empty">{tr("Completed agent responses will appear here.", "As respostas de agentes finalizados aparecerão aqui.")}</p>
+              {/each}
+            </div>
+            <div class="settings-section-label history-label">{tr("Activity", "Atividade")}</div>
             {#each history as entry (entry.id)}
               <div class="history-row">
                 <span class="history-dot event-{entry.event}" aria-hidden="true"></span>
@@ -1224,7 +1391,7 @@
               </div>
             {:else}
               <div class="empty-state">
-                <strong>{tr("No history yet", "Histórico vazio")}</strong>
+                <strong>{tr("No activity yet", "Nenhuma atividade")}</strong>
                 <p>{tr("Completions, errors, and decisions will appear here.", "Conclusões, erros e decisões aparecerão aqui.")}</p>
               </div>
             {/each}
@@ -1234,25 +1401,44 @@
           <div class="settings" in:fade={{ duration: 150 }}>
             <div class="settings-section-label">{tr("Agents", "Agentes")}</div>
             {#each integrations as integration}
+              {@const diagnostic = integrationDiagnostics[integration.kind]}
               <div class="integration-row">
                 <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
                 <div>
                   <strong>{integration.label}</strong>
                   <span>{shown(integration.detail)}</span>
                 </div>
-                <button
-                  class:connected={integration.configured}
-                  disabled={!integration.installed || configuringIntegration === integration.kind}
-                  type="button"
-                  onclick={() => toggleIntegration(integration)}
-                >
-                  {configuringIntegration === integration.kind
-                    ? "…"
-                    : integration.configured
-                      ? tr("Connected", "Conectado")
-                      : tr("Connect", "Conectar")}
-                </button>
+                <div class="integration-actions">
+                  <button
+                    class="diagnose-button"
+                    disabled={diagnosingIntegration !== null}
+                    type="button"
+                    onclick={() => runIntegrationDiagnostic(integration)}
+                  >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
+                  <button
+                    class:connected={integration.configured}
+                    disabled={!integration.installed || configuringIntegration === integration.kind}
+                    type="button"
+                    onclick={() => toggleIntegration(integration)}
+                  >
+                    {configuringIntegration === integration.kind
+                      ? "…"
+                      : integration.configured
+                        ? tr("Connected", "Conectado")
+                        : tr("Connect", "Conectar")}
+                  </button>
+                </div>
               </div>
+              {#if diagnostic}
+                <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
+                  {#each diagnostic.checks as check (check.id)}
+                    <div class="diagnostic-check status-{check.status}">
+                      <i aria-hidden="true"></i>
+                      <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             {/each}
             {#if settingsMessage}
               <p class:error={settingsMessageIsError} class="settings-feedback" transition:fade>
@@ -1296,6 +1482,18 @@
                 <option value="pt-BR">Português</option>
               </select>
             </label>
+            <div class="setting-row">
+              <div><strong>{tr("Dark mode", "Modo escuro")}</strong><span>{tr("Switch between the light and dark appearance.", "Alterne entre a aparência clara e escura.")}</span></div>
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  checked={effectiveDark}
+                  onchange={(event) =>
+                    updatePreference("darkMode", event.currentTarget.checked)}
+                />
+                <span></span>
+              </label>
+            </div>
             <div class="setting-row">
               <div><strong>{tr("Start with the system", "Iniciar com o sistema")}</strong><span>{tr("Lume stays available in the system tray.", "Lume fica disponível na bandeja.")}</span></div>
               <label class="switch">
@@ -1373,6 +1571,47 @@
                 {/each}
               </div>
             </div>
+            <div class="settings-section-label preferences-label">{tr("Project profiles", "Perfis por projeto")}</div>
+            {#if detectedProjects.length > 0}
+              <label class="field-row">
+                <span><strong>{tr("Project", "Projeto")}</strong><small>{tr("Overrides only for this project.", "Ajustes somente para este projeto.")}</small></span>
+                <select
+                  value={selectedProfileKey ?? ""}
+                  onchange={(event) => (selectedProfileKey = event.currentTarget.value)}
+                >
+                  {#each detectedProjects as project (project.key)}
+                    <option value={project.key}>{project.label}</option>
+                  {/each}
+                </select>
+              </label>
+              <div class="setting-row">
+                <div><strong>{tr("Project sounds", "Sons do projeto")}</strong><span>{tr("Allow completion, error, and permission sounds.", "Permite sons de conclusão, erro e permissão.")}</span></div>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    checked={selectedProjectProfile?.soundEnabled ?? true}
+                    onchange={(event) =>
+                      updateSelectedProjectProfile({ soundEnabled: event.currentTarget.checked })}
+                  />
+                  <span></span>
+                </label>
+              </div>
+              <div class="launch-setting project-launch-setting">
+                <span><strong>{tr("Session destination", "Destino das sessões")}</strong><small>{tr("Override the global destination.", "Substitui o destino global.")}</small></span>
+                <div class="segmented" aria-label={tr("Project session destination", "Destino das sessões do projeto")}>
+                  {#each [["", tr("Global", "Global")], ["auto", "Auto"], ["terminal", "Terminal"], ["vscode", "VS Code"]] as option}
+                    <button
+                      class:active={(selectedProjectProfile?.launchTarget ?? "") === option[0]}
+                      type="button"
+                      onclick={() =>
+                        updateSelectedProjectProfile({ launchTarget: option[0] ? option[0] as Preferences["launchTarget"] : undefined })}
+                    >{option[1]}</button>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <p class="profile-empty">{tr("Profiles appear after a project is detected.", "Os perfis aparecem depois que um projeto é detectado.")}</p>
+            {/if}
             <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
             <div class="update-card" aria-live="polite">
               <div class="update-main">
@@ -1443,12 +1682,12 @@
           class:active={view === "history"}
           type="button"
           onclick={() => openView("history")}
-          aria-label={tr("History", "Histórico")}
+          aria-label={tr("Results", "Resultados")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M4.5 5.5h11M4.5 10h11M4.5 14.5h7" />
           </svg>
-          <span>{tr("History", "Histórico")}</span>
+          <span>{tr("Results", "Resultados")}</span>
         </button>
         <button
           class:active={view === "settings"}
@@ -1715,6 +1954,9 @@
   .status-line.status-failed > i { background: #b95454; }
   .status-line.status-waiting_for_input { color: #a87925; }
   .status-line.status-waiting_for_input > i { background: #c99a3f; }
+  .response-preview { min-width: 0; margin-top: 4px; padding: 6px 7px; display: grid; gap: 2px; border-left: 2px solid rgba(77, 117, 99, 0.22); border-radius: 0 7px 7px 0; color: #697771; background: rgba(73, 102, 89, 0.035); }
+  .response-preview b { color: #668075; font-size: 7px; letter-spacing: 0.055em; text-transform: uppercase; }
+  .response-preview span { overflow: hidden; display: -webkit-box; font-size: 9px; line-height: 1.35; line-clamp: 2; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 
   @keyframes status-dot-bounce {
     0%, 60%, 100% { opacity: 0.48; transform: translateY(1px); }
@@ -1728,6 +1970,9 @@
   .access-profile { margin: -2px 0 10px; display: grid; gap: 1px; }
   .access-profile span { color: #46554f; font-size: 10px; font-weight: 700; }
   .access-profile small { color: #89938f; font-size: 9px; }
+  .capability-bar { margin: -2px 0 9px; display: flex; align-items: center; gap: 5px; }
+  .capability-bar button { height: 24px; padding: 0 7px; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 7px; color: #63786e; background: rgba(77, 105, 92, 0.035); font-size: 8px; font-weight: 700; cursor: pointer; }
+  .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
 
   .permission-block { padding-left: 11px; border-left: 2px solid #d49350; display: grid; gap: 6px; }
   .permission-block .eyebrow { color: #a06323; font-size: 9px; font-weight: 780; letter-spacing: 0.05em; text-transform: uppercase; }
@@ -1804,6 +2049,23 @@
   .quiet-orbit i { width: 7px; height: 7px; border-radius: 50%; background: #799186; }
 
   .history-list { padding: 6px 16px 16px; }
+  .results-intro { padding: 8px 1px 12px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .results-intro .eyebrow { display: block; margin-bottom: 4px; color: #71867c; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
+  .results-intro strong { color: #2d3a35; font-size: 12px; }
+  .results-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; }
+  .results-list { display: grid; gap: 8px; padding: 10px 0 3px; }
+  .result-card { padding: 9px 10px; border: 1px solid rgba(91, 115, 104, 0.1); border-radius: 11px; background: rgba(75, 105, 91, 0.03); }
+  .result-heading { display: flex; align-items: center; gap: 7px; }
+  .result-heading .agent-avatar { width: 25px; height: 25px; border-radius: 8px; }
+  .result-heading > span:last-child { min-width: 0; display: grid; gap: 1px; }
+  .result-heading strong { color: #34443d; font-size: 9px; }
+  .result-heading small { overflow: hidden; color: #87928d; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .result-card > p { max-height: 78px; margin: 8px 0; overflow: hidden; display: -webkit-box; color: #52615b; font-size: 9px; line-height: 1.45; line-clamp: 4; overflow-wrap: anywhere; white-space: pre-wrap; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
+  .result-actions { display: flex; align-items: center; gap: 5px; }
+  .result-actions button { height: 24px; padding: 0 7px; border: 1px solid rgba(84, 109, 98, 0.12); border-radius: 7px; color: #5e756b; background: rgba(255, 255, 255, 0.36); font-size: 8px; font-weight: 700; cursor: pointer; }
+  .result-actions button:hover { background: rgba(255, 255, 255, 0.72); }
+  .results-empty { margin: 8px 2px 4px; color: #89938f; font-size: 9px; }
+  .history-label { margin-top: 7px; }
   .history-row { min-height: 60px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .history-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #6f9b88; }
   .history-dot.event-failed,
@@ -1820,7 +2082,7 @@
   .settings-section-label.preferences-label { padding-top: 17px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .integration-row .agent-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: 10px; }
-  .integration-row > div { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .integration-row > div:not(.integration-actions) { min-width: 0; flex: 1; display: grid; gap: 2px; }
   .integration-row strong { color: #35423d; font-size: 10px; }
   .integration-row div span { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .integration-row button { min-width: 63px; height: 27px; padding: 0 8px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 8px; color: #577064; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: background 150ms ease, color 150ms ease, transform 150ms ease; }
@@ -1829,6 +2091,16 @@
   .integration-row button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(82, 112, 99, 0.06); }
   .integration-row button.connected { border-color: transparent; color: #6d7e76; }
   .integration-row button:disabled { cursor: default; opacity: 0.5; }
+  .integration-actions { display: flex; align-items: center; gap: 4px; }
+  .integration-actions .diagnose-button { min-width: 42px; padding: 0 6px; border-color: transparent; color: #78877f; }
+  .diagnostic-card { margin: -1px 0 7px 38px; padding: 7px 8px; display: grid; gap: 6px; border: 1px solid rgba(93, 113, 104, 0.1); border-radius: 9px; background: rgba(75, 103, 90, 0.03); }
+  .diagnostic-check { min-width: 0; display: flex; align-items: flex-start; gap: 7px; }
+  .diagnostic-check > i { width: 6px; height: 6px; margin-top: 3px; flex: 0 0 auto; border-radius: 50%; background: #789487; }
+  .diagnostic-check.status-warning > i { background: #c3933c; }
+  .diagnostic-check.status-error > i { background: #bd5c59; }
+  .diagnostic-check > span { min-width: 0; display: grid; gap: 1px; }
+  .diagnostic-check strong { color: #4c5c55; font-size: 8px; }
+  .diagnostic-check small { overflow: hidden; color: #89958f; font-size: 8px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .browser-row button { min-width: 68px; }
   .browser-path { margin: 7px 2px 0; overflow-wrap: anywhere; color: #89938f; font-size: 9px; line-height: 1.4; }
   .setting-row,
@@ -1856,6 +2128,8 @@
   .segmented { padding: 2px; display: grid; grid-template-columns: repeat(3, 1fr); border-radius: 9px; background: rgba(83, 104, 95, 0.07); }
   .segmented button { height: 29px; border: 0; border-radius: 7px; color: #74817b; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease; }
   .segmented button.active { color: #35473f; background: rgba(255, 255, 255, 0.82); box-shadow: 0 1px 4px rgba(37, 53, 46, 0.1); }
+  .project-launch-setting .segmented { grid-template-columns: repeat(4, 1fr); }
+  .profile-empty { margin: 5px 1px 2px; color: #89938f; font-size: 9px; line-height: 1.45; }
   .update-card { padding: 12px; border: 1px solid rgba(92, 111, 103, 0.11); border-radius: 13px; background: rgba(84, 111, 99, 0.035); }
   .update-main { display: flex; align-items: center; gap: 9px; }
   .update-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -1896,55 +2170,68 @@
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   }
 
-  @media (prefers-color-scheme: dark) {
-    .lume-orb,
-    .panel,
-    .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
-    .brand-lockup strong,
-    .session-title-row strong,
-    .board-intro strong,
-    .terminal-picker-copy strong,
-    .history-row strong,
-    .setting-row strong,
-    .integration-row strong,
-    .field-row strong,
-    .launch-setting strong { color: #e3ebe7; }
-    .update-copy strong { color: #e3ebe7; }
-    .launcher-row strong { color: #dfe8e3; }
-    .panel-header,
-    footer,
-    .session-row,
-    .history-row,
-    .setting-row,
-    .field-row { border-color: rgba(190, 209, 200, 0.09); }
-    .session-row:hover,
-    .session-row.selected { background: rgba(198, 218, 208, 0.045); }
-    .project-name,
-    .board-intro p,
-    .terminal-picker-copy small,
-    .history-row span,
-    .settings-feedback { color: #adbab4; }
-    .settings-feedback.error { color: #d68d8d; }
-    .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
-    .update-card p.error { color: #d68d8d; }
-    .access-profile span,
-    .empty-state strong { color: #c5d0cb; }
-    code,
-    .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
-    .permission-block > strong { color: #e2d0bd; }
-    .permission-actions button,
-    .field-row select,
-    .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-    .final-response { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
-    .final-response .eyebrow { color: #8ca69a; }
-    .final-response p { color: #c2d0c9; }
-    .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
-    .board-intro,
-    .terminal-picker-row,
-    .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
-    .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-    .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
-    .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
-    .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
-  }
+  .overlay-shell.dark { color-scheme: dark; }
+  .overlay-shell.dark .lume-orb,
+  .overlay-shell.dark .panel,
+  .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
+  .overlay-shell.dark .brand-lockup strong,
+  .overlay-shell.dark .session-title-row strong,
+  .overlay-shell.dark .board-intro strong,
+  .overlay-shell.dark .terminal-picker-copy strong,
+  .overlay-shell.dark .history-row strong,
+  .overlay-shell.dark .setting-row strong,
+  .overlay-shell.dark .integration-row strong,
+  .overlay-shell.dark .field-row strong,
+  .overlay-shell.dark .launch-setting strong { color: #e3ebe7; }
+  .overlay-shell.dark .update-copy strong { color: #e3ebe7; }
+  .overlay-shell.dark .launcher-row strong { color: #dfe8e3; }
+  .overlay-shell.dark .panel-header,
+  .overlay-shell.dark footer,
+  .overlay-shell.dark .session-row,
+  .overlay-shell.dark .history-row,
+  .overlay-shell.dark .setting-row,
+  .overlay-shell.dark .field-row { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .session-row:hover,
+  .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
+  .overlay-shell.dark .project-name,
+  .overlay-shell.dark .board-intro p,
+  .overlay-shell.dark .terminal-picker-copy small,
+  .overlay-shell.dark .history-row span,
+  .overlay-shell.dark .settings-feedback { color: #adbab4; }
+  .overlay-shell.dark .settings-feedback.error { color: #d68d8d; }
+  .overlay-shell.dark .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .update-card p.error { color: #d68d8d; }
+  .overlay-shell.dark .diagnostic-card,
+  .overlay-shell.dark .result-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .diagnostic-check strong,
+  .overlay-shell.dark .result-heading strong,
+  .overlay-shell.dark .results-intro strong { color: #dce7e1; }
+  .overlay-shell.dark .diagnostic-check small,
+  .overlay-shell.dark .result-heading small,
+  .overlay-shell.dark .results-intro p,
+  .overlay-shell.dark .result-card > p { color: #aebdb5; }
+  .overlay-shell.dark .result-actions button,
+  .overlay-shell.dark .capability-bar button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .access-profile span,
+  .overlay-shell.dark .empty-state strong { color: #c5d0cb; }
+  .overlay-shell.dark code,
+  .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
+  .overlay-shell.dark .permission-block > strong { color: #e2d0bd; }
+  .overlay-shell.dark .permission-actions button,
+  .overlay-shell.dark .field-row select,
+  .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .final-response,
+  .overlay-shell.dark .response-preview { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
+  .overlay-shell.dark .final-response .eyebrow,
+  .overlay-shell.dark .response-preview b { color: #8ca69a; }
+  .overlay-shell.dark .final-response p,
+  .overlay-shell.dark .response-preview span { color: #c2d0c9; }
+  .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
+  .overlay-shell.dark .board-intro,
+  .overlay-shell.dark .terminal-picker-row,
+  .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
 </style>

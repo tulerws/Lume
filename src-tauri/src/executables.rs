@@ -19,6 +19,10 @@ pub fn available(name: &str) -> bool {
     resolve(name).is_some()
 }
 
+pub fn path(name: &str) -> Option<PathBuf> {
+    resolve(name)
+}
+
 fn resolve(name: &str) -> Option<PathBuf> {
     explicit_path(name)
         .or_else(|| path_lookup(name))
