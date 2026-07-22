@@ -13,7 +13,7 @@ usuário vê está em **um único arquivo**: `src/routes/+page.svelte`.
 ```
 src/
 ├── routes/
-│   ├── +page.svelte      A TELA. A cápsula inteira (~1950 linhas).
+│   ├── +page.svelte      A TELA. A cápsula e suas quatro vistas principais.
 │   ├── +layout.svelte    "Moldura" em volta de toda página (aqui só carrega o CSS).
 │   └── +layout.ts        Config: ssr = false (roda 100% no webview, sem servidor).
 ├── lib/
@@ -199,6 +199,9 @@ Não é uma tela só: são **quatro abas** no mesmo arquivo, controladas pelo `v
 {#if view === "settings"} ... {/if}   <!-- ajustes -->
 ```
 Mais o `<style>` de tudo isso. São efetivamente quatro telas e seus estilos num arquivo.
+Além das abas, o arquivo concentra a paleta global de comandos, perfis por projeto, layouts
+salvos do Whiteboard, notas de resultados e a instalação dos detectores externos. Os dados e
+as operações nativas continuam tipados em `domain.ts` e encapsulados em `lume.ts`.
 
 ## Quero mudar X, edito onde
 
@@ -211,6 +214,8 @@ Mais o `<style>` de tudo isso. São efetivamente quatro telas e seus estilos num
 | Textos em pt/en                                    | `src/lib/i18n.ts`                              |
 | Adicionar/alterar uma chamada ao Rust              | `src/lib/lume.ts` (+ o comando em `lib.rs`)    |
 | Um tipo de dado novo                               | `src/lib/domain.ts` (+ `src-tauri/src/domain.rs`) |
+| Perfis, layouts, notas ou paleta de comandos       | `src/routes/+page.svelte` + `src/lib/domain.ts` |
+| Catálogo e validação de detectores externos        | `src-tauri/src/agent_plugins.rs`               |
 | Estilos globais (fonte, fundo)                     | `src/app.css`                                  |
 
 ## Como rodar e ver suas mudanças

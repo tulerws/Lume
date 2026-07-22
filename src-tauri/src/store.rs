@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::domain::{AgentSession, HistoryEntry, Preferences};
+use crate::domain::{AgentSession, HistoryEntry, Preferences, ResultNote};
 
 pub struct Store {
     connection: Connection,
@@ -23,11 +23,7 @@ impl Store {
                 "PRAGMA journal_mode = WAL;
                  PRAGMA foreign_keys = ON;
                  PRAGMA secure_delete = ON;
-                 CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
-                 );
+                 DROP TABLE IF EXISTS sessions;
                  CREATE TABLE IF NOT EXISTS history (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -42,6 +38,16 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS preferences (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     payload TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS result_notes (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    agent_label TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    files TEXT NOT NULL,
+                    tests TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
                  );",
             )
             .map_err(|error| error.to_string())?;
@@ -49,44 +55,16 @@ impl Store {
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>, String> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT payload FROM sessions ORDER BY updated_at DESC")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?;
-
-        rows.map(|row| {
-            let payload = row.map_err(|error| error.to_string())?;
-            serde_json::from_str(&payload).map_err(|error| error.to_string())
-        })
-        .collect()
+        Ok(Vec::new())
     }
 
-    pub fn save_session(&self, session: &AgentSession) -> Result<(), String> {
-        // Solicitações, diretórios e respostas são mantidos apenas em memória.
-        let mut sanitized = session.clone();
-        sanitized.pending_permission = None;
-        sanitized.working_directory = None;
-        sanitized.last_response = None;
-        let payload = serde_json::to_string(&sanitized).map_err(|error| error.to_string())?;
-        self.connection
-            .execute(
-                "INSERT INTO sessions(id, payload, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET payload = excluded.payload,
-                    updated_at = excluded.updated_at",
-                params![session.id, payload, session.updated_at],
-            )
-            .map_err(|error| error.to_string())?;
+    pub fn save_session(&self, _session: &AgentSession) -> Result<(), String> {
         Ok(())
     }
 
-    pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
-        self.connection
-            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])
-            .map_err(|error| error.to_string())?;
+    pub fn delete_session(&self, _session_id: &str) -> Result<(), String> {
         Ok(())
     }
 
@@ -133,6 +111,64 @@ impl Store {
             .map_err(|error| error.to_string())?;
         rows.map(|row| row.map_err(|error| error.to_string()))
             .collect()
+    }
+
+    pub fn save_result_note(&self, note: &ResultNote) -> Result<(), String> {
+        let files = serde_json::to_string(&note.files).map_err(|error| error.to_string())?;
+        let tests = serde_json::to_string(&note.tests).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO result_notes
+                 (id, title, body, agent_label, project, files, tests, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    note.id,
+                    note.title,
+                    note.body,
+                    note.agent_label,
+                    note.project,
+                    files,
+                    tests,
+                    note.created_at
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn result_notes(&self, limit: usize) -> Result<Vec<ResultNote>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, title, body, agent_label, project, files, tests, created_at
+                 FROM result_notes ORDER BY created_at DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([limit as i64], |row| {
+                let files: String = row.get(5)?;
+                let tests: String = row.get(6)?;
+                Ok(ResultNote {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    agent_label: row.get(3)?,
+                    project: row.get(4)?,
+                    files: serde_json::from_str(&files).unwrap_or_default(),
+                    tests: serde_json::from_str(&tests).unwrap_or_default(),
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub fn delete_result_note(&self, id: &str) -> Result<(), String> {
+        self.connection
+            .execute("DELETE FROM result_notes WHERE id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn load_preferences(&self) -> Result<Preferences, String> {
@@ -185,7 +221,7 @@ mod tests {
     };
 
     #[test]
-    fn pending_permission_payload_is_never_persisted() {
+    fn agent_sessions_are_never_persisted() {
         let store = Store::open(Path::new(":memory:")).expect("banco em memória");
         let session = AgentSession {
             id: "session".into(),
@@ -205,6 +241,7 @@ mod tests {
                 mode: AccessMode::Custom,
                 label: "Sessão".into(),
                 approval_policy: "on-request".into(),
+                approvals_reviewer: None,
                 can_respond_from_lume: true,
                 available_actions: vec![PermissionAction::Deny],
             },
@@ -217,13 +254,17 @@ mod tests {
                 requested_at: "0".into(),
             }),
             last_response: Some("resposta que nao pode ser salva".into()),
+            results: vec![crate::domain::SessionResult {
+                id: "result-1".into(),
+                response: "outra resposta sensível".into(),
+                created_at: 1,
+                files: Vec::new(),
+                tests: Vec::new(),
+            }],
         };
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].pending_permission.is_none());
-        assert!(loaded[0].working_directory.is_none());
-        assert!(loaded[0].last_response.is_none());
+        assert!(loaded.is_empty());
     }
 
     #[test]
@@ -234,6 +275,46 @@ mod tests {
         .expect("preferências antigas");
         assert!(preferences.overlay_x.is_none());
         assert!(preferences.overlay_y.is_none());
+        assert!(preferences.dark_mode.is_none());
         assert_eq!(preferences.language, "en");
+        assert!(preferences.project_profiles.is_empty());
+        assert!(preferences.whiteboard_layouts.is_empty());
+        assert_eq!(preferences.global_shortcut, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn explicitly_saved_result_notes_round_trip_locally() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        let note = ResultNote {
+            id: "note:result-1".into(),
+            title: "Codex · Lume".into(),
+            body: "Resposta final".into(),
+            agent_label: "Codex".into(),
+            project: "Lume".into(),
+            files: vec!["src/main.rs".into()],
+            tests: vec!["cargo test".into()],
+            created_at: 42,
+        };
+        store.save_result_note(&note).expect("salva nota");
+
+        let notes = store.result_notes(10).expect("carrega notas");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "Resposta final");
+        assert_eq!(notes[0].files, vec!["src/main.rs"]);
+
+        store.delete_result_note(&note.id).expect("remove nota");
+        assert!(store.result_notes(10).expect("notas vazias").is_empty());
+    }
+
+    #[test]
+    fn old_project_profiles_gain_the_new_optional_fields() {
+        let profile: crate::domain::ProjectProfile = serde_json::from_str(
+            r#"{"label":"Lume","soundEnabled":true,"launchTarget":"terminal"}"#,
+        )
+        .expect("perfil antigo");
+        assert!(profile.monitor_id.is_none());
+        assert!(profile.permission_mode.is_none());
+        assert!(profile.whiteboard_layout_id.is_none());
+        assert!(profile.preferred_agents.is_empty());
     }
 }

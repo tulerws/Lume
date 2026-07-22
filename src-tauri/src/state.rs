@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9,12 +9,14 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PermissionAction, PermissionProfile, Preferences, SessionSource, SessionStatus,
+        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionResult, SessionSource,
+        SessionStatus,
     },
     store::Store,
 };
 
-const PROCESS_MISSING_SCAN_LIMIT: u8 = 3;
+const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
+const WEB_SESSION_STALE_MS: i64 = 12_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,22 +29,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(database_path: &Path) -> Result<Self, String> {
         let store = Store::open(database_path)?;
-        let mut sessions = store.load_sessions()?;
-        for session in &mut sessions {
-            session.pending_permission = None;
-            session.working_directory = None;
-            session.last_response = None;
-            if matches!(
-                session.status,
-                SessionStatus::Running
-                    | SessionStatus::PermissionRequired
-                    | SessionStatus::WaitingForInput
-            ) {
-                session.status = SessionStatus::Completed;
-                session.status_label = "Aguardando redetecção".into();
-            }
-            store.save_session(session)?;
-        }
+        let sessions = Vec::new();
         // O banco é pequeno; a limpeza física na inicialização também remove
         // vestígios deixados em WAL/páginas livres por versões anteriores.
         store.scrub_deleted_content()?;
@@ -63,28 +50,18 @@ impl AppState {
             .sessions
             .lock()
             .map_err(|_| "Não foi possível acessar as sessões".to_string())?
-            .iter()
-            .filter(|session| {
-                matches!(
-                    session.status,
-                    SessionStatus::Running
-                        | SessionStatus::PermissionRequired
-                        | SessionStatus::WaitingForInput
-                ) || now_millis() - session.updated_at < 10 * 60 * 1_000
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+            .clone();
         let mut deduplicated = Vec::<AgentSession>::new();
-        for session in sessions {
-            let duplicate = session.native_session_id.as_ref().and_then(|native_id| {
-                deduplicated.iter().position(|existing| {
-                    existing.agent == session.agent
-                        && existing.native_session_id.as_ref() == Some(native_id)
-                })
-            });
+        for mut session in sessions {
+            let duplicate = deduplicated
+                .iter()
+                .position(|existing| same_session_identity(existing, &session));
             if let Some(index) = duplicate {
                 if prefer_session(&session, &deduplicated[index]) {
+                    merge_results(&mut session, &deduplicated[index]);
                     deduplicated[index] = session;
+                } else {
+                    merge_results(&mut deduplicated[index], &session);
                 }
             } else {
                 deduplicated.push(session);
@@ -134,7 +111,7 @@ impl AppState {
                         .any(|(agent, source, native_directory)| {
                             agent == &session.agent
                                 && source == &session.source
-                                && native_directory == directory
+                                && same_directory(Some(native_directory), Some(directory))
                         })
                 }) && !(session.source == SessionSource::Vscode
                     && native_vscode_agents.contains(&session.agent)))
@@ -169,27 +146,82 @@ impl AppState {
         store.purge_history(cutoff)
     }
 
+    pub fn result_notes(&self, limit: usize) -> Result<Vec<ResultNote>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível acessar as notas".to_string())?
+            .result_notes(limit.min(200))
+    }
+
+    pub fn save_result_note(
+        &self,
+        session_id: &str,
+        result_id: &str,
+        title: &str,
+    ) -> Result<ResultNote, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar o resultado".to_string())?;
+        let session = sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        let result = session
+            .results
+            .iter()
+            .find(|result| result.id == result_id)
+            .ok_or_else(|| "Resultado não encontrado".to_string())?;
+        let title = title.trim();
+        let note = ResultNote {
+            id: format!("note:{result_id}"),
+            title: if title.is_empty() {
+                format!("{} · {}", session.agent_label, session.project)
+            } else {
+                title.chars().take(120).collect()
+            },
+            body: result.response.chars().take(64 * 1024).collect(),
+            agent_label: session.agent_label.clone(),
+            project: session.project.clone(),
+            files: result.files.clone(),
+            tests: result.tests.clone(),
+            created_at: now_millis(),
+        };
+        drop(sessions);
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível salvar a nota".to_string())?
+            .save_result_note(&note)?;
+        Ok(note)
+    }
+
+    pub fn delete_result_note(&self, id: &str) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível remover a nota".to_string())?
+            .delete_result_note(id)
+    }
+
     pub fn mark_process_terminated(&self, process_id: u32) -> Result<bool, String> {
         let now = now_millis();
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| "Não foi possível encerrar as sessões".to_string())?;
-        let mut snapshots = Vec::new();
+        let removed = sessions
+            .iter()
+            .filter(|session| session.process_id == Some(process_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Ok(false);
+        }
         let mut history = Vec::new();
         let mut cancelled_permissions = Vec::new();
-        for session in sessions
-            .iter_mut()
-            .filter(|session| session.process_id == Some(process_id))
-        {
-            session.status = SessionStatus::Completed;
-            session.status_label = "Encerrado pelo Lume".into();
-            session.process_id = None;
-            session.updated_at = now;
-            if let Some(permission) = session.pending_permission.take() {
-                cancelled_permissions.push(permission.id);
+        for session in &removed {
+            if let Some(permission) = session.pending_permission.as_ref() {
+                cancelled_permissions.push(permission.id.clone());
             }
-            snapshots.push(session.clone());
             history.push(HistoryEntry {
                 id: format!("{}-{}-terminated", now, session.id),
                 session_id: session.id.clone(),
@@ -200,14 +232,16 @@ impl AppState {
                 created_at: now,
             });
         }
+        let removed_ids = removed
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        sessions.retain(|session| !removed_ids.contains(&session.id));
         drop(sessions);
-        if snapshots.is_empty() {
-            return Ok(false);
-        }
         self.missing_process_scans
             .lock()
             .map_err(|_| "Não foi possível limpar a presença do processo".to_string())?
-            .retain(|session_id, _| !snapshots.iter().any(|session| &session.id == session_id));
+            .retain(|session_id, _| !removed_ids.contains(session_id));
 
         if !cancelled_permissions.is_empty() {
             let (decisions, decision_changed) = &*self.decisions;
@@ -223,9 +257,6 @@ impl AppState {
             .store
             .lock()
             .map_err(|_| "Não foi possível persistir o encerramento".to_string())?;
-        for session in snapshots {
-            store.save_session(&session)?;
-        }
         for entry in history {
             store.add_history(&entry)?;
         }
@@ -238,6 +269,7 @@ impl AppState {
         }
 
         let now = now_millis();
+        let session_ended = matches!(&event.event, HookEventKind::SessionEnded);
         let mut sessions = self
             .sessions
             .lock()
@@ -282,7 +314,12 @@ impl AppState {
                         .process_id
                         .is_some_and(|process_id| session.process_id == Some(process_id))
                         || (event.source == Some(SessionSource::Vscode)
-                            && session.source == SessionSource::Vscode))
+                            && ((session.source == SessionSource::Vscode
+                                && event.working_directory.is_none())
+                                || same_directory(
+                                    session.working_directory.as_deref(),
+                                    event.working_directory.as_deref(),
+                                ))))
             })
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
@@ -319,6 +356,14 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível atualizar a presença da sessão".to_string())?
             .remove(&target_session_id);
+        let superseded_permission_id = (!matches!(&event.event, HookEventKind::PermissionRequest))
+            .then(|| {
+                session
+                    .pending_permission
+                    .as_ref()
+                    .map(|permission| permission.id.clone())
+            })
+            .flatten();
 
         let permission_id = match event.event {
             HookEventKind::SessionStarted => {
@@ -368,9 +413,32 @@ impl AppState {
             }
         };
 
+        if matches!(
+            &event.event,
+            HookEventKind::Completed | HookEventKind::SessionEnded
+        ) {
+            remember_result(session, now);
+        }
+
         let snapshot = session.clone();
         let history = history_for_event(&snapshot, &event.event, now);
+        if session_ended {
+            sessions.retain(|session| session.id != target_session_id);
+            self.missing_process_scans
+                .lock()
+                .map_err(|_| "Não foi possível remover a sessão encerrada".to_string())?
+                .remove(&target_session_id);
+        }
         drop(sessions);
+
+        if let Some(permission_id) = superseded_permission_id {
+            let (decisions, decision_changed) = &*self.decisions;
+            decisions
+                .lock()
+                .map_err(|_| "Não foi possível liberar a permissão antiga".to_string())?
+                .insert(permission_id, PermissionAction::Deny);
+            decision_changed.notify_all();
+        }
 
         let store = self
             .store
@@ -492,7 +560,20 @@ impl AppState {
         Ok(values.remove(permission_id))
     }
 
+    #[cfg(test)]
     pub fn reconcile_processes(&self, discovered: Vec<DiscoveredProcess>) -> Result<bool, String> {
+        let live_pids = discovered
+            .iter()
+            .map(|process| process.process_id)
+            .collect();
+        self.reconcile_process_snapshot(discovered, live_pids)
+    }
+
+    pub fn reconcile_process_snapshot(
+        &self,
+        discovered: Vec<DiscoveredProcess>,
+        live_pids: HashSet<u32>,
+    ) -> Result<bool, String> {
         let now = now_millis();
         let active_pids = discovered
             .iter()
@@ -513,6 +594,28 @@ impl AppState {
         let mut cancelled_permissions = Vec::new();
         let mut removed_sessions = Vec::new();
 
+        let stale_web_ids = sessions
+            .iter()
+            .filter(|session| {
+                session.source == SessionSource::Web
+                    && now - session.updated_at > WEB_SESSION_STALE_MS
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        if !stale_web_ids.is_empty() {
+            for session in sessions
+                .iter()
+                .filter(|session| stale_web_ids.contains(&session.id))
+            {
+                if let Some(permission) = session.pending_permission.as_ref() {
+                    cancelled_permissions.push(permission.id.clone());
+                }
+            }
+            sessions.retain(|session| !stale_web_ids.contains(&session.id));
+            removed_sessions.extend(stale_web_ids);
+            changed = true;
+        }
+
         let duplicate_provisional_ids = duplicate_provisional_ids(&sessions, &active_pids);
         if !duplicate_provisional_ids.is_empty() {
             sessions.retain(|session| !duplicate_provisional_ids.contains(&session.id));
@@ -524,7 +627,7 @@ impl AppState {
             let has_recent_native_vscode_chat = process.source == SessionSource::Vscode
                 && sessions.iter().any(|session| {
                     !is_provisional_process(session)
-                        && session.agent == process.agent
+                        && session_matches_process(session, &process)
                         && session.source == SessionSource::Vscode
                         && (matches!(
                             session.status,
@@ -538,7 +641,7 @@ impl AppState {
                     .iter()
                     .filter(|session| {
                         is_provisional_process(session)
-                            && session.agent == process.agent
+                            && session_matches_process(session, &process)
                             && session.source == SessionSource::Vscode
                     })
                     .map(|session| session.id.clone())
@@ -558,7 +661,7 @@ impl AppState {
                         .iter()
                         .filter(|session| !is_provisional_process(session))
                         .filter(|session| {
-                            session.agent == process.agent
+                            session_matches_process(session, &process)
                                 && session.source == process.source
                                 && session.working_directory.as_ref() == Some(directory)
                                 && matches!(
@@ -617,6 +720,10 @@ impl AppState {
                     session.source = process.source.clone();
                     refreshed = true;
                 }
+                if session.agent_label != process.agent_label {
+                    session.agent_label = process.agent_label.clone();
+                    refreshed = true;
+                }
                 if is_provisional_process(session) && session.status == SessionStatus::Completed {
                     session.status = SessionStatus::WaitingForInput;
                     session.status_label = "Esperando ação".into();
@@ -633,9 +740,12 @@ impl AppState {
             }
             if let Some(session) = sessions.iter_mut().find(|session| {
                 is_provisional_process(session)
-                    && session.agent == process.agent
+                    && session_matches_process(session, &process)
                     && session.source == process.source
-                    && session.working_directory == process.working_directory
+                    && same_directory(
+                        session.working_directory.as_deref(),
+                        process.working_directory.as_deref(),
+                    )
             }) {
                 session.process_id = Some(process.process_id);
                 session.status = SessionStatus::WaitingForInput;
@@ -652,7 +762,7 @@ impl AppState {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Sessão local")
                 .to_string();
-            let agent_name = agent_label(&process.agent).to_string();
+            let agent_name = process.agent_label.clone();
             let session = AgentSession {
                 id: format!(
                     "process:{}:{}",
@@ -674,6 +784,7 @@ impl AppState {
                 permission_profile: default_profile(&process.agent),
                 pending_permission: None,
                 last_response: None,
+                results: Vec::new(),
             };
             snapshots.push(session.clone());
             sessions.push(session);
@@ -683,17 +794,18 @@ impl AppState {
         for session in sessions.iter().filter(|session| {
             session
                 .process_id
-                .is_some_and(|pid| active_pids.contains(&pid))
+                .is_some_and(|pid| live_pids.contains(&pid))
         }) {
             missing_process_scans.remove(&session.id);
         }
         missing_process_scans
             .retain(|session_id, _| sessions.iter().any(|session| &session.id == session_id));
 
-        for session in sessions.iter_mut().filter(|session| {
+        let mut closed_session_ids = Vec::new();
+        for session in sessions.iter().filter(|session| {
             session
                 .process_id
-                .is_some_and(|pid| !active_pids.contains(&pid))
+                .is_some_and(|pid| !live_pids.contains(&pid))
         }) {
             let missing_scans = missing_process_scans
                 .entry(session.id.clone())
@@ -703,23 +815,10 @@ impl AppState {
                 continue;
             }
             missing_process_scans.remove(&session.id);
-            session.process_id = None;
-            if matches!(
-                session.status,
-                SessionStatus::Completed | SessionStatus::Failed
-            ) {
-                session.updated_at = now;
-                snapshots.push(session.clone());
-                changed = true;
-                continue;
+            closed_session_ids.push(session.id.clone());
+            if let Some(permission) = session.pending_permission.as_ref() {
+                cancelled_permissions.push(permission.id.clone());
             }
-            session.status = SessionStatus::Completed;
-            session.status_label = "Processo encerrado".into();
-            if let Some(permission) = session.pending_permission.take() {
-                cancelled_permissions.push(permission.id);
-            }
-            session.updated_at = now;
-            snapshots.push(session.clone());
             history.push(HistoryEntry {
                 id: format!("{}-{}-completed", now, session.id),
                 session_id: session.id.clone(),
@@ -729,6 +828,10 @@ impl AppState {
                 summary: "Sessão encerrada".into(),
                 created_at: now,
             });
+        }
+        if !closed_session_ids.is_empty() {
+            sessions.retain(|session| !closed_session_ids.contains(&session.id));
+            removed_sessions.extend(closed_session_ids);
             changed = true;
         }
         drop(sessions);
@@ -796,6 +899,131 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .unwrap_or_else(|| default_profile(&event.agent)),
         pending_permission: None,
         last_response: event.last_response.clone(),
+        results: Vec::new(),
+    }
+}
+
+fn remember_result(session: &mut AgentSession, now: i64) {
+    let Some(response) = session
+        .last_response
+        .as_deref()
+        .map(str::trim)
+        .filter(|response| !response.is_empty())
+    else {
+        return;
+    };
+    if session
+        .results
+        .last()
+        .is_some_and(|result| result.response == response)
+    {
+        return;
+    }
+    let (files, tests) = extract_result_artifacts(response);
+    session.results.push(SessionResult {
+        id: format!("{}-result-{}", session.id, now),
+        response: response.to_string(),
+        created_at: now,
+        files,
+        tests,
+    });
+    if session.results.len() > 12 {
+        session.results.drain(..session.results.len() - 12);
+    }
+}
+
+fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut tests = Vec::new();
+    const FILE_EXTENSIONS: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "svelte", "json", "toml", "yaml", "yml", "md", "css",
+        "scss", "html", "py", "go", "java", "cs", "sh", "sql",
+    ];
+    const TEST_MARKERS: &[&str] = &[
+        "cargo test",
+        "npm test",
+        "npm run test",
+        "npm run check",
+        "npm run build",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "dotnet test",
+        "mvn test",
+        "gradle test",
+        "flutter test",
+        "flutter analyze",
+    ];
+
+    for line in response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let lower = line.to_lowercase();
+        if TEST_MARKERS.iter().any(|marker| lower.contains(marker)) {
+            let check = line
+                .trim_start_matches(['-', '*', ' ', '`'])
+                .trim_end_matches('`')
+                .replace('`', "")
+                .chars()
+                .take(180)
+                .collect::<String>();
+            if !tests.contains(&check) {
+                tests.push(check);
+            }
+        }
+
+        for token in line.split_whitespace() {
+            let cleaned = token
+                .trim_matches(|character: char| {
+                    matches!(
+                        character,
+                        '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';'
+                    )
+                })
+                .trim_end_matches(['.', '`']);
+            let candidate = cleaned.split(':').next().unwrap_or_default();
+            let extension = candidate
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.trim_end_matches(['.', ':']))
+                .unwrap_or_default()
+                .to_lowercase();
+            if !FILE_EXTENSIONS.contains(&extension.as_str()) || candidate.starts_with("http") {
+                continue;
+            }
+            let sanitized = if Path::new(candidate).is_absolute() {
+                Path::new(candidate)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(candidate)
+                    .to_string()
+            } else {
+                candidate.trim_start_matches("./").to_string()
+            };
+            if !sanitized.is_empty() && !files.contains(&sanitized) {
+                files.push(sanitized);
+            }
+        }
+    }
+    files.truncate(24);
+    tests.truncate(12);
+    (files, tests)
+}
+
+fn merge_results(target: &mut AgentSession, source: &AgentSession) {
+    for result in &source.results {
+        if !target
+            .results
+            .iter()
+            .any(|existing| existing.id == result.id)
+        {
+            target.results.push(result.clone());
+        }
+    }
+    target.results.sort_by_key(|result| result.created_at);
+    if target.results.len() > 12 {
+        target.results.drain(..target.results.len() - 12);
     }
 }
 
@@ -824,6 +1052,11 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(profile) = &event.permission_profile {
         if profile.can_respond_from_lume || !session.permission_profile.can_respond_from_lume {
             session.permission_profile = profile.clone();
+        } else {
+            session.permission_profile.mode = profile.mode.clone();
+            session.permission_profile.label = profile.label.clone();
+            session.permission_profile.approval_policy = profile.approval_policy.clone();
+            session.permission_profile.approvals_reviewer = profile.approvals_reviewer.clone();
         }
     }
     if let Some(response) = &event.last_response {
@@ -837,6 +1070,7 @@ fn default_profile(agent: &AgentKind) -> PermissionProfile {
             mode: AccessMode::Custom,
             label: "Permissões da sessão".into(),
             approval_policy: "Ações disponíveis conforme o hook".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![
                 PermissionAction::AllowOnce,
@@ -848,6 +1082,7 @@ fn default_profile(agent: &AgentKind) -> PermissionProfile {
             mode: AccessMode::Custom,
             label: "Monitoramento local".into(),
             approval_policy: "A resposta depende da origem".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: false,
             available_actions: vec![PermissionAction::OpenSource],
         },
@@ -884,9 +1119,75 @@ fn is_provisional_process(session: &AgentSession) -> bool {
 fn same_provisional_context(left: &AgentSession, right: &AgentSession) -> bool {
     is_provisional_process(left)
         && is_provisional_process(right)
-        && left.agent == right.agent
+        && same_agent_identity(
+            &left.agent,
+            &left.agent_label,
+            &right.agent,
+            &right.agent_label,
+        )
         && left.source == right.source
-        && left.working_directory == right.working_directory
+        && (left.process_id.is_some() && left.process_id == right.process_id
+            || same_directory(
+                left.working_directory.as_deref(),
+                right.working_directory.as_deref(),
+            ))
+}
+
+fn same_session_identity(left: &AgentSession, right: &AgentSession) -> bool {
+    if !same_agent_identity(
+        &left.agent,
+        &left.agent_label,
+        &right.agent,
+        &right.agent_label,
+    ) {
+        return false;
+    }
+    match (&left.native_session_id, &right.native_session_id) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        (None, None) => same_provisional_context(left, right),
+        _ => false,
+    }
+}
+
+fn same_agent_identity(
+    left_agent: &AgentKind,
+    left_label: &str,
+    right_agent: &AgentKind,
+    right_label: &str,
+) -> bool {
+    left_agent == right_agent
+        && (*left_agent != AgentKind::Unknown || left_label.eq_ignore_ascii_case(right_label))
+}
+
+fn session_matches_process(session: &AgentSession, process: &DiscoveredProcess) -> bool {
+    same_agent_identity(
+        &session.agent,
+        &session.agent_label,
+        &process.agent,
+        &process.agent_label,
+    )
+}
+
+fn same_directory(left: Option<&str>, right: Option<&str>) -> bool {
+    match (
+        left.and_then(normalize_directory),
+        right.and_then(normalize_directory),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn normalize_directory(directory: &str) -> Option<String> {
+    let normalized = directory.trim().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    return Some(normalized.to_ascii_lowercase());
+    #[cfg(not(target_os = "windows"))]
+    Some(normalized.to_string())
 }
 
 fn duplicate_provisional_ids(
@@ -933,9 +1234,17 @@ fn coalesce_discovered_processes(discovered: Vec<DiscoveredProcess>) -> Vec<Disc
     let mut unique = Vec::<DiscoveredProcess>::new();
     for process in discovered {
         if let Some(existing) = unique.iter_mut().find(|existing| {
-            existing.agent == process.agent
-                && existing.source == process.source
-                && existing.working_directory == process.working_directory
+            same_agent_identity(
+                &existing.agent,
+                &existing.agent_label,
+                &process.agent,
+                &process.agent_label,
+            ) && existing.source == process.source
+                && (existing.process_id == process.process_id
+                    || same_directory(
+                        existing.working_directory.as_deref(),
+                        process.working_directory.as_deref(),
+                    ))
         }) {
             if process.process_id < existing.process_id {
                 *existing = process;
@@ -992,6 +1301,7 @@ mod tests {
     fn discovered(process_id: u32) -> DiscoveredProcess {
         DiscoveredProcess {
             agent: AgentKind::Claude,
+            agent_label: "Claude".into(),
             process_id,
             working_directory: Some("/work/lume".into()),
             source: SessionSource::Cli,
@@ -1020,6 +1330,60 @@ mod tests {
     }
 
     #[test]
+    fn identity_normalizes_directory_separators_and_trailing_slashes() {
+        assert!(same_directory(Some("/work/lume/"), Some("/work/lume")));
+        assert!(same_directory(
+            Some("C:\\work\\lume\\"),
+            Some("C:/work/lume")
+        ));
+    }
+
+    #[test]
+    fn processes_without_context_are_not_merged_by_agent_name_alone() {
+        let mut first = discovered(4242);
+        first.working_directory = None;
+        let mut second = discovered(4343);
+        second.working_directory = None;
+        assert_eq!(coalesce_discovered_processes(vec![first, second]).len(), 2);
+    }
+
+    #[test]
+    fn external_plugins_with_different_labels_are_not_merged() {
+        let mut first = discovered(4242);
+        first.agent = AgentKind::Unknown;
+        first.agent_label = "Local Agent A".into();
+        let mut second = discovered(4343);
+        second.agent = AgentKind::Unknown;
+        second.agent_label = "Local Agent B".into();
+
+        let discovered = coalesce_discovered_processes(vec![first, second]);
+        assert_eq!(discovered.len(), 2);
+    }
+
+    #[test]
+    fn completed_responses_are_kept_in_memory_per_chat_without_duplicates() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut completed = started_event("claude:results", 4242);
+        completed.event = HookEventKind::Completed;
+        completed.last_response = Some("Resposta final".into());
+        state.ingest(completed.clone()).expect("primeiro resultado");
+        state.ingest(completed).expect("evento repetido");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions[0].results.len(), 1);
+        assert_eq!(sessions[0].results[0].response, "Resposta final");
+    }
+
+    #[test]
+    fn final_response_extracts_reported_files_and_checks() {
+        let (files, tests) = extract_result_artifacts(
+            "Alterei `src/state.rs` e `src/lib/lume.ts`.\n- `cargo test --lib`: passou",
+        );
+        assert_eq!(files, vec!["src/state.rs", "src/lib/lume.ts"]);
+        assert_eq!(tests, vec!["cargo test --lib: passou"]);
+    }
+
+    #[test]
     fn hook_event_reuses_the_provisional_process_session() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -1044,8 +1408,41 @@ mod tests {
             .expect("store")
             .load_sessions()
             .expect("persistência");
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].id, "claude:session-1");
+        assert!(persisted.is_empty());
+    }
+
+    #[test]
+    fn vscode_completion_reuses_a_process_misclassified_as_cli() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
+                process_id: 4242,
+                working_directory: Some("/work/lume".into()),
+                source: SessionSource::Cli,
+            }])
+            .expect("processo provisório");
+        let mut event = started_event("codex-app-server:chat-1", 4242);
+        event.agent = AgentKind::Codex;
+        event.source = Some(SessionSource::Vscode);
+        event.process_id = None;
+        event.native_session_id = Some("chat-1".into());
+        event.event = HookEventKind::Running;
+        state.ingest(event.clone()).expect("execução");
+
+        event.event = HookEventKind::Completed;
+        event.status_label = Some("Tarefa finalizada".into());
+        event.last_response = Some("Tudo pronto".into());
+        state.ingest(event).expect("conclusão");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "codex-app-server:chat-1");
+        assert_eq!(sessions[0].source, SessionSource::Vscode);
+        assert_eq!(sessions[0].process_id, Some(4242));
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].last_response.as_deref(), Some("Tudo pronto"));
     }
 
     #[test]
@@ -1117,6 +1514,34 @@ mod tests {
     }
 
     #[test]
+    fn live_pid_survives_a_temporary_agent_classification_gap() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut running = started_event("claude:live-session", 4242);
+        running.event = HookEventKind::Running;
+        state.ingest(running).expect("hook");
+
+        for _ in 0..=PROCESS_MISSING_SCAN_LIMIT {
+            state
+                .reconcile_process_snapshot(Vec::new(), HashSet::from([4242]))
+                .expect("processo ainda vivo");
+        }
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:live-session");
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+        assert!(state.history(10).expect("histórico").is_empty());
+
+        for _ in 0..PROCESS_MISSING_SCAN_LIMIT {
+            state
+                .reconcile_process_snapshot(Vec::new(), HashSet::new())
+                .expect("processo encerrado");
+        }
+
+        assert!(state.sessions().expect("sessões").is_empty());
+    }
+
+    #[test]
     fn reconciliation_removes_provisional_duplicates_already_in_the_store() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -1142,16 +1567,13 @@ mod tests {
             .expect("limpeza");
 
         assert_eq!(state.sessions().expect("sessões").len(), 1);
-        assert_eq!(
-            state
-                .store
-                .lock()
-                .expect("store")
-                .load_sessions()
-                .expect("persistência")
-                .len(),
-            1
-        );
+        assert!(state
+            .store
+            .lock()
+            .expect("store")
+            .load_sessions()
+            .expect("persistência")
+            .is_empty());
     }
 
     #[test]
@@ -1162,6 +1584,7 @@ mod tests {
             mode: AccessMode::Custom,
             label: "Integração direta".into(),
             approval_policy: "Perguntar".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![PermissionAction::AllowOnce],
         });
@@ -1171,9 +1594,10 @@ mod tests {
         hook.event = HookEventKind::Completed;
         hook.status_label = Some("Finalizado pelo hook".into());
         hook.permission_profile = Some(PermissionProfile {
-            mode: AccessMode::Custom,
+            mode: AccessMode::ReadOnly,
             label: "Somente observação".into(),
             approval_policy: "Abrir origem".into(),
+            approvals_reviewer: Some("auto_review".into()),
             can_respond_from_lume: false,
             available_actions: vec![PermissionAction::OpenSource],
         });
@@ -1184,6 +1608,11 @@ mod tests {
         assert_eq!(sessions[0].id, "claude-direct:chat-1");
         assert_eq!(sessions[0].status, SessionStatus::Completed);
         assert!(sessions[0].permission_profile.can_respond_from_lume);
+        assert_eq!(sessions[0].permission_profile.mode, AccessMode::ReadOnly);
+        assert_eq!(
+            sessions[0].permission_profile.approvals_reviewer.as_deref(),
+            Some("auto_review")
+        );
     }
 
     #[test]
@@ -1201,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn terminating_a_process_completes_all_of_its_chats() {
+    fn terminating_a_process_removes_all_of_its_chats() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let mut first = started_event("claude:chat-1", 4242);
         first.native_session_id = Some("native-chat-1".into());
@@ -1212,13 +1641,7 @@ mod tests {
 
         assert!(state.mark_process_terminated(4242).expect("encerramento"));
 
-        let sessions = state.sessions().expect("sessões");
-        assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().all(|session| {
-            session.status == SessionStatus::Completed
-                && session.status_label == "Encerrado pelo Lume"
-                && session.process_id.is_none()
-        }));
+        assert!(state.sessions().expect("sessões").is_empty());
         assert_eq!(state.history(10).expect("histórico").len(), 2);
     }
 
@@ -1243,6 +1666,7 @@ mod tests {
         state
             .reconcile_processes(vec![DiscoveredProcess {
                 agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
                 process_id: 5252,
                 working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
                 source: SessionSource::Vscode,
@@ -1274,6 +1698,7 @@ mod tests {
         state
             .reconcile_processes(vec![DiscoveredProcess {
                 agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
                 process_id: 5252,
                 working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
                 source: SessionSource::Vscode,
@@ -1288,16 +1713,13 @@ mod tests {
         assert!(sessions
             .iter()
             .all(|session| session.source == SessionSource::Vscode));
-        assert_eq!(
-            state
-                .store
-                .lock()
-                .expect("store")
-                .load_sessions()
-                .expect("persistência")
-                .len(),
-            2
-        );
+        assert!(state
+            .store
+            .lock()
+            .expect("store")
+            .load_sessions()
+            .expect("persistência")
+            .is_empty());
     }
 
     #[test]
@@ -1322,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn disappearing_process_completes_a_hook_backed_session() {
+    fn disappearing_process_removes_a_hook_backed_session() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
             .ingest(started_event("claude:session-2", 4343))
@@ -1334,15 +1756,71 @@ mod tests {
                 .expect("reconciliação");
         }
 
-        let sessions = state.sessions().expect("sessões");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].status, SessionStatus::Completed);
-        assert_eq!(sessions[0].status_label, "Processo encerrado");
+        assert!(state.sessions().expect("sessões").is_empty());
 
         let history = state.history(10).expect("histórico");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].session_id, "claude:session-2");
         assert_eq!(history[0].event, "completed");
+    }
+
+    #[test]
+    fn session_end_removes_the_agent_immediately() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:closed-session", 4343))
+            .expect("início");
+        let mut ended = started_event("claude:closed-session", 4343);
+        ended.event = HookEventKind::SessionEnded;
+
+        state.ingest(ended).expect("fim da sessão");
+
+        assert!(state.sessions().expect("sessões").is_empty());
+    }
+
+    #[test]
+    fn stale_browser_heartbeat_removes_the_web_agent() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("web:codex:chat", 4343);
+        event.source = Some(SessionSource::Web);
+        event.process_id = None;
+        state.ingest(event).expect("evento web");
+        state.sessions.lock().expect("sessões")[0].updated_at =
+            now_millis() - WEB_SESSION_STALE_MS - 1;
+
+        state.reconcile_processes(Vec::new()).expect("limpeza");
+
+        assert!(state.sessions().expect("sessões").is_empty());
+    }
+
+    #[test]
+    fn later_running_event_clears_a_stale_permission() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut permission = started_event("codex:chat-1", 4242);
+        permission.event = HookEventKind::PermissionRequest;
+        permission.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "npm test".into(),
+            risk: "medium".into(),
+            requested_at: "1".into(),
+        });
+        state.ingest(permission).expect("permissão");
+
+        let mut running = started_event("codex:chat-1", 4242);
+        running.event = HookEventKind::Running;
+        state.ingest(running).expect("execução");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::Running);
+        assert!(session.pending_permission.is_none());
+        assert_eq!(
+            state
+                .wait_for_decision("permission-1", Duration::ZERO)
+                .expect("decisão"),
+            Some(PermissionAction::Deny)
+        );
     }
 
     #[test]
@@ -1354,6 +1832,7 @@ mod tests {
             mode: AccessMode::WorkspaceWrite,
             label: "Acesso ao projeto".into(),
             approval_policy: "Perguntar".into(),
+            approvals_reviewer: None,
             can_respond_from_lume: true,
             available_actions: vec![PermissionAction::AllowOnce, PermissionAction::Deny],
         });
@@ -1382,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_does_not_restore_a_stale_active_state() {
+    fn restart_does_not_restore_agent_sessions() {
         let database_path = std::env::temp_dir().join(format!(
             "lume-restart-state-{}-{}.sqlite3",
             std::process::id(),
@@ -1396,11 +1875,7 @@ mod tests {
         }
 
         let restarted = AppState::new(&database_path).expect("reinício");
-        let sessions = restarted.sessions().expect("sessões");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].status, SessionStatus::Completed);
-        assert_eq!(sessions[0].status_label, "Aguardando redetecção");
-        assert!(sessions[0].pending_permission.is_none());
+        assert!(restarted.sessions().expect("sessões").is_empty());
         drop(restarted);
 
         let _ = std::fs::remove_file(&database_path);

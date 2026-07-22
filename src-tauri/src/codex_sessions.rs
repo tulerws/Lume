@@ -2,17 +2,17 @@ use std::{
     collections::HashMap,
     env,
     fs::{self, File},
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::{
     domain::{
@@ -24,8 +24,6 @@ use crate::{
 };
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
-const RECENT_SESSION_AGE: Duration = Duration::from_secs(15 * 60);
-const INITIAL_TAIL_BYTES: u64 = 512 * 1_024;
 
 #[derive(Clone, Debug)]
 struct SessionMetadata {
@@ -71,6 +69,8 @@ struct RecordPayload {
     #[serde(default)]
     approval_policy: Option<String>,
     #[serde(default)]
+    approvals_reviewer: Option<String>,
+    #[serde(default)]
     sandbox_policy: Option<Value>,
     #[serde(default)]
     last_agent_message: Option<String>,
@@ -88,7 +88,7 @@ fn monitor(state: AppState, app: AppHandle) {
     let Some(root) = sessions_root() else {
         return;
     };
-    let mut observed = initialize(&root, &state, &app);
+    let mut observed = initialize(&root);
     loop {
         if watch_session_files(&root, &state, &app, &mut observed).is_ok() {
             return;
@@ -133,38 +133,18 @@ fn watch_session_files(
     }
 }
 
-fn initialize(root: &Path, state: &AppState, app: &AppHandle) -> HashMap<PathBuf, ObservedFile> {
+fn initialize(root: &Path) -> HashMap<PathBuf, ObservedFile> {
     let mut observed = HashMap::new();
-    let mut changed = false;
     for path in session_files(root) {
         let Ok(file_metadata) = fs::metadata(&path) else {
             continue;
         };
-        let session = read_session_metadata(&path);
-        let mut file = ObservedFile {
+        let file = ObservedFile {
             offset: file_metadata.len(),
-            session,
+            session: read_session_metadata(&path),
             profile: None,
         };
-        if file.session.is_some() && recently_modified(&file_metadata) {
-            let start = tail_record_boundary(&path, file_metadata.len());
-            if let Ok((records, offset)) = read_records(&path, start) {
-                let events = events_from_records(records, &mut file);
-                let event = events
-                    .last()
-                    .cloned()
-                    .or_else(|| session_started_event(&file));
-                if let Some(event) = event {
-                    let _ = state.ingest(event);
-                    changed = true;
-                }
-                file.offset = offset;
-            }
-        }
         observed.insert(path, file);
-    }
-    if changed {
-        let _ = app.emit("lume://sessions-changed", ());
     }
     observed
 }
@@ -391,33 +371,6 @@ fn read_records(path: &Path, start: u64) -> Result<(Vec<CodexRecord>, u64), Stri
     Ok((records, start + stream.byte_offset() as u64))
 }
 
-fn tail_record_boundary(path: &Path, length: u64) -> u64 {
-    let start = length.saturating_sub(INITIAL_TAIL_BYTES);
-    if start == 0 {
-        return 0;
-    }
-    let Ok(mut file) = File::open(path) else {
-        return length;
-    };
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return length;
-    }
-    let mut position = start;
-    let mut buffer = [0_u8; 8 * 1_024];
-    loop {
-        let Ok(read) = file.read(&mut buffer) else {
-            return length;
-        };
-        if read == 0 {
-            return length;
-        }
-        if let Some(index) = buffer[..read].iter().position(|byte| *byte == b'\n') {
-            return position + index as u64 + 1;
-        }
-        position += read as u64;
-    }
-}
-
 fn profile_from_context(payload: &RecordPayload) -> PermissionProfile {
     let sandbox = payload
         .sandbox_policy
@@ -439,6 +392,7 @@ fn profile_from_context(payload: &RecordPayload) -> PermissionProfile {
             .approval_policy
             .clone()
             .unwrap_or_else(|| "Gerenciada na origem".into()),
+        approvals_reviewer: payload.approvals_reviewer.clone(),
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
@@ -449,17 +403,10 @@ fn default_profile() -> PermissionProfile {
         mode: AccessMode::Custom,
         label: "Permissões da sessão".into(),
         approval_policy: "Gerenciada na origem".into(),
+        approvals_reviewer: None,
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
-}
-
-fn recently_modified(metadata: &fs::Metadata) -> bool {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_none_or(|age| age <= RECENT_SESSION_AGE)
 }
 
 fn sessions_root() -> Option<PathBuf> {
@@ -555,12 +502,13 @@ mod tests {
     #[test]
     fn reads_the_permission_profile_without_prompt_content() {
         let context = record(
-            r#"{"type":"turn_context","payload":{"cwd":"/work/lume","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"user_message":"nao deve ser guardada"}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/work/lume","approval_policy":"on-request","approvals_reviewer":"auto_review","sandbox_policy":{"type":"workspace-write"},"user_message":"nao deve ser guardada"}}"#,
         );
         let profile = profile_from_context(&context.payload);
 
         assert_eq!(profile.mode, AccessMode::WorkspaceWrite);
         assert_eq!(profile.approval_policy, "on-request");
+        assert_eq!(profile.approvals_reviewer.as_deref(), Some("auto_review"));
         assert!(!profile.can_respond_from_lume);
     }
 }

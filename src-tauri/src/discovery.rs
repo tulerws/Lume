@@ -1,4 +1,8 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 
 use sysinfo::{
     get_current_pid, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind,
@@ -6,6 +10,7 @@ use sysinfo::{
 use tauri::{AppHandle, Emitter};
 
 use crate::{
+    agent_plugins::{self, ExternalAgentPlugin},
     domain::{AgentKind, SessionSource},
     state::AppState,
 };
@@ -13,27 +18,35 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct DiscoveredProcess {
     pub agent: AgentKind,
+    pub agent_label: String,
     pub process_id: u32,
     pub working_directory: Option<String>,
     pub source: SessionSource,
+}
+
+struct ProcessScan {
+    discovered: Vec<DiscoveredProcess>,
+    live_pids: HashSet<u32>,
 }
 
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
     thread::Builder::new()
         .name("lume-process-discovery".into())
         .spawn(move || loop {
-            if let Ok(changed) = state.reconcile_processes(scan()) {
+            let plugins = agent_plugins::external_catalog(&app);
+            let scan = scan(&plugins);
+            if let Ok(changed) = state.reconcile_process_snapshot(scan.discovered, scan.live_pids) {
                 if changed {
                     let _ = app.emit("lume://sessions-changed", ());
                 }
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(1));
         })
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn scan() -> Vec<DiscoveredProcess> {
+fn scan(external_plugins: &[ExternalAgentPlugin]) -> ProcessScan {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -44,6 +57,11 @@ fn scan() -> Vec<DiscoveredProcess> {
             .without_tasks(),
     );
     let own_pid = get_current_pid().ok();
+    let live_pids = system
+        .processes()
+        .keys()
+        .map(|pid| pid.as_u32())
+        .collect::<HashSet<_>>();
     let candidates = system
         .processes()
         .iter()
@@ -62,35 +80,55 @@ fn scan() -> Vec<DiscoveredProcess> {
             if is_lume_codex_process(&command) {
                 return None;
             }
-            let agent = detect_agent(&name, &command)?;
-            Some((*pid, process.parent(), agent))
+            let (agent, agent_label) = detect_agent(&name, &command)
+                .map(|agent| {
+                    let label = match agent {
+                        AgentKind::Codex => "Codex",
+                        AgentKind::Claude => "Claude",
+                        AgentKind::Gemini => "Gemini",
+                        AgentKind::Unknown => "Agent",
+                    };
+                    (agent, label.to_string())
+                })
+                .or_else(|| detect_external_agent(&name, &command, external_plugins))?;
+            Some((*pid, process.parent(), agent, agent_label))
         })
         .collect::<Vec<_>>();
     let agents_by_pid = candidates
         .iter()
-        .map(|(pid, _, agent)| (*pid, agent.clone()))
+        .map(|(pid, _, agent, label)| (*pid, (agent.clone(), label.clone())))
         .collect::<HashMap<_, _>>();
 
-    candidates
+    let discovered = candidates
         .into_iter()
         // Mantém o processo detectado mais próximo da raiz. Um comando executado
         // pelo agente pode conter "codex", "claude" ou "gemini" nos argumentos;
         // escolher esse descendente efêmero faria a sessão trocar de PID.
-        .filter(|(pid, _, agent)| {
-            !agents_by_pid.iter().any(|(ancestor_pid, ancestor_agent)| {
-                ancestor_agent == agent && process_descends_from(&system, *pid, *ancestor_pid)
-            })
+        .filter(|(pid, _, agent, label)| {
+            !agents_by_pid
+                .iter()
+                .any(|(ancestor_pid, (ancestor_agent, ancestor_label))| {
+                    ancestor_agent == agent
+                        && ancestor_label == label
+                        && process_descends_from(&system, *pid, *ancestor_pid)
+                })
         })
-        .filter_map(|(pid, _, agent)| {
+        .filter_map(|(pid, _, agent, agent_label)| {
             let process = system.process(pid)?;
             Some(DiscoveredProcess {
                 agent,
+                agent_label,
                 process_id: pid.as_u32(),
                 working_directory: process.cwd().map(|path| path.to_string_lossy().to_string()),
                 source: source_for(&system, pid),
             })
         })
-        .collect()
+        .collect();
+
+    ProcessScan {
+        discovered,
+        live_pids,
+    }
 }
 
 fn is_lume_codex_process(command: &str) -> bool {
@@ -158,6 +196,24 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
     } else {
         None
     }
+}
+
+fn detect_external_agent(
+    name: &str,
+    command: &str,
+    plugins: &[ExternalAgentPlugin],
+) -> Option<(AgentKind, String)> {
+    plugins.iter().find_map(|plugin| {
+        let matches_name = plugin
+            .process_names
+            .iter()
+            .any(|candidate| name == candidate.to_lowercase());
+        let matches_command = plugin
+            .command_tokens
+            .iter()
+            .any(|candidate| command.contains(&candidate.to_lowercase()));
+        (matches_name || matches_command).then(|| (AgentKind::Unknown, plugin.name.clone()))
+    })
 }
 
 pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> Result<(), String> {
@@ -247,5 +303,21 @@ mod tests {
         assert!(is_lume_codex_process(
             "codex --remote ws://127.0.0.1:43131 resume chat"
         ));
+    }
+
+    #[test]
+    fn external_manifest_detects_a_custom_cli_process() {
+        let plugin = ExternalAgentPlugin {
+            id: "local-agent".into(),
+            name: "Local Agent".into(),
+            executable: "local-agent".into(),
+            process_names: vec!["local-agent".into(), "local-agent.exe".into()],
+            command_tokens: vec!["local-agent".into()],
+            ..ExternalAgentPlugin::default()
+        };
+        assert_eq!(
+            detect_external_agent("local-agent", "/usr/bin/local-agent", &[plugin]),
+            Some((AgentKind::Unknown, "Local Agent".into()))
+        );
     }
 }

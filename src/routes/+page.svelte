@@ -4,7 +4,7 @@
   import { cubicOut } from "svelte/easing";
   import { fade, fly, slide } from "svelte/transition";
   import { getVersion } from "@tauri-apps/api/app";
-  import { listen } from "@tauri-apps/api/event";
+  import { emit, listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -23,33 +23,46 @@
     AgentKind,
     AgentSession,
     CompanionStatus,
+    ExternalAgentPlugin,
     HistoryEntry,
+    IntegrationDiagnostic,
     IntegrationStatus,
     PermissionAction,
     Preferences,
+    ResultNote,
     SessionStatus,
     TerminalWindowState,
+    WhiteboardLayout,
   } from "$lib/domain";
   import { demoSessions } from "$lib/demo";
   import {
     configureIntegration,
     configureVscode,
+    diagnoseIntegration,
     decidePermission,
     defaultPreferences,
+    deleteResultNote,
     loadHistory,
+    loadResultNotes,
     loadIntegrationStatuses,
     loadPreferences,
     loadSessions,
     loadTerminalWindows,
+    loadExternalPlugins,
     openSessionSource,
     openTerminalWindow,
     loadVscodeStatus,
     moveOverlay,
+    installExternalPlugin,
+    removeExternalPlugin,
     revealBrowserCompanion,
     launchAgentSession,
     savePreferences,
+    saveResultNote,
+    restoreTerminalLayout,
     submitPrompt,
     terminateSession,
+    revealPluginDirectory,
   } from "$lib/lume";
 
   type View = "sessions" | "board" | "history" | "settings";
@@ -80,6 +93,7 @@
   let view = $state<View>("sessions");
   let sessions = $state<AgentSession[]>(isTauri ? [] : structuredClone(demoSessions));
   let history = $state<HistoryEntry[]>([]);
+  let resultNotes = $state<ResultNote[]>([]);
   let preferences = $state<Preferences>({ ...defaultPreferences });
   let monitors = $state<MonitorOption[]>([]);
   let integrations = $state<IntegrationStatus[]>([]);
@@ -92,6 +106,8 @@
   let permissionError = $state<string | null>(null);
   let savingSettings = $state(false);
   let configuringIntegration = $state<IntegrationStatus["kind"] | null>(null);
+  let diagnosingIntegration = $state<IntegrationStatus["kind"] | null>(null);
+  let integrationDiagnostics = $state<Partial<Record<IntegrationStatus["kind"], IntegrationDiagnostic>>>({});
   let configuringVscode = $state(false);
   let launcherOpen = $state(false);
   let launching = $state<IntegrationStatus["kind"] | null>(null);
@@ -106,9 +122,22 @@
   let terminateConfirmId = $state<string | null>(null);
   let terminatingSessionId = $state<string | null>(null);
   let sessionActionMessage = $state<string | null>(null);
+  let copiedResultId = $state<string | null>(null);
+  let savingNoteId = $state<string | null>(null);
+  let noteMessage = $state<string | null>(null);
+  let selectedProfileKey = $state<string | null>(null);
   let terminalWindows = $state<TerminalWindowState[]>([]);
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
+  let layoutName = $state("");
+  let selectedLayoutId = $state<string | null>(null);
+  let restoringLayout = $state(false);
+  let externalPlugins = $state<ExternalAgentPlugin[]>([]);
+  let installingPlugin = $state(false);
+  let pluginMessage = $state<string | null>(null);
+  let paletteOpen = $state(false);
+  let paletteQuery = $state("");
+  let paletteIndex = $state(0);
   let overlayPosition = $state({ x: 0, y: 12 });
   let compactAnchorPosition: { x: number; y: number } | null = null;
   let overlayReady = $state(false);
@@ -116,7 +145,7 @@
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
-  let appVersion = $state("0.3.7");
+  let appVersion = $state("0.4.0");
   let updateState = $state<UpdateState>("idle");
   let availableVersion = $state<string | null>(null);
   let updateDetail = $state("Updates are checked automatically.");
@@ -131,6 +160,7 @@
     originY: number;
   } | null = null;
   let moveFrame: number | null = null;
+  let systemDark = $state(false);
 
   function tr(english: string, portuguese: string) {
     return localize(preferences.language, english, portuguese);
@@ -188,10 +218,37 @@
     };
   }
 
+  const effectiveDark = $derived(preferences.darkMode ?? systemDark);
+  $effect(() => {
+    document.documentElement.dataset.theme = effectiveDark ? "dark" : "light";
+  });
   const activeCount = $derived(
     sessions.filter((session) =>
       ["running", "permission_required", "waiting_for_input"].includes(session.status),
     ).length,
+  );
+  const recentResults = $derived.by(() =>
+    sessions
+      .flatMap((session) => session.results.map((result) => ({ session, result })))
+      .sort((left, right) => right.result.createdAt - left.result.createdAt),
+  );
+  const detectedProjects = $derived.by(() => {
+    const projects = new Map<string, string>();
+    for (const [key, profile] of Object.entries(preferences.projectProfiles)) {
+      if (profile.label) projects.set(key, profile.label);
+    }
+    for (const session of sessions) {
+      projects.set(projectKey(session.workingDirectory ?? session.project), session.project);
+    }
+    return Array.from(projects, ([key, label]) => ({ key, label })).sort((left, right) =>
+      left.label.localeCompare(right.label),
+    );
+  });
+  const selectedProject = $derived(
+    detectedProjects.find((project) => project.key === selectedProfileKey),
+  );
+  const selectedProjectProfile = $derived(
+    selectedProfileKey ? preferences.projectProfiles[selectedProfileKey] : undefined,
   );
 
   const shellStatus = $derived.by<ShellStatus>(() => {
@@ -209,27 +266,39 @@
 
   onMount(() => {
     if (isTerminalWindow) return;
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
+      systemDark = event.matches;
+    };
+    syncSystemTheme(colorScheme);
+    colorScheme.addEventListener("change", syncSystemTheme);
     let disposed = false;
     let stopListening: (() => void) | undefined;
     let stopTerminalListening: (() => void) | undefined;
+    let stopPaletteListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
 
     updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
 
     void (async () => {
-      const [nextSessions, nextPreferences, nextIntegrations, nextVscodeStatus] = await Promise.all([
+      const [nextSessions, nextPreferences, nextIntegrations, nextVscodeStatus, nextPlugins] = await Promise.all([
         loadSessions(),
         loadPreferences(),
         loadIntegrationStatuses(),
         loadVscodeStatus(),
+        loadExternalPlugins(),
       ]);
       if (disposed) return;
       sessions = nextSessions;
       preferences = nextPreferences;
+      selectedProfileKey = detectedProjects[0]?.key ?? null;
       void initializeUpdater();
       integrations = nextIntegrations;
       vscodeStatus = nextVscodeStatus;
+      externalPlugins = nextPlugins;
+      selectedLayoutId = preferences.whiteboardLayouts[0]?.id ?? null;
+      layoutName = preferences.whiteboardLayouts[0]?.name ?? "";
       selectedId =
         sessions.find((session) => session.status === "permission_required")?.id ?? null;
       await loadMonitorOptions();
@@ -242,6 +311,9 @@
         stopTerminalListening = await listen("lume://terminal-windows-changed", () => {
           void refreshTerminalWindows();
         });
+        stopPaletteListening = await listen("lume://open-command-palette", () => {
+          void showCommandPalette();
+        });
         pollTimer = setInterval(() => void refreshSessions(false), 5_000);
       }
     })();
@@ -250,6 +322,8 @@
       disposed = true;
       stopListening?.();
       stopTerminalListening?.();
+      stopPaletteListening?.();
+      colorScheme.removeEventListener("change", syncSystemTheme);
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
@@ -346,6 +420,7 @@
     if (withSound && preferences.soundEnabled) {
       const previous = new Map(sessions.map((session) => [session.id, session.status]));
       for (const session of next) {
+        if (!projectSoundEnabled(session)) continue;
         const previousStatus = previous.get(session.id);
         if (previousStatus === session.status) continue;
         if (session.status === "permission_required") playTone("permission");
@@ -616,10 +691,7 @@
   }
 
   function canSubmitToSession(session: AgentSession) {
-    return (
-      session.source === "web" ||
-      (session.agent !== "unknown" && Boolean(session.nativeSessionId))
-    );
+    return sessionCapabilities(session).canPrompt;
   }
 
   function canContinueSession(session: AgentSession) {
@@ -654,7 +726,65 @@
   }
 
   function canTerminateSession(session: AgentSession) {
-    return session.source === "cli" && Boolean(session.processId);
+    return sessionCapabilities(session).canTerminate;
+  }
+
+  function sessionCapabilities(session: AgentSession) {
+    return {
+      canPrompt:
+        session.source === "web" ||
+        (session.agent !== "unknown" && Boolean(session.nativeSessionId)),
+      canApprove: Boolean(
+        session.pendingPermission && session.permissionProfile.canRespondFromLume,
+      ),
+      canTerminate: session.source === "cli" && Boolean(session.processId),
+      canOpenSource: session.source === "web" || session.source === "vscode",
+      canReadResults: session.results.length > 0 || Boolean(session.lastResponse),
+    };
+  }
+
+  async function copyResult(resultId: string, response: string) {
+    try {
+      await navigator.clipboard.writeText(response);
+      copiedResultId = resultId;
+      setTimeout(() => {
+        if (copiedResultId === resultId) copiedResultId = null;
+      }, 1_500);
+    } catch {
+      copiedResultId = null;
+    }
+  }
+
+  async function keepResultAsNote(session: AgentSession, resultId: string) {
+    if (savingNoteId) return;
+    savingNoteId = resultId;
+    noteMessage = null;
+    try {
+      const note = await saveResultNote(session.id, resultId, `${session.agentLabel} · ${session.project}`);
+      resultNotes = [note, ...resultNotes.filter((item) => item.id !== note.id)];
+      noteMessage = tr("Result saved as a local note.", "Resultado salvo como nota local.");
+    } catch (error) {
+      noteMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      savingNoteId = null;
+    }
+  }
+
+  async function removeResultNote(id: string) {
+    try {
+      await deleteResultNote(id);
+      resultNotes = resultNotes.filter((note) => note.id !== id);
+    } catch (error) {
+      noteMessage = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function continueFromResult(session: AgentSession) {
+    view = "sessions";
+    selectedId = session.id;
+    composerSessionId = session.id;
+    composerPrompt = "";
+    composerMessage = null;
   }
 
   async function terminateAgent(session: AgentSession) {
@@ -699,6 +829,113 @@
     }
   }
 
+  async function saveCurrentLayout() {
+    await refreshTerminalWindows();
+    if (terminalWindows.length === 0) {
+      terminalMessage = tr("Open at least one terminal before saving a layout.", "Abra ao menos um terminal antes de salvar um layout.");
+      return;
+    }
+    const name = layoutName.trim() || tr("My layout", "Meu layout");
+    const id = selectedLayoutId && preferences.whiteboardLayouts.some((layout) => layout.id === selectedLayoutId)
+      ? selectedLayoutId
+      : `layout-${Date.now().toString(36)}`;
+    const layout: WhiteboardLayout = {
+      id,
+      name,
+      terminals: terminalWindows.flatMap((terminal) => {
+        const session = sessions.find((item) => item.id === terminal.sessionId);
+        return session
+          ? [{
+              agent: session.agent,
+              agentLabel: session.agentLabel,
+              project: session.project,
+              source: session.source,
+              x: terminal.x,
+              y: terminal.y,
+              width: terminal.width,
+              height: terminal.height,
+              groupId: terminal.groupId,
+            }]
+          : [];
+      }),
+    };
+    const layouts = preferences.whiteboardLayouts.some((item) => item.id === id)
+      ? preferences.whiteboardLayouts.map((item) => item.id === id ? layout : item)
+      : [...preferences.whiteboardLayouts, layout];
+    await updatePreference("whiteboardLayouts", layouts);
+    selectedLayoutId = id;
+    layoutName = name;
+    terminalMessage = tr("Whiteboard layout saved.", "Layout do whiteboard salvo.");
+  }
+
+  async function restoreSavedLayout(layout: WhiteboardLayout) {
+    if (restoringLayout) return;
+    restoringLayout = true;
+    terminalMessage = null;
+    const used = new Set<string>();
+    const entries: Array<{
+      sessionId: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      groupId?: string;
+    }> = [];
+    try {
+      for (const slot of layout.terminals) {
+        const session = sessions.find((item) =>
+          !used.has(item.id) &&
+          item.agent === slot.agent &&
+          (item.agent !== "unknown" || item.agentLabel === slot.agentLabel) &&
+          item.project === slot.project &&
+          item.source === slot.source,
+        );
+        if (!session) continue;
+        used.add(session.id);
+        await openTerminalWindow(session.id);
+        entries.push({
+          sessionId: session.id,
+          x: slot.x,
+          y: slot.y,
+          width: slot.width,
+          height: slot.height,
+          groupId: slot.groupId,
+        });
+      }
+      if (entries.length === 0) {
+        terminalMessage = tr("No open session matches this layout.", "Nenhuma sessão aberta corresponde a este layout.");
+        return;
+      }
+      terminalWindows = await restoreTerminalLayout(entries);
+      selectedLayoutId = layout.id;
+      layoutName = layout.name;
+      terminalMessage = tr(`Restored ${entries.length} terminals.`, `${entries.length} terminais restaurados.`);
+    } catch (error) {
+      terminalMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      restoringLayout = false;
+    }
+  }
+
+  async function deleteSavedLayout(id: string) {
+    const profiles = Object.fromEntries(
+      Object.entries(preferences.projectProfiles).map(([key, profile]) => [
+        key,
+        profile.whiteboardLayoutId === id
+          ? { ...profile, whiteboardLayoutId: undefined }
+          : profile,
+      ]),
+    );
+    preferences = {
+      ...preferences,
+      whiteboardLayouts: preferences.whiteboardLayouts.filter((layout) => layout.id !== id),
+      projectProfiles: profiles,
+    };
+    await savePreferences(preferences);
+    selectedLayoutId = preferences.whiteboardLayouts[0]?.id ?? null;
+    layoutName = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)?.name ?? "";
+  }
+
   function terminalIsOpen(session: AgentSession) {
     return terminalWindows.some((terminal) => terminal.sessionId === session.id);
   }
@@ -741,6 +978,7 @@
 
   async function openView(nextView: View) {
     view = nextView;
+    paletteOpen = false;
     selectedId = null;
     permissionError = null;
     launcherOpen = false;
@@ -748,13 +986,80 @@
     composerMessage = null;
     terminalMessage = null;
     if (nextView === "board") await refreshTerminalWindows();
-    if (nextView === "history") history = await loadHistory();
+    if (nextView === "history") {
+      [history, resultNotes] = await Promise.all([loadHistory(), loadResultNotes()]);
+    }
     if (nextView === "settings") {
+      selectedProfileKey ??= detectedProjects[0]?.key ?? null;
       settingsMessage = null;
-      [integrations, vscodeStatus] = await Promise.all([
+      [integrations, vscodeStatus, externalPlugins] = await Promise.all([
         loadIntegrationStatuses(),
         loadVscodeStatus(),
+        loadExternalPlugins(),
       ]);
+    }
+  }
+
+  type PaletteCommand = { id: string; label: string; detail: string; run: () => void | Promise<void> };
+
+  function paletteCommands(): PaletteCommand[] {
+    const commands: PaletteCommand[] = [
+      { id: "sessions", label: tr("Sessions", "Sessões"), detail: tr("Show active agents", "Mostrar agentes ativos"), run: () => openView("sessions") },
+      { id: "whiteboard", label: "Whiteboard", detail: tr("Open floating terminals", "Abrir terminais flutuantes"), run: () => openView("board") },
+      { id: "history", label: tr("History and notes", "Histórico e notas"), detail: tr("Open completed results", "Abrir resultados finalizados"), run: () => openView("history") },
+      { id: "settings", label: tr("Settings", "Ajustes"), detail: tr("Configure Lume", "Configurar o Lume"), run: () => openView("settings") },
+      { id: "new-session", label: tr("New agent session", "Nova sessão de agente"), detail: tr("Open the agent launcher", "Abrir o iniciador de agentes"), run: async () => { await openView("sessions"); launcherOpen = true; } },
+    ];
+    for (const session of sessions) {
+      commands.push({
+        id: `session-${session.id}`,
+        label: `${session.agentLabel} · ${session.project}`,
+        detail: shown(session.statusLabel),
+        run: async () => {
+          await openView("sessions");
+          selectedId = session.id;
+        },
+      });
+    }
+    const query = paletteQuery.trim().toLowerCase();
+    return query
+      ? commands.filter((command) => `${command.label} ${command.detail}`.toLowerCase().includes(query))
+      : commands;
+  }
+
+  async function showCommandPalette() {
+    if (!expanded) await toggleExpanded();
+    paletteQuery = "";
+    paletteIndex = 0;
+    paletteOpen = true;
+    await tick();
+    document.querySelector<HTMLInputElement>("[data-command-palette]")?.focus();
+  }
+
+  async function runPaletteCommand(command: PaletteCommand) {
+    paletteOpen = false;
+    await command.run();
+  }
+
+  function handlePaletteKey(event: KeyboardEvent) {
+    const commands = paletteCommands();
+    if (event.key === "Escape") {
+      paletteOpen = false;
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      paletteIndex = commands.length ? (paletteIndex + 1) % commands.length : 0;
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      paletteIndex = commands.length ? (paletteIndex - 1 + commands.length) % commands.length : 0;
+      return;
+    }
+    if (event.key === "Enter" && commands[paletteIndex]) {
+      event.preventDefault();
+      void runPaletteCommand(commands[paletteIndex]);
     }
   }
 
@@ -783,12 +1088,15 @@
     launching = agent;
     launchError = null;
     try {
+      const profile = preferences.projectProfiles[projectKey(selected)];
       await launchAgentSession(
         agent,
         selected,
         resume,
         undefined,
-        preferences.launchTarget,
+        profile?.launchTarget ?? preferences.launchTarget,
+        resume ? undefined : profile?.permissionMode,
+        resume ? undefined : profile?.approvalPolicy,
       );
       launcherOpen = false;
     } catch (error) {
@@ -823,6 +1131,22 @@
     }
   }
 
+  async function runIntegrationDiagnostic(integration: IntegrationStatus) {
+    diagnosingIntegration = integration.kind;
+    settingsMessage = null;
+    try {
+      integrationDiagnostics = {
+        ...integrationDiagnostics,
+        [integration.kind]: await diagnoseIntegration(integration.kind),
+      };
+    } catch (error) {
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      diagnosingIntegration = null;
+    }
+  }
+
   async function toggleVscode() {
     if (!vscodeStatus.installed) return;
     const enabling = !vscodeStatus.configured;
@@ -854,6 +1178,46 @@
     }
   }
 
+  async function addExternalPlugin() {
+    if (!isTauri || installingPlugin) return;
+    const selected = await openDialog({
+      multiple: false,
+      directory: false,
+      title: tr("Install agent detector", "Instalar detector de agente"),
+      filters: [{ name: "Lume plugin", extensions: ["json"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    installingPlugin = true;
+    pluginMessage = null;
+    try {
+      const plugin = await installExternalPlugin(selected);
+      externalPlugins = await loadExternalPlugins();
+      pluginMessage = tr(`${plugin.name} is now monitored.`, `${plugin.name} agora é monitorado.`);
+    } catch (error) {
+      pluginMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      installingPlugin = false;
+    }
+  }
+
+  async function uninstallExternalPlugin(id: string) {
+    try {
+      await removeExternalPlugin(id);
+      externalPlugins = await loadExternalPlugins();
+      pluginMessage = tr("Detector removed.", "Detector removido.");
+    } catch (error) {
+      pluginMessage = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function openPluginFolder() {
+    try {
+      pluginMessage = await revealPluginDirectory();
+    } catch (error) {
+      pluginMessage = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
   async function updatePreference<K extends keyof Preferences>(
     key: K,
     value: Preferences[K],
@@ -870,6 +1234,7 @@
     savingSettings = true;
     try {
       await savePreferences(preferences);
+      if (isTauri) void emit("lume://preferences-changed", preferences);
       if (key === "monitorId") await positionWindow();
     } catch (error) {
       preferences = previous;
@@ -878,6 +1243,101 @@
     } finally {
       savingSettings = false;
     }
+  }
+
+  function projectKey(value: string) {
+    const normalized = value.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+    const identity = /^[a-z]:/i.test(normalized) ? normalized.toLowerCase() : normalized;
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return `project-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  }
+
+  function projectSoundEnabled(session: AgentSession) {
+    const profile = preferences.projectProfiles[projectKey(session.workingDirectory ?? session.project)];
+    return profile?.soundEnabled ?? true;
+  }
+
+  async function updateSelectedProjectProfile(
+    patch: Partial<Preferences["projectProfiles"][string]>,
+  ) {
+    if (!selectedProfileKey || !selectedProject) return;
+    const current = preferences.projectProfiles[selectedProfileKey] ?? {
+      label: selectedProject.label,
+      soundEnabled: true,
+      launchTarget: undefined,
+      monitorId: undefined,
+      overlayX: undefined,
+      overlayY: undefined,
+      permissionMode: undefined,
+      approvalPolicy: undefined,
+      whiteboardLayoutId: undefined,
+      preferredAgents: [],
+    };
+    await updatePreference("projectProfiles", {
+      ...preferences.projectProfiles,
+      [selectedProfileKey]: { ...current, ...patch },
+    });
+  }
+
+  async function captureProfilePosition() {
+    const position = expanded
+      ? compactPositionFromExpanded(overlayPosition)
+      : overlayPosition;
+    await updateSelectedProjectProfile({
+      overlayX: Math.round(position.x),
+      overlayY: Math.round(position.y),
+    });
+  }
+
+  async function togglePreferredAgent(agent: AgentKind) {
+    const current = selectedProjectProfile?.preferredAgents ?? [];
+    await updateSelectedProjectProfile({
+      preferredAgents: current.includes(agent)
+        ? current.filter((item) => item !== agent)
+        : [...current, agent],
+    });
+  }
+
+  async function applySelectedProjectProfile() {
+    const profile = selectedProjectProfile;
+    if (!profile) return;
+    preferences = {
+      ...preferences,
+      monitorId: profile.monitorId ?? preferences.monitorId,
+      overlayX: profile.overlayX ?? preferences.overlayX,
+      overlayY: profile.overlayY ?? preferences.overlayY,
+    };
+    await savePreferences(preferences);
+    if (isTauri) void emit("lume://preferences-changed", preferences);
+    await positionWindow(true);
+    const layout = preferences.whiteboardLayouts.find(
+      (item) => item.id === profile.whiteboardLayoutId,
+    );
+    if (layout) {
+      view = "board";
+      await restoreSavedLayout(layout);
+    }
+    settingsMessageIsError = false;
+    settingsMessage = tr("Project profile applied.", "Perfil do projeto aplicado.");
+  }
+
+  function launcherIntegrations() {
+    const preferred = selectedProjectProfile?.preferredAgents ?? [];
+    return integrations
+      .filter((integration) => integration.installed)
+      .slice()
+      .sort((left, right) => {
+        const leftIndex = preferred.indexOf(left.kind);
+        const rightIndex = preferred.indexOf(right.kind);
+        if (leftIndex === rightIndex) return left.label.localeCompare(right.label);
+        if (leftIndex < 0) return 1;
+        if (rightIndex < 0) return -1;
+        return leftIndex - rightIndex;
+      });
   }
 
   function playTone(kind: "completed" | "failed" | "permission") {
@@ -967,6 +1427,7 @@
 {:else}
 <main
   class:expanded
+  class:dark={effectiveDark}
   class="overlay-shell"
   style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
   onpointermove={wakeMascot}
@@ -1006,6 +1467,9 @@
           </div>
         </div>
         <div class="header-actions">
+          <button class="palette-button" type="button" title={preferences.globalShortcut} onclick={showCommandPalette} aria-label={tr("Open command palette", "Abrir paleta de comandos")}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.5" /><path d="m12 12 4 4" /></svg>
+          </button>
           {#if view === "sessions"}
             <button class:active={launcherOpen} class="add-button" type="button" onclick={toggleLauncher} aria-label={tr("Open or resume session", "Abrir ou retomar sessão")}>
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 5v10M5 10h10" /></svg>
@@ -1020,7 +1484,7 @@
       {#if launcherOpen}
         <div class="launcher-popover" transition:fly={{ y: -5, duration: 170, easing: cubicOut }}>
           <span class="launcher-title">{tr("Open session", "Abrir sessão")}</span>
-          {#each integrations.filter((integration) => integration.installed) as integration}
+          {#each launcherIntegrations() as integration}
             <div class="launcher-row">
               <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
               <strong>{integration.label}</strong>
@@ -1031,6 +1495,35 @@
             <p>{tr("No compatible CLI was found.", "Nenhuma CLI compatível foi encontrada.")}</p>
           {/each}
           {#if launchError}<p class="launcher-error">{launchError}</p>{/if}
+        </div>
+      {/if}
+
+      {#if paletteOpen}
+        <div class="command-palette-layer" transition:fade={{ duration: 120 }}>
+          <button class="command-palette-backdrop" type="button" aria-label={tr("Close command palette", "Fechar paleta de comandos")} onclick={() => (paletteOpen = false)}></button>
+          <div class="command-palette" role="dialog" aria-label={tr("Command palette", "Paleta de comandos")}>
+            <div class="command-search">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.5" /><path d="m12 12 4 4" /></svg>
+              <input
+                data-command-palette
+                value={paletteQuery}
+                placeholder={tr("Search sessions and commands…", "Buscar sessões e comandos…")}
+                oninput={(event) => { paletteQuery = event.currentTarget.value; paletteIndex = 0; }}
+                onkeydown={handlePaletteKey}
+              />
+              <kbd>Esc</kbd>
+            </div>
+            <div class="command-results">
+              {#each paletteCommands() as command, index (command.id)}
+                <button class:active={paletteIndex === index} type="button" onmouseenter={() => (paletteIndex = index)} onclick={() => runPaletteCommand(command)}>
+                  <span><strong>{command.label}</strong><small>{command.detail}</small></span>
+                  <kbd>↵</kbd>
+                </button>
+              {:else}
+                <p>{tr("No matching command.", "Nenhum comando encontrado.")}</p>
+              {/each}
+            </div>
+          </div>
         </div>
       {/if}
 
@@ -1053,6 +1546,12 @@
                         <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
                         {sourceLabel(session)}
                       </span>
+                      {#if session.permissionProfile.approvalsReviewer === "auto_review" && session.permissionProfile.mode !== "full_access"}
+                        <span class="access-badge auto-review">{tr("Approve for me", "Aprovar por mim")}</span>
+                      {/if}
+                      {#if session.permissionProfile.mode === "full_access"}
+                        <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
+                      {/if}
                     </span>
                     <span class="project-name">{session.project}</span>
                     <span class="status-line status-{session.status}">
@@ -1063,6 +1562,12 @@
                       {/if}
                       {shown(session.statusLabel)}
                     </span>
+                    {#if session.lastResponse && selectedId !== session.id}
+                      <span class="response-preview">
+                        <b>{tr("Final response", "Resposta final")}</b>
+                        <span>{session.lastResponse}</span>
+                      </span>
+                    {/if}
                   </span>
                   <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true">
                     <path d="m8 5 5 5-5 5" />
@@ -1070,10 +1575,15 @@
                 </button>
 
                 {#if selectedId === session.id}
+                  {@const capabilities = sessionCapabilities(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
-                    <div class="access-profile">
-                      <span>{shown(session.permissionProfile.label)}</span>
-                      <small>{shown(session.permissionProfile.approvalPolicy)}</small>
+                    <div class="capability-bar">
+                      {#if capabilities.canOpenSource}
+                        <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
+                      {/if}
+                      {#if capabilities.canReadResults && session.lastResponse}
+                        <button type="button" onclick={() => copyResult(`${session.id}-latest`, session.lastResponse ?? "")}>{copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy result", "Copiar resultado")}</button>
+                      {/if}
                     </div>
 
                     {#if session.lastResponse}
@@ -1085,7 +1595,6 @@
 
                     {#if session.pendingPermission}
                       <div class="permission-block risk-{session.pendingPermission.risk}">
-                        <span class="eyebrow">{tr("Permission requested", "Permissão solicitada")}</span>
                         <strong>{shown(session.pendingPermission.summary)}</strong>
                         <code>{session.pendingPermission.resource}</code>
                         <div class="permission-actions">
@@ -1104,10 +1613,6 @@
                           <p class="inline-error" transition:fade>{permissionError}</p>
                         {/if}
                       </div>
-                    {:else if !session.permissionProfile.canRespondFromLume}
-                      <p class="integration-note">
-                        {tr("Lume monitors this source; actions continue there.", "O Lume acompanha esta origem; as ações continuam nela.")}
-                      </p>
                     {/if}
 
                     {#if canContinueSession(session) && canSubmitToSession(session)}
@@ -1176,9 +1681,33 @@
         {:else if view === "board"}
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="board-intro">
-              <span class="eyebrow">{tr("Floating terminals", "Terminais flutuantes")}</span>
               <strong>{tr("A separate space for each chat", "Um espaço separado para cada chat")}</strong>
               <p>{tr("Open independent mini terminals and move them close to dock them.", "Abra mini terminais independentes e aproxime um do outro para acoplá-los.")}</p>
+            </div>
+
+            <div class="layout-toolbar">
+              <select
+                aria-label={tr("Saved whiteboard layout", "Layout salvo do whiteboard")}
+                value={selectedLayoutId ?? ""}
+                onchange={(event) => {
+                  selectedLayoutId = event.currentTarget.value || null;
+                  layoutName = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)?.name ?? "";
+                }}
+              >
+                <option value="">{tr("New layout", "Novo layout")}</option>
+                {#each preferences.whiteboardLayouts as layout (layout.id)}
+                  <option value={layout.id}>{layout.name}</option>
+                {/each}
+              </select>
+              <input bind:value={layoutName} maxlength="48" placeholder={tr("Layout name", "Nome do layout")} />
+              <button type="button" onclick={saveCurrentLayout}>{tr("Save", "Salvar")}</button>
+              {#if selectedLayoutId}
+                {@const selectedLayout = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)}
+                <button disabled={!selectedLayout || restoringLayout} type="button" onclick={() => selectedLayout && restoreSavedLayout(selectedLayout)}>
+                  {restoringLayout ? "…" : tr("Restore", "Restaurar")}
+                </button>
+                <button class="layout-delete" type="button" aria-label={tr("Delete layout", "Excluir layout")} onclick={() => selectedLayoutId && deleteSavedLayout(selectedLayoutId)}>×</button>
+              {/if}
             </div>
 
             <div class="terminal-picker">
@@ -1214,6 +1743,64 @@
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
+            <div class="results-intro">
+              <strong>{tr("Final responses from your agents", "Respostas finais dos seus agentes")}</strong>
+              <p>{tr("Kept only while Lume is running.", "Mantidas apenas enquanto o Lume está aberto.")}</p>
+            </div>
+            {#if resultNotes.length > 0}
+              <div class="settings-section-label history-label">{tr("Saved notes", "Notas salvas")}</div>
+              <div class="saved-notes">
+                {#each resultNotes as note (note.id)}
+                  <article class="saved-note">
+                    <span><strong>{note.title}</strong><small>{note.project} · {relativeTime(note.createdAt)}</small></span>
+                    <p>{note.body}</p>
+                    {#if note.files.length || note.tests.length}
+                      <div class="artifact-summary">
+                        {#if note.files.length}<span>{note.files.length} {tr("files", "arquivos")}</span>{/if}
+                        {#if note.tests.length}<span>{note.tests.length} {tr("checks", "verificações")}</span>{/if}
+                      </div>
+                    {/if}
+                    <button type="button" onclick={() => removeResultNote(note.id)}>{tr("Delete", "Excluir")}</button>
+                  </article>
+                {/each}
+              </div>
+            {/if}
+            <div class="results-list">
+              {#each recentResults as item (item.result.id)}
+                {@const capabilities = sessionCapabilities(item.session)}
+                <article class="result-card">
+                  <div class="result-heading">
+                    <span class="agent-avatar agent-{item.session.agent}"><BrandIcon name={item.session.agent} size={15} /></span>
+                    <span><strong>{item.session.agentLabel}</strong><small>{item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
+                  </div>
+                  <p>{item.result.response}</p>
+                  {#if item.result.files?.length || item.result.tests?.length}
+                    <div class="result-artifacts">
+                      {#if item.result.files?.length}
+                        <span><strong>{tr("Files", "Arquivos")}</strong>{item.result.files.join(" · ")}</span>
+                      {/if}
+                      {#if item.result.tests?.length}
+                        <span><strong>{tr("Checks", "Verificações")}</strong>{item.result.tests.join(" · ")}</span>
+                      {/if}
+                    </div>
+                  {/if}
+                  <div class="result-actions">
+                    <button type="button" onclick={() => copyResult(item.result.id, item.result.response)}>{copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}</button>
+                    <button disabled={savingNoteId === item.result.id} type="button" onclick={() => keepResultAsNote(item.session, item.result.id)}>{savingNoteId === item.result.id ? "…" : tr("Save note", "Salvar nota")}</button>
+                    {#if capabilities.canPrompt && canContinueSession(item.session)}
+                      <button type="button" onclick={() => continueFromResult(item.session)}>{tr("Continue", "Continuar")}</button>
+                    {/if}
+                    {#if capabilities.canOpenSource}
+                      <button type="button" onclick={() => openSessionSource(item.session.id)}>{tr("Open source", "Abrir origem")}</button>
+                    {/if}
+                  </div>
+                </article>
+              {:else}
+                <p class="results-empty">{tr("Completed agent responses will appear here.", "As respostas de agentes finalizados aparecerão aqui.")}</p>
+              {/each}
+            </div>
+            {#if noteMessage}<p class="board-message">{noteMessage}</p>{/if}
+            <div class="settings-section-label history-label">{tr("Activity", "Atividade")}</div>
             {#each history as entry (entry.id)}
               <div class="history-row">
                 <span class="history-dot event-{entry.event}" aria-hidden="true"></span>
@@ -1224,7 +1811,7 @@
               </div>
             {:else}
               <div class="empty-state">
-                <strong>{tr("No history yet", "Histórico vazio")}</strong>
+                <strong>{tr("No activity yet", "Nenhuma atividade")}</strong>
                 <p>{tr("Completions, errors, and decisions will appear here.", "Conclusões, erros e decisões aparecerão aqui.")}</p>
               </div>
             {/each}
@@ -1234,26 +1821,60 @@
           <div class="settings" in:fade={{ duration: 150 }}>
             <div class="settings-section-label">{tr("Agents", "Agentes")}</div>
             {#each integrations as integration}
+              {@const diagnostic = integrationDiagnostics[integration.kind]}
               <div class="integration-row">
                 <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
                 <div>
                   <strong>{integration.label}</strong>
                   <span>{shown(integration.detail)}</span>
                 </div>
-                <button
-                  class:connected={integration.configured}
-                  disabled={!integration.installed || configuringIntegration === integration.kind}
-                  type="button"
-                  onclick={() => toggleIntegration(integration)}
-                >
-                  {configuringIntegration === integration.kind
-                    ? "…"
-                    : integration.configured
-                      ? tr("Connected", "Conectado")
-                      : tr("Connect", "Conectar")}
-                </button>
+                <div class="integration-actions">
+                  <button
+                    class="diagnose-button"
+                    disabled={diagnosingIntegration !== null}
+                    type="button"
+                    onclick={() => runIntegrationDiagnostic(integration)}
+                  >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
+                  <button
+                    class:connected={integration.configured}
+                    disabled={!integration.installed || configuringIntegration === integration.kind}
+                    type="button"
+                    onclick={() => toggleIntegration(integration)}
+                  >
+                    {configuringIntegration === integration.kind
+                      ? "…"
+                      : integration.configured
+                        ? tr("Connected", "Conectado")
+                        : tr("Connect", "Conectar")}
+                  </button>
+                </div>
               </div>
+              {#if diagnostic}
+                <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
+                  {#each diagnostic.checks as check (check.id)}
+                    <div class="diagnostic-check status-{check.status}">
+                      <i aria-hidden="true"></i>
+                      <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             {/each}
+            <div class="settings-section-label preferences-label">{tr("External detectors", "Detectores externos")}</div>
+            {#each externalPlugins as plugin (plugin.id)}
+              <div class="integration-row external-plugin-row">
+                <span class="agent-avatar agent-unknown"><BrandIcon name="unknown" size={17} /></span>
+                <div><strong>{plugin.name}</strong><span>{plugin.executable} · {plugin.id}</span></div>
+                <button type="button" onclick={() => uninstallExternalPlugin(plugin.id)}>{tr("Remove", "Remover")}</button>
+              </div>
+            {:else}
+              <p class="profile-empty">{tr("Install a JSON manifest to monitor another CLI process.", "Instale um manifesto JSON para monitorar outro processo CLI.")}</p>
+            {/each}
+            <div class="plugin-actions">
+              <button disabled={installingPlugin} type="button" onclick={addExternalPlugin}>{installingPlugin ? "…" : tr("Install manifest", "Instalar manifesto")}</button>
+              <button type="button" onclick={openPluginFolder}>{tr("Open folder", "Abrir pasta")}</button>
+            </div>
+            {#if pluginMessage}<p class="browser-path">{pluginMessage}</p>{/if}
             {#if settingsMessage}
               <p class:error={settingsMessageIsError} class="settings-feedback" transition:fade>
                 {settingsMessage}
@@ -1296,6 +1917,18 @@
                 <option value="pt-BR">Português</option>
               </select>
             </label>
+            <div class="setting-row">
+              <div><strong>{tr("Dark mode", "Modo escuro")}</strong><span>{tr("Switch between the light and dark appearance.", "Alterne entre a aparência clara e escura.")}</span></div>
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  checked={effectiveDark}
+                  onchange={(event) =>
+                    updatePreference("darkMode", event.currentTarget.checked)}
+                />
+                <span></span>
+              </label>
+            </div>
             <div class="setting-row">
               <div><strong>{tr("Start with the system", "Iniciar com o sistema")}</strong><span>{tr("Lume stays available in the system tray.", "Lume fica disponível na bandeja.")}</span></div>
               <label class="switch">
@@ -1373,6 +2006,103 @@
                 {/each}
               </div>
             </div>
+            <div class="field-row shortcut-row">
+              <span><strong>{tr("Command palette", "Paleta de comandos")}</strong><small>{tr("Available even when Lume is hidden.", "Disponível mesmo com o Lume oculto.")}</small></span>
+              <kbd>{preferences.globalShortcut}</kbd>
+            </div>
+            <div class="settings-section-label preferences-label">{tr("Project profiles", "Perfis por projeto")}</div>
+            {#if detectedProjects.length > 0}
+              <label class="field-row">
+                <span><strong>{tr("Project", "Projeto")}</strong><small>{tr("Overrides only for this project.", "Ajustes somente para este projeto.")}</small></span>
+                <select
+                  value={selectedProfileKey ?? ""}
+                  onchange={(event) => (selectedProfileKey = event.currentTarget.value)}
+                >
+                  {#each detectedProjects as project (project.key)}
+                    <option value={project.key}>{project.label}</option>
+                  {/each}
+                </select>
+              </label>
+              <div class="setting-row">
+                <div><strong>{tr("Project sounds", "Sons do projeto")}</strong><span>{tr("Allow completion, error, and permission sounds.", "Permite sons de conclusão, erro e permissão.")}</span></div>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    checked={selectedProjectProfile?.soundEnabled ?? true}
+                    onchange={(event) =>
+                      updateSelectedProjectProfile({ soundEnabled: event.currentTarget.checked })}
+                  />
+                  <span></span>
+                </label>
+              </div>
+              <div class="launch-setting project-launch-setting">
+                <span><strong>{tr("Session destination", "Destino das sessões")}</strong><small>{tr("Override the global destination.", "Substitui o destino global.")}</small></span>
+                <div class="segmented" aria-label={tr("Project session destination", "Destino das sessões do projeto")}>
+                  {#each [["", tr("Global", "Global")], ["auto", "Auto"], ["terminal", "Terminal"], ["vscode", "VS Code"]] as option}
+                    <button
+                      class:active={(selectedProjectProfile?.launchTarget ?? "") === option[0]}
+                      type="button"
+                      onclick={() =>
+                        updateSelectedProjectProfile({ launchTarget: option[0] ? option[0] as Preferences["launchTarget"] : undefined })}
+                    >{option[1]}</button>
+                  {/each}
+                </div>
+              </div>
+              <label class="field-row">
+                <span><strong>{tr("Profile monitor", "Monitor do perfil")}</strong><small>{tr("Where this project should appear.", "Onde este projeto deve aparecer.")}</small></span>
+                <select value={selectedProjectProfile?.monitorId ?? ""} onchange={(event) => updateSelectedProjectProfile({ monitorId: event.currentTarget.value || undefined })}>
+                  <option value="">{tr("Global", "Global")}</option>
+                  {#each monitors as monitor}
+                    <option value={monitor.id}>{monitor.label}</option>
+                  {/each}
+                </select>
+              </label>
+              <div class="setting-row">
+                <div><strong>{tr("Capsule position", "Posição da cápsula")}</strong><span>{selectedProjectProfile?.overlayX !== undefined ? `${selectedProjectProfile.overlayX}, ${selectedProjectProfile.overlayY}` : tr("Use the global position", "Usar a posição global")}</span></div>
+                <button class="profile-action" type="button" onclick={captureProfilePosition}>{tr("Use current", "Usar atual")}</button>
+              </div>
+              <label class="field-row">
+                <span><strong>{tr("Permission preset", "Preset de permissão")}</strong><small>{tr("Applied only when Lume starts a new session.", "Aplicado apenas ao iniciar uma nova sessão pelo Lume.")}</small></span>
+                <select value={selectedProjectProfile?.permissionMode ?? ""} onchange={(event) => updateSelectedProjectProfile({ permissionMode: (event.currentTarget.value || undefined) as Preferences["projectProfiles"][string]["permissionMode"] })}>
+                  <option value="">{tr("Agent default", "Padrão do agente")}</option>
+                  <option value="plan">Plan</option>
+                  <option value="read_only">{tr("Read only", "Somente leitura")}</option>
+                  <option value="workspace_write">Workspace write</option>
+                  <option value="full_access">{tr("Full access — no sandbox", "Acesso total — sem sandbox")}</option>
+                </select>
+              </label>
+              <label class="field-row">
+                <span><strong>{tr("Approval policy", "Política de aprovação")}</strong><small>{tr("Supported by Codex launch profiles.", "Suportada nos perfis de abertura do Codex.")}</small></span>
+                <select value={selectedProjectProfile?.approvalPolicy ?? ""} onchange={(event) => updateSelectedProjectProfile({ approvalPolicy: (event.currentTarget.value || undefined) as Preferences["projectProfiles"][string]["approvalPolicy"] })}>
+                  <option value="">{tr("Agent default", "Padrão do agente")}</option>
+                  <option value="untrusted">Untrusted</option>
+                  <option value="on-request">On request</option>
+                  <option value="never">Never</option>
+                </select>
+              </label>
+              <label class="field-row">
+                <span><strong>Whiteboard</strong><small>{tr("Default saved layout for this project.", "Layout salvo padrão deste projeto.")}</small></span>
+                <select value={selectedProjectProfile?.whiteboardLayoutId ?? ""} onchange={(event) => updateSelectedProjectProfile({ whiteboardLayoutId: event.currentTarget.value || undefined })}>
+                  <option value="">{tr("No layout", "Sem layout")}</option>
+                  {#each preferences.whiteboardLayouts as layout (layout.id)}
+                    <option value={layout.id}>{layout.name}</option>
+                  {/each}
+                </select>
+              </label>
+              <div class="launch-setting preferred-agents-setting">
+                <span><strong>{tr("Preferred agents", "Agentes preferidos")}</strong><small>{tr("Shown first in the launcher.", "Aparecem primeiro no iniciador.")}</small></span>
+                <div class="agent-preferences">
+                  {#each integrations as integration (integration.kind)}
+                    <button class:active={(selectedProjectProfile?.preferredAgents ?? []).includes(integration.kind)} type="button" onclick={() => togglePreferredAgent(integration.kind)}>
+                      <BrandIcon name={integration.kind} size={14} />{integration.label}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+              <button class="apply-profile-button" type="button" onclick={applySelectedProjectProfile}>{tr("Apply project profile", "Aplicar perfil do projeto")}</button>
+            {:else}
+              <p class="profile-empty">{tr("Profiles appear after a project is detected.", "Os perfis aparecem depois que um projeto é detectado.")}</p>
+            {/if}
             <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
             <div class="update-card" aria-live="polite">
               <div class="update-main">
@@ -1443,12 +2173,12 @@
           class:active={view === "history"}
           type="button"
           onclick={() => openView("history")}
-          aria-label={tr("History", "Histórico")}
+          aria-label={tr("Results", "Resultados")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M4.5 5.5h11M4.5 10h11M4.5 14.5h7" />
           </svg>
-          <span>{tr("History", "Histórico")}</span>
+          <span>{tr("Results", "Resultados")}</span>
         </button>
         <button
           class:active={view === "settings"}
@@ -1483,6 +2213,7 @@
   }
 
   button,
+  input,
   select,
   textarea {
     -webkit-tap-highlight-color: transparent;
@@ -1516,7 +2247,7 @@
 
   .status-permission_required { color: #ae6b24; }
   .status-failed { color: #a84d4d; }
-  .status-completed { color: #708079; }
+  .status-completed { color: #4f966b; }
   .status-idle { color: #829089; }
 
   .agent-count {
@@ -1544,7 +2275,6 @@
     border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
-    backdrop-filter: blur(28px) saturate(125%);
   }
 
   .panel-content,
@@ -1552,7 +2282,7 @@
   .panel .brand-lockup > div,
   .panel .header-actions,
   .panel .launcher-popover {
-    transition: opacity 150ms ease, transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+    transition: opacity 150ms ease;
   }
   .panel:not(.content-visible) .panel-content,
   .panel:not(.content-visible) footer,
@@ -1561,7 +2291,6 @@
   .panel:not(.content-visible) .launcher-popover {
     opacity: 0;
     pointer-events: none;
-    transform: translateY(-4px) scale(0.985);
   }
 
   .panel-header {
@@ -1584,6 +2313,7 @@
   .brand-lockup div span { color: #75817c; font-size: 10px; }
 
   .add-button,
+  .palette-button,
   .collapse-button {
     border: 0;
     color: #697872;
@@ -1600,11 +2330,12 @@
   }
 
   .header-actions { display: flex; align-items: center; gap: 2px; }
-  .add-button { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 10px; }
+  .add-button, .palette-button { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 10px; }
   .add-button:hover,
   .add-button.active { color: #486d5e; background: rgba(80, 103, 94, 0.07); }
 
   .add-button:hover,
+  .palette-button:hover,
   .collapse-button:hover { background: rgba(80, 103, 94, 0.07); }
 
   svg {
@@ -1628,6 +2359,19 @@
   .launcher-row button:disabled { opacity: 0.45; }
   .launcher-popover > p { margin: 8px 3px; color: #89938f; font-size: 10px; }
   .launcher-popover .launcher-error { color: #a54c4c; }
+  .command-palette-layer { position: absolute; z-index: 12; inset: 0 0 16px; display: grid; place-items: start center; padding-top: 66px; }
+  .command-palette-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(21, 31, 27, 0.2); backdrop-filter: blur(3px); cursor: default; }
+  .command-palette { position: relative; width: calc(100% - 30px); overflow: hidden; border: 1px solid rgba(89, 111, 101, 0.16); border-radius: 15px; background: rgba(250, 252, 251, 0.98); box-shadow: 0 18px 45px rgba(24, 38, 32, 0.24); }
+  .command-search { height: 43px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(91, 112, 102, 0.1); }
+  .command-search svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: #6f8179; stroke-width: 1.5; }
+  .command-search input { min-width: 0; flex: 1; border: 0; outline: 0; color: #304039; background: transparent; font: inherit; font-size: 10px; }
+  .command-palette kbd, .shortcut-row kbd { padding: 3px 5px; border: 1px solid rgba(92, 112, 103, 0.13); border-radius: 5px; color: #7b8983; background: rgba(80, 105, 94, 0.045); font-family: inherit; font-size: 7px; }
+  .command-results { max-height: 265px; padding: 5px; overflow-y: auto; }
+  .command-results > button { width: 100%; min-height: 42px; padding: 6px 8px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 9px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+  .command-results > button.active { background: rgba(78, 109, 95, 0.075); }
+  .command-results > button span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .command-results strong { overflow: hidden; color: #34443d; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .command-results small, .command-results > p { margin: 0; color: #89958f; font-size: 8px; }
   .session-list,
   .history-list,
   .settings { max-height: 431px; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
@@ -1696,9 +2440,12 @@
   .agent-unknown { color: #48534f; background: #e2e7e4; }
 
   .session-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
-  .session-title-row { display: flex; align-items: center; gap: 6px; }
+  .session-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
   .session-title-row strong { color: #27342f; font-size: 11px; }
   .source-label { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 8px; font-weight: 720; letter-spacing: 0.045em; line-height: 1.25; text-transform: uppercase; }
+  .access-badge { padding: 2px 5px; border: 1px solid transparent; border-radius: 999px; font-size: 7px; font-weight: 760; letter-spacing: 0.025em; line-height: 1.25; white-space: nowrap; }
+  .access-badge.auto-review { border-color: rgba(80, 120, 170, 0.12); color: #5579a3; background: rgba(80, 120, 170, 0.08); }
+  .access-badge.full-access { border-color: rgba(177, 115, 65, 0.13); color: #9b663d; background: rgba(177, 115, 65, 0.09); }
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
@@ -1710,11 +2457,14 @@
   .running-dots i:nth-child(3) { animation-delay: 240ms; }
   .status-line.status-permission_required { color: #a46522; }
   .status-line.status-permission_required > i { background: #cb8235; box-shadow: 0 0 0 3px rgba(203, 130, 53, 0.1); }
-  .status-line.status-completed { color: #77817d; }
-  .status-line.status-completed > i { background: #89928e; }
+  .status-line.status-completed { color: #4f966b; }
+  .status-line.status-completed > i { background: #59aa78; box-shadow: 0 0 0 3px rgba(89, 170, 120, 0.1); }
   .status-line.status-failed > i { background: #b95454; }
   .status-line.status-waiting_for_input { color: #a87925; }
   .status-line.status-waiting_for_input > i { background: #c99a3f; }
+  .response-preview { min-width: 0; margin-top: 4px; padding: 6px 7px; display: grid; gap: 2px; border-left: 2px solid rgba(77, 117, 99, 0.22); border-radius: 0 7px 7px 0; color: #697771; background: rgba(73, 102, 89, 0.035); }
+  .response-preview b { color: #668075; font-size: 7px; letter-spacing: 0.055em; text-transform: uppercase; }
+  .response-preview span { overflow: hidden; display: -webkit-box; font-size: 9px; line-height: 1.35; line-clamp: 2; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 
   @keyframes status-dot-bounce {
     0%, 60%, 100% { opacity: 0.48; transform: translateY(1px); }
@@ -1725,12 +2475,11 @@
   .selected .chevron { transform: rotate(90deg); }
 
   .session-details { padding: 0 2px 13px 43px; }
-  .access-profile { margin: -2px 0 10px; display: grid; gap: 1px; }
-  .access-profile span { color: #46554f; font-size: 10px; font-weight: 700; }
-  .access-profile small { color: #89938f; font-size: 9px; }
+  .capability-bar { margin: -2px 0 9px; display: flex; align-items: center; gap: 5px; }
+  .capability-bar button { height: 24px; padding: 0 7px; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 7px; color: #63786e; background: rgba(77, 105, 92, 0.035); font-size: 8px; font-weight: 700; cursor: pointer; }
+  .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
 
   .permission-block { padding-left: 11px; border-left: 2px solid #d49350; display: grid; gap: 6px; }
-  .permission-block .eyebrow { color: #a06323; font-size: 9px; font-weight: 780; letter-spacing: 0.05em; text-transform: uppercase; }
   .permission-block > strong { color: #4d3b2a; font-size: 11px; font-weight: 650; line-height: 1.4; }
   code { padding: 7px 8px; overflow: hidden; border-radius: 7px; color: #46524d; background: rgba(70, 82, 77, 0.055); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -1780,9 +2529,12 @@
 
   .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
-  .board-intro .eyebrow { display: block; margin-bottom: 4px; color: #7a8c84; font-size: 8px; font-weight: 760; letter-spacing: 0.065em; text-transform: uppercase; }
   .board-intro strong { color: #2d3a35; font-size: 12px; }
   .board-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; line-height: 1.45; }
+  .layout-toolbar { padding: 8px 0 4px; display: grid; grid-template-columns: minmax(72px, 1fr) minmax(70px, 1fr) auto auto auto; gap: 4px; }
+  .layout-toolbar select, .layout-toolbar input { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; outline: 0; color: #52625b; background: rgba(255, 255, 255, 0.42); font: inherit; font-size: 8px; }
+  .layout-toolbar button { height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; color: #567165; background: rgba(255, 255, 255, 0.4); font-size: 8px; cursor: pointer; }
+  .layout-toolbar .layout-delete { color: #a45a58; }
   .terminal-picker { min-height: 0; padding: 9px 0 6px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
   .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
   .terminal-picker-row:last-child { border-bottom: 0; }
@@ -1804,6 +2556,34 @@
   .quiet-orbit i { width: 7px; height: 7px; border-radius: 50%; background: #799186; }
 
   .history-list { padding: 6px 16px 16px; }
+  .results-intro { padding: 8px 1px 12px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .results-intro strong { color: #2d3a35; font-size: 12px; }
+  .results-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; }
+  .results-list { display: grid; gap: 8px; padding: 10px 0 3px; }
+  .result-card { padding: 9px 10px; border: 1px solid rgba(91, 115, 104, 0.1); border-radius: 11px; background: rgba(75, 105, 91, 0.03); }
+  .result-heading { display: flex; align-items: center; gap: 7px; }
+  .result-heading .agent-avatar { width: 25px; height: 25px; border-radius: 8px; }
+  .result-heading > span:last-child { min-width: 0; display: grid; gap: 1px; }
+  .result-heading strong { color: #34443d; font-size: 9px; }
+  .result-heading small { overflow: hidden; color: #87928d; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .result-card > p { max-height: 78px; margin: 8px 0; overflow: hidden; display: -webkit-box; color: #52615b; font-size: 9px; line-height: 1.45; line-clamp: 4; overflow-wrap: anywhere; white-space: pre-wrap; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
+  .result-artifacts { margin: 0 0 8px; display: grid; gap: 4px; }
+  .result-artifacts span { overflow: hidden; color: #78867f; font-size: 8px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+  .result-artifacts strong { margin-right: 5px; color: #60766c; font-size: 7px; text-transform: uppercase; }
+  .result-actions { display: flex; align-items: center; gap: 5px; }
+  .result-actions button { height: 24px; padding: 0 7px; border: 1px solid rgba(84, 109, 98, 0.12); border-radius: 7px; color: #5e756b; background: rgba(255, 255, 255, 0.36); font-size: 8px; font-weight: 700; cursor: pointer; }
+  .result-actions button:hover { background: rgba(255, 255, 255, 0.72); }
+  .results-empty { margin: 8px 2px 4px; color: #89938f; font-size: 9px; }
+  .saved-notes { display: grid; gap: 6px; }
+  .saved-note { position: relative; padding: 9px 34px 9px 10px; border: 1px solid rgba(83, 112, 99, 0.12); border-radius: 10px; background: rgba(244, 239, 198, 0.16); }
+  .saved-note > span { display: grid; gap: 1px; }
+  .saved-note strong { color: #4c5d55; font-size: 9px; }
+  .saved-note small { color: #8a958f; font-size: 8px; }
+  .saved-note p { max-height: 42px; margin: 6px 0; overflow: hidden; color: #65736d; font-size: 8px; line-height: 1.4; }
+  .saved-note > button { position: absolute; top: 7px; right: 7px; padding: 3px; border: 0; color: #9a7771; background: transparent; font-size: 7px; cursor: pointer; }
+  .artifact-summary { display: flex; gap: 5px; }
+  .artifact-summary span { padding: 2px 4px; border-radius: 5px; color: #73837b; background: rgba(77, 105, 92, 0.06); font-size: 7px; }
+  .history-label { margin-top: 7px; }
   .history-row { min-height: 60px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .history-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #6f9b88; }
   .history-dot.event-failed,
@@ -1820,7 +2600,7 @@
   .settings-section-label.preferences-label { padding-top: 17px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .integration-row .agent-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: 10px; }
-  .integration-row > div { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .integration-row > div:not(.integration-actions) { min-width: 0; flex: 1; display: grid; gap: 2px; }
   .integration-row strong { color: #35423d; font-size: 10px; }
   .integration-row div span { overflow: hidden; color: #89938f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .integration-row button { min-width: 63px; height: 27px; padding: 0 8px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 8px; color: #577064; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: background 150ms ease, color 150ms ease, transform 150ms ease; }
@@ -1829,8 +2609,21 @@
   .integration-row button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(82, 112, 99, 0.06); }
   .integration-row button.connected { border-color: transparent; color: #6d7e76; }
   .integration-row button:disabled { cursor: default; opacity: 0.5; }
+  .integration-actions { display: flex; align-items: center; gap: 4px; }
+  .integration-actions .diagnose-button { min-width: 42px; padding: 0 6px; border-color: transparent; color: #78877f; }
+  .diagnostic-card { margin: -1px 0 7px 38px; padding: 7px 8px; display: grid; gap: 6px; border: 1px solid rgba(93, 113, 104, 0.1); border-radius: 9px; background: rgba(75, 103, 90, 0.03); }
+  .diagnostic-check { min-width: 0; display: flex; align-items: flex-start; gap: 7px; }
+  .diagnostic-check > i { width: 6px; height: 6px; margin-top: 3px; flex: 0 0 auto; border-radius: 50%; background: #789487; }
+  .diagnostic-check.status-warning > i { background: #c3933c; }
+  .diagnostic-check.status-error > i { background: #bd5c59; }
+  .diagnostic-check > span { min-width: 0; display: grid; gap: 1px; }
+  .diagnostic-check strong { color: #4c5c55; font-size: 8px; }
+  .diagnostic-check small { overflow: hidden; color: #89958f; font-size: 8px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .browser-row button { min-width: 68px; }
   .browser-path { margin: 7px 2px 0; overflow-wrap: anywhere; color: #89938f; font-size: 9px; line-height: 1.4; }
+  .plugin-actions { padding-top: 8px; display: flex; gap: 5px; }
+  .plugin-actions button, .profile-action, .apply-profile-button { min-height: 27px; padding: 0 8px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 8px; color: #577064; background: transparent; font-size: 8px; font-weight: 680; cursor: pointer; }
+  .external-plugin-row > button { min-width: 54px; }
   .setting-row,
   .field-row { min-height: 67px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .setting-row > div,
@@ -1856,6 +2649,14 @@
   .segmented { padding: 2px; display: grid; grid-template-columns: repeat(3, 1fr); border-radius: 9px; background: rgba(83, 104, 95, 0.07); }
   .segmented button { height: 29px; border: 0; border-radius: 7px; color: #74817b; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease; }
   .segmented button.active { color: #35473f; background: rgba(255, 255, 255, 0.82); box-shadow: 0 1px 4px rgba(37, 53, 46, 0.1); }
+  .project-launch-setting .segmented { grid-template-columns: repeat(4, 1fr); }
+  .preferred-agents-setting { border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .agent-preferences { display: flex; flex-wrap: wrap; gap: 5px; }
+  .agent-preferences button { min-height: 29px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid rgba(83, 107, 97, 0.12); border-radius: 8px; color: #74817b; background: transparent; font-size: 8px; cursor: pointer; }
+  .agent-preferences button.active { color: #3f6656; border-color: rgba(72, 114, 96, 0.24); background: rgba(72, 114, 96, 0.07); }
+  .apply-profile-button { width: 100%; margin-top: 10px; color: #f6fbf8; border-color: #527c6c; background: #527c6c; }
+  .shortcut-row kbd { font-size: 8px; white-space: nowrap; }
+  .profile-empty { margin: 5px 1px 2px; color: #89938f; font-size: 9px; line-height: 1.45; }
   .update-card { padding: 12px; border: 1px solid rgba(92, 111, 103, 0.11); border-radius: 13px; background: rgba(84, 111, 99, 0.035); }
   .update-main { display: flex; align-items: center; gap: 9px; }
   .update-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -1896,55 +2697,84 @@
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   }
 
-  @media (prefers-color-scheme: dark) {
-    .lume-orb,
-    .panel,
-    .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
-    .brand-lockup strong,
-    .session-title-row strong,
-    .board-intro strong,
-    .terminal-picker-copy strong,
-    .history-row strong,
-    .setting-row strong,
-    .integration-row strong,
-    .field-row strong,
-    .launch-setting strong { color: #e3ebe7; }
-    .update-copy strong { color: #e3ebe7; }
-    .launcher-row strong { color: #dfe8e3; }
-    .panel-header,
-    footer,
-    .session-row,
-    .history-row,
-    .setting-row,
-    .field-row { border-color: rgba(190, 209, 200, 0.09); }
-    .session-row:hover,
-    .session-row.selected { background: rgba(198, 218, 208, 0.045); }
-    .project-name,
-    .board-intro p,
-    .terminal-picker-copy small,
-    .history-row span,
-    .settings-feedback { color: #adbab4; }
-    .settings-feedback.error { color: #d68d8d; }
-    .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
-    .update-card p.error { color: #d68d8d; }
-    .access-profile span,
-    .empty-state strong { color: #c5d0cb; }
-    code,
-    .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
-    .permission-block > strong { color: #e2d0bd; }
-    .permission-actions button,
-    .field-row select,
-    .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-    .final-response { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
-    .final-response .eyebrow { color: #8ca69a; }
-    .final-response p { color: #c2d0c9; }
-    .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
-    .board-intro,
-    .terminal-picker-row,
-    .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
-    .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-    .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
-    .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
-    .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
-  }
+  .overlay-shell.dark { color-scheme: dark; }
+  .overlay-shell.dark .lume-orb,
+  .overlay-shell.dark .panel,
+  .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
+  .overlay-shell.dark .brand-lockup strong,
+  .overlay-shell.dark .session-title-row strong,
+  .overlay-shell.dark .board-intro strong,
+  .overlay-shell.dark .terminal-picker-copy strong,
+  .overlay-shell.dark .history-row strong,
+  .overlay-shell.dark .setting-row strong,
+  .overlay-shell.dark .integration-row strong,
+  .overlay-shell.dark .field-row strong,
+  .overlay-shell.dark .launch-setting strong { color: #e3ebe7; }
+  .overlay-shell.dark .update-copy strong { color: #e3ebe7; }
+  .overlay-shell.dark .launcher-row strong { color: #dfe8e3; }
+  .overlay-shell.dark .panel-header,
+  .overlay-shell.dark footer,
+  .overlay-shell.dark .session-row,
+  .overlay-shell.dark .history-row,
+  .overlay-shell.dark .setting-row,
+  .overlay-shell.dark .field-row { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .session-row:hover,
+  .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
+  .overlay-shell.dark .project-name,
+  .overlay-shell.dark .board-intro p,
+  .overlay-shell.dark .terminal-picker-copy small,
+  .overlay-shell.dark .history-row span,
+  .overlay-shell.dark .settings-feedback { color: #adbab4; }
+  .overlay-shell.dark .settings-feedback.error { color: #d68d8d; }
+  .overlay-shell.dark .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .update-card p.error { color: #d68d8d; }
+  .overlay-shell.dark .diagnostic-card,
+  .overlay-shell.dark .result-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .diagnostic-check strong,
+  .overlay-shell.dark .result-heading strong,
+  .overlay-shell.dark .results-intro strong { color: #dce7e1; }
+  .overlay-shell.dark .diagnostic-check small,
+  .overlay-shell.dark .result-heading small,
+  .overlay-shell.dark .results-intro p,
+  .overlay-shell.dark .result-card > p { color: #aebdb5; }
+  .overlay-shell.dark .result-actions button,
+  .overlay-shell.dark .capability-bar button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .empty-state strong { color: #c5d0cb; }
+  .overlay-shell.dark code,
+  .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
+  .overlay-shell.dark .permission-block > strong { color: #e2d0bd; }
+  .overlay-shell.dark .permission-actions button,
+  .overlay-shell.dark .field-row select,
+  .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .final-response,
+  .overlay-shell.dark .response-preview { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
+  .overlay-shell.dark .final-response .eyebrow,
+  .overlay-shell.dark .response-preview b { color: #8ca69a; }
+  .overlay-shell.dark .final-response p,
+  .overlay-shell.dark .response-preview span { color: #c2d0c9; }
+  .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
+  .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
+  .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }
+  .overlay-shell.dark .board-intro,
+  .overlay-shell.dark .terminal-picker-row,
+  .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
+  .overlay-shell.dark .command-palette { border-color: rgba(207, 223, 215, 0.13); background: rgba(27, 34, 31, 0.985); }
+  .overlay-shell.dark .command-search { border-color: rgba(207, 223, 215, 0.09); }
+  .overlay-shell.dark .command-search input,
+  .overlay-shell.dark .command-results strong { color: #dce7e1; }
+  .overlay-shell.dark .command-results > button.active { background: rgba(213, 229, 221, 0.07); }
+  .overlay-shell.dark .layout-toolbar select,
+  .overlay-shell.dark .layout-toolbar input,
+  .overlay-shell.dark .layout-toolbar button,
+  .overlay-shell.dark .plugin-actions button,
+  .overlay-shell.dark .profile-action,
+  .overlay-shell.dark .agent-preferences button { color: #bdcbc4; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .saved-note { border-color: rgba(207, 223, 215, 0.1); background: rgba(226, 211, 121, 0.04); }
+  .overlay-shell.dark .saved-note strong { color: #d7e2dc; }
+  .overlay-shell.dark .saved-note p,
+  .overlay-shell.dark .result-artifacts span { color: #aab8b1; }
 </style>

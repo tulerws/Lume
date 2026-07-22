@@ -33,46 +33,158 @@ pub struct CompanionStatus {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticCheck {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationDiagnostic {
+    pub kind: IntegrationKind,
+    pub label: String,
+    pub healthy: bool,
+    pub checks: Vec<DiagnosticCheck>,
+    pub last_event_at: Option<i64>,
+}
+
+pub fn lume_executable() -> Result<PathBuf, String> {
+    if let Some(app_image) = env::var_os("APPIMAGE").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(app_image));
+    }
+    std::env::current_exe().map_err(|error| error.to_string())
+}
+
 pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
-    [
-        (IntegrationKind::Codex, "Codex", "codex", true),
-        (IntegrationKind::Claude, "Claude", "claude", true),
-        (IntegrationKind::Gemini, "Gemini", "gemini", false),
-    ]
-    .into_iter()
-    .map(|(kind, label, command, direct_permissions)| {
-        let installed = crate::executables::available(command);
-        let configured = config_path(&kind)
-            .and_then(|path| fs::read_to_string(path).ok())
-            .is_some_and(|content| configured_content(&content, &kind, executable));
-        let detail = if !installed {
-            "CLI não encontrada".into()
-        } else if configured {
-            if kind == IntegrationKind::Codex {
-                "Hook instalado; confirme a confiança em /hooks".into()
-            } else if direct_permissions {
-                "Monitoramento e decisões conectados".into()
+    crate::agent_plugins::catalog()
+        .into_iter()
+        .map(|plugin| {
+            let kind = plugin.kind();
+            let installed = crate::executables::available(plugin.executable());
+            let configured = config_path(&kind)
+                .and_then(|path| fs::read_to_string(path).ok())
+                .is_some_and(|content| configured_content(&content, &kind, executable));
+            let detail = if !installed {
+                "CLI não encontrada".into()
+            } else if configured {
+                if kind == IntegrationKind::Codex {
+                    "Hook conectado; /hooks está disponível no Codex CLI".into()
+                } else if plugin.direct_permissions() {
+                    "Monitoramento e decisões conectados".into()
+                } else {
+                    "Monitoramento conectado".into()
+                }
+            } else if kind == IntegrationKind::Codex {
+                "Decisões diretas ao abrir uma sessão pelo Lume".into()
             } else {
-                "Monitoramento conectado".into()
+                "Pronto para conectar".into()
+            };
+            IntegrationStatus {
+                kind,
+                label: plugin.label().into(),
+                installed,
+                configured,
+                direct_permissions: plugin.direct_permissions(),
+                detail,
             }
-        } else if kind == IntegrationKind::Codex {
-            "Decisões diretas ao abrir uma sessão pelo Lume".into()
+        })
+        .collect()
+}
+
+pub fn diagnose(
+    kind: &IntegrationKind,
+    executable: &str,
+    last_event_at: Option<i64>,
+) -> Result<IntegrationDiagnostic, String> {
+    let plugin =
+        crate::agent_plugins::find(kind).ok_or_else(|| "Integração não reconhecida".to_string())?;
+    let mut checks = Vec::new();
+    let executable_path = crate::executables::path(plugin.executable());
+    checks.push(DiagnosticCheck {
+        id: "cli".into(),
+        label: "CLI".into(),
+        status: if executable_path.is_some() {
+            "ok"
         } else {
-            "Pronto para conectar".into()
-        };
-        IntegrationStatus {
-            kind,
-            label: label.into(),
-            installed,
-            configured,
-            direct_permissions,
-            detail,
+            "error"
         }
+        .into(),
+        detail: executable_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{} não encontrado", plugin.executable())),
+    });
+
+    if executable_path.is_some() {
+        let version = crate::executables::command(plugin.executable())
+            .and_then(|mut command| {
+                command
+                    .arg("--version")
+                    .output()
+                    .map_err(|error| error.to_string())
+            })
+            .ok()
+            .and_then(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                (!stdout.is_empty())
+                    .then_some(stdout)
+                    .or((!stderr.is_empty()).then_some(stderr))
+            });
+        checks.push(DiagnosticCheck {
+            id: "version".into(),
+            label: "Versão".into(),
+            status: if version.is_some() { "ok" } else { "warning" }.into(),
+            detail: version.unwrap_or_else(|| "Não foi possível consultar a versão".into()),
+        });
+    }
+
+    let hook_path = config_path(kind);
+    let configured = hook_path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|content| configured_content(&content, kind, executable));
+    checks.push(DiagnosticCheck {
+        id: "hooks".into(),
+        label: "Monitoramento".into(),
+        status: if configured { "ok" } else { "warning" }.into(),
+        detail: if configured {
+            format!("{} eventos configurados", plugin.hook_events().len())
+        } else {
+            "Hook do Lume ainda não conectado".into()
+        },
+    });
+    checks.push(DiagnosticCheck {
+        id: "activity".into(),
+        label: "Último evento".into(),
+        status: if last_event_at.is_some() {
+            "ok"
+        } else {
+            "warning"
+        }
+        .into(),
+        detail: last_event_at
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_else(|| "Nenhum evento recebido nesta execução".into()),
+    });
+    let healthy = checks.iter().all(|check| check.status != "error");
+    Ok(IntegrationDiagnostic {
+        kind: plugin.kind(),
+        label: plugin.label().into(),
+        healthy,
+        checks,
+        last_event_at,
     })
-    .collect()
 }
 
 pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Result<(), String> {
+    if enabled && *kind == IntegrationKind::Codex {
+        ensure_codex_hooks_enabled()?;
+    }
     let path =
         config_path(kind).ok_or_else(|| "Diretório do usuário não encontrado".to_string())?;
     let mut root = read_config(&path)?;
@@ -109,6 +221,21 @@ pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Res
     }
     let payload = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{payload}\n")).map_err(|error| error.to_string())
+}
+
+pub fn refresh_connected(executable: &str) {
+    for plugin in crate::agent_plugins::catalog() {
+        let kind = plugin.kind();
+        let Some(path) = config_path(&kind) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        if has_lume_handler(&content, &kind) {
+            let _ = configure(&kind, executable, true);
+        }
+    }
 }
 
 pub fn vscode_status() -> CompanionStatus {
@@ -267,30 +394,9 @@ fn read_config(path: &PathBuf) -> Result<Value, String> {
 }
 
 fn events(kind: &IntegrationKind) -> &'static [&'static str] {
-    match kind {
-        IntegrationKind::Codex => &[
-            "SessionStart",
-            "UserPromptSubmit",
-            "PermissionRequest",
-            "Stop",
-        ],
-        IntegrationKind::Claude => &[
-            "SessionStart",
-            "UserPromptSubmit",
-            "PermissionRequest",
-            "Notification",
-            "Stop",
-            "StopFailure",
-            "SessionEnd",
-        ],
-        IntegrationKind::Gemini => &[
-            "SessionStart",
-            "BeforeAgent",
-            "Notification",
-            "AfterAgent",
-            "SessionEnd",
-        ],
-    }
+    crate::agent_plugins::find(kind)
+        .map(|plugin| plugin.hook_events())
+        .unwrap_or_default()
 }
 
 fn config_path(kind: &IntegrationKind) -> Option<PathBuf> {
@@ -301,6 +407,71 @@ fn config_path(kind: &IntegrationKind) -> Option<PathBuf> {
         IntegrationKind::Gemini => ".gemini/settings.json",
     };
     Some(PathBuf::from(user_home).join(directory))
+}
+
+fn codex_user_config_path() -> Option<PathBuf> {
+    let user_home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(PathBuf::from(user_home).join(".codex/config.toml"))
+}
+
+fn ensure_codex_hooks_enabled() -> Result<(), String> {
+    let path = codex_user_config_path()
+        .ok_or_else(|| "Diretório de configuração do Codex não encontrado".to_string())?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(updated) = config_with_hooks_enabled(&content)? else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("lume-backup.toml");
+        if !backup.exists() {
+            fs::copy(&path, &backup).map_err(|error| error.to_string())?;
+        }
+    }
+    fs::write(path, updated).map_err(|error| error.to_string())
+}
+
+fn config_with_hooks_enabled(content: &str) -> Result<Option<String>, String> {
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(features_index) = lines.iter().position(|line| line.trim() == "[features]") {
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(features_index + 1)
+            .find(|(_, line)| line.trim().starts_with('['))
+            .map(|(index, _)| index)
+            .unwrap_or(lines.len());
+        if let Some(line) = lines[features_index + 1..section_end].iter().find(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "hooks")
+        }) {
+            let value = line
+                .split_once('=')
+                .map(|(_, value)| value.split('#').next().unwrap_or_default().trim())
+                .unwrap_or_default();
+            return match value {
+                "true" => Ok(None),
+                "false" => Err(
+                    "Os hooks estão desativados em ~/.codex/config.toml; ative features.hooks para conectar o Lume"
+                        .into(),
+                ),
+                _ => Err("A opção features.hooks do Codex não é válida".into()),
+            };
+        }
+        lines.insert(features_index + 1, "hooks = true".into());
+    } else {
+        if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.extend(["[features]".into(), "hooks = true".into()]);
+    }
+    Ok(Some(format!("{}\n", lines.join("\n"))))
 }
 
 fn provider(kind: &IntegrationKind) -> &'static str {
@@ -340,7 +511,46 @@ fn configured_content(content: &str, kind: &IntegrationKind, executable: &str) -
                                                 == Some(provider(kind))
                                     },
                                 );
-                            exec_form || command.contains(&marker(kind, executable))
+                            let shell_form = command.contains(executable)
+                                && command.contains(&format!(" hook {}", provider(kind)));
+                            let windows_form = handler
+                                .get("commandWindows")
+                                .and_then(Value::as_str)
+                                .is_some_and(|command| {
+                                    command.contains(executable)
+                                        && command.contains(&format!(" hook {}", provider(kind)))
+                                });
+                            exec_form || shell_form || windows_form
+                        })
+                    })
+            })
+        })
+    })
+}
+
+fn has_lume_handler(content: &str, kind: &IntegrationKind) -> bool {
+    let Ok(root) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    let provider_suffix = format!(" hook {}", provider(kind));
+    hooks.values().any(|groups| {
+        groups.as_array().is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| {
+                        handlers.iter().any(|handler| {
+                            handler.get("name").and_then(Value::as_str) == Some("Lume")
+                                || handler.get("statusMessage").and_then(Value::as_str)
+                                    == Some("Lume monitor")
+                                || handler
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|command| command.contains(&provider_suffix))
                         })
                     })
             })
@@ -437,5 +647,67 @@ mod tests {
             &IntegrationKind::Claude,
             "/opt/Lume App/lume"
         ));
+    }
+
+    #[test]
+    fn recognizes_connected_lume_hooks_from_an_older_executable() {
+        let root = json!({
+            "hooks": {
+                "PermissionRequest": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "name": "Lume",
+                        "command": "/old/Lume/lume",
+                        "args": ["hook", "claude"]
+                    }]
+                }]
+            }
+        });
+
+        assert!(has_lume_handler(
+            &root.to_string(),
+            &IntegrationKind::Claude
+        ));
+    }
+
+    #[test]
+    fn quoted_codex_command_is_recognized_as_connected() {
+        let root = json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"/usr/bin/lume\" hook codex",
+                        "statusMessage": "Lume monitor"
+                    }]
+                }]
+            }
+        });
+
+        assert!(configured_content(
+            &root.to_string(),
+            &IntegrationKind::Codex,
+            "/usr/bin/lume"
+        ));
+    }
+
+    #[test]
+    fn enables_codex_hooks_without_replacing_other_features() {
+        let content = "model = \"gpt\"\n[features]\nmemories = true\n\n[projects.test]\ntrust_level = \"trusted\"\n";
+        let updated = config_with_hooks_enabled(content)
+            .expect("configuração válida")
+            .expect("mudança necessária");
+        assert!(updated.contains("[features]\nhooks = true\nmemories = true"));
+        assert!(updated.contains("[projects.test]"));
+        assert!(config_with_hooks_enabled(&updated)
+            .expect("configuração válida")
+            .is_none());
+    }
+
+    #[test]
+    fn respects_an_explicit_codex_hooks_disable() {
+        let result = config_with_hooks_enabled("[features]\nhooks = false\n");
+        assert!(result.is_err());
     }
 }

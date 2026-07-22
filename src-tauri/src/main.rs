@@ -14,14 +14,5 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("ingest") {
         std::process::exit(lume_lib::run_ingest_client());
     }
-    // O renderizador DMABUF do WebKitGTK quebra em alguns compositores Wayland
-    // com sincronização explícita (ex.: KWin), derrubando a conexão com
-    // "Error 71 (Protocol error)" antes de a cápsula aparecer. Desligá-lo usa um
-    // caminho de composição compatível; num overlay pequeno o custo é
-    // irrelevante. Só definimos quando o usuário ainda não escolheu um valor.
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
     lume_lib::run()
 }

@@ -1,4 +1,5 @@
 mod adapters;
+mod agent_plugins;
 mod browser_server;
 mod codex_bridge;
 mod codex_sessions;
@@ -15,8 +16,8 @@ mod terminal_windows;
 
 use std::io::Read;
 
-use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences};
-use integrations::{CompanionStatus, IntegrationKind, IntegrationStatus};
+use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences, ResultNote};
+use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
 use state::AppState;
 use tauri::{
@@ -25,6 +26,7 @@ use tauri::{
     AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 fn reveal_main_window(app: &AppHandle) {
@@ -141,7 +143,7 @@ fn submit_prompt(
     } else {
         preferences.launch_target
     };
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -154,6 +156,8 @@ fn submit_prompt(
             resume_id: Some(resume_id),
             target,
             initial_prompt: Some(prompt.to_string()),
+            permission_mode: None,
+            approval_policy: None,
         },
         &executable,
         &app_data_dir,
@@ -196,6 +200,29 @@ fn list_history(
 }
 
 #[tauri::command]
+fn list_result_notes(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ResultNote>, String> {
+    state.result_notes(limit.unwrap_or(100))
+}
+
+#[tauri::command]
+fn save_result_note(
+    state: State<'_, AppState>,
+    session_id: String,
+    result_id: String,
+    title: String,
+) -> Result<ResultNote, String> {
+    state.save_result_note(&session_id, &result_id, &title)
+}
+
+#[tauri::command]
+fn delete_result_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.delete_result_note(&id)
+}
+
+#[tauri::command]
 fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
     state.preferences()
 }
@@ -206,6 +233,9 @@ fn set_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<(), String> {
+    let previous = state.preferences()?;
+    let overlay_configuration_changed = previous.monitor_id != preferences.monitor_id
+        || previous.show_over_fullscreen != preferences.show_over_fullscreen;
     if preferences.autostart {
         app.autolaunch()
             .enable()
@@ -216,7 +246,10 @@ fn set_preferences(
             .map_err(|error| error.to_string())?;
     }
     state.save_preferences(&preferences)?;
-    if let Some(window) = app.get_webview_window("main") {
+    if overlay_configuration_changed {
+        let Some(window) = app.get_webview_window("main") else {
+            return Ok(());
+        };
         let show_over_fullscreen = preferences.show_over_fullscreen;
         let monitor_id = preferences.monitor_id.clone();
         let window_for_layer = window.clone();
@@ -361,14 +394,47 @@ fn undock_terminal_window(
 }
 
 #[tauri::command]
+fn restore_terminal_layout(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    entries: Vec<terminal_windows::RestoredTerminalPlacement>,
+) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.restore_layout(&app, entries, monitor_id.as_deref())
+}
+
+#[tauri::command]
 fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     Ok(integrations::statuses(&executable.to_string_lossy()))
 }
 
 #[tauri::command]
+fn diagnose_integration(
+    kind: IntegrationKind,
+    state: State<'_, AppState>,
+) -> Result<IntegrationDiagnostic, String> {
+    let executable = integrations::lume_executable()?;
+    let last_event_at = state
+        .sessions()?
+        .into_iter()
+        .filter(|session| {
+            matches!(
+                (&kind, &session.agent),
+                (IntegrationKind::Codex, domain::AgentKind::Codex)
+                    | (IntegrationKind::Claude, domain::AgentKind::Claude)
+                    | (IntegrationKind::Gemini, domain::AgentKind::Gemini)
+            )
+        })
+        .map(|session| session.updated_at)
+        .max();
+    integrations::diagnose(&kind, &executable.to_string_lossy(), last_event_at)
+}
+
+#[tauri::command]
 fn configure_integration(kind: IntegrationKind, enabled: bool) -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     integrations::configure(&kind, &executable.to_string_lossy(), enabled)
 }
 
@@ -413,12 +479,50 @@ fn reveal_browser_companion(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn list_external_plugins(
+    app: AppHandle,
+) -> Result<Vec<agent_plugins::ExternalAgentPlugin>, String> {
+    Ok(agent_plugins::external_catalog(&app))
+}
+
+#[tauri::command]
+fn install_external_plugin(
+    app: AppHandle,
+    path: String,
+) -> Result<agent_plugins::ExternalAgentPlugin, String> {
+    agent_plugins::install_external(&app, std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn remove_external_plugin(app: AppHandle, id: String) -> Result<(), String> {
+    agent_plugins::remove_external(&app, &id)
+}
+
+#[tauri::command]
+fn reveal_plugin_directory(app: AppHandle) -> Result<String, String> {
+    let directory = agent_plugins::plugin_directory(&app)?;
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let template = directory.join("plugin-template.json.example");
+    if !template.exists() {
+        std::fs::write(
+            &template,
+            include_str!("../../docs/external-plugin.example.json"),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    app.opener()
+        .open_path(directory.to_string_lossy(), None::<String>)
+        .map_err(|error| error.to_string())?;
+    Ok(directory.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn launch_session(
     app: AppHandle,
     bridge: State<'_, codex_bridge::CodexBridge>,
     request: LaunchRequest,
 ) -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = integrations::lume_executable()?;
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -443,11 +547,36 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        reveal_main_window(app);
+                        let _ = app.emit("lume://open-command-palette", ());
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
+            let _ = app.global_shortcut().register(Shortcut::new(
+                Some(Modifiers::CONTROL | Modifiers::SHIFT),
+                Code::Space,
+            ));
+            if let Ok(executable) = integrations::lume_executable() {
+                integrations::refresh_connected(&executable.to_string_lossy());
+            }
             let database_path = app
                 .path()
                 .app_data_dir()
@@ -469,13 +598,25 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let preferences = state.preferences()?;
-                let _ = overlay::configure(
+                let configured = overlay::configure(
                     &window,
                     preferences.show_over_fullscreen,
                     preferences.monitor_id.as_deref(),
                     preferences.overlay_x,
                     preferences.overlay_y,
                 );
+                if !configured {
+                    if let Ok((default_x, default_y)) =
+                        overlay::default_position(&window, preferences.monitor_id.as_deref())
+                    {
+                        let _ = overlay::move_to(
+                            &window,
+                            preferences.overlay_x.unwrap_or(default_x),
+                            preferences.overlay_y.unwrap_or(default_y),
+                            preferences.monitor_id.as_deref(),
+                        );
+                    }
+                }
                 window.show()?;
             }
 
@@ -521,6 +662,9 @@ pub fn run() {
             submit_prompt,
             terminate_session,
             list_history,
+            list_result_notes,
+            save_result_note,
+            delete_result_note,
             get_preferences,
             set_preferences,
             move_overlay,
@@ -532,11 +676,17 @@ pub fn run() {
             sync_terminal_window_position,
             resize_terminal_window,
             undock_terminal_window,
+            restore_terminal_layout,
             integration_statuses,
+            diagnose_integration,
             configure_integration,
             vscode_status,
             configure_vscode,
             reveal_browser_companion,
+            list_external_plugins,
+            install_external_plugin,
+            remove_external_plugin,
+            reveal_plugin_directory,
             launch_session
         ])
         .run(tauri::generate_context!())

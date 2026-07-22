@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "my-local-agent",
+  "name": "My Local Agent",
+  "executable": "my-agent",
+  "processNames": ["my-agent", "my-agent.exe"],
+  "commandTokens": ["my-agent"]
+}

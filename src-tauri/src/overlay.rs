@@ -246,6 +246,36 @@ pub fn configure(
     }
 }
 
+pub fn default_position(
+    window: &tauri::WebviewWindow,
+    monitor_id: Option<&str>,
+) -> Result<(i32, i32), String> {
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let primary = window
+        .primary_monitor()
+        .map_err(|error| error.to_string())?;
+    let monitor = monitor_id
+        .and_then(|id| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name().is_some_and(|name| name == id))
+        })
+        .or(primary.as_ref())
+        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "Nenhum monitor disponível".to_string())?;
+    let window_size = window.outer_size().map_err(|error| error.to_string())?;
+    let scale = monitor.scale_factor().max(1.0);
+    let x = (i64::from(monitor.size().width) - i64::from(window_size.width))
+        .div_euclid(2)
+        .max(0) as i32;
+    let top_inset = if cfg!(target_os = "linux") { 44 } else { 12 };
+    let y = (f64::from(top_inset) * scale).round() as i32;
+    Ok((x, y))
+}
+
 pub fn move_to(
     window: &tauri::WebviewWindow,
     x: i32,

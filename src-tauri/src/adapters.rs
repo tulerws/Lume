@@ -56,6 +56,9 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         (_, "SessionStart") => HookEventKind::SessionStarted,
         ("codex", "UserPromptSubmit") | ("claude", "UserPromptSubmit") => HookEventKind::Running,
         ("gemini", "BeforeAgent") => HookEventKind::Running,
+        ("codex", "PostToolUse")
+        | ("claude", "PostToolUse" | "PostToolUseFailure")
+        | ("gemini", "AfterTool") => HookEventKind::Running,
         (_, "PermissionRequest") => HookEventKind::PermissionRequest,
         ("gemini", "Notification")
             if string(raw, "notification_type").as_deref() == Some("ToolPermission") =>
@@ -84,7 +87,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     let permission_mode = string(raw, "permission_mode");
     let is_permission = matches!(event, HookEventKind::PermissionRequest);
     let direct_response = provider == "claude" && hook_name == "PermissionRequest";
-    let permission_profile = if is_permission {
+    let permission_profile = if is_permission || permission_mode.is_some() {
         Some(permission_profile(
             provider,
             permission_mode.as_deref(),
@@ -153,11 +156,7 @@ fn permission_profile(
             "Somente leitura",
             "Alterações exigem permissão",
         ),
-        _ => (
-            AccessMode::Custom,
-            "Permissões da sessão",
-            "Segue a configuração desta conversa",
-        ),
+        _ => (AccessMode::Custom, "Permissões da sessão", ""),
     };
 
     let mut available_actions = if direct_response {
@@ -178,6 +177,8 @@ fn permission_profile(
         mode: access_mode,
         label: label.into(),
         approval_policy: policy.into(),
+        approvals_reviewer: string(raw, "approvals_reviewer")
+            .or_else(|| string(raw, "approvalsReviewer")),
         can_respond_from_lume: direct_response,
         available_actions,
     }
@@ -288,7 +289,9 @@ fn claude_permission_output(action: Option<PermissionAction>, raw: &Value) -> Op
 fn status_label(hook: &str) -> Option<&'static str> {
     match hook {
         "SessionStart" => Some("Sessão detectada"),
-        "UserPromptSubmit" | "BeforeAgent" => Some("Executando"),
+        "UserPromptSubmit" | "BeforeAgent" | "PostToolUse" | "PostToolUseFailure" | "AfterTool" => {
+            Some("Executando")
+        }
         "PermissionRequest" | "Notification" => Some("Aguardando permissão"),
         "Stop" | "AfterAgent" | "SessionEnd" => Some("Finalizado"),
         "StopFailure" => Some("Encerrado com erro"),
@@ -331,7 +334,11 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        if agent_pid.is_none() && command.contains(provider) {
+        // Hooks de Codex/Gemini podem passar por um shell efêmero cujo comando
+        // também contém o provider. Continua subindo para guardar o processo
+        // estável mais externo da sessão, em vez do wrapper que termina logo
+        // após enviar o evento ao Lume.
+        if command.contains(provider) {
             agent_pid = Some(pid.as_u32());
         }
         if name == "code"
@@ -441,6 +448,56 @@ mod tests {
         assert_eq!(
             profile.available_actions,
             vec![PermissionAction::AllowOnce, PermissionAction::Deny]
+        );
+    }
+
+    #[test]
+    fn tool_completion_returns_the_session_to_running() {
+        for (provider, hook) in [
+            ("codex", "PostToolUse"),
+            ("claude", "PostToolUse"),
+            ("claude", "PostToolUseFailure"),
+            ("gemini", "AfterTool"),
+        ] {
+            let raw = json!({
+                "session_id": format!("{provider}-session"),
+                "cwd": "/work/project",
+                "hook_event_name": hook,
+                "tool_name": "Bash"
+            });
+            let event = map_event(provider, &raw).expect("evento pós-ferramenta");
+            assert!(matches!(event.event, HookEventKind::Running));
+            assert_eq!(event.status_label.as_deref(), Some("Executando"));
+        }
+    }
+
+    #[test]
+    fn non_permission_hooks_keep_the_active_full_access_mode() {
+        let raw = json!({
+            "session_id": "claude-session",
+            "cwd": "/work/project",
+            "hook_event_name": "UserPromptSubmit",
+            "permission_mode": "bypassPermissions"
+        });
+        let event = map_event("claude", &raw).expect("evento Claude");
+        let profile = event.permission_profile.expect("perfil");
+        assert_eq!(profile.mode, AccessMode::FullAccess);
+        assert!(!profile.can_respond_from_lume);
+    }
+
+    #[test]
+    fn completed_hook_carries_the_final_agent_response() {
+        let raw = json!({
+            "session_id": "claude-session",
+            "cwd": "/work/project",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Resposta final do agente"
+        });
+        let event = map_event("claude", &raw).expect("evento final do Claude");
+        assert!(matches!(event.event, HookEventKind::Completed));
+        assert_eq!(
+            event.last_response.as_deref(),
+            Some("Resposta final do agente")
         );
     }
 }

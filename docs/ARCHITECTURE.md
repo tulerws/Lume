@@ -8,8 +8,8 @@ Para o propósito do produto veja [Produto](PRODUCT.md); para as garantias de da
 ## Visão geral
 
 O Lume é uma sobreposição local (a "cápsula") que acompanha sessões de agentes de IA
-(**Codex, Claude, Gemini**) já abertas ou iniciadas pelo próprio aplicativo. Tudo roda na
-máquina: sem servidor remoto, conta ou telemetria.
+(**Codex, Claude, Gemini** e detectores externos declarativos) já abertas ou iniciadas pelo
+próprio aplicativo. Tudo roda na máquina: sem servidor remoto, conta ou telemetria.
 
 - **Frontend:** SvelteKit 5 + TypeScript (Svelte 5 *runes*), `adapter-static`, SPA. Renderiza
   dentro de uma janela Tauri transparente e sem decoração — só a cápsula aparece.
@@ -17,6 +17,8 @@ máquina: sem servidor remoto, conta ou telemetria.
   (descoberta de processos), `tungstenite` (WebSocket com o Codex), `notify`, e — no Linux —
   `gtk` + `libloading` para posicionamento por *layer-shell*; no Windows, `windows-sys`.
 - **Companions:** uma extensão Chromium (Chrome/Edge/Brave) e uma extensão do VS Code.
+- **Extensibilidade local:** manifestos JSON acrescentam detectores de processo sem carregar
+  bibliotecas ou executar código de terceiros dentro do Lume.
 
 ## Um binário, vários papéis
 
@@ -47,7 +49,8 @@ Todos os serviços escutam apenas em *loopback* (`127.0.0.1`).
   Hooks dos agentes      │  Svelte (cápsula)  ⇅ invoke / emit ⇅  Rust       │
   (Claude/Codex/Gemini)  │                                                  │
         │ JSONL           │   AppState = sessões (memória) + SQLite          │
-        ▼                 │             + canal de decisões (Condvar)         │
+        ▼                 │    (preferências, histórico e notas explícitas)   │
+                          │             + canal de decisões (Condvar)         │
    :43119 event_server ───┼──► ingest(HookEvent) ──► lume://sessions-changed │
                           │                                                  │
    discovery (sysinfo/2s)─┼──► reconcile_processes ─────────────┘            │
@@ -70,7 +73,8 @@ O modelo de domínio é definido em `src-tauri/src/domain.rs` e **espelhado** em
 - `PermissionAction` — `AllowOnce` | `AllowSession` | `Deny` | `OpenSource`
 - **`PermissionProfile`** — a política, **por sessão**:
   `{ mode, label, approvalPolicy, canRespondFromLume, availableActions }`.
-- `AgentSession`, `PermissionRequest`, `HistoryEntry`, `Preferences`, `HookEvent`, `HookResponse`.
+- `AgentSession`, `PermissionRequest`, `SessionResult`, `HistoryEntry`, `ResultNote`,
+  `Preferences`, `ProjectProfile`, `WhiteboardLayout`, `HookEvent` e `HookResponse`.
 
 Duas regras nascem daqui e valem para todo o produto:
 
@@ -86,8 +90,8 @@ do mesmo agente está em modo de planejamento ou somente leitura.
 compartilhado por todos os subsistemas via estado gerenciado do Tauri.
 
 ```rust
-sessions:  Arc<Mutex<Vec<AgentSession>>>                     // verdade viva, em memória
-store:     Arc<Mutex<Store>>                                  // SQLite (sanitizado)
+sessions:  Arc<Mutex<Vec<AgentSession>>>                     // verdade viva, só em memória
+store:     Arc<Mutex<Store>>                // preferências, histórico e notas explícitas
 decisions: Arc<(Mutex<HashMap<PermId, PermissionAction>>, Condvar)>  // canal de decisão
 missing_process_scans: Arc<Mutex<HashMap<SessionId, u8>>>     // histerese de presença
 ```
@@ -98,11 +102,10 @@ A ordem de inicialização está em `lib.rs::run` → `setup`:
 janela → ícone de bandeja e *autostart*.
 
 A superfície de comandos Tauri (o contrato chamável pelo frontend) também vive em `lib.rs`:
-`list_sessions`, `resolve_permission`, `submit_prompt`, `terminate_session`, `list_history`,
+`list_sessions`, `resolve_permission`, `submit_prompt`, `terminate_session`, histórico e notas,
 `get_preferences`/`set_preferences`, `move_overlay`, `launch_session`, os comandos de janela de
-terminal (`open`/`list`/`close`/`move`/`sync`/`resize`/`undock`) e os de integração
-(`integration_statuses`, `configure_integration`, `vscode_status`, `configure_vscode`,
-`reveal_browser_companion`).
+terminal (`open`/`list`/`close`/`move`/`sync`/`resize`/`undock`/`restore`) e os de integração,
+diagnóstico, VS Code, Companion Chromium e detectores externos.
 
 ## Ingestão: duas vias que convergem numa sessão
 
@@ -136,9 +139,10 @@ A parte mais delicada (e a mais testada) é fundir as duas visões:
 - Sessões são deduplicadas por `(agente, native_session_id)`, preferindo a que tem
   `can_respond_from_lume`.
 - O processo hospedeiro do VS Code é escondido atrás dos chats nativos daquele agente.
-- Depois de **3 varreduras** consecutivas sem enxergar o PID (histerese
-  `missing_process_scans`, `PROCESS_MISSING_SCAN_LIMIT`), a sessão é marcada `completed` — o que
-  evita piscar em lacunas transitórias de detecção.
+- Depois de **2 varreduras** consecutivas sem enxergar o PID (histerese
+  `missing_process_scans`, `PROCESS_MISSING_SCAN_LIMIT`), a sessão é removida da lista viva e
+  vira apenas um resumo no histórico. Isso evita piscar em lacunas transitórias sem manter
+  agentes fechados na cápsula.
 
 O módulo de testes ao final de `state.rs` documenta cada uma dessas regras como casos
 executáveis.
@@ -216,8 +220,9 @@ inserido **antes** do `resume`.
 `terminal_windows.rs` implementa o **Whiteboard**: cada sessão abre uma `WebviewWindow` Tauri
 flutuante (não um terminal nativo), com rótulo `terminal-<hash>`, carregando a mesma SPA — que
 renderiza `TerminalWindow.svelte` quando o rótulo começa com `terminal-`. Janelas próximas
-podem **acoplar**: ao soltar a menos de ~34 px de outra, ocorre um *snap* de bordas e os grupos
-se fundem, passando a se mover em conjunto.
+podem **acoplar**: dentro de uma zona de até 84 px aparece uma prévia de encaixe; ao finalizar
+o arrasto ocorre o *snap*, o terminal se adapta ao tamanho do alvo e os grupos passam a se
+mover em conjunto. Posição, tamanho e grupo podem ser salvos em layouts reutilizáveis.
 
 ## Companions
 
@@ -253,32 +258,35 @@ O **mascote** (`LumeMascot.svelte`) reduz todas as sessões a um único estado v
 altura da cápsula é dinâmica (`ResizeObserver`). `src/lib/i18n.ts` traduz os rótulos de status
 em pt-BR emitidos pelo backend para inglês na exibição.
 
+As quatro vistas continuam na mesma rota, mas Ajustes também administra perfis por projeto,
+layouts do Whiteboard, detectores externos e o atalho global da paleta de comandos. Respostas
+finais ficam na sessão viva e só entram no SQLite quando o usuário as salva como nota.
+
 Para um guia introdutório da interface — voltado a quem nunca usou Svelte, com o mapa de
 "quero mudar X, edito onde" — veja [Interface](FRONTEND.md).
 
 ## Persistência e privacidade
 
-O banco SQLite (`store.rs`) fica no diretório de dados do aplicativo e guarda apenas dados
-sanitizados. As invariantes são aplicadas **no ponto de gravação e no boot**, não como um filtro
-posterior:
+O banco SQLite (`store.rs`) fica no diretório de dados do aplicativo. Sessões, respostas finais,
+diretórios de trabalho, comandos e *payloads* de permissão **nunca são persistidos**:
+`load_sessions` devolve vazio e `save_session`/`delete_session` são operações nulas mantidas
+apenas para preservar o contrato interno.
 
-- `save_session` **remove `pending_permission`, `working_directory` e `last_response` antes de
-  toda gravação**. Comando, caminho e *payload* de uma permissão existem **só em memória**
-  enquanto a decisão está pendente.
-- Na inicialização, `AppState::new` rebaixa qualquer status ativo obsoleto para `Completed`
-  ("Aguardando redetecção"), executa `VACUUM` + `wal_checkpoint(TRUNCATE)` (`scrub_deleted_content`)
-  para não deixar rastros em WAL, e purga o histórico além da retenção (padrão **30 dias**).
-- `PRAGMA secure_delete = ON`. O histórico guarda só resumos ("Tarefa finalizada", "Permissão
-  concedida/recusada"). Uma decisão é vinculada ao par `(permission_id, session_id)`; respostas
-  fora desse par são recusadas.
+- O SQLite guarda preferências, layouts, perfis por projeto, resumos sanitizados do histórico e
+  somente as respostas que o usuário escolher explicitamente salvar como nota.
+- Na inicialização, `AppState::new` começa com a lista de sessões vazia, executa `VACUUM` +
+  `wal_checkpoint(TRUNCATE)` (`scrub_deleted_content`) para limpar rastros de versões antigas e
+  purga o histórico além da retenção (padrão **30 dias**).
+- `PRAGMA secure_delete = ON`. Uma decisão é vinculada ao par
+  `(permission_id, session_id)`; respostas fora desse par são recusadas.
 
 ## Build e release
 
 - **CI** (`.github/workflows/ci.yml`, Ubuntu + Windows): `npm run check` → `npm run build:vscode`
   → `npm run build` → `cargo test`.
 - **Instaladores** (`.github/workflows/installers.yml`, em *tag* `v*` ou manual): usa
-  `tauri-action` para gerar `.deb` + AppImage (Linux) e NSIS (Windows), cria a GitHub Release e
-  publica o `latest.json` consumido pelo atualizador. Requer o *secret*
+  `tauri-action` para gerar `.deb`, `.rpm` e AppImage (Linux) e NSIS (Windows), cria a GitHub
+  Release e publica o `latest.json` consumido pelo atualizador. Requer o *secret*
   `TAURI_SIGNING_PRIVATE_KEY`.
 - O número de versão precisa ser mantido em sincronia entre `package.json`,
   `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`.
@@ -296,6 +304,7 @@ posterior:
 | `src-tauri/src/store.rs`         | Persistência SQLite sanitizada                                      |
 | `src-tauri/src/event_server.rs`  | Entrada JSONL dos *hooks* (`:43119`)                                |
 | `src-tauri/src/discovery.rs`     | Descoberta de processos por `sysinfo`                               |
+| `src-tauri/src/agent_plugins.rs` | Catálogo embutido e detectores externos declarativos                |
 | `src-tauri/src/adapters.rs`      | Normalização dos *hooks* de cada agente                             |
 | `src-tauri/src/integrations.rs`  | Instalação de *hooks* preservando a configuração existente          |
 | `src-tauri/src/executables.rs`   | Localização dos binários dos agentes                                |

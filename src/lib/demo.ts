@@ -11,6 +11,7 @@ export const demoSessions: AgentSession[] = [
     statusLabel: "Implementando a interface",
     startedAt: "2026-07-20T15:32:00-03:00",
     updatedAt: Date.now(),
+    results: [],
     permissionProfile: {
       mode: "workspace_write",
       label: "Acesso ao projeto",
@@ -29,6 +30,7 @@ export const demoSessions: AgentSession[] = [
     statusLabel: "Aguardando permissão",
     startedAt: "2026-07-20T15:28:00-03:00",
     updatedAt: Date.now() - 12_000,
+    results: [],
     permissionProfile: {
       mode: "read_only",
       label: "Somente leitura",
@@ -55,6 +57,14 @@ export const demoSessions: AgentSession[] = [
     statusLabel: "Finalizado há 2 min",
     startedAt: "2026-07-20T15:18:00-03:00",
     updatedAt: Date.now() - 120_000,
+    lastResponse: "I found the relevant references and grouped them by implementation approach.",
+    results: [{
+      id: "gemini-result-1",
+      response: "I found the relevant references and grouped them by implementation approach.",
+      createdAt: Date.now() - 120_000,
+      files: ["references.md"],
+      tests: [],
+    }],
     permissionProfile: {
       mode: "full_access",
       label: "Sem acesso local",

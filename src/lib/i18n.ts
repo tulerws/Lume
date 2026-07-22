@@ -17,13 +17,10 @@ const englishDisplayText = new Map<string, string>([
   ["Falhou", "Failed"],
   ["Erro", "Error"],
   ["Encerrado", "Stopped"],
-  ["Processo encerrado", "Process stopped"],
-  ["Encerrado pelo Lume", "Stopped by Lume"],
   ["Tarefa encerrada com erro", "Task failed"],
   ["Prompt enviado pelo Lume", "Prompt sent by Lume"],
   ["Continuando a tarefa", "Continuing task"],
   ["Permissão recusada", "Permission denied"],
-  ["Aguardando redetecção", "Waiting for detection"],
   ["Sessão detectada", "Session detected"],
   ["Finalizado pelo hook", "Completed by hook"],
   ["Permissões da sessão", "Session permissions"],
@@ -52,13 +49,19 @@ const englishDisplayText = new Map<string, string>([
   ["Monitoramento e decisões conectados", "Monitoring and decisions connected"],
   ["Necessário para abrir sessões no editor", "Required to open sessions in the editor"],
   ["CLI não encontrada", "CLI not found"],
-  ["Hook instalado; confirme a confiança em /hooks", "Hook installed; confirm trust in /hooks"],
+  ["Hook conectado; /hooks está disponível no Codex CLI", "Hook connected; /hooks is available in Codex CLI"],
   ["Monitoramento conectado", "Monitoring connected"],
   ["Disponível para conectar", "Available to connect"],
   ["Companion conectado", "Companion connected"],
   ["Companion disponível", "Companion available"],
   ["VS Code não encontrado", "VS Code not found"],
   ["Verificando…", "Checking…"],
+  ["Versão", "Version"],
+  ["Monitoramento", "Monitoring"],
+  ["Último evento", "Last event"],
+  ["Hook do Lume ainda não conectado", "Lume hook is not connected yet"],
+  ["Nenhum evento recebido nesta execução", "No event received in this run"],
+  ["Não foi possível consultar a versão", "Could not read the version"],
 ]);
 
 export function displayText(language: Language, value: string) {
@@ -68,6 +71,12 @@ export function displayText(language: Language, value: string) {
   if (value.startsWith("Finalizado há ")) return value.replace("Finalizado há ", "Completed ").replace(" min", " min ago");
   if (value.endsWith(" quer executar uma ação")) {
     return `${value.slice(0, -" quer executar uma ação".length)} wants to perform an action`;
+  }
+  if (/^\d+ eventos configurados$/.test(value)) {
+    return value.replace(" eventos configurados", " events configured");
+  }
+  if (value.endsWith(" não encontrado")) {
+    return `${value.slice(0, -" não encontrado".length)} not found`;
   }
   return value;
 }

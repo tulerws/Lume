@@ -24,6 +24,7 @@ export interface PermissionProfile {
   mode: AccessMode;
   label: string;
   approvalPolicy: string;
+  approvalsReviewer?: "user" | "auto_review" | string;
   canRespondFromLume: boolean;
   availableActions: PermissionAction[];
 }
@@ -54,6 +55,26 @@ export interface AgentSession {
   permissionProfile: PermissionProfile;
   pendingPermission?: PermissionRequest;
   lastResponse?: string;
+  results: SessionResult[];
+}
+
+export interface SessionResult {
+  id: string;
+  response: string;
+  createdAt: number;
+  files: string[];
+  tests: string[];
+}
+
+export interface ResultNote {
+  id: string;
+  title: string;
+  body: string;
+  agentLabel: string;
+  project: string;
+  files: string[];
+  tests: string[];
+  createdAt: number;
 }
 
 export interface HistoryEntry {
@@ -68,6 +89,7 @@ export interface HistoryEntry {
 
 export interface Preferences {
   language: "en" | "pt-BR";
+  darkMode?: boolean;
   soundEnabled: boolean;
   autostart: boolean;
   monitorId?: string;
@@ -76,6 +98,40 @@ export interface Preferences {
   showOverFullscreen: boolean;
   historyRetentionDays: number;
   launchTarget: "auto" | "terminal" | "vscode";
+  projectProfiles: Record<string, ProjectProfile>;
+  whiteboardLayouts: WhiteboardLayout[];
+  globalShortcut: string;
+}
+
+export interface ProjectProfile {
+  label: string;
+  soundEnabled: boolean;
+  launchTarget?: Preferences["launchTarget"];
+  monitorId?: string;
+  overlayX?: number;
+  overlayY?: number;
+  permissionMode?: AccessMode;
+  approvalPolicy?: "untrusted" | "on-request" | "never";
+  whiteboardLayoutId?: string;
+  preferredAgents: AgentKind[];
+}
+
+export interface WhiteboardLayoutTerminal {
+  agent: AgentKind;
+  agentLabel: string;
+  project: string;
+  source: AgentSession["source"];
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  groupId?: string;
+}
+
+export interface WhiteboardLayout {
+  id: string;
+  name: string;
+  terminals: WhiteboardLayoutTerminal[];
 }
 
 export interface IntegrationStatus {
@@ -85,6 +141,21 @@ export interface IntegrationStatus {
   configured: boolean;
   directPermissions: boolean;
   detail: string;
+}
+
+export interface DiagnosticCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warning" | "error";
+  detail: string;
+}
+
+export interface IntegrationDiagnostic {
+  kind: IntegrationStatus["kind"];
+  label: string;
+  healthy: boolean;
+  checks: DiagnosticCheck[];
+  lastEventAt?: number;
 }
 
 export interface CompanionStatus {
@@ -101,4 +172,37 @@ export interface TerminalWindowState {
   width: number;
   height: number;
   docked: boolean;
+  groupId?: string;
+}
+
+export interface RestoredTerminalPlacement {
+  sessionId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  groupId?: string;
+}
+
+export interface ExternalAgentPlugin {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  executable: string;
+  processNames: string[];
+  commandTokens: string[];
+}
+
+export type DockSide = "left" | "right" | "top" | "bottom";
+
+export interface DockPreviewEvent {
+  movingLabel: string;
+  preview: {
+    targetLabel: string;
+    side: DockSide;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
 }

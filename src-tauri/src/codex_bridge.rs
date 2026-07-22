@@ -673,6 +673,7 @@ fn direct_profile() -> PermissionProfile {
         mode: AccessMode::Custom,
         label: "Permissões desta sessão".into(),
         approval_policy: "Decisões encaminhadas pelo Codex App Server".into(),
+        approvals_reviewer: None,
         can_respond_from_lume: true,
         available_actions: vec![
             PermissionAction::AllowOnce,
@@ -708,6 +709,13 @@ fn profile_from_params(params: &Value, mut profile: PermissionProfile) -> Permis
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| "Política granular".into());
+    }
+    if let Some(reviewer) = params
+        .get("approvalsReviewer")
+        .or_else(|| params.get("approvals_reviewer"))
+        .and_then(Value::as_str)
+    {
+        profile.approvals_reviewer = Some(reviewer.into());
     }
     profile
 }
@@ -774,13 +782,15 @@ mod tests {
             &json!({
                 "threadId": "thread",
                 "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
-                "approvalPolicy": "on-request"
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review"
             }),
             direct_profile(),
         );
         assert_eq!(profile.mode, AccessMode::ReadOnly);
         assert_eq!(profile.label, "Somente leitura");
         assert_eq!(profile.approval_policy, "on-request");
+        assert_eq!(profile.approvals_reviewer.as_deref(), Some("auto_review"));
     }
 
     #[test]

@@ -156,7 +156,7 @@
   .status-running .feet { animation: feet-run 260ms steps(2, end) infinite; transform-origin: center; }
   .status-permission_required { --mascot-color: #cb8b45; }
   .status-permission_required .dino { animation: listen 1s steps(2, end) infinite; }
-  .status-completed { --mascot-color: #8b9490; }
+  .status-completed { --mascot-color: #63a57d; }
   .status-completed .dino { animation: settle 1.5s steps(2, end) infinite; }
   .status-failed { --mascot-color: #bd6965; }
   .status-failed .dino { animation: shake 1.4s steps(2, end) infinite; }
@@ -192,11 +192,9 @@
   @keyframes doze-off { from { transform: translateY(-1px); } to { transform: translateY(1px) scaleY(0.97); } }
   @keyframes sleep-in { from { opacity: 0; transform: translate(-2px, 2px); } to { opacity: 1; transform: none; } }
 
-  @media (prefers-color-scheme: dark) {
-    .mascot { color: #20322c; }
-    .belly { fill: rgba(255, 255, 255, 0.22); }
-    .eye-light { fill: #eaf2ee; }
-  }
+  :global(.dark) .mascot { color: #20322c; }
+  :global(.dark) .belly { fill: rgba(255, 255, 255, 0.22); }
+  :global(.dark) .eye-light { fill: #eaf2ee; }
 
   @media (prefers-reduced-motion: reduce) {
     .mascot *,
