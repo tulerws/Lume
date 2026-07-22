@@ -66,7 +66,7 @@ Para instalar o Companion web, abra **Ajustes → Navegadores → Abrir pasta**,
 npm run tauri build
 ```
 
-No Linux, os pacotes ficam em `src-tauri/target/release/bundle` (o `.rpm` em `bundle/rpm`). Para gerar apenas o pacote do Fedora, use `npm run tauri build -- --bundles rpm`. Sem a chave de assinatura configurada localmente, o comando termina com um erro do passo de assinatura do updater, mas o `.rpm` já foi gravado antes disso; instale-o com `sudo dnf install ./src-tauri/target/release/bundle/rpm/lume-*.x86_64.rpm`. O workflow **Instaladores** gera `.deb`, `.rpm`, AppImage e instalador NSIS para Windows, cria a GitHub Release e publica o `latest.json` usado pelo atualizador.
+No Linux, os pacotes ficam em `src-tauri/target/release/bundle` (o `.rpm` em `bundle/rpm`). Para gerar apenas o pacote do Fedora, use `npm run tauri build -- --bundles rpm`. Sem a chave de assinatura configurada localmente, o comando termina com um erro do passo de assinatura do updater, mas o `.rpm` já foi gravado antes disso; instale-o com `sudo dnf install ./src-tauri/target/release/bundle/rpm/Lume-*.x86_64.rpm`. O workflow **Instaladores** gera `.deb`, `.rpm`, AppImage e instalador NSIS para Windows, cria a GitHub Release e publica o `latest.json` usado pelo atualizador.
 
 Antes da próxima release, cadastre a chave privada de assinatura em **Settings → Secrets and variables → Actions** com o nome `TAURI_SIGNING_PRIVATE_KEY`. A chave pública já fica no aplicativo; a privada nunca deve entrar no repositório. Em cada nova versão, atualize o número em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`, então execute o workflow ou publique uma tag `v*`.
 
