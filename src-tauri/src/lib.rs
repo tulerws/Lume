@@ -232,22 +232,18 @@ fn set_preferences(
     app: AppHandle,
     state: State<'_, AppState>,
     preferences: Preferences,
-    runtime_x: Option<i32>,
-    runtime_y: Option<i32>,
 ) -> Result<(), String> {
     let previous = state.preferences()?;
     let overlay_configuration_changed = previous.monitor_id != preferences.monitor_id
         || previous.show_over_fullscreen != preferences.show_over_fullscreen;
-    if previous.autostart != preferences.autostart {
-        if preferences.autostart {
-            app.autolaunch()
-                .enable()
-                .map_err(|error| error.to_string())?;
-        } else {
-            app.autolaunch()
-                .disable()
-                .map_err(|error| error.to_string())?;
-        }
+    if preferences.autostart {
+        app.autolaunch()
+            .enable()
+            .map_err(|error| error.to_string())?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|error| error.to_string())?;
     }
     state.save_preferences(&preferences)?;
     if overlay_configuration_changed {
@@ -262,8 +258,8 @@ fn set_preferences(
                 &window_for_layer,
                 show_over_fullscreen,
                 monitor_id.as_deref(),
-                runtime_x.or(preferences.overlay_x),
-                runtime_y.or(preferences.overlay_y),
+                preferences.overlay_x,
+                preferences.overlay_y,
             );
         });
     }
@@ -277,17 +273,14 @@ fn move_overlay(
     x: i32,
     y: i32,
     persist: bool,
-    monitor_id: Option<String>,
 ) -> Result<(), String> {
-    let monitor_id = if persist {
-        let mut preferences = state.preferences()?;
+    let mut preferences = state.preferences()?;
+    if persist {
         preferences.overlay_x = Some(x);
         preferences.overlay_y = Some(y);
         state.save_preferences(&preferences)?;
-        preferences.monitor_id
-    } else {
-        monitor_id
-    };
+    }
+    let monitor_id = preferences.monitor_id.clone();
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Janela do Lume não encontrada".to_string())?;
@@ -352,39 +345,35 @@ fn close_terminal_window(
 #[tauri::command]
 fn move_terminal_window(
     app: AppHandle,
+    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
     y: i32,
     finalize: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.move_window(&app, &label, x, y, finalize)
-}
-
-#[tauri::command]
-fn cancel_terminal_window_move(
-    app: AppHandle,
-    terminals: State<'_, terminal_windows::TerminalWindows>,
-    label: String,
-) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.cancel_move(&app, &label)
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.move_window(&app, &label, x, y, finalize, monitor_id.as_deref())
 }
 
 #[tauri::command]
 fn sync_terminal_window_position(
     app: AppHandle,
+    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
     y: i32,
     finalize: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.sync_native_position(&app, &label, x, y, finalize)
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.sync_native_position(&app, &label, x, y, finalize, monitor_id.as_deref())
 }
 
 #[tauri::command]
 fn resize_terminal_window(
     app: AppHandle,
+    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
@@ -392,34 +381,16 @@ fn resize_terminal_window(
     width: i32,
     height: i32,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.resize_window(&app, &label, x, y, width, height)
-}
-
-#[tauri::command]
-fn begin_layered_terminal_resize(
-    app: AppHandle,
-    terminals: State<'_, terminal_windows::TerminalWindows>,
-    label: String,
-) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.begin_layered_resize(&app, &label)
-}
-
-#[tauri::command]
-fn finish_layered_terminal_resize(
-    app: AppHandle,
-    terminals: State<'_, terminal_windows::TerminalWindows>,
-    label: String,
-) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.finish_layered_resize(&app, &label)
+    let monitor_id = state.preferences()?.monitor_id;
+    terminals.resize_window(&app, &label, x, y, width, height, monitor_id.as_deref())
 }
 
 #[tauri::command]
 fn undock_terminal_window(
-    app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.undock(&app, &label)
+    terminals.undock(&label)
 }
 
 #[tauri::command]
@@ -702,11 +673,8 @@ pub fn run() {
             get_terminal_window_state,
             close_terminal_window,
             move_terminal_window,
-            cancel_terminal_window_move,
             sync_terminal_window_position,
             resize_terminal_window,
-            begin_layered_terminal_resize,
-            finish_layered_terminal_resize,
             undock_terminal_window,
             restore_terminal_layout,
             integration_statuses,

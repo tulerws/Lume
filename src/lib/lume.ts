@@ -56,13 +56,8 @@ export async function openSessionSource(sessionId: string): Promise<void> {
   await invoke("open_session_source", { sessionId });
 }
 
-export async function moveOverlay(
-  x: number,
-  y: number,
-  persist: boolean,
-  monitorId?: string,
-): Promise<void> {
-  await invoke("move_overlay", { x: Math.round(x), y: Math.round(y), persist, monitorId });
+export async function moveOverlay(x: number, y: number, persist: boolean): Promise<void> {
+  await invoke("move_overlay", { x: Math.round(x), y: Math.round(y), persist });
 }
 
 export async function submitPrompt(sessionId: string, prompt: string): Promise<void> {
@@ -104,10 +99,6 @@ export async function moveTerminalWindow(
   });
 }
 
-export async function cancelTerminalWindowMove(label: string): Promise<TerminalWindowState> {
-  return invoke<TerminalWindowState>("cancel_terminal_window_move", { label });
-}
-
 export async function syncTerminalWindowPosition(
   label: string,
   x: number,
@@ -136,14 +127,6 @@ export async function resizeTerminalWindow(
     width: Math.round(width),
     height: Math.round(height),
   });
-}
-
-export async function beginLayeredTerminalResize(label: string): Promise<TerminalWindowState> {
-  return invoke<TerminalWindowState>("begin_layered_terminal_resize", { label });
-}
-
-export async function finishLayeredTerminalResize(label: string): Promise<TerminalWindowState> {
-  return invoke<TerminalWindowState>("finish_layered_terminal_resize", { label });
 }
 
 export async function undockTerminalWindow(label: string): Promise<TerminalWindowState> {
@@ -189,16 +172,9 @@ export async function loadPreferences(): Promise<Preferences> {
   }
 }
 
-export async function savePreferences(
-  preferences: Preferences,
-  runtimePosition?: { x: number; y: number },
-): Promise<void> {
+export async function savePreferences(preferences: Preferences): Promise<void> {
   if (!("__TAURI_INTERNALS__" in window)) return;
-  await invoke("set_preferences", {
-    preferences,
-    runtimeX: runtimePosition ? Math.round(runtimePosition.x) : undefined,
-    runtimeY: runtimePosition ? Math.round(runtimePosition.y) : undefined,
-  });
+  await invoke("set_preferences", { preferences });
 }
 
 export async function loadIntegrationStatuses(): Promise<IntegrationStatus[]> {
