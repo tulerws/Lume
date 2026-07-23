@@ -14,6 +14,7 @@
     LogicalSize,
     primaryMonitor,
   } from "@tauri-apps/api/window";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
@@ -78,8 +79,10 @@
     | "error";
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  const isLinux = typeof navigator !== "undefined" &&
-    navigator.userAgent.toLowerCase().includes("linux");
+  const runtimePlatform = typeof navigator === "undefined"
+    ? ""
+    : `${navigator.userAgent} ${navigator.platform}`.toLowerCase();
+  const isLinux = runtimePlatform.includes("linux") || runtimePlatform.includes("x11");
   const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
   const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
   const compactSize = { width: 78, height: 46 };
@@ -89,7 +92,7 @@
 
   let expanded = $state(!isTauri);
   let contentVisible = $state(!isTauri);
-  let panelVisible = $state(true);
+  let surfaceBlank = $state(false);
   let morphing = $state<"opening" | "closing" | null>(null);
   let morphProgress = $state(isTauri ? 0 : 1);
   let expandedHeight = $state(expandedMaxHeight);
@@ -498,41 +501,31 @@
     if (!expanded) {
       compactAnchorPosition = { ...overlayPosition };
       morphing = "opening";
-      expanded = true;
       contentVisible = false;
-      await tick();
-      await animateWindowSize(true);
+      if (isTauri && isLinux) {
+        await animateLinuxSurface(true);
+      } else {
+        expanded = true;
+        await tick();
+        await animateWindowSize(true);
+      }
       contentVisible = true;
       morphing = null;
       return;
     }
     morphing = "closing";
     contentVisible = false;
-    let linuxSurfaceWasHidden = false;
     if (isTauri && isLinux) {
-      const compactPosition = compactAnchorPosition ??
-        compactPositionFromExpanded(overlayPosition, currentExpandedSize());
-      panelVisible = false;
-      await waitForPanelFade();
-      linuxSurfaceWasHidden = await hideExpandedLinuxSurface();
-      if (linuxSurfaceWasHidden) {
-        overlayPosition = compactPosition;
-        morphProgress = 0;
-      } else {
-        panelVisible = true;
-        await animateWindowSize(false);
-      }
+      await animateLinuxSurface(false);
     } else {
       await animateWindowSize(false);
+      expanded = false;
     }
-    expanded = false;
     compactAnchorPosition = null;
     selectedId = null;
     view = "sessions";
     launcherOpen = false;
     await tick();
-    await remapCompactSurface(linuxSurfaceWasHidden);
-    panelVisible = true;
     morphing = null;
   }
 
@@ -615,44 +608,105 @@
       });
   }
 
-  async function hideExpandedLinuxSurface() {
-    if (!isTauri || !isLinux) return false;
+  async function animateLinuxSurface(opening: boolean) {
     const currentWindow = getCurrentWindow();
-    try {
-      await currentWindow.hide();
-      await new Promise<void>((resolve) => setTimeout(resolve, 36));
-      return true;
-    } catch {
-      return false;
+    if (opening) {
+      expanded = opening;
+      await tick();
+    }
+
+    const expandedTarget = currentExpandedSize();
+    const compactPosition = compactAnchorPosition ??
+      compactPositionFromExpanded(overlayPosition, expandedTarget);
+    const expandedPosition = expandedPositionFromCompact(compactPosition, expandedTarget);
+    const from = opening ? compactSize : expandedTarget;
+    const to = opening ? expandedTarget : compactSize;
+    const fromPosition = opening ? compactPosition : expandedPosition;
+    const toPosition = opening ? expandedPosition : compactPosition;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const steps = reducedMotion ? 1 : opening ? 16 : 14;
+
+    for (let step = 1; step <= steps; step += 1) {
+      const linear = step / steps;
+      const eased = linear < 0.5
+        ? 4 * linear * linear * linear
+        : 1 - Math.pow(-2 * linear + 2, 3) / 2;
+      const width = Math.round(from.width + (to.width - from.width) * eased);
+      const height = Math.round(from.height + (to.height - from.height) * eased);
+      const x = Math.round(fromPosition.x + (toPosition.x - fromPosition.x) * eased);
+      const y = Math.round(fromPosition.y + (toPosition.y - fromPosition.y) * eased);
+      morphProgress = opening ? eased : 1 - eased;
+      if (opening && eased > 0.48) contentVisible = true;
+      await Promise.allSettled([
+        currentWindow.setSize(new LogicalSize(width, height)),
+        moveOverlay(x, y, false, preferences.monitorId),
+      ]);
+      overlayPosition = { x, y };
+      await waitForWindowSize({ width, height }, 1, 8);
+      if (step < steps) await nextAnimationFrame();
+    }
+
+    await Promise.allSettled([
+      currentWindow.setSize(new LogicalSize(to.width, to.height)),
+      moveOverlay(toPosition.x, toPosition.y, false, preferences.monitorId),
+    ]);
+    overlayPosition = { ...toPosition };
+    morphProgress = opening ? 1 : 0;
+    await waitForWindowSize(to, 3, 60);
+
+    if (!opening) {
+      surfaceBlank = true;
+      await waitForSurfacePaint(20);
+      expanded = false;
+      await tick();
+      morphing = null;
+      surfaceBlank = false;
+      await getCurrentWebview().setBackgroundColor([0, 0, 0, 0]).catch(() => undefined);
+      await waitForSurfacePaint();
     }
   }
 
-  async function waitForPanelFade() {
-    await tick();
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => {
-        setTimeout(resolve, reducedMotion ? 0 : 180);
-      });
-    });
+  async function waitForWindowSize(
+    target: { width: number; height: number },
+    requiredStableSamples: number,
+    maxAttempts: number,
+  ) {
+    const currentWindow = getCurrentWindow();
+    const expectedWidth = Math.round(target.width * monitorBounds.scale);
+    const expectedHeight = Math.round(target.height * monitorBounds.scale);
+    let stableSamples = 0;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const size = await currentWindow.innerSize();
+        if (
+          Math.abs(size.width - expectedWidth) <= 2 &&
+          Math.abs(size.height - expectedHeight) <= 2
+        ) {
+          stableSamples += 1;
+          if (stableSamples >= requiredStableSamples) return;
+        } else {
+          stableSamples = 0;
+        }
+      } catch {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 16));
+    }
   }
 
-  async function remapCompactSurface(surfaceWasHidden: boolean) {
-    if (!surfaceWasHidden) return;
-    const currentWindow = getCurrentWindow();
-    try {
-      await currentWindow.setSize(new LogicalSize(compactSize.width, compactSize.height));
-      await moveOverlay(
-        overlayPosition.x,
-        overlayPosition.y,
-        false,
-        preferences.monitorId,
-      );
-      await new Promise<void>((resolve) => setTimeout(resolve, 18));
-    } catch {
-      // The final show still restores the compact capsule if geometry sync fails.
-    } finally {
-      await currentWindow.show().catch(() => undefined);
+  async function nextAnimationFrame() {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  async function waitForSurfacePaint(extraDelay = 0) {
+    await tick();
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+    if (extraDelay > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, extraDelay));
     }
   }
 
@@ -1541,6 +1595,7 @@
 <main
   class:expanded
   class:dark={effectiveDark}
+  class:surface-blank={surfaceBlank}
   class="overlay-shell"
   style={`--panel-gap-right: ${Math.round(8 * morphProgress)}px; --panel-gap-bottom: ${Math.round(16 * morphProgress)}px; --panel-radius: ${Math.round(23 - 2 * morphProgress)}px;`}
   onpointermove={wakeMascot}
@@ -1562,13 +1617,7 @@
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section
-      use:observePanelSize
-      class:content-visible={contentVisible}
-      class:surface-visible={panelVisible}
-      class:morphing
-      class="panel"
-    >
+    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class="panel">
       <header
         role="banner"
         class:dragging
@@ -2320,6 +2369,7 @@
 
 <style>
   .overlay-shell {
+    position: relative;
     width: 100%;
     height: 100%;
     display: flex;
@@ -2329,6 +2379,10 @@
 
   .overlay-shell.expanded {
     padding: 0 var(--panel-gap-right) var(--panel-gap-bottom) 0;
+  }
+
+  .overlay-shell.surface-blank > * {
+    visibility: hidden !important;
   }
 
   button,
@@ -2392,18 +2446,6 @@
     border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
-    opacity: 1;
-    transform: scale(1);
-    transform-origin: top left;
-    transition:
-      opacity 150ms ease,
-      transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
-  }
-
-  .panel:not(.surface-visible) {
-    opacity: 0;
-    transform: scale(0.985);
-    pointer-events: none;
   }
 
   .panel-content,

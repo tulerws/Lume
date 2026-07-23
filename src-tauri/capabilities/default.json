@@ -12,6 +12,7 @@
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
     "core:window:allow-available-monitors",
+    "core:webview:allow-set-webview-background-color",
     "dialog:allow-open",
     "opener:default",
     "process:allow-restart",
