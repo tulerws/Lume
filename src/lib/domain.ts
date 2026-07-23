@@ -126,6 +126,7 @@ export interface WhiteboardLayoutTerminal {
   width: number;
   height: number;
   groupId?: string;
+  monitorId?: string;
 }
 
 export interface WhiteboardLayout {
@@ -173,6 +174,9 @@ export interface TerminalWindowState {
   height: number;
   docked: boolean;
   groupId?: string;
+  monitorId: string;
+  layered: boolean;
+  scale: number;
 }
 
 export interface RestoredTerminalPlacement {
@@ -182,6 +186,7 @@ export interface RestoredTerminalPlacement {
   width: number;
   height: number;
   groupId?: string;
+  monitorId?: string;
 }
 
 export interface ExternalAgentPlugin {
