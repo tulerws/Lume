@@ -89,6 +89,7 @@
 
   let expanded = $state(!isTauri);
   let contentVisible = $state(!isTauri);
+  let panelVisible = $state(true);
   let morphing = $state<"opening" | "closing" | null>(null);
   let morphProgress = $state(isTauri ? 0 : 1);
   let expandedHeight = $state(expandedMaxHeight);
@@ -507,8 +508,23 @@
     }
     morphing = "closing";
     contentVisible = false;
-    await animateWindowSize(false);
-    const linuxSurfaceWasHidden = await hideExpandedLinuxSurface();
+    let linuxSurfaceWasHidden = false;
+    if (isTauri && isLinux) {
+      const compactPosition = compactAnchorPosition ??
+        compactPositionFromExpanded(overlayPosition, currentExpandedSize());
+      panelVisible = false;
+      await waitForPanelFade();
+      linuxSurfaceWasHidden = await hideExpandedLinuxSurface();
+      if (linuxSurfaceWasHidden) {
+        overlayPosition = compactPosition;
+        morphProgress = 0;
+      } else {
+        panelVisible = true;
+        await animateWindowSize(false);
+      }
+    } else {
+      await animateWindowSize(false);
+    }
     expanded = false;
     compactAnchorPosition = null;
     selectedId = null;
@@ -516,6 +532,7 @@
     launcherOpen = false;
     await tick();
     await remapCompactSurface(linuxSurfaceWasHidden);
+    panelVisible = true;
     morphing = null;
   }
 
@@ -608,6 +625,16 @@
     } catch {
       return false;
     }
+  }
+
+  async function waitForPanelFade() {
+    await tick();
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        setTimeout(resolve, reducedMotion ? 0 : 180);
+      });
+    });
   }
 
   async function remapCompactSurface(surfaceWasHidden: boolean) {
@@ -1535,7 +1562,13 @@
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class="panel">
+    <section
+      use:observePanelSize
+      class:content-visible={contentVisible}
+      class:surface-visible={panelVisible}
+      class:morphing
+      class="panel"
+    >
       <header
         role="banner"
         class:dragging
@@ -2359,6 +2392,18 @@
     border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
+    opacity: 1;
+    transform: scale(1);
+    transform-origin: top left;
+    transition:
+      opacity 150ms ease,
+      transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .panel:not(.surface-visible) {
+    opacity: 0;
+    transform: scale(0.985);
+    pointer-events: none;
   }
 
   .panel-content,
