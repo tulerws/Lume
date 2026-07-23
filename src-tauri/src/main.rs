@@ -14,5 +14,11 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("ingest") {
         std::process::exit(lume_lib::run_ingest_client());
     }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        && std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland")
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     lume_lib::run()
 }

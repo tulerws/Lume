@@ -7,14 +7,18 @@
   import LumeLogo from "$lib/LumeLogo.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
+    beginLayeredTerminalResize,
+    cancelTerminalWindowMove,
     closeTerminalWindow,
     decidePermission,
+    finishLayeredTerminalResize,
     loadPreferences,
     loadSessions,
     loadTerminalWindowState,
+    moveTerminalWindow,
     openSessionSource,
+    resizeTerminalWindow,
     submitPrompt,
-    syncTerminalWindowPosition,
     terminateSession,
     undockTerminalWindow,
   } from "$lib/lume";
@@ -29,11 +33,34 @@
   let sending = $state(false);
   let dragging = $state(false);
   let dragMoved = false;
-  let dragFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingMove: { x: number; y: number } | null = null;
   let lastMove: { x: number; y: number } | null = null;
   let moveSyncRunning = false;
   let finalizeRequested = false;
+  let dragState: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    scale: number;
+  } | null = null;
+  let resizing = $state(false);
+  let resizeEndTimer: ReturnType<typeof setTimeout> | undefined;
+  let resizeDragState: {
+    pointerId: number;
+    direction: ResizeDirection;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    originWidth: number;
+    originHeight: number;
+    scale: number;
+  } | null = null;
+  let resizePreparing: Promise<void> | null = null;
+  let pendingResize: { x: number; y: number; width: number; height: number } | null = null;
+  let resizeSyncRunning = false;
   let settling = $state(false);
   let dockMovingLabel = $state<string | null>(null);
   let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
@@ -65,7 +92,8 @@
   onMount(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;
-    let stopMoved: (() => void) | undefined;
+    let stopWindowChanges: (() => void) | undefined;
+    let stopResized: (() => void) | undefined;
     let stopPreferences: (() => void) | undefined;
     let stopDockPreview: (() => void) | undefined;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
@@ -85,6 +113,13 @@
       await refresh();
       if (disposed) return;
       stopListening = await listen("lume://sessions-changed", () => void refresh());
+      stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
+        try {
+          windowState = await loadTerminalWindowState(label);
+        } catch {
+          // The window may be closing.
+        }
+      });
       stopPreferences = await listen<Preferences>("lume://preferences-changed", ({ payload }) => {
         language = payload.language;
         darkMode = payload.darkMode;
@@ -100,21 +135,30 @@
           dockPreview = null;
         }
       });
-      stopMoved = await currentWindow.onMoved(({ payload }) => {
+      stopResized = await currentWindow.onResized(() => {
         if (settling) return;
-        dragging = true;
-        dragMoved = true;
-        queueNativeMove(payload.x, payload.y);
+        if (resizeDragState) return;
+        resizing = true;
+        if (resizeEndTimer) clearTimeout(resizeEndTimer);
+        resizeEndTimer = setTimeout(async () => {
+          resizing = false;
+          try {
+            windowState = await loadTerminalWindowState(label);
+          } catch {
+            // The window may be closing.
+          }
+        }, 180);
       });
     })();
     return () => {
       disposed = true;
       stopListening?.();
-      stopMoved?.();
+      stopWindowChanges?.();
+      stopResized?.();
       stopPreferences?.();
       stopDockPreview?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
-      if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
+      if (resizeEndTimer) clearTimeout(resizeEndTimer);
     };
   });
 
@@ -140,35 +184,29 @@
     return "unknown" as const;
   }
 
-  function queueNativeMove(x: number, y: number) {
+  function queueMove(x: number, y: number) {
     const next = { x, y };
     pendingMove = next;
     lastMove = next;
-    finalizeRequested = false;
-    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
-    dragFinalizeTimer = setTimeout(() => {
-      finalizeRequested = true;
-      void flushNativeMoves();
-    }, 520);
-    void flushNativeMoves();
+    void flushMoves();
   }
 
-  async function flushNativeMoves() {
+  async function flushMoves() {
     if (moveSyncRunning) return;
     moveSyncRunning = true;
     try {
       while (pendingMove) {
         const next = pendingMove;
         pendingMove = null;
-        windowState = await syncTerminalWindowPosition(label, next.x, next.y, false);
+        windowState = await moveTerminalWindow(label, next.x, next.y, false);
       }
       if (finalizeRequested && lastMove) {
         const finalPosition = lastMove;
         finalizeRequested = false;
         settling = true;
-        dragging = false;
         dockPreview = null;
-        windowState = await syncTerminalWindowPosition(
+        dockMovingLabel = null;
+        windowState = await moveTerminalWindow(
           label,
           finalPosition.x,
           finalPosition.y,
@@ -183,32 +221,76 @@
       settling = false;
       finalizeRequested = false;
       pendingMove = null;
+      dockMovingLabel = null;
+      dockPreview = null;
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
       moveSyncRunning = false;
-      if (pendingMove || finalizeRequested) void flushNativeMoves();
+      if (pendingMove || finalizeRequested) void flushMoves();
     }
   }
 
-  async function beginDrag(event: PointerEvent) {
+  function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
     if ((event.target as HTMLElement).closest("button, textarea")) return;
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture(event.pointerId);
     dragging = true;
     dragMoved = false;
     pendingMove = null;
     lastMove = null;
     finalizeRequested = false;
     settling = false;
-    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
-    try {
-      await currentWindow.startDragging();
-      setTimeout(() => {
-        if (!dragMoved) dragging = false;
-      }, 600);
-    } catch (error) {
-      dragging = false;
-      message = String(error).replace(/^Error:\s*/, "");
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.screenX,
+      startY: event.screenY,
+      originX: windowState.x,
+      originY: windowState.y,
+      scale: windowState.scale,
+    };
+  }
+
+  function moveDrag(event: PointerEvent) {
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const dx = (event.screenX - dragState.startX) * dragState.scale;
+    const dy = (event.screenY - dragState.startY) * dragState.scale;
+    if (!dragMoved && Math.hypot(dx, dy) < 2) return;
+    event.preventDefault();
+    dragMoved = true;
+    queueMove(
+      Math.round(dragState.originX + dx),
+      Math.round(dragState.originY + dy),
+    );
+  }
+
+  function endDrag(event: PointerEvent) {
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const target = event.currentTarget as HTMLElement;
+    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    dragState = null;
+    dragging = false;
+    if (!dragMoved || !lastMove) {
+      dockMovingLabel = null;
+      dockPreview = null;
+      return;
     }
+    finalizeRequested = true;
+    void flushMoves();
+  }
+
+  function cancelDrag(event: PointerEvent) {
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    dragState = null;
+    dragging = false;
+    finalizeRequested = false;
+    pendingMove = null;
+    dockMovingLabel = null;
+    dockPreview = null;
+    void (async () => {
+      while (moveSyncRunning) await new Promise((resolve) => setTimeout(resolve, 0));
+      await cancelTerminalWindowMove(label);
+    })().catch(() => undefined);
   }
 
   async function detach() {
@@ -223,11 +305,111 @@
     finalizeRequested = false;
     pendingMove = null;
     dockPreview = null;
-    if (dragFinalizeTimer) clearTimeout(dragFinalizeTimer);
+    dockMovingLabel = null;
+    resizing = true;
+    if (windowState?.layered) {
+      const target = event.currentTarget as HTMLElement;
+      target.setPointerCapture(event.pointerId);
+      resizeDragState = {
+        pointerId: event.pointerId,
+        direction,
+        startX: event.screenX,
+        startY: event.screenY,
+        originX: windowState.x,
+        originY: windowState.y,
+        originWidth: windowState.width,
+        originHeight: windowState.height,
+        scale: windowState.scale,
+      };
+      pendingResize = null;
+      resizePreparing = beginLayeredTerminalResize(label)
+        .then((state) => {
+          windowState = state;
+        })
+        .catch((error) => {
+          message = String(error).replace(/^Error:\s*/, "");
+          resizeDragState = null;
+          resizing = false;
+        })
+        .finally(() => {
+          resizePreparing = null;
+          if (pendingResize) void flushResize();
+        });
+      return;
+    }
     try {
       await currentWindow.startResizeDragging(direction);
     } catch (error) {
+      resizing = false;
       message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function moveResize(event: PointerEvent) {
+    if (!resizeDragState || resizeDragState.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const scale = resizeDragState.scale;
+    const dx = (event.screenX - resizeDragState.startX) * scale;
+    const dy = (event.screenY - resizeDragState.startY) * scale;
+    const east = resizeDragState.direction.endsWith("East");
+    const south = resizeDragState.direction.startsWith("South");
+    const desiredWidth = resizeDragState.originWidth + (east ? dx : -dx) / scale;
+    const desiredHeight = resizeDragState.originHeight + (south ? dy : -dy) / scale;
+    const width = Math.max(300, Math.min(760, Math.round(desiredWidth)));
+    const height = Math.max(240, Math.min(640, Math.round(desiredHeight)));
+    pendingResize = {
+      x: east
+        ? resizeDragState.originX
+        : resizeDragState.originX + Math.round((resizeDragState.originWidth - width) * scale),
+      y: south
+        ? resizeDragState.originY
+        : resizeDragState.originY + Math.round((resizeDragState.originHeight - height) * scale),
+      width,
+      height,
+    };
+    void flushResize();
+  }
+
+  async function flushResize() {
+    if (resizeSyncRunning || resizePreparing) return;
+    resizeSyncRunning = true;
+    try {
+      while (pendingResize) {
+        const next = pendingResize;
+        pendingResize = null;
+        windowState = await resizeTerminalWindow(
+          label,
+          next.x,
+          next.y,
+          next.width,
+          next.height,
+        );
+      }
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+      pendingResize = null;
+    } finally {
+      resizeSyncRunning = false;
+      if (pendingResize) void flushResize();
+    }
+  }
+
+  async function endResize(event: PointerEvent) {
+    if (!resizeDragState || resizeDragState.pointerId !== event.pointerId) return;
+    const target = event.currentTarget as HTMLElement;
+    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    resizeDragState = null;
+    if (resizePreparing) await resizePreparing;
+    while (resizeSyncRunning || pendingResize) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    try {
+      windowState = await finishLayeredTerminalResize(label);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      resizing = false;
     }
   }
 
@@ -304,6 +486,7 @@
   {#if session}
     <section
       class:dragging
+      class:resizing
       class:settling
       class:dock-moving={dockMovingLabel === label && Boolean(dockPreview)}
       class:dock-target={dockPreview?.targetLabel === label}
@@ -318,7 +501,10 @@
       {/if}
       <header
         role="banner"
-        onpointerdown={(event) => void beginDrag(event)}
+        onpointerdown={beginDrag}
+        onpointermove={moveDrag}
+        onpointerup={endDrag}
+        onpointercancel={cancelDrag}
       >
         <LumeLogo size={25} />
         <span class="agent-icon"><BrandIcon name={session.agent} size={16} /></span>
@@ -409,10 +595,10 @@
         {/if}
       </form>
       {#if message}<p class="message">{message}</p>{/if}
-      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")}></button>
-      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")}></button>
-      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")}></button>
-      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")}></button>
+      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
     </section>
   {:else}
     <section class="terminal-card loading"><LumeLogo size={34} /><span>{tr("Connecting to session…", "Conectando à sessão…")}</span></section>
@@ -421,13 +607,13 @@
 
 <style>
   .terminal-window { width: 100%; height: 100%; }
-  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.97); box-shadow: 0 10px 34px rgba(20, 36, 29, 0.2); backdrop-filter: blur(24px) saturate(120%); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.985); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
   .terminal-card.resizing { user-select: none; }
-  .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.5); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.24), 0 0 0 2px rgba(75, 157, 120, 0.08); transform: scale(0.992); }
-  .terminal-card.dock-target { border-color: rgba(65, 151, 111, 0.7); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.22), 0 0 0 3px rgba(75, 157, 120, 0.14); }
-  .terminal-card.settling { border-color: rgba(69, 139, 108, 0.42); box-shadow: 0 12px 38px rgba(31, 91, 66, 0.2); }
+  .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.58); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.12); transform: scale(0.992); }
+  .terminal-card.dock-target { border-color: rgba(65, 151, 111, 0.78); box-shadow: inset 0 0 0 3px rgba(75, 157, 120, 0.18); }
+  .terminal-card.settling { border-color: rgba(69, 139, 108, 0.48); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.11); }
   .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.62); border-radius: 13px; background: rgba(76, 161, 121, 0.075); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.48); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
   .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.68); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.32), rgba(77, 164, 121, 0.12)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.14); }
   .dock-silhouette span { position: absolute; z-index: 1; padding: 3px 6px; border-radius: 999px; color: #39755a; background: rgba(232, 246, 239, 0.9); font-size: 7px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
@@ -447,7 +633,7 @@
   .identity strong { color: #26342e; font-size: 11px; }
   .identity small { overflow: hidden; color: #829089; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
   .source-badge { padding: 3px 5px; display: inline-flex; align-items: center; gap: 3px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 7px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
-  header button { width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
+  header button { position: relative; z-index: 25; width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   .dock-button { color: #4a7564; }
   .terminate-button { color: #9d615c; }
@@ -501,7 +687,7 @@
   .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
   .terminal-window.dark .terminal-card.dock-moving,
   .terminal-window.dark .terminal-card.dock-target,
-  .terminal-window.dark .terminal-card.settling { border-color: rgba(91, 186, 143, 0.5); box-shadow: 0 12px 38px rgba(8, 21, 15, 0.48), 0 0 0 2px rgba(91, 186, 143, 0.08); }
+  .terminal-window.dark .terminal-card.settling { border-color: rgba(91, 186, 143, 0.5); box-shadow: inset 0 0 0 2px rgba(91, 186, 143, 0.1), inset 0 -10px 24px rgba(8, 21, 15, 0.18); }
   .terminal-window.dark .dock-silhouette { border-color: rgba(96, 193, 149, 0.5); background: rgba(72, 157, 116, 0.06); box-shadow: inset 0 0 0 1px rgba(154, 220, 188, 0.08); }
   .terminal-window.dark .dock-silhouette::before { border-color: rgba(99, 197, 152, 0.52); background: linear-gradient(135deg, rgba(79, 174, 128, 0.22), rgba(69, 149, 111, 0.08)); }
   .terminal-window.dark .dock-silhouette span { color: #a8d9c2; background: rgba(27, 51, 40, 0.92); }

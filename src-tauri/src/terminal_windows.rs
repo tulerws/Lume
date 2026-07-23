@@ -62,6 +62,9 @@ pub struct TerminalWindowState {
     pub height: i32,
     pub docked: bool,
     pub group_id: Option<String>,
+    pub monitor_id: String,
+    pub layered: bool,
+    pub scale: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -73,6 +76,7 @@ pub struct RestoredTerminalPlacement {
     pub width: i32,
     pub height: i32,
     pub group_id: Option<String>,
+    pub monitor_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +89,8 @@ struct Placement {
     height: i32,
     scale: f64,
     group: Option<String>,
+    monitor_id: String,
+    layered: bool,
     ready: bool,
 }
 
@@ -138,6 +144,9 @@ impl Placement {
             height: self.height,
             docked: self.group.is_some(),
             group_id: self.group.clone(),
+            monitor_id: self.monitor_id.clone(),
+            layered: self.layered,
+            scale: self.scale,
         }
     }
 }
@@ -156,7 +165,7 @@ impl TerminalWindows {
         monitor_id: Option<&str>,
         origin_x: i32,
         origin_y: i32,
-        _show_over_fullscreen: bool,
+        show_over_fullscreen: bool,
     ) -> Result<String, String> {
         let label = terminal_label(&session.id);
         if let Some(window) = app.get_webview_window(&label) {
@@ -174,13 +183,32 @@ impl TerminalWindows {
                 );
             } else {
                 let current = self.state(&label)?;
-                let (x, y) = initial_position(app, monitor_id, current.x, current.y);
+                if current.docked {
+                    window.show().map_err(|error| error.to_string())?;
+                    let _ = window.set_focus();
+                    return Ok(label);
+                }
+                let effective_monitor = monitor_id.or(Some(current.monitor_id.as_str()));
+                let (resolved_monitor_id, monitor) = selected_monitor(app, effective_monitor)
+                    .ok_or_else(|| "Nenhum monitor disponível".to_string())?;
+                let (x, y) = clamp_drag_to_monitor(
+                    current.x,
+                    current.y,
+                    current.width,
+                    current.height,
+                    monitor.size().width as i32,
+                    monitor.size().height as i32,
+                    monitor.scale_factor(),
+                );
                 if let Ok(mut placements) = self.placements.lock() {
                     if let Some(placement) = placements.get_mut(&label) {
                         placement.x = x;
                         placement.y = y;
+                        placement.monitor_id = resolved_monitor_id.clone();
+                        placement.scale = monitor.scale_factor();
                     }
                 }
+                overlay::move_to(&window, x, y, Some(&resolved_monitor_id))?;
                 window.show().map_err(|error| error.to_string())?;
                 let _ = window.set_focus();
                 return Ok(label);
@@ -198,7 +226,12 @@ impl TerminalWindows {
             monitor_id,
             origin_x + 96 + offset,
             origin_y + 64 + offset,
+            TERMINAL_WIDTH,
+            TERMINAL_HEIGHT,
         );
+        let (resolved_monitor_id, monitor_scale) = selected_monitor(app, monitor_id)
+            .map(|(id, monitor)| (id, monitor.scale_factor()))
+            .unwrap_or_else(|| (monitor_id.unwrap_or_default().to_string(), 1.0));
         let placement = Placement {
             label: label.clone(),
             session_id: session.id.clone(),
@@ -206,8 +239,10 @@ impl TerminalWindows {
             y,
             width: TERMINAL_WIDTH,
             height: TERMINAL_HEIGHT,
-            scale: selected_monitor_scale(app, monitor_id),
+            scale: monitor_scale,
             group: None,
+            monitor_id: resolved_monitor_id.clone(),
+            layered: false,
             ready: false,
         };
 
@@ -222,7 +257,6 @@ impl TerminalWindows {
             match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("Lume · {}", session.agent_label))
                 .inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
-                .position(f64::from(x), f64::from(y))
                 .min_inner_size(
                     f64::from(TERMINAL_MIN_WIDTH),
                     f64::from(TERMINAL_MIN_HEIGHT),
@@ -237,7 +271,7 @@ impl TerminalWindows {
                 .skip_taskbar(true)
                 .shadow(false)
                 .resizable(true)
-                .visible(true)
+                .visible(false)
                 .on_page_load(move |window, payload| {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         ready_registry.mark_ready(&ready_label);
@@ -261,6 +295,7 @@ impl TerminalWindows {
         window.on_window_event(move |event| match event {
             WindowEvent::Destroyed => {
                 emit_dock_preview(event_window.app_handle(), &cleanup_label, None);
+                overlay::forget_window(&cleanup_label);
                 registry.remove(&cleanup_label);
             }
             WindowEvent::Resized(size) => {
@@ -270,6 +305,7 @@ impl TerminalWindows {
                 let scale = event_window.scale_factor().unwrap_or(1.0);
                 let position = relative_window_position(&event_window);
                 registry.resize(
+                    event_window.app_handle(),
                     &cleanup_label,
                     position,
                     (f64::from(size.width) / scale).round() as i32,
@@ -277,20 +313,24 @@ impl TerminalWindows {
                     scale,
                 );
             }
-            WindowEvent::Moved(_) => {
-                if registry.is_settling(&cleanup_label) {
-                    return;
-                }
-                let Some((x, y)) = relative_window_position(&event_window) else {
-                    return;
-                };
-                if let Ok(preview) = registry.observe_native_position(&cleanup_label, x, y) {
-                    emit_dock_preview(event_window.app_handle(), &cleanup_label, preview);
-                }
-            }
             _ => {}
         });
 
+        let layered = overlay::configure_terminal(
+            &window,
+            show_over_fullscreen,
+            Some(&resolved_monitor_id),
+            x,
+            y,
+        );
+        if let Ok(mut placements) = self.placements.lock() {
+            if let Some(placement) = placements.get_mut(&label) {
+                placement.layered = layered;
+            }
+        }
+        if !layered {
+            overlay::move_to(&window, x, y, Some(&resolved_monitor_id))?;
+        }
         window.show().map_err(|error| {
             self.remove(&label);
             let _ = window.close();
@@ -337,6 +377,11 @@ impl TerminalWindows {
         Ok(())
     }
 
+    pub fn cancel_move(&self, app: &AppHandle, label: &str) -> Result<TerminalWindowState, String> {
+        emit_dock_preview(app, label, None);
+        self.state(label)
+    }
+
     pub fn move_window(
         &self,
         app: &AppHandle,
@@ -344,22 +389,49 @@ impl TerminalWindows {
         x: i32,
         y: i32,
         finalize: bool,
-        monitor_id: Option<&str>,
     ) -> Result<TerminalWindowState, String> {
+        if self.is_settling(label) {
+            return self.state(label);
+        }
         validate_coordinates(x, y)?;
-        let update = {
+        let current = self.state(label)?;
+        let (x, y) = selected_monitor(app, Some(&current.monitor_id))
+            .map(|(_, monitor)| {
+                clamp_drag_to_monitor(
+                    x,
+                    y,
+                    current.width,
+                    current.height,
+                    monitor.size().width as i32,
+                    monitor.size().height as i32,
+                    monitor.scale_factor(),
+                )
+            })
+            .unwrap_or((x, y));
+        let result = {
             let mut placements = self
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível mover o mini terminal".to_string())?;
-            update_placements(&mut placements, label, x, y, finalize)?
+            update_placements(&mut placements, label, x, y, finalize)
+        };
+        let update = match result {
+            Ok(update) => update,
+            Err(error) => {
+                emit_dock_preview(app, label, None);
+                return Err(error);
+            }
         };
         emit_dock_preview(app, label, update.preview.clone());
         if update.snapped {
-            self.animate_native_windows(app, update.transitions, monitor_id);
+            self.animate_native_windows(app, update.transitions);
+            emit_windows_changed(app);
         } else {
             let states = self.states_for_labels(&update.moving_labels)?;
-            move_native_windows(app, &states, monitor_id, true);
+            move_native_windows(app, &states, false);
+            if finalize {
+                emit_windows_changed(app);
+            }
         }
         Ok(update.current)
     }
@@ -371,8 +443,10 @@ impl TerminalWindows {
         physical_x: i32,
         physical_y: i32,
         finalize: bool,
-        monitor_id: Option<&str>,
     ) -> Result<TerminalWindowState, String> {
+        if self.is_settling(label) {
+            return self.state(label);
+        }
         validate_coordinates(physical_x, physical_y)?;
         let window = app
             .get_webview_window(label)
@@ -411,19 +485,24 @@ impl TerminalWindows {
             }
             if let Some(current) = placements.get_mut(label) {
                 current.scale = monitor_scale;
+                if let Some(monitor) = monitor.as_ref() {
+                    if let Ok(monitors) = window.available_monitors() {
+                        current.monitor_id = overlay::monitor_identifier(&monitors, monitor);
+                    }
+                }
             }
             update_placements(&mut placements, label, x, y, finalize)?
         };
         emit_dock_preview(app, label, update.preview.clone());
         if update.snapped {
-            self.animate_native_windows(app, update.transitions, monitor_id);
-        } else if finalize || update.moving_labels.len() > 1 {
-            let states = self
-                .states_for_labels(&update.moving_labels)?
-                .into_iter()
-                .filter(|state| finalize || state.label != label)
-                .collect::<Vec<_>>();
-            move_native_windows(app, &states, monitor_id, false);
+            self.animate_native_windows(app, update.transitions);
+            emit_windows_changed(app);
+        } else {
+            let states = self.states_for_labels(&update.moving_labels)?;
+            move_native_windows(app, &states, false);
+            if finalize {
+                emit_windows_changed(app);
+            }
         }
         Ok(update.current)
     }
@@ -440,12 +519,7 @@ impl TerminalWindows {
             .collect())
     }
 
-    fn animate_native_windows(
-        &self,
-        app: &AppHandle,
-        transitions: Vec<WindowTransition>,
-        monitor_id: Option<&str>,
-    ) {
+    fn animate_native_windows(&self, app: &AppHandle, transitions: Vec<WindowTransition>) {
         if transitions.is_empty() {
             return;
         }
@@ -458,7 +532,6 @@ impl TerminalWindows {
         }
         let settling = self.settling.clone();
         let app = app.clone();
-        let monitor_id = monitor_id.map(str::to_string);
         let _ = std::thread::Builder::new()
             .name("lume-terminal-dock".into())
             .spawn(move || {
@@ -469,7 +542,7 @@ impl TerminalWindows {
                         .iter()
                         .map(|transition| interpolate_state(transition, eased))
                         .collect::<Vec<_>>();
-                    move_native_windows(&app, &states, monitor_id.as_deref(), true);
+                    move_native_windows(&app, &states, true);
                     std::thread::sleep(Duration::from_millis(16));
                 }
                 std::thread::sleep(Duration::from_millis(48));
@@ -481,7 +554,26 @@ impl TerminalWindows {
             });
     }
 
-    pub fn undock(&self, label: &str) -> Result<TerminalWindowState, String> {
+    fn settle_while(&self, app: &AppHandle, states: Vec<TerminalWindowState>, resize: bool) {
+        if let Ok(mut settling) = self.settling.lock() {
+            settling.extend(states.iter().map(|state| state.label.clone()));
+        }
+        let settling = self.settling.clone();
+        let app = app.clone();
+        let _ = std::thread::Builder::new()
+            .name("lume-terminal-layout".into())
+            .spawn(move || {
+                move_native_windows(&app, &states, resize);
+                std::thread::sleep(Duration::from_millis(220));
+                if let Ok(mut settling) = settling.lock() {
+                    for state in &states {
+                        settling.remove(&state.label);
+                    }
+                }
+            });
+    }
+
+    pub fn undock(&self, app: &AppHandle, label: &str) -> Result<TerminalWindowState, String> {
         let mut placements = self
             .placements
             .lock()
@@ -494,10 +586,13 @@ impl TerminalWindows {
         if let Some(group) = old_group {
             clear_single_member_group(&mut placements, &group);
         }
-        placements
+        let state = placements
             .get(label)
             .map(Placement::state)
-            .ok_or_else(|| "Mini terminal não encontrado".to_string())
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        drop(placements);
+        emit_windows_changed(app);
+        Ok(state)
     }
 
     pub fn restore_layout(
@@ -506,24 +601,65 @@ impl TerminalWindows {
         entries: Vec<RestoredTerminalPlacement>,
         monitor_id: Option<&str>,
     ) -> Result<Vec<TerminalWindowState>, String> {
+        for entry in &entries {
+            validate_coordinates(entry.x, entry.y)?;
+        }
+
+        let updates = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let selected = selected_monitor(app, entry.monitor_id.as_deref().or(monitor_id));
+                let (resolved_monitor_id, monitor) = selected?;
+                let width = entry.width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+                let height = entry.height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+                let (x, y) = clamp_drag_to_monitor(
+                    entry.x,
+                    entry.y,
+                    width,
+                    height,
+                    monitor.size().width as i32,
+                    monitor.size().height as i32,
+                    monitor.scale_factor(),
+                );
+                Some((
+                    entry.session_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    entry.group_id,
+                    resolved_monitor_id,
+                    monitor.scale_factor(),
+                ))
+            })
+            .collect::<Vec<_>>();
+
         let states = {
             let mut placements = self
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível restaurar o layout".to_string())?;
-            for entry in entries {
-                validate_coordinates(entry.x, entry.y)?;
+            for (session_id, x, y, width, height, group, monitor_id, scale) in updates {
                 let Some(placement) = placements
                     .values_mut()
-                    .find(|placement| placement.session_id == entry.session_id)
+                    .find(|placement| placement.session_id == session_id)
                 else {
                     continue;
                 };
-                placement.x = entry.x;
-                placement.y = entry.y;
-                placement.width = entry.width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
-                placement.height = entry.height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
-                placement.group = entry.group_id;
+                placement.x = x;
+                placement.y = y;
+                placement.width = width;
+                placement.height = height;
+                placement.group = group;
+                placement.monitor_id = monitor_id;
+                placement.scale = scale;
+            }
+            let groups = placements
+                .values()
+                .filter_map(|placement| placement.group.clone())
+                .collect::<HashSet<_>>();
+            for group in groups {
+                clear_single_member_group(&mut placements, &group);
             }
             placements
                 .values()
@@ -531,21 +667,8 @@ impl TerminalWindows {
                 .collect::<Vec<_>>()
         };
 
-        for state in &states {
-            let Some(window) = app.get_webview_window(&state.label) else {
-                continue;
-            };
-            let target = state.clone();
-            let monitor = monitor_id.map(str::to_string);
-            let layout_window = window.clone();
-            let _ = window.run_on_main_thread(move || {
-                let _ = layout_window.set_size(LogicalSize::new(
-                    f64::from(target.width),
-                    f64::from(target.height),
-                ));
-                let _ = overlay::move_to(&layout_window, target.x, target.y, monitor.as_deref());
-            });
-        }
+        self.settle_while(app, states.clone(), true);
+        emit_windows_changed(app);
         Ok(states)
     }
 
@@ -557,8 +680,24 @@ impl TerminalWindows {
         y: i32,
         width: i32,
         height: i32,
-        monitor_id: Option<&str>,
     ) -> Result<TerminalWindowState, String> {
+        validate_coordinates(x, y)?;
+        let current = self.state(label)?;
+        let width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+        let height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+        let (x, y) = selected_monitor(app, Some(&current.monitor_id))
+            .map(|(_, monitor)| {
+                clamp_drag_to_monitor(
+                    x,
+                    y,
+                    width,
+                    height,
+                    monitor.size().width as i32,
+                    monitor.size().height as i32,
+                    monitor.scale_factor(),
+                )
+            })
+            .unwrap_or((x, y));
         let state = {
             let mut placements = self
                 .placements
@@ -570,8 +709,8 @@ impl TerminalWindows {
                 .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
             entry.x = x;
             entry.y = y;
-            entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
-            entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+            entry.width = width;
+            entry.height = height;
             entry.group = None;
             let state = entry.state();
             if let Some(group) = old_group {
@@ -579,21 +718,43 @@ impl TerminalWindows {
             }
             state
         };
-        let window = app
-            .get_webview_window(label)
-            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-        let target = state.clone();
-        let monitor = monitor_id.map(str::to_string);
-        let resize_window = window.clone();
-        window
-            .run_on_main_thread(move || {
-                let _ = resize_window.set_size(LogicalSize::new(
-                    f64::from(target.width),
-                    f64::from(target.height),
-                ));
-                let _ = overlay::move_to(&resize_window, target.x, target.y, monitor.as_deref());
-            })
-            .map_err(|error| error.to_string())?;
+        move_native_windows(app, std::slice::from_ref(&state), true);
+        Ok(state)
+    }
+
+    pub fn begin_layered_resize(
+        &self,
+        app: &AppHandle,
+        label: &str,
+    ) -> Result<TerminalWindowState, String> {
+        let state = self.state(label)?;
+        if let Ok(mut settling) = self.settling.lock() {
+            settling.insert(label.to_string());
+        }
+        if state.docked {
+            self.undock(app, label)
+        } else {
+            Ok(state)
+        }
+    }
+
+    pub fn finish_layered_resize(
+        &self,
+        app: &AppHandle,
+        label: &str,
+    ) -> Result<TerminalWindowState, String> {
+        let state = self.state(label)?;
+        let settling = self.settling.clone();
+        let label = label.to_string();
+        let _ = std::thread::Builder::new()
+            .name("lume-terminal-resize".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(140));
+                if let Ok(mut settling) = settling.lock() {
+                    settling.remove(&label);
+                }
+            });
+        emit_windows_changed(app);
         Ok(state)
     }
 
@@ -609,50 +770,54 @@ impl TerminalWindows {
 
     fn resize(
         &self,
+        app: &AppHandle,
         label: &str,
         position: Option<(i32, i32)>,
         width: i32,
         height: i32,
         scale: f64,
     ) {
+        if self.resize_placement(label, position, width, height, scale) {
+            emit_windows_changed(app);
+        }
+    }
+
+    fn resize_placement(
+        &self,
+        label: &str,
+        position: Option<(i32, i32)>,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) -> bool {
         let Ok(mut placements) = self.placements.lock() else {
-            return;
+            return false;
         };
+        let width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
+        let height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+        let size_changed = placements
+            .get(label)
+            .is_some_and(|entry| entry.width != width || entry.height != height);
+        let old_group = size_changed
+            .then(|| placements.get(label).and_then(|entry| entry.group.clone()))
+            .flatten();
         if let Some(entry) = placements.get_mut(label) {
             if let Some((x, y)) = position {
                 entry.x = x;
                 entry.y = y;
             }
-            entry.width = width.clamp(TERMINAL_MIN_WIDTH, TERMINAL_MAX_WIDTH);
-            entry.height = height.clamp(TERMINAL_MIN_HEIGHT, TERMINAL_MAX_HEIGHT);
+            entry.width = width;
+            entry.height = height;
             entry.scale = scale.max(1.0);
+            if size_changed {
+                entry.group = None;
+            }
         }
-    }
-
-    fn observe_native_position(
-        &self,
-        label: &str,
-        x: i32,
-        y: i32,
-    ) -> Result<Option<DockPreview>, String> {
-        validate_coordinates(x, y)?;
-        let mut placements = self
-            .placements
-            .lock()
-            .map_err(|_| "Não foi possível detectar o acoplamento".to_string())?;
-        {
-            let current = placements
-                .get_mut(label)
-                .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-            current.x = x;
-            current.y = y;
+        if let Some(group) = old_group {
+            clear_single_member_group(&mut placements, &group);
+            return true;
         }
-        let current = placements
-            .get(label)
-            .cloned()
-            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-        let moving_labels = group_labels(&placements, &current);
-        Ok(dock_candidate(&placements, label, &moving_labels).map(|plan| plan.preview()))
+        false
     }
 
     fn is_settling(&self, label: &str) -> bool {
@@ -690,64 +855,34 @@ fn initial_position(
     monitor_id: Option<&str>,
     desired_x: i32,
     desired_y: i32,
+    width: i32,
+    height: i32,
 ) -> (i32, i32) {
-    let Some(main) = app.get_webview_window("main") else {
+    let Some((_, monitor)) = selected_monitor(app, monitor_id) else {
         return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
     };
-    let Ok(monitors) = main.available_monitors() else {
-        return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
-    };
-    let monitor = monitor_id
-        .and_then(|id| {
-            monitors
-                .iter()
-                .find(|monitor| monitor.name().is_some_and(|name| name == id))
-        })
-        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
-        .or_else(|| monitors.first());
-    let Some(monitor) = monitor else {
-        return (desired_x.max(SCREEN_MARGIN), desired_y.max(SCREEN_MARGIN));
-    };
-    clamp_to_monitor(
+    clamp_drag_to_monitor(
         desired_x,
         desired_y,
+        width,
+        height,
         monitor.size().width as i32,
         monitor.size().height as i32,
         monitor.scale_factor(),
     )
 }
 
-fn selected_monitor_scale(app: &AppHandle, monitor_id: Option<&str>) -> f64 {
+fn selected_monitor(app: &AppHandle, monitor_id: Option<&str>) -> Option<(String, tauri::Monitor)> {
     let Some(main) = app.get_webview_window("main") else {
-        return 1.0;
+        return None;
     };
     let Ok(monitors) = main.available_monitors() else {
-        return 1.0;
+        return None;
     };
-    monitor_id
-        .and_then(|id| {
-            monitors
-                .iter()
-                .find(|monitor| monitor.name().is_some_and(|name| name == id))
-        })
-        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
-        .or_else(|| monitors.first())
-        .map(|monitor| monitor.scale_factor())
-        .unwrap_or(1.0)
-}
-
-fn clamp_to_monitor(
-    x: i32,
-    y: i32,
-    monitor_width: i32,
-    monitor_height: i32,
-    scale: f64,
-) -> (i32, i32) {
-    let physical_width = (f64::from(TERMINAL_WIDTH) * scale).round() as i32;
-    let physical_height = (f64::from(TERMINAL_HEIGHT) * scale).round() as i32;
-    let max_x = (monitor_width - physical_width - SCREEN_MARGIN).max(SCREEN_MARGIN);
-    let max_y = (monitor_height - physical_height - SCREEN_MARGIN).max(SCREEN_MARGIN);
-    (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
+    let primary = main.primary_monitor().ok().flatten();
+    let monitor = overlay::select_monitor(&monitors, primary, monitor_id)?;
+    let id = overlay::monitor_identifier(&monitors, &monitor);
+    Some((id, monitor))
 }
 
 fn clamp_drag_to_monitor(
@@ -902,6 +1037,7 @@ fn dock_candidate(
     placements
         .values()
         .filter(|other| !moving_labels.contains(&other.label))
+        .filter(|other| other.monitor_id == current.monitor_id)
         .filter_map(|other| snap(current, other))
         .filter(|plan| plan.score <= DOCK_DISTANCE)
         .min_by_key(|plan| plan.score)
@@ -1015,6 +1151,10 @@ fn emit_dock_preview(app: &AppHandle, moving_label: &str, preview: Option<DockPr
     );
 }
 
+fn emit_windows_changed(app: &AppHandle) {
+    let _ = app.emit("lume://terminal-windows-changed", ());
+}
+
 fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWindowState {
     let interpolate =
         |from: i32, to: i32| (f64::from(from) + f64::from(to - from) * progress).round() as i32;
@@ -1027,21 +1167,18 @@ fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWi
         height: interpolate(transition.from.height, transition.to.height),
         docked: transition.to.docked,
         group_id: transition.to.group_id.clone(),
+        monitor_id: transition.to.monitor_id.clone(),
+        layered: transition.to.layered,
+        scale: transition.to.scale,
     }
 }
 
-fn move_native_windows(
-    app: &AppHandle,
-    states: &[TerminalWindowState],
-    monitor_id: Option<&str>,
-    resize: bool,
-) {
+fn move_native_windows(app: &AppHandle, states: &[TerminalWindowState], resize: bool) {
     for state in states {
         let Some(window) = app.get_webview_window(&state.label) else {
             continue;
         };
         let target = state.clone();
-        let monitor = monitor_id.map(str::to_string);
         let layer_window = window.clone();
         let _ = window.run_on_main_thread(move || {
             if resize {
@@ -1050,7 +1187,7 @@ fn move_native_windows(
                     f64::from(target.height),
                 ));
             }
-            let _ = overlay::move_to(&layer_window, target.x, target.y, monitor.as_deref());
+            let _ = overlay::move_to(&layer_window, target.x, target.y, Some(&target.monitor_id));
         });
     }
 }
@@ -1069,6 +1206,8 @@ mod tests {
             height: TERMINAL_HEIGHT,
             scale: 1.0,
             group: None,
+            monitor_id: "0:primary".into(),
+            layered: false,
             ready: true,
         }
     }
@@ -1149,23 +1288,28 @@ mod tests {
     }
 
     #[test]
-    fn native_move_emits_preview_without_waiting_for_frontend_sync() {
-        let registry = TerminalWindows::default();
+    fn moving_a_docked_terminal_preserves_the_group_delta() {
+        let mut left = placement("left", 20, 40);
+        let mut right = placement("right", 356, 40);
+        left.group = Some("pair".into());
+        right.group = Some("pair".into());
+        let mut placements =
+            HashMap::from([(left.label.clone(), left), (right.label.clone(), right)]);
+
+        update_placements(&mut placements, "left", 92, 64, false).expect("movimento");
+
+        assert_eq!((placements["left"].x, placements["left"].y), (92, 64));
+        assert_eq!((placements["right"].x, placements["right"].y), (428, 64));
+    }
+
+    #[test]
+    fn terminals_on_different_monitors_never_dock() {
         let left = placement("left", 20, 40);
-        let right = placement("right", 500, 48);
-        registry
-            .placements
-            .lock()
-            .expect("posições")
-            .extend([(left.label.clone(), left), (right.label.clone(), right)]);
+        let mut right = placement("right", 350, 48);
+        right.monitor_id = "1:test".into();
+        let placements = HashMap::from([(left.label.clone(), left), (right.label.clone(), right)]);
 
-        let preview = registry
-            .observe_native_position("left", 92, 40)
-            .expect("movimento")
-            .expect("highlight");
-
-        assert_eq!(preview.target_label, "right");
-        assert_eq!(preview.side, DockSide::Left);
+        assert!(dock_candidate(&placements, "left", &["left".into()]).is_none());
     }
 
     #[test]
@@ -1178,7 +1322,7 @@ mod tests {
             .expect("posições")
             .insert(terminal.label.clone(), terminal);
 
-        registry.resize("terminal", Some((130, 150)), 420, 310, 1.0);
+        registry.resize_placement("terminal", Some((130, 150)), 420, 310, 1.0);
         let state = registry.state("terminal").expect("terminal");
 
         assert_eq!((state.x, state.y), (130, 150));
@@ -1200,14 +1344,30 @@ mod tests {
 
     #[test]
     fn terminal_opened_near_the_edge_stays_inside_the_monitor() {
-        let (x, y) = clamp_to_monitor(1_920, 1_080, 1_920, 1_080, 1.0);
+        let (x, y) = clamp_drag_to_monitor(
+            1_920,
+            1_080,
+            TERMINAL_WIDTH,
+            TERMINAL_HEIGHT,
+            1_920,
+            1_080,
+            1.0,
+        );
         assert_eq!(x, 1_572);
         assert_eq!(y, 782);
     }
 
     #[test]
     fn terminal_clamp_accounts_for_windows_display_scaling() {
-        let (x, y) = clamp_to_monitor(1_900, 1_050, 1_920, 1_080, 1.25);
+        let (x, y) = clamp_drag_to_monitor(
+            1_900,
+            1_050,
+            TERMINAL_WIDTH,
+            TERMINAL_HEIGHT,
+            1_920,
+            1_080,
+            1.25,
+        );
         assert_eq!(x, 1_488);
         assert_eq!(y, 710);
     }

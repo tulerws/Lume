@@ -273,14 +273,17 @@ fn move_overlay(
     x: i32,
     y: i32,
     persist: bool,
+    monitor_id: Option<String>,
 ) -> Result<(), String> {
-    let mut preferences = state.preferences()?;
-    if persist {
+    let monitor_id = if persist {
+        let mut preferences = state.preferences()?;
         preferences.overlay_x = Some(x);
         preferences.overlay_y = Some(y);
         state.save_preferences(&preferences)?;
-    }
-    let monitor_id = preferences.monitor_id.clone();
+        preferences.monitor_id
+    } else {
+        monitor_id
+    };
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Janela do Lume não encontrada".to_string())?;
@@ -345,35 +348,39 @@ fn close_terminal_window(
 #[tauri::command]
 fn move_terminal_window(
     app: AppHandle,
-    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
     y: i32,
     finalize: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    let monitor_id = state.preferences()?.monitor_id;
-    terminals.move_window(&app, &label, x, y, finalize, monitor_id.as_deref())
+    terminals.move_window(&app, &label, x, y, finalize)
+}
+
+#[tauri::command]
+fn cancel_terminal_window_move(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    terminals.cancel_move(&app, &label)
 }
 
 #[tauri::command]
 fn sync_terminal_window_position(
     app: AppHandle,
-    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
     y: i32,
     finalize: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    let monitor_id = state.preferences()?.monitor_id;
-    terminals.sync_native_position(&app, &label, x, y, finalize, monitor_id.as_deref())
+    terminals.sync_native_position(&app, &label, x, y, finalize)
 }
 
 #[tauri::command]
 fn resize_terminal_window(
     app: AppHandle,
-    state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
     x: i32,
@@ -381,16 +388,34 @@ fn resize_terminal_window(
     width: i32,
     height: i32,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    let monitor_id = state.preferences()?.monitor_id;
-    terminals.resize_window(&app, &label, x, y, width, height, monitor_id.as_deref())
+    terminals.resize_window(&app, &label, x, y, width, height)
+}
+
+#[tauri::command]
+fn begin_layered_terminal_resize(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    terminals.begin_layered_resize(&app, &label)
+}
+
+#[tauri::command]
+fn finish_layered_terminal_resize(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalWindowState, String> {
+    terminals.finish_layered_resize(&app, &label)
 }
 
 #[tauri::command]
 fn undock_terminal_window(
+    app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.undock(&label)
+    terminals.undock(&app, &label)
 }
 
 #[tauri::command]
@@ -673,8 +698,11 @@ pub fn run() {
             get_terminal_window_state,
             close_terminal_window,
             move_terminal_window,
+            cancel_terminal_window_move,
             sync_terminal_window_position,
             resize_terminal_window,
+            begin_layered_terminal_resize,
+            finish_layered_terminal_resize,
             undock_terminal_window,
             restore_terminal_layout,
             integration_statuses,
