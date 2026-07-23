@@ -508,14 +508,15 @@
     morphing = "closing";
     contentVisible = false;
     await animateWindowSize(false);
+    const linuxSurfaceWasHidden = await hideExpandedLinuxSurface();
     expanded = false;
     compactAnchorPosition = null;
     selectedId = null;
     view = "sessions";
     launcherOpen = false;
     await tick();
+    await remapCompactSurface(linuxSurfaceWasHidden);
     morphing = null;
-    void remapCompactSurface();
   }
 
   async function animateWindowSize(opening: boolean) {
@@ -597,11 +598,22 @@
       });
   }
 
-  async function remapCompactSurface() {
-    if (!isTauri || !isLinux) return;
+  async function hideExpandedLinuxSurface() {
+    if (!isTauri || !isLinux) return false;
     const currentWindow = getCurrentWindow();
     try {
       await currentWindow.hide();
+      await new Promise<void>((resolve) => setTimeout(resolve, 36));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function remapCompactSurface(surfaceWasHidden: boolean) {
+    if (!surfaceWasHidden) return;
+    const currentWindow = getCurrentWindow();
+    try {
       await currentWindow.setSize(new LogicalSize(compactSize.width, compactSize.height));
       await moveOverlay(
         overlayPosition.x,
@@ -609,6 +621,9 @@
         false,
         preferences.monitorId,
       );
+      await new Promise<void>((resolve) => setTimeout(resolve, 18));
+    } catch {
+      // The final show still restores the compact capsule if geometry sync fails.
     } finally {
       await currentWindow.show().catch(() => undefined);
     }
