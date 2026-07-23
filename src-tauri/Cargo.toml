@@ -1,6 +1,6 @@
 [package]
 name = "lume"
-version = "0.4.5"
+version = "0.4.6"
 description = "Monitor local e discreto para agentes de IA no Windows e Linux"
 authors = ["tulerws"]
 edition = "2021"

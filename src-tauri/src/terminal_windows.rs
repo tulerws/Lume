@@ -92,6 +92,8 @@ struct Placement {
     monitor_id: String,
     layered: bool,
     ready: bool,
+    configured: bool,
+    presented: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +246,8 @@ impl TerminalWindows {
             monitor_id: resolved_monitor_id.clone(),
             layered: false,
             ready: false,
+            configured: false,
+            presented: false,
         };
 
         self.placements
@@ -275,9 +279,7 @@ impl TerminalWindows {
                 .on_page_load(move |window, payload| {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         ready_registry.mark_ready(&ready_label);
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("lume://terminal-windows-changed", ());
+                        ready_registry.present_if_ready(&window, &ready_label);
                     }
                 })
                 .build()
@@ -323,20 +325,11 @@ impl TerminalWindows {
             x,
             y,
         );
-        if let Ok(mut placements) = self.placements.lock() {
-            if let Some(placement) = placements.get_mut(&label) {
-                placement.layered = layered;
-            }
-        }
         if !layered {
             overlay::move_to(&window, x, y, Some(&resolved_monitor_id))?;
         }
-        window.show().map_err(|error| {
-            self.remove(&label);
-            let _ = window.close();
-            error.to_string()
-        })?;
-        let _ = window.set_focus();
+        self.mark_configured(&label, layered);
+        self.present_if_ready(&window, &label);
         Ok(label)
     }
 
@@ -834,6 +827,44 @@ impl TerminalWindows {
             }
         }
     }
+
+    fn mark_configured(&self, label: &str, layered: bool) {
+        if let Ok(mut placements) = self.placements.lock() {
+            if let Some(placement) = placements.get_mut(label) {
+                placement.layered = layered;
+                placement.configured = true;
+            }
+        }
+    }
+
+    fn present_if_ready(&self, window: &tauri::WebviewWindow, label: &str) {
+        let should_present = self
+            .placements
+            .lock()
+            .ok()
+            .and_then(|mut placements| {
+                let placement = placements.get_mut(label)?;
+                if !placement.ready || !placement.configured || placement.presented {
+                    return Some(false);
+                }
+                placement.presented = true;
+                Some(true)
+            })
+            .unwrap_or(false);
+        if !should_present {
+            return;
+        }
+        if window.show().is_err() {
+            if let Ok(mut placements) = self.placements.lock() {
+                if let Some(placement) = placements.get_mut(label) {
+                    placement.presented = false;
+                }
+            }
+            return;
+        }
+        let _ = window.set_focus();
+        emit_windows_changed(window.app_handle());
+    }
 }
 
 fn relative_window_position(window: &tauri::WebviewWindow) -> Option<(i32, i32)> {
@@ -1209,6 +1240,8 @@ mod tests {
             monitor_id: "0:primary".into(),
             layered: false,
             ready: true,
+            configured: true,
+            presented: true,
         }
     }
 

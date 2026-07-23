@@ -78,6 +78,8 @@
     | "error";
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const isLinux = typeof navigator !== "undefined" &&
+    navigator.userAgent.toLowerCase().includes("linux");
   const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
   const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
   const compactSize = { width: 78, height: 46 };
@@ -475,7 +477,7 @@
             Math.max(0, Math.round((monitor.size.width - target.width * scale) / 2)),
           y:
             preferences.overlayY ??
-            (navigator.userAgent.toLowerCase().includes("linux") ? Math.round(44 * scale) : 12),
+            (isLinux ? Math.round(44 * scale) : 12),
         };
         overlayReady = true;
       }
@@ -508,10 +510,12 @@
     await animateWindowSize(false);
     expanded = false;
     compactAnchorPosition = null;
-    morphing = null;
     selectedId = null;
     view = "sessions";
     launcherOpen = false;
+    await tick();
+    morphing = null;
+    void remapCompactSurface();
   }
 
   async function animateWindowSize(opening: boolean) {
@@ -591,6 +595,23 @@
           );
         }
       });
+  }
+
+  async function remapCompactSurface() {
+    if (!isTauri || !isLinux) return;
+    const currentWindow = getCurrentWindow();
+    try {
+      await currentWindow.hide();
+      await currentWindow.setSize(new LogicalSize(compactSize.width, compactSize.height));
+      await moveOverlay(
+        overlayPosition.x,
+        overlayPosition.y,
+        false,
+        preferences.monitorId,
+      );
+    } finally {
+      await currentWindow.show().catch(() => undefined);
+    }
   }
 
   function clampOverlayPosition(
