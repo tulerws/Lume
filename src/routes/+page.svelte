@@ -154,12 +154,14 @@
   let suppressCompactToggle = false;
   let dragState: {
     pointerId: number;
-    startX: number;
-    startY: number;
-    originX: number;
-    originY: number;
+    grabX: number;
+    grabY: number;
   } | null = null;
   let moveFrame: number | null = null;
+  let pendingOverlayMove: { x: number; y: number } | null = null;
+  let overlayMoveTask: Promise<void> | null = null;
+  let pendingMorphGeometry: { width: number; height: number; x: number; y: number } | null = null;
+  let morphGeometryTask: Promise<void> | null = null;
   let systemDark = $state(false);
 
   function tr(english: string, portuguese: string) {
@@ -193,13 +195,13 @@
         overlayPosition = position;
         void Promise.all([
           getCurrentWindow().setSize(new LogicalSize(target.width, target.height)),
-          moveOverlay(position.x, position.y, false),
+          moveOverlay(position.x, position.y, false, preferences.monitorId),
         ]).catch(() => undefined);
       }
     };
 
     const observer = new ResizeObserver(() => {
-      if (!expanded || morphing) return;
+      if (!expanded || morphing || dragging) return;
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = null;
@@ -438,13 +440,31 @@
     if (!isTauri) return;
     try {
       const found = await availableMonitors();
-      monitors = found.map((monitor, index) => ({
-        id: monitor.name ?? `monitor-${index}`,
-        label: monitor.name ?? `Monitor ${index + 1}`,
-      }));
+      const totals = new Map<string, number>();
+      for (const monitor of found) {
+        const name = monitor.name ?? "";
+        totals.set(name, (totals.get(name) ?? 0) + 1);
+      }
+      const occurrences = new Map<string, number>();
+      monitors = found.map((monitor, index) => {
+        const name = monitor.name ?? "";
+        const occurrence = (occurrences.get(name) ?? 0) + 1;
+        occurrences.set(name, occurrence);
+        const label = name || `Monitor ${index + 1}`;
+        return {
+          id: `${index}:${name}`,
+          label: (totals.get(name) ?? 0) > 1 ? `${label} (${occurrence})` : label,
+        };
+      });
     } catch {
       monitors = [];
     }
+  }
+
+  function resolvedMonitorOption(monitorId?: string) {
+    if (!monitorId) return "";
+    if (monitors.some((monitor) => monitor.id === monitorId)) return monitorId;
+    return monitors.find((monitor) => monitor.id.endsWith(`:${monitorId}`))?.id ?? "";
   }
 
   async function positionWindow(resetPosition = false) {
@@ -457,10 +477,11 @@
       const found = await availableMonitors();
       const configured = preferences.monitorId
         ? found.find((monitor, index) =>
-            (monitor.name ?? `monitor-${index}`) === preferences.monitorId,
+            `${index}:${monitor.name ?? ""}` === preferences.monitorId ||
+            monitor.name === preferences.monitorId,
           )
         : undefined;
-      const monitor = configured ?? (await primaryMonitor());
+      const monitor = configured ?? (await primaryMonitor()) ?? found[0];
       if (!monitor) return;
       const scale = monitor.scaleFactor || 1;
       monitorBounds = { width: monitor.size.width, height: monitor.size.height, scale };
@@ -471,12 +492,17 @@
             Math.max(0, Math.round((monitor.size.width - target.width * scale) / 2)),
           y:
             preferences.overlayY ??
-            (navigator.userAgent.toLowerCase().includes("linux") ? Math.round(44 * scale) : 12),
+            Math.round(
+              (navigator.userAgent.toLowerCase().includes("linux") ? 44 : 12) * scale,
+            ),
         };
         overlayReady = true;
       }
       overlayPosition = clampOverlayPosition(overlayPosition.x, overlayPosition.y, target);
-      await moveOverlay(overlayPosition.x, overlayPosition.y, false);
+      compactAnchorPosition = expanded
+        ? compactPositionFromExpanded(overlayPosition, target)
+        : { ...overlayPosition };
+      await moveOverlay(overlayPosition.x, overlayPosition.y, false, preferences.monitorId);
     } catch {
       // Alguns compositores Wayland ignoram posicionamento solicitado pelo cliente.
     }
@@ -488,6 +514,7 @@
       return;
     }
     if (morphing) return;
+    paletteOpen = false;
     if (!expanded) {
       compactAnchorPosition = { ...overlayPosition };
       morphing = "opening";
@@ -512,10 +539,20 @@
 
   async function animateWindowSize(opening: boolean) {
     const expandedTarget = currentExpandedSize();
-    const compactTargetPosition = compactAnchorPosition ??
+    const compactCandidate = compactAnchorPosition ??
       compactPositionFromExpanded(overlayPosition, expandedTarget);
-    const expandedTargetPosition = expandedPositionFromCompact(
+    const compactTargetPosition = clampOverlayPosition(
+      compactCandidate.x,
+      compactCandidate.y,
+      compactSize,
+    );
+    const expandedCandidate = expandedPositionFromCompact(
       compactTargetPosition,
+      expandedTarget,
+    );
+    const expandedTargetPosition = clampOverlayPosition(
+      expandedCandidate.x,
+      expandedCandidate.y,
       expandedTarget,
     );
     const from = opening ? compactSize : expandedTarget;
@@ -531,7 +568,7 @@
     const currentWindow = getCurrentWindow();
     const startedAt = performance.now();
     await new Promise<void>((resolve) => {
-      const frame = async (now: number) => {
+      const frame = (now: number) => {
         const linear = Math.min(1, (now - startedAt) / duration);
         const eased = linear < 0.5
           ? 4 * linear * linear * linear
@@ -542,30 +579,51 @@
         const height = Math.round(from.height + (to.height - from.height) * eased);
         const x = Math.round(fromPosition.x + (toPosition.x - fromPosition.x) * eased);
         const y = Math.round(fromPosition.y + (toPosition.y - fromPosition.y) * eased);
-        try {
-          await Promise.all([
-            currentWindow.setSize(new LogicalSize(width, height)),
-            moveOverlay(x, y, false),
-          ]);
-          overlayPosition = { x, y };
-        } catch {
-          resolve();
-          return;
-        }
+        queueMorphGeometry(width, height, x, y);
+        overlayPosition = { x, y };
         if (linear < 1) {
-          requestAnimationFrame((next) => void frame(next));
+          requestAnimationFrame(frame);
         } else {
           resolve();
         }
       };
-      requestAnimationFrame((now) => void frame(now));
+      requestAnimationFrame(frame);
     });
+    while (morphGeometryTask) await morphGeometryTask;
     await Promise.allSettled([
       currentWindow.setSize(new LogicalSize(to.width, to.height)),
-      moveOverlay(toPosition.x, toPosition.y, false),
+      moveOverlay(toPosition.x, toPosition.y, false, preferences.monitorId),
     ]);
     overlayPosition = { ...toPosition };
     morphProgress = opening ? 1 : 0;
+  }
+
+  function queueMorphGeometry(width: number, height: number, x: number, y: number) {
+    pendingMorphGeometry = { width, height, x, y };
+    if (morphGeometryTask) return;
+    const currentWindow = getCurrentWindow();
+    morphGeometryTask = (async () => {
+      while (pendingMorphGeometry) {
+        const geometry = pendingMorphGeometry;
+        pendingMorphGeometry = null;
+        await Promise.all([
+          currentWindow.setSize(new LogicalSize(geometry.width, geometry.height)),
+          moveOverlay(geometry.x, geometry.y, false, preferences.monitorId),
+        ]);
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        morphGeometryTask = null;
+        if (pendingMorphGeometry) {
+          queueMorphGeometry(
+            pendingMorphGeometry.width,
+            pendingMorphGeometry.height,
+            pendingMorphGeometry.x,
+            pendingMorphGeometry.y,
+          );
+        }
+      });
   }
 
   function clampOverlayPosition(
@@ -626,12 +684,11 @@
     }
     const target = event.currentTarget as HTMLElement;
     target.setPointerCapture(event.pointerId);
+    suppressCompactToggle = false;
     dragState = {
       pointerId: event.pointerId,
-      startX: event.screenX,
-      startY: event.screenY,
-      originX: overlayPosition.x,
-      originY: overlayPosition.y,
+      grabX: event.clientX * monitorBounds.scale,
+      grabY: event.clientY * monitorBounds.scale,
     };
     dragging = false;
   }
@@ -648,17 +705,38 @@
 
   function moveOverlayDrag(event: PointerEvent) {
     if (!dragState || dragState.pointerId !== event.pointerId) return;
-    const dx = event.screenX - dragState.startX;
-    const dy = event.screenY - dragState.startY;
+    const dx = event.clientX * monitorBounds.scale - dragState.grabX;
+    const dy = event.clientY * monitorBounds.scale - dragState.grabY;
     if (!dragging && Math.hypot(dx, dy) < 3) return;
     dragging = true;
     event.preventDefault();
-    overlayPosition = clampOverlayPosition(dragState.originX + dx, dragState.originY + dy);
+    overlayPosition = clampOverlayPosition(overlayPosition.x + dx, overlayPosition.y + dy);
     if (moveFrame !== null) cancelAnimationFrame(moveFrame);
     moveFrame = requestAnimationFrame(() => {
       moveFrame = null;
-      void moveOverlay(overlayPosition.x, overlayPosition.y, false);
+      queueOverlayMove(overlayPosition.x, overlayPosition.y);
     });
+  }
+
+  function queueOverlayMove(x: number, y: number) {
+    pendingOverlayMove = { x, y };
+    if (overlayMoveTask) return;
+    overlayMoveTask = (async () => {
+      while (pendingOverlayMove) {
+        const next = pendingOverlayMove;
+        pendingOverlayMove = null;
+        await moveOverlay(next.x, next.y, false, preferences.monitorId);
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        overlayMoveTask = null;
+        if (pendingOverlayMove) queueOverlayMove(pendingOverlayMove.x, pendingOverlayMove.y);
+      });
+  }
+
+  async function waitForOverlayMoves() {
+    while (overlayMoveTask) await overlayMoveTask;
   }
 
   async function endOverlayDrag(event: PointerEvent, compact = false) {
@@ -667,6 +745,7 @@
     if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
     dragState = null;
     if (!dragging) return;
+    dragging = false;
     if (compact) suppressCompactToggle = true;
     const persistedPosition = expanded
       ? compactPositionFromExpanded(overlayPosition)
@@ -677,9 +756,17 @@
       overlayX: Math.round(persistedPosition.x),
       overlayY: Math.round(persistedPosition.y),
     };
-    await savePreferences(preferences);
-    await moveOverlay(overlayPosition.x, overlayPosition.y, false);
-    dragging = false;
+    try {
+      queueOverlayMove(overlayPosition.x, overlayPosition.y);
+      await waitForOverlayMoves();
+      await savePreferences(preferences, overlayPosition);
+    } catch {
+      // Keep the current visual position when persistence is temporarily unavailable.
+    }
+  }
+
+  function cancelOverlayDrag(event: PointerEvent) {
+    void endOverlayDrag(event, false);
   }
 
   function openSession(session: AgentSession) {
@@ -855,6 +942,7 @@
               width: terminal.width,
               height: terminal.height,
               groupId: terminal.groupId,
+              monitorId: terminal.monitorId,
             }]
           : [];
       }),
@@ -880,6 +968,7 @@
       width: number;
       height: number;
       groupId?: string;
+      monitorId?: string;
     }> = [];
     try {
       for (const slot of layout.terminals) {
@@ -900,6 +989,7 @@
           width: slot.width,
           height: slot.height,
           groupId: slot.groupId,
+          monitorId: slot.monitorId,
         });
       }
       if (entries.length === 0) {
@@ -931,7 +1021,7 @@
       whiteboardLayouts: preferences.whiteboardLayouts.filter((layout) => layout.id !== id),
       projectProfiles: profiles,
     };
-    await savePreferences(preferences);
+    await savePreferences(preferences, overlayPosition);
     selectedLayoutId = preferences.whiteboardLayouts[0]?.id ?? null;
     layoutName = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)?.name ?? "";
   }
@@ -1233,9 +1323,9 @@
     }
     savingSettings = true;
     try {
-      await savePreferences(preferences);
+      await savePreferences(preferences, overlayPosition);
       if (isTauri) void emit("lume://preferences-changed", preferences);
-      if (key === "monitorId") await positionWindow();
+      if (isTauri) await positionWindow();
     } catch (error) {
       preferences = previous;
       settingsMessageIsError = true;
@@ -1311,7 +1401,7 @@
       overlayX: profile.overlayX ?? preferences.overlayX,
       overlayY: profile.overlayY ?? preferences.overlayY,
     };
-    await savePreferences(preferences);
+    await savePreferences(preferences, overlayPosition);
     if (isTauri) void emit("lume://preferences-changed", preferences);
     await positionWindow(true);
     const layout = preferences.whiteboardLayouts.find(
@@ -1442,7 +1532,7 @@
       onpointerdown={(event) => beginOverlayDrag(event, true)}
       onpointermove={moveOverlayDrag}
       onpointerup={(event) => endOverlayDrag(event, true)}
-      onpointercancel={(event) => endOverlayDrag(event, true)}
+      onpointercancel={cancelOverlayDrag}
       aria-label={tr(`Open Lume, ${activeCount} active agents`, `Abrir Lume, ${activeCount} agentes ativos`)}
     >
       <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={30} />
@@ -1457,7 +1547,7 @@
         onpointerdown={beginOverlayDrag}
         onpointermove={moveOverlayDrag}
         onpointerup={endOverlayDrag}
-        onpointercancel={endOverlayDrag}
+        onpointercancel={cancelOverlayDrag}
       >
         <div class="brand-lockup">
           <LumeMascot status={shellStatus} awake={mascotAwake || dragging} size={32} />
@@ -1498,7 +1588,7 @@
         </div>
       {/if}
 
-      {#if paletteOpen}
+      {#if paletteOpen && !morphing}
         <div class="command-palette-layer" transition:fade={{ duration: 120 }}>
           <button class="command-palette-backdrop" type="button" aria-label={tr("Close command palette", "Fechar paleta de comandos")} onclick={() => (paletteOpen = false)}></button>
           <div class="command-palette" role="dialog" aria-label={tr("Command palette", "Paleta de comandos")}>
@@ -1745,7 +1835,6 @@
           <div class="history-list" in:fade={{ duration: 150 }}>
             <div class="results-intro">
               <strong>{tr("Final responses from your agents", "Respostas finais dos seus agentes")}</strong>
-              <p>{tr("Kept only while Lume is running.", "Mantidas apenas enquanto o Lume está aberto.")}</p>
             </div>
             {#if resultNotes.length > 0}
               <div class="settings-section-label history-label">{tr("Saved notes", "Notas salvas")}</div>
@@ -1968,7 +2057,7 @@
             <label class="field-row">
               <span><strong>{tr("Monitor", "Monitor")}</strong><small>{tr("The primary display is used by default.", "O principal é usado por padrão.")}</small></span>
               <select
-                value={preferences.monitorId ?? ""}
+                value={resolvedMonitorOption(preferences.monitorId)}
                 onchange={(event) =>
                   updatePreference("monitorId", event.currentTarget.value || undefined)}
               >
@@ -2050,7 +2139,7 @@
               </div>
               <label class="field-row">
                 <span><strong>{tr("Profile monitor", "Monitor do perfil")}</strong><small>{tr("Where this project should appear.", "Onde este projeto deve aparecer.")}</small></span>
-                <select value={selectedProjectProfile?.monitorId ?? ""} onchange={(event) => updateSelectedProjectProfile({ monitorId: event.currentTarget.value || undefined })}>
+                <select value={resolvedMonitorOption(selectedProjectProfile?.monitorId)} onchange={(event) => updateSelectedProjectProfile({ monitorId: event.currentTarget.value || undefined })}>
                   <option value="">{tr("Global", "Global")}</option>
                   {#each monitors as monitor}
                     <option value={monitor.id}>{monitor.label}</option>
@@ -2230,20 +2319,22 @@
     border-radius: 999px;
     color: #4e7567;
     background: rgba(249, 251, 250, 0.94);
-    box-shadow: 0 7px 26px rgba(28, 43, 37, 0.17);
-    backdrop-filter: blur(22px) saturate(120%);
+    box-shadow: inset 0 -2px 5px rgba(28, 43, 37, 0.08);
     cursor: pointer;
     touch-action: none;
-    transition: transform 160ms ease, box-shadow 160ms ease;
+    user-select: none;
+    transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
   }
 
   .lume-orb:hover {
-    transform: translateY(1px) scale(1.02);
-    box-shadow: 0 9px 30px rgba(28, 43, 37, 0.2);
+    border-color: rgba(78, 111, 97, 0.32);
+    background: rgba(252, 253, 252, 0.98);
+    box-shadow: inset 0 0 0 2px rgba(78, 111, 97, 0.05);
   }
 
   .lume-orb:active { transform: scale(0.97); }
   .lume-orb.dragging { cursor: grabbing; transform: scale(0.985); }
+  .lume-orb:focus-visible { outline: 2px solid #73877f; outline-offset: -3px; }
 
   .status-permission_required { color: #ae6b24; }
   .status-failed { color: #a84d4d; }
@@ -2275,6 +2366,7 @@
     border-radius: var(--panel-radius);
     color: #26322e;
     background: rgba(249, 251, 250, 0.965);
+    box-shadow: 0 10px 16px -10px rgba(28, 43, 37, 0.25);
   }
 
   .panel-content,
@@ -2303,6 +2395,7 @@
     border-bottom: 1px solid rgba(101, 120, 112, 0.11);
     cursor: grab;
     touch-action: none;
+    user-select: none;
   }
 
   .panel-header.dragging { cursor: grabbing; }
@@ -2359,7 +2452,7 @@
   .launcher-row button:disabled { opacity: 0.45; }
   .launcher-popover > p { margin: 8px 3px; color: #89938f; font-size: 10px; }
   .launcher-popover .launcher-error { color: #a54c4c; }
-  .command-palette-layer { position: absolute; z-index: 12; inset: 0 0 16px; display: grid; place-items: start center; padding-top: 66px; }
+  .command-palette-layer { position: absolute; z-index: 12; inset: 0; display: grid; place-items: start center; padding-top: 66px; }
   .command-palette-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(21, 31, 27, 0.2); backdrop-filter: blur(3px); cursor: default; }
   .command-palette { position: relative; width: calc(100% - 30px); overflow: hidden; border: 1px solid rgba(89, 111, 101, 0.16); border-radius: 15px; background: rgba(250, 252, 251, 0.98); box-shadow: 0 18px 45px rgba(24, 38, 32, 0.24); }
   .command-search { height: 43px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(91, 112, 102, 0.1); }
@@ -2396,13 +2489,16 @@
   .session-list { padding: 5px 14px 8px; }
 
   .session-row {
+    margin: 0 -6px;
+    padding: 0 6px;
     border-bottom: 1px solid rgba(105, 123, 115, 0.1);
+    border-radius: 12px;
     transition: background 160ms ease;
   }
 
   .session-row:last-child { border-bottom: 0; }
   .session-row:hover,
-  .session-row.selected { margin: 0 -6px; padding: 0 6px; border-radius: 12px; background: rgba(76, 104, 92, 0.045); }
+  .session-row.selected { background: rgba(76, 104, 92, 0.045); }
   .session-row.attention { background: linear-gradient(90deg, rgba(183, 111, 36, 0.07), transparent 75%); }
 
   .session-summary {
@@ -2761,6 +2857,16 @@
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
   .overlay-shell.dark .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .terminate-agent-control > button { color: #d68d8d; }
+  .overlay-shell.dark .terminate-agent-control.confirming { border-color: rgba(214, 141, 141, 0.18); background: rgba(214, 141, 141, 0.05); }
+  .overlay-shell.dark .terminate-agent-control.confirming span { color: #c9b3ae; }
+  .overlay-shell.dark .terminate-agent-control.confirming button { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.05); }
+  .overlay-shell.dark .terminate-agent-control.confirming button.danger { color: #d68d8d; border-color: rgba(214, 141, 141, 0.28); }
+  .overlay-shell.dark .integration-row button,
+  .overlay-shell.dark .update-main button:not(.update-available) { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); }
+  .overlay-shell.dark .integration-row button.connected { color: #93a49c; }
+  .overlay-shell.dark .launcher-row button { color: #b9c8c0; background: rgba(222, 233, 228, 0.06); }
+  .overlay-shell.dark .launcher-row button:hover { background: rgba(222, 233, 228, 0.11); }
   .overlay-shell.dark .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
   .overlay-shell.dark .command-palette { border-color: rgba(207, 223, 215, 0.13); background: rgba(27, 34, 31, 0.985); }
   .overlay-shell.dark .command-search { border-color: rgba(207, 223, 215, 0.09); }
@@ -2777,4 +2883,5 @@
   .overlay-shell.dark .saved-note strong { color: #d7e2dc; }
   .overlay-shell.dark .saved-note p,
   .overlay-shell.dark .result-artifacts span { color: #aab8b1; }
+  .overlay-shell.dark footer button.has-update::after { border-color: rgba(27, 34, 31, 0.96); }
 </style>

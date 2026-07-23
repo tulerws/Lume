@@ -178,6 +178,7 @@ pub struct WhiteboardLayoutTerminal {
     pub width: i32,
     pub height: i32,
     pub group_id: Option<String>,
+    pub monitor_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

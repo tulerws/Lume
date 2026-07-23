@@ -1,6 +1,10 @@
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{ffi::CString, sync::OnceLock};
+    use std::{
+        collections::HashMap,
+        ffi::CString,
+        sync::{Mutex, OnceLock},
+    };
 
     use gtk::{gdk::prelude::MonitorExt, glib::translate::ToGlibPtr};
     use libloading::Library;
@@ -86,12 +90,62 @@ mod linux {
         API.get_or_init(|| unsafe { LayerApi::load() }).as_ref()
     }
 
-    pub fn configure(
+    fn layer_monitors() -> &'static Mutex<HashMap<String, (String, f64)>> {
+        static MONITORS: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
+        MONITORS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn remember_layer_monitor(window: &WebviewWindow, monitor_id: Option<&str>, scale: f64) {
+        if let Ok(mut monitors) = layer_monitors().lock() {
+            monitors.insert(
+                window.label().to_string(),
+                (monitor_id.unwrap_or_default().to_string(), scale.max(1.0)),
+            );
+        }
+    }
+
+    fn cached_layer_scale(window: &WebviewWindow, monitor_id: Option<&str>) -> Option<f64> {
+        let requested = monitor_id.unwrap_or_default();
+        layer_monitors()
+            .lock()
+            .ok()
+            .and_then(|monitors| monitors.get(window.label()).cloned())
+            .filter(|(configured, _)| configured == requested)
+            .map(|(_, scale)| scale)
+    }
+
+    pub fn forget_window(label: &str) {
+        if let Ok(mut monitors) = layer_monitors().lock() {
+            monitors.remove(label);
+        }
+    }
+
+    fn monitor_index(window: &WebviewWindow, monitor_id: Option<&str>) -> Option<usize> {
+        let id = monitor_id?;
+        let monitors = window.available_monitors().ok()?;
+        if let Some((index, expected_name)) = id.split_once(':') {
+            let index = index.parse::<usize>().ok()?;
+            let monitor = monitors.get(index)?;
+            let actual_name = monitor.name().map(String::as_str).unwrap_or("");
+            if expected_name.is_empty() || expected_name == actual_name {
+                return Some(index);
+            }
+        }
+        monitors.iter().position(|monitor| {
+            monitor
+                .name()
+                .as_ref()
+                .is_some_and(|name| name.as_str() == id)
+        })
+    }
+
+    fn configure_layer(
         window: &WebviewWindow,
         show_over_fullscreen: bool,
         monitor_id: Option<&str>,
         position_x: Option<i32>,
         position_y: Option<i32>,
+        namespace: &str,
     ) -> bool {
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
             return false;
@@ -114,24 +168,18 @@ mod linux {
             }
             let mut left_margin = 0;
             let mut top_margin = 12;
+            let mut layer_scale = window.scale_factor().unwrap_or(1.0).max(1.0);
             if let Some(display) = gtk::gdk::Display::default() {
-                let selected_index = monitor_id.and_then(|id| {
-                    window.available_monitors().ok().and_then(|monitors| {
-                        monitors.iter().position(|monitor| {
-                            monitor
-                                .name()
-                                .as_ref()
-                                .is_some_and(|name| name.as_str() == id)
-                        })
-                    })
-                });
+                let selected_index = monitor_index(window, monitor_id);
                 let monitor = selected_index
                     .and_then(|index| display.monitor(index as i32))
-                    .or_else(|| display.primary_monitor());
+                    .or_else(|| display.primary_monitor())
+                    .or_else(|| display.monitor(0));
                 if let Some(monitor) = monitor {
                     let geometry = monitor.geometry();
                     let workarea = monitor.workarea();
-                    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+                    let scale = f64::from(monitor.scale_factor()).max(1.0);
+                    layer_scale = scale;
                     let window_width = window
                         .outer_size()
                         .map(|size| (f64::from(size.width) / scale).round() as i32)
@@ -162,11 +210,46 @@ mod linux {
             (api.set_margin)(pointer, 2, top_margin);
             (api.set_exclusive_zone)(pointer, -1);
             (api.set_keyboard_mode)(pointer, 2);
-            if let Ok(namespace) = CString::new("lume") {
+            if let Ok(namespace) = CString::new(namespace) {
                 (api.set_namespace)(pointer, namespace.as_ptr());
             }
+            remember_layer_monitor(window, monitor_id, layer_scale);
         }
         true
+    }
+
+    pub fn configure(
+        window: &WebviewWindow,
+        show_over_fullscreen: bool,
+        monitor_id: Option<&str>,
+        position_x: Option<i32>,
+        position_y: Option<i32>,
+    ) -> bool {
+        configure_layer(
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            position_x,
+            position_y,
+            "lume",
+        )
+    }
+
+    pub fn configure_terminal(
+        window: &WebviewWindow,
+        show_over_fullscreen: bool,
+        monitor_id: Option<&str>,
+        position_x: i32,
+        position_y: i32,
+    ) -> bool {
+        configure_layer(
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            Some(position_x),
+            Some(position_y),
+            &format!("lume-{}", window.label()),
+        )
     }
 
     pub fn move_to(window: &WebviewWindow, x: i32, y: i32, monitor_id: Option<&str>) -> bool {
@@ -186,34 +269,87 @@ mod linux {
             if (api.is_layer_window)(pointer) == 0 {
                 return false;
             }
+            if let Some(scale) = cached_layer_scale(window, monitor_id) {
+                (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
+                (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+                return true;
+            }
             if let Some(display) = gtk::gdk::Display::default() {
-                let selected_index = monitor_id.and_then(|id| {
-                    window.available_monitors().ok().and_then(|monitors| {
-                        monitors.iter().position(|monitor| {
-                            monitor
-                                .name()
-                                .as_ref()
-                                .is_some_and(|name| name.as_str() == id)
-                        })
-                    })
-                });
+                let selected_index = monitor_index(window, monitor_id);
                 let monitor = selected_index
                     .and_then(|index| display.monitor(index as i32))
-                    .or_else(|| display.primary_monitor());
+                    .or_else(|| display.primary_monitor())
+                    .or_else(|| display.monitor(0));
                 if let Some(monitor) = monitor {
                     (api.set_monitor)(pointer, monitor.to_glib_none().0);
+                    let scale = f64::from(monitor.scale_factor()).max(1.0);
+                    remember_layer_monitor(window, monitor_id, scale);
+                    (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
+                    (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+                    return true;
                 }
             }
             let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
-            (api.set_anchor)(pointer, 0, 1);
-            (api.set_anchor)(pointer, 1, 0);
-            (api.set_anchor)(pointer, 2, 1);
-            (api.set_anchor)(pointer, 3, 0);
             (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
             (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
         }
         true
     }
+}
+
+pub fn forget_window(label: &str) {
+    #[cfg(target_os = "linux")]
+    linux::forget_window(label);
+    #[cfg(not(target_os = "linux"))]
+    let _ = label;
+}
+
+pub(crate) fn monitor_identifier(monitors: &[tauri::Monitor], monitor: &tauri::Monitor) -> String {
+    let index = monitors
+        .iter()
+        .position(|candidate| {
+            candidate.position() == monitor.position()
+                && candidate.size() == monitor.size()
+                && candidate.name() == monitor.name()
+        })
+        .unwrap_or(0);
+    format!(
+        "{index}:{}",
+        monitor.name().map(String::as_str).unwrap_or_default()
+    )
+}
+
+pub(crate) fn select_monitor(
+    monitors: &[tauri::Monitor],
+    primary: Option<tauri::Monitor>,
+    monitor_id: Option<&str>,
+) -> Option<tauri::Monitor> {
+    if let Some(id) = monitor_id {
+        if let Some((index, expected_name)) = id.split_once(':') {
+            if let Ok(index) = index.parse::<usize>() {
+                if let Some(monitor) = monitors.get(index) {
+                    let actual_name = monitor.name().map(String::as_str).unwrap_or("");
+                    if expected_name.is_empty() || expected_name == actual_name {
+                        return Some(monitor.clone());
+                    }
+                }
+            }
+        }
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|monitor| monitor.name().is_some_and(|name| name == id))
+        {
+            return Some(monitor.clone());
+        }
+    }
+    primary
+        .or_else(|| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.position().x == 0)
+                .cloned()
+        })
+        .or_else(|| monitors.first().cloned())
 }
 
 pub fn configure(
@@ -246,6 +382,36 @@ pub fn configure(
     }
 }
 
+pub fn configure_terminal(
+    window: &tauri::WebviewWindow,
+    show_over_fullscreen: bool,
+    monitor_id: Option<&str>,
+    position_x: i32,
+    position_y: i32,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::configure_terminal(
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            position_x,
+            position_y,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            window,
+            show_over_fullscreen,
+            monitor_id,
+            position_x,
+            position_y,
+        );
+        false
+    }
+}
+
 pub fn default_position(
     window: &tauri::WebviewWindow,
     monitor_id: Option<&str>,
@@ -256,15 +422,7 @@ pub fn default_position(
     let primary = window
         .primary_monitor()
         .map_err(|error| error.to_string())?;
-    let monitor = monitor_id
-        .and_then(|id| {
-            monitors
-                .iter()
-                .find(|monitor| monitor.name().is_some_and(|name| name == id))
-        })
-        .or(primary.as_ref())
-        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
-        .or_else(|| monitors.first())
+    let monitor = select_monitor(&monitors, primary, monitor_id)
         .ok_or_else(|| "Nenhum monitor disponível".to_string())?;
     let window_size = window.outer_size().map_err(|error| error.to_string())?;
     let scale = monitor.scale_factor().max(1.0);
@@ -290,14 +448,10 @@ pub fn move_to(
     let monitors = window
         .available_monitors()
         .map_err(|error| error.to_string())?;
-    let monitor = monitor_id
-        .and_then(|id| {
-            monitors
-                .iter()
-                .find(|monitor| monitor.name().is_some_and(|name| name == id))
-        })
-        .or_else(|| monitors.iter().find(|monitor| monitor.position().x == 0))
-        .or_else(|| monitors.first());
+    let primary = window
+        .primary_monitor()
+        .map_err(|error| error.to_string())?;
+    let monitor = select_monitor(&monitors, primary, monitor_id);
     let Some(monitor) = monitor else {
         return Err("Nenhum monitor disponível".into());
     };
