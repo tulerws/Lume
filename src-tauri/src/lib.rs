@@ -347,8 +347,10 @@ fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
 #[tauri::command]
 fn display_backend() -> &'static str {
     #[cfg(target_os = "linux")]
-    if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
-        return "xwayland-fallback";
+    match std::env::var("LUME_LINUX_BACKEND").ok().as_deref() {
+        Some("xwayland-fallback") => return "xwayland-fallback",
+        Some("native-gnome") => return "native-gnome",
+        _ => {}
     }
     "native"
 }

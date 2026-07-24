@@ -416,13 +416,17 @@ mod linux {
         position_y: Option<i32>,
         namespace: &str,
     ) -> bool {
-        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
+        let backend = std::env::var("LUME_LINUX_BACKEND").ok();
+        if backend.as_deref() == Some("xwayland-fallback") {
             if let Ok(gtk_window) = window.gtk_window() {
                 gtk_window.set_type_hint(gtk::gdk::WindowTypeHint::Dock);
                 gtk_window.set_decorated(false);
                 gtk_window.set_keep_above(true);
                 gtk_window.set_skip_taskbar_hint(true);
             }
+            return false;
+        }
+        if backend.as_deref() == Some("native-gnome") {
             return false;
         }
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {

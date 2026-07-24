@@ -24,6 +24,7 @@
     submitPrompt,
     terminateSession,
     undockTerminalWindow,
+    type DisplayBackend,
   } from "$lib/lume";
 
   const currentWindow = getCurrentWindow();
@@ -40,7 +41,7 @@
   let lastMove: { x: number; y: number } | null = null;
   let moveSyncRunning = false;
   let finalizeRequested = false;
-  let displayBackend = $state<"native" | "xwayland-fallback">("native");
+  let displayBackend = $state<DisplayBackend>("native");
   let nativeDragActive = false;
   let dragState: {
     pointerId: number;
@@ -384,6 +385,25 @@
           nativeDragActive = false;
           dragging = false;
           message = String(error).replace(/^Error:\s*/, "");
+        });
+      return;
+    }
+    if (displayBackend === "native-gnome") {
+      event.preventDefault();
+      dragging = true;
+      nativeDragActive = true;
+      dockMovingLabel = null;
+      dockPreview = null;
+      void currentWindow
+        .startDragging()
+        .catch((error) => {
+          message = String(error).replace(/^Error:\s*/, "");
+        })
+        .finally(() => {
+          setTimeout(() => {
+            nativeDragActive = false;
+            dragging = false;
+          }, 300);
         });
       return;
     }

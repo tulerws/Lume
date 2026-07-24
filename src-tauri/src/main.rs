@@ -23,6 +23,18 @@ fn should_use_xwayland_fallback(
 }
 
 #[cfg(target_os = "linux")]
+fn should_use_native_gnome_drag(session_type: &str, desktop: &str) -> bool {
+    let desktop_parts = desktop.split([':', ';']).map(str::trim).collect::<Vec<_>>();
+    let is_gnome = desktop_parts.iter().any(|part| {
+        part.eq_ignore_ascii_case("gnome") || part.to_lowercase().starts_with("gnome-")
+    });
+    let is_ubuntu_or_pop = desktop_parts
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("ubuntu") || part.eq_ignore_ascii_case("pop"));
+    session_type.eq_ignore_ascii_case("wayland") && is_gnome && is_ubuntu_or_pop
+}
+
+#[cfg(target_os = "linux")]
 fn configure_linux_display_backend() {
     let force_native_wayland = std::env::var("LUME_FORCE_NATIVE_WAYLAND")
         .ok()
@@ -43,6 +55,9 @@ fn configure_linux_display_backend() {
         std::env::set_var("GDK_BACKEND", "x11");
         std::env::set_var("LUME_LINUX_BACKEND", "xwayland-fallback");
         eprintln!("Lume: usando XWayland para posicionamento compatível com GNOME");
+    } else if should_use_native_gnome_drag(&session_type, &desktop) {
+        std::env::set_var("LUME_LINUX_BACKEND", "native-gnome");
+        eprintln!("Lume: usando Wayland nativo com arraste do GNOME");
     }
 }
 
@@ -72,7 +87,7 @@ fn main() {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::should_use_xwayland_fallback;
+    use super::{should_use_native_gnome_drag, should_use_xwayland_fallback};
 
     #[test]
     fn uses_xwayland_on_fedora_gnome_wayland() {
@@ -98,6 +113,10 @@ mod tests {
             Some(":1"),
             false
         ));
+        assert!(should_use_native_gnome_drag("wayland", "ubuntu:GNOME"));
+        assert!(should_use_native_gnome_drag("wayland", "pop:GNOME"));
+        assert!(!should_use_native_gnome_drag("wayland", "COSMIC"));
+        assert!(!should_use_native_gnome_drag("x11", "ubuntu:GNOME"));
     }
 
     #[test]

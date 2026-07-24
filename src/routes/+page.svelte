@@ -43,6 +43,7 @@
     decidePermission,
     defaultPreferences,
     deleteResultNote,
+    loadDisplayBackend,
     loadHistory,
     loadResultNotes,
     loadIntegrationStatuses,
@@ -67,6 +68,7 @@
     takePendingShortcutAction,
     terminateSession,
     revealPluginDirectory,
+    type DisplayBackend,
   } from "$lib/lume";
 
   type View = "sessions" | "board" | "history" | "settings";
@@ -160,6 +162,7 @@
   let compactAnchorPosition: { x: number; y: number } | null = null;
   let overlayReady = $state(false);
   let monitorBounds = $state({ x: 0, y: 0, width: 1920, height: 1080, scale: 1 });
+  let displayBackend = $state<DisplayBackend>("native");
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
@@ -309,9 +312,13 @@
     updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
 
     void (async () => {
-      const nextPreferences = await loadPreferences();
+      const [nextPreferences, nextDisplayBackend] = await Promise.all([
+        loadPreferences(),
+        loadDisplayBackend(),
+      ]);
       if (disposed) return;
       preferences = nextPreferences;
+      displayBackend = nextDisplayBackend;
       try {
         overlayPosition = await loadOverlayPosition();
         overlayReady = true;
@@ -677,7 +684,7 @@
   async function setOverlaySurfaceSize(width: number, height: number) {
     const size = new LogicalSize(width, height);
     const tasks: Promise<unknown>[] = [getCurrentWindow().setSize(size)];
-    if (isLinux) {
+    if (isLinux && displayBackend !== "native-gnome") {
       tasks.push(
         getCurrentWebview().setSize(size),
         resizeOverlaySurface(width, height),
@@ -746,6 +753,18 @@
   function beginOverlayDrag(event: PointerEvent, compact = false) {
     if (!isTauri || !overlayReady || event.button !== 0 || morphing) return;
     if (!compact && (event.target as HTMLElement).closest("button, input, select, textarea")) {
+      return;
+    }
+    if (displayBackend === "native-gnome") {
+      dragging = true;
+      void getCurrentWindow()
+        .startDragging()
+        .catch(() => undefined)
+        .finally(() => {
+          setTimeout(() => {
+            dragging = false;
+          }, 120);
+        });
       return;
     }
     const target = event.currentTarget as HTMLElement;

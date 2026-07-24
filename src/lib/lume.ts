@@ -209,7 +209,9 @@ export async function loadPreferences(): Promise<Preferences> {
   }
 }
 
-export async function loadDisplayBackend(): Promise<"native" | "xwayland-fallback"> {
+export type DisplayBackend = "native" | "native-gnome" | "xwayland-fallback";
+
+export async function loadDisplayBackend(): Promise<DisplayBackend> {
   if (!inDesktop()) return "native";
   try {
     return await invoke("display_backend");

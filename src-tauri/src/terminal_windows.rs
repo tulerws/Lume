@@ -307,6 +307,7 @@ impl TerminalWindows {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         ready_registry.mark_ready(&ready_label);
                         ready_registry.present_if_ready(&window, &ready_label);
+                        emit_windows_changed(window.app_handle());
                     }
                 })
                 .build()
@@ -1013,7 +1014,8 @@ impl TerminalWindows {
             .ok()
             .and_then(|mut placements| {
                 let placement = placements.get_mut(label)?;
-                if !placement.ready || !placement.configured || placement.presented {
+                let ready_for_platform = placement.ready || cfg!(target_os = "windows");
+                if !ready_for_platform || !placement.configured || placement.presented {
                     return Some(false);
                 }
                 placement.presented = true;

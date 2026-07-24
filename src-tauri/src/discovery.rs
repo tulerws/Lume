@@ -57,7 +57,6 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
         true,
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always)
             .without_tasks(),
     );
     let own_pid = get_current_pid().ok();
@@ -98,6 +97,19 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
             Some((*pid, process.parent(), agent, agent_label))
         })
         .collect::<Vec<_>>();
+    let candidate_pids = candidates
+        .iter()
+        .map(|(pid, _, _, _)| *pid)
+        .collect::<Vec<_>>();
+    if !candidate_pids.is_empty() {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&candidate_pids),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cwd(UpdateKind::Always)
+                .without_tasks(),
+        );
+    }
     let agents_by_pid = candidates
         .iter()
         .map(|(pid, _, agent, label)| (*pid, (agent.clone(), label.clone())))
