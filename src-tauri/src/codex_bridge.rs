@@ -15,7 +15,7 @@ use tungstenite::{accept, connect, stream::MaybeTlsStream, Message, WebSocket};
 use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        PermissionRequest, SessionSource,
+        PermissionRequest, SessionActivity, SessionSource,
     },
     event_server,
     state::{now_millis, AppState},
@@ -229,7 +229,8 @@ fn prompt_connection(
             "method": "initialize",
             "id": 1,
             "params": {
-                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") }
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
             }
         }),
     )?;
@@ -375,6 +376,9 @@ fn intercept_server_message(
         return approval_response(&value, method, state, app, profiles).map(Some);
     }
     remember_response(&value, method, responses);
+    if let Some(event) = activity_event(&value, method) {
+        let _ = event_server::publish_event(state, app, event);
+    }
     if let Some(event) = notification_event(&value, method, profiles, responses) {
         let _ = event_server::publish_event(state, app, event);
     }
@@ -455,6 +459,7 @@ fn approval_response(
             requested_at: now_millis().to_string(),
         }),
         last_response: None,
+        activity: None,
         wait_for_decision: true,
     };
     event_server::publish_event(state, app, event)?;
@@ -529,6 +534,380 @@ fn decision_result(method: &str, action: PermissionAction, params: &Value) -> Va
             PermissionAction::Deny | PermissionAction::OpenSource => "decline",
         }
     })
+}
+
+fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
+    let params = value.get("params")?;
+    let thread_id = text_at(params, "threadId")?;
+    let activity = match method {
+        "item/started" | "item/completed" => {
+            codex_item_activity(thread_id, params.get("item")?, method == "item/completed")?
+        }
+        "item/agentMessage/delta" => {
+            codex_delta_activity(thread_id, params, "message", "Resposta do agente", "delta")?
+        }
+        "item/commandExecution/outputDelta" => {
+            codex_delta_activity(thread_id, params, "command", "Saída do comando", "delta")?
+        }
+        "item/fileChange/outputDelta" => {
+            codex_delta_activity(thread_id, params, "file", "Alteração de arquivos", "delta")?
+        }
+        "item/fileChange/patchUpdated" => {
+            let files = item_files(params);
+            SessionActivity {
+                id: codex_activity_id(thread_id, params)?,
+                kind: "file".into(),
+                title: if files.len() == 1 {
+                    files[0].clone()
+                } else {
+                    format!("{} arquivos alterados", files.len())
+                },
+                detail: first_value_text(params, &["changes"]),
+                status: "running".into(),
+                created_at: now_millis(),
+                files,
+                append_detail: false,
+            }
+        }
+        "item/plan/delta" => {
+            codex_delta_activity(thread_id, params, "plan", "Plano atualizado", "delta")?
+        }
+        "item/reasoning/summaryTextDelta" => codex_delta_activity(
+            thread_id,
+            params,
+            "analysis",
+            "Resumo do raciocínio",
+            "delta",
+        )?,
+        "turn/diff/updated" => {
+            let diff = text_at(params, "diff")?;
+            SessionActivity {
+                id: format!(
+                    "codex:{thread_id}:diff:{}",
+                    text_at(params, "turnId").unwrap_or("turn")
+                ),
+                kind: "file".into(),
+                title: "Alterações da tarefa".into(),
+                detail: Some(truncate_text(diff, 32 * 1024)),
+                status: "running".into(),
+                created_at: now_millis(),
+                files: files_from_diff(diff),
+                append_detail: false,
+            }
+        }
+        "turn/plan/updated" => SessionActivity {
+            id: format!(
+                "codex:{thread_id}:plan:{}",
+                text_at(params, "turnId").unwrap_or("turn")
+            ),
+            kind: "plan".into(),
+            title: "Plano atualizado".into(),
+            detail: Some(plan_text(params)),
+            status: "running".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            append_detail: false,
+        },
+        _ => return None,
+    };
+    Some(HookEvent {
+        event: HookEventKind::Activity,
+        session_id: session_id(thread_id),
+        agent: AgentKind::Codex,
+        agent_label: Some("Codex".into()),
+        project: None,
+        source: None,
+        source_app: None,
+        status_label: None,
+        started_at: None,
+        process_id: None,
+        native_session_id: Some(thread_id.into()),
+        working_directory: None,
+        permission_profile: None,
+        permission: None,
+        last_response: None,
+        activity: Some(activity),
+        wait_for_decision: false,
+    })
+}
+
+fn codex_delta_activity(
+    thread_id: &str,
+    params: &Value,
+    kind: &str,
+    title: &str,
+    detail_key: &str,
+) -> Option<SessionActivity> {
+    Some(SessionActivity {
+        id: codex_activity_id(thread_id, params)?,
+        kind: kind.into(),
+        title: title.into(),
+        detail: first_value_text(params, &[detail_key]),
+        status: "running".into(),
+        created_at: now_millis(),
+        files: Vec::new(),
+        append_detail: true,
+    })
+}
+
+fn codex_activity_id(thread_id: &str, value: &Value) -> Option<String> {
+    text_at(value, "itemId")
+        .or_else(|| text_at(value, "id"))
+        .map(|item_id| format!("codex:{thread_id}:{item_id}"))
+}
+
+fn codex_item_activity(thread_id: &str, item: &Value, completed: bool) -> Option<SessionActivity> {
+    let item_type = text_at(item, "type")?;
+    let item_id = text_at(item, "id")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{item_type}:{}", now_millis()));
+    let status = if item_failed(item) {
+        "failed"
+    } else if completed {
+        "completed"
+    } else {
+        "running"
+    };
+    let (kind, title, detail, files) = match item_type {
+        "commandExecution" => {
+            let command =
+                value_text(item.get("command")).unwrap_or_else(|| "Comando em execução".into());
+            let output = first_value_text(
+                item,
+                &["aggregatedOutput", "output", "stdout", "stderr", "result"],
+            );
+            (
+                if is_test_command(&command) {
+                    "test"
+                } else {
+                    "command"
+                },
+                truncate_text(&command, 240),
+                output,
+                Vec::new(),
+            )
+        }
+        "fileChange" => {
+            let files = item_files(item);
+            let title = if files.is_empty() {
+                "Arquivos alterados".into()
+            } else if files.len() == 1 {
+                files[0].clone()
+            } else {
+                format!("{} arquivos alterados", files.len())
+            };
+            let detail = first_value_text(item, &["diff", "patch", "changes"]);
+            ("file", title, detail, files)
+        }
+        "mcpToolCall" | "toolCall" | "dynamicToolCall" => {
+            let server = text_at(item, "server").unwrap_or("");
+            let tool = text_at(item, "tool")
+                .or_else(|| text_at(item, "name"))
+                .unwrap_or("Ferramenta");
+            let title = if server.is_empty() {
+                tool.into()
+            } else {
+                format!("{server} · {tool}")
+            };
+            let detail = first_value_text(item, &["arguments", "result", "contentItems", "error"]);
+            ("tool", title, detail, Vec::new())
+        }
+        "collabAgentToolCall" => (
+            "tool",
+            format!(
+                "Subagente · {}",
+                text_at(item, "tool").unwrap_or("colaboração")
+            ),
+            first_value_text(item, &["prompt", "agentsStates", "receiverThreadIds"]),
+            Vec::new(),
+        ),
+        "subAgentActivity" => (
+            "tool",
+            format!(
+                "Subagente · {}",
+                text_at(item, "agentPath").unwrap_or("atividade")
+            ),
+            first_value_text(item, &["kind", "agentThreadId"]),
+            Vec::new(),
+        ),
+        "webSearch" => (
+            "tool",
+            "Pesquisa na web".into(),
+            first_value_text(item, &["query", "action"]),
+            Vec::new(),
+        ),
+        "agentMessage" => (
+            "message",
+            "Resposta do agente".into(),
+            first_value_text(item, &["text", "content"]),
+            Vec::new(),
+        ),
+        "userMessage" => (
+            "prompt",
+            "Prompt enviado".into(),
+            user_message_text(item),
+            Vec::new(),
+        ),
+        "plan" => (
+            "plan",
+            "Plano atualizado".into(),
+            first_value_text(item, &["text", "plan"]),
+            Vec::new(),
+        ),
+        "reasoning" => (
+            "analysis",
+            if completed {
+                "Análise concluída".into()
+            } else {
+                "Analisando a solicitação".into()
+            },
+            first_value_text(item, &["summary"]),
+            Vec::new(),
+        ),
+        _ => return None,
+    };
+    Some(SessionActivity {
+        id: format!("codex:{thread_id}:{item_id}"),
+        kind: kind.into(),
+        title,
+        detail: detail.map(|detail| truncate_text(&detail, 16 * 1024)),
+        status: status.into(),
+        created_at: now_millis(),
+        files,
+        append_detail: false,
+    })
+}
+
+fn user_message_text(item: &Value) -> Option<String> {
+    let content = item.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|part| {
+            text_at(part, "text")
+                .or_else(|| text_at(part, "url"))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn files_from_diff(diff: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in diff.lines() {
+        let Some(path) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+        else {
+            continue;
+        };
+        if path != "/dev/null" && !files.iter().any(|existing| existing == path) {
+            files.push(path.to_string());
+        }
+    }
+    files.truncate(48);
+    files
+}
+
+fn plan_text(params: &Value) -> String {
+    let mut lines = text_at(params, "explanation")
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(plan) = params.get("plan").and_then(Value::as_array) {
+        lines.extend(plan.iter().filter_map(|entry| {
+            let step = text_at(entry, "step")?;
+            let marker = match text_at(entry, "status") {
+                Some("completed") => "✓",
+                Some("inProgress") => "●",
+                _ => "○",
+            };
+            Some(format!("{marker} {step}"))
+        }));
+    }
+    truncate_text(&lines.join("\n"), 16 * 1024)
+}
+
+fn item_failed(item: &Value) -> bool {
+    matches!(
+        text_at(item, "status"),
+        Some("failed" | "error" | "declined" | "cancelled")
+    ) || item.get("error").is_some_and(|error| !error.is_null())
+}
+
+fn is_test_command(command: &str) -> bool {
+    let command = command.to_lowercase();
+    [
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "cargo test",
+        "dotnet test",
+        "go test",
+        "flutter test",
+        "pytest",
+        "vitest",
+        "jest",
+        "mvn test",
+        "gradle test",
+        "gradlew test",
+    ]
+    .iter()
+    .any(|pattern| command.contains(pattern))
+}
+
+fn item_files(item: &Value) -> Vec<String> {
+    let mut files = Vec::new();
+    for key in ["path", "filePath", "file_path"] {
+        if let Some(path) = text_at(item, key) {
+            files.push(path.to_string());
+        }
+    }
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        for change in changes {
+            for key in ["path", "filePath", "file_path"] {
+                if let Some(path) = text_at(change, key) {
+                    if !files.iter().any(|existing| existing == path) {
+                        files.push(path.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    files.truncate(48);
+    files
+}
+
+fn first_value_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value_text(value.get(*key)))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn value_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(values) if values.iter().all(Value::is_string) => Some(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        Value::Null => None,
+        value => serde_json::to_string_pretty(value).ok(),
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let shortened = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
 }
 
 fn notification_event(
@@ -617,6 +996,7 @@ fn notification_event(
         ),
         permission: None,
         last_response,
+        activity: None,
         wait_for_decision: false,
     })
 }
@@ -835,5 +1215,78 @@ mod tests {
 
         assert_eq!(event.last_response.as_deref(), Some("Resposta final"));
         assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn codex_items_expose_commands_and_changed_files() {
+        let command = codex_item_activity(
+            "thread-1",
+            &json!({
+                "id": "command-1",
+                "type": "commandExecution",
+                "command": ["npm", "test"],
+                "status": "completed",
+                "aggregatedOutput": "12 tests passed"
+            }),
+            true,
+        )
+        .expect("atividade de comando");
+        assert_eq!(command.kind, "test");
+        assert_eq!(command.title, "npm test");
+        assert_eq!(command.status, "completed");
+        assert_eq!(command.detail.as_deref(), Some("12 tests passed"));
+
+        let files = codex_item_activity(
+            "thread-1",
+            &json!({
+                "id": "file-1",
+                "type": "fileChange",
+                "changes": [
+                    { "path": "src/lib/domain.ts" },
+                    { "path": "src/lib/TerminalWindow.svelte" }
+                ]
+            }),
+            true,
+        )
+        .expect("atividade de arquivo");
+        assert_eq!(files.kind, "file");
+        assert_eq!(files.files.len(), 2);
+    }
+
+    #[test]
+    fn codex_stream_deltas_update_the_existing_activity() {
+        let event = activity_event(
+            &json!({
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "command-1",
+                    "delta": "compiling…"
+                }
+            }),
+            "item/commandExecution/outputDelta",
+        )
+        .expect("delta de comando");
+        let activity = event.activity.expect("atividade");
+        assert_eq!(activity.id, "codex:thread-1:command-1");
+        assert!(activity.append_detail);
+        assert_eq!(activity.detail.as_deref(), Some("compiling…"));
+
+        let diff = activity_event(
+            &json!({
+                "method": "turn/diff/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "diff": "--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@"
+                }
+            }),
+            "turn/diff/updated",
+        )
+        .expect("diff da tarefa")
+        .activity
+        .expect("atividade de diff");
+        assert_eq!(diff.files, vec!["src/old.rs", "src/new.rs"]);
     }
 }

@@ -6,9 +6,14 @@ mod linux {
         sync::{Mutex, OnceLock},
     };
 
-    use gtk::{gdk::prelude::MonitorExt, glib::translate::ToGlibPtr};
+    use gtk::{
+        gdk::prelude::MonitorExt,
+        glib::translate::ToGlibPtr,
+        prelude::{GtkWindowExt, WidgetExt},
+    };
     use libloading::Library;
     use tauri::WebviewWindow;
+    use x11_dl::xlib;
 
     type GtkWindow = *mut gtk::ffi::GtkWindow;
 
@@ -28,6 +33,13 @@ mod linux {
 
     unsafe impl Send for LayerApi {}
     unsafe impl Sync for LayerApi {}
+
+    struct X11Api {
+        functions: xlib::Xlib,
+        display: *mut xlib::Display,
+    }
+
+    unsafe impl Send for X11Api {}
 
     impl LayerApi {
         unsafe fn load() -> Option<Self> {
@@ -90,9 +102,184 @@ mod linux {
         API.get_or_init(|| unsafe { LayerApi::load() }).as_ref()
     }
 
+    fn x11_api() -> Option<&'static Mutex<X11Api>> {
+        static API: OnceLock<Option<Mutex<X11Api>>> = OnceLock::new();
+        API.get_or_init(|| {
+            let functions = xlib::Xlib::open().ok()?;
+            let display = unsafe { (functions.XOpenDisplay)(std::ptr::null()) };
+            if display.is_null() {
+                return None;
+            }
+            Some(Mutex::new(X11Api { functions, display }))
+        })
+        .as_ref()
+    }
+
+    fn move_xwayland_frame(surface: &gtk::gdk::Window, x: i32, y: i32) -> bool {
+        let Some(api) = x11_api() else {
+            return false;
+        };
+        let Ok(api) = api.lock() else {
+            return false;
+        };
+
+        unsafe {
+            let surface_pointer: *mut gtk::gdk::ffi::GdkWindow = surface.to_glib_none().0;
+            let client = gdkx11::ffi::gdk_x11_window_get_xid(surface_pointer.cast());
+            let mut root = 0;
+            let mut parent = 0;
+            let mut children = std::ptr::null_mut();
+            let mut child_count = 0;
+            if client == 0
+                || (api.functions.XQueryTree)(
+                    api.display,
+                    client,
+                    &mut root,
+                    &mut parent,
+                    &mut children,
+                    &mut child_count,
+                ) == 0
+            {
+                return false;
+            }
+            if !children.is_null() {
+                (api.functions.XFree)(children.cast());
+            }
+
+            let frame = if parent != 0 && parent != root {
+                parent
+            } else {
+                client
+            };
+            let mut attributes: xlib::XSetWindowAttributes = std::mem::zeroed();
+            attributes.override_redirect = xlib::True;
+            (api.functions.XChangeWindowAttributes)(
+                api.display,
+                frame,
+                xlib::CWOverrideRedirect,
+                &mut attributes,
+            );
+            (api.functions.XMoveWindow)(api.display, frame, x, y);
+            attributes.override_redirect = xlib::False;
+            (api.functions.XChangeWindowAttributes)(
+                api.display,
+                frame,
+                xlib::CWOverrideRedirect,
+                &mut attributes,
+            );
+            (api.functions.XSync)(api.display, xlib::False);
+        }
+        true
+    }
+
+    pub fn xwayland_drag_target(window: &WebviewWindow) -> Option<super::XwaylandDragTarget> {
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() != Some("xwayland-fallback") {
+            return None;
+        }
+        let gtk_window = window.gtk_window().ok()?;
+        let surface = gtk_window.window()?;
+        let surface_pointer: *mut gtk::gdk::ffi::GdkWindow = surface.to_glib_none().0;
+        let client = unsafe { gdkx11::ffi::gdk_x11_window_get_xid(surface_pointer.cast()) };
+        (client != 0).then_some(super::XwaylandDragTarget {
+            client: client as u64,
+        })
+    }
+
+    pub fn drag_snapshot_target(target: super::XwaylandDragTarget) -> Option<(bool, i32, i32)> {
+        let api = x11_api()?;
+        let api = api.lock().ok()?;
+        unsafe {
+            let client = target.client as xlib::Window;
+            let mut root = 0;
+            let mut parent = 0;
+            let mut children = std::ptr::null_mut();
+            let mut child_count = 0;
+            if client == 0
+                || (api.functions.XQueryTree)(
+                    api.display,
+                    client,
+                    &mut root,
+                    &mut parent,
+                    &mut children,
+                    &mut child_count,
+                ) == 0
+            {
+                return None;
+            }
+            if !children.is_null() {
+                (api.functions.XFree)(children.cast());
+            }
+            let frame = if parent != 0 && parent != root {
+                parent
+            } else {
+                client
+            };
+            let mut root_return = 0;
+            let mut child_return = 0;
+            let mut root_x = 0;
+            let mut root_y = 0;
+            let mut window_x = 0;
+            let mut window_y = 0;
+            let mut mask = 0;
+            if (api.functions.XQueryPointer)(
+                api.display,
+                root,
+                &mut root_return,
+                &mut child_return,
+                &mut root_x,
+                &mut root_y,
+                &mut window_x,
+                &mut window_y,
+                &mut mask,
+            ) == 0
+            {
+                return None;
+            }
+            let mut frame_x = 0;
+            let mut frame_y = 0;
+            let mut translated_child = 0;
+            if (api.functions.XTranslateCoordinates)(
+                api.display,
+                frame,
+                root,
+                0,
+                0,
+                &mut frame_x,
+                &mut frame_y,
+                &mut translated_child,
+            ) == 0
+            {
+                return None;
+            }
+            Some((mask & xlib::Button1Mask != 0, frame_x, frame_y))
+        }
+    }
+
+    pub fn drag_snapshot(window: &WebviewWindow) -> Option<(bool, i32, i32)> {
+        drag_snapshot_target(xwayland_drag_target(window)?)
+    }
+
     fn layer_monitors() -> &'static Mutex<HashMap<String, (String, f64)>> {
         static MONITORS: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
         MONITORS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn layer_positions() -> &'static Mutex<HashMap<String, (i32, i32)>> {
+        static POSITIONS: OnceLock<Mutex<HashMap<String, (i32, i32)>>> = OnceLock::new();
+        POSITIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn remember_layer_position(window: &WebviewWindow, x: i32, y: i32) {
+        if let Ok(mut positions) = layer_positions().lock() {
+            positions.insert(window.label().to_string(), (x, y));
+        }
+    }
+
+    pub fn layer_position(window: &WebviewWindow) -> Option<(i32, i32)> {
+        layer_positions()
+            .lock()
+            .ok()
+            .and_then(|positions| positions.get(window.label()).copied())
     }
 
     fn remember_layer_monitor(window: &WebviewWindow, monitor_id: Option<&str>, scale: f64) {
@@ -114,10 +301,92 @@ mod linux {
             .map(|(_, scale)| scale)
     }
 
+    fn rounded_window_region(width: i32, height: i32, radius: i32) -> gtk::cairo::Region {
+        let radius = radius.clamp(0, width.min(height) / 2);
+        let radius_squared = f64::from(radius * radius);
+        let rectangles = (0..height)
+            .map(|y| {
+                let edge_distance = if y < radius {
+                    f64::from(radius - y) - 0.5
+                } else if y >= height - radius {
+                    f64::from(y - (height - radius)) + 0.5
+                } else {
+                    0.0
+                };
+                let inset = if edge_distance > 0.0 {
+                    (f64::from(radius) - (radius_squared - edge_distance.powi(2)).sqrt()).ceil()
+                        as i32
+                } else {
+                    0
+                };
+                gtk::cairo::RectangleInt::new(inset, y, (width - inset * 2).max(1), 1)
+            })
+            .collect::<Vec<_>>();
+        gtk::cairo::Region::create_rectangles(&rectangles)
+    }
+
+    fn shape_xwayland_window(
+        gtk_window: &gtk::ApplicationWindow,
+        width: i32,
+        height: i32,
+        radius: i32,
+    ) {
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() != Some("xwayland-fallback") {
+            return;
+        }
+        let Some(surface) = gtk_window.window() else {
+            return;
+        };
+        let region = rounded_window_region(width, height, radius);
+        surface.shape_combine_region(Some(&region), 0, 0);
+        surface.input_shape_combine_region(&region, 0, 0);
+    }
+
     pub fn forget_window(label: &str) {
         if let Ok(mut monitors) = layer_monitors().lock() {
             monitors.remove(label);
         }
+        if let Ok(mut positions) = layer_positions().lock() {
+            positions.remove(label);
+        }
+    }
+
+    pub fn resize_surface(window: &WebviewWindow, width: i32, height: i32) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        let allocation = gtk::Allocation::new(0, 0, width, height);
+        let webview_resized = window
+            .with_webview(move |webview| {
+                let widget = webview.inner();
+                widget.set_size_request(width, height);
+                widget.size_allocate(&allocation);
+                let mut parent = widget.parent();
+                while let Some(container) = parent {
+                    parent = container.parent();
+                    let allocation = gtk::Allocation::new(0, 0, width, height);
+                    container.set_size_request(width, height);
+                    container.size_allocate(&allocation);
+                }
+            })
+            .is_ok();
+        let Ok(gtk_window) = window.gtk_window() else {
+            return false;
+        };
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
+            // An unresizable GTK window publishes its current dimensions as
+            // fixed X11 size hints. Keep the undecorated fallback resizable so
+            // the capsule can shrink and expand frame by frame.
+            gtk_window.set_resizable(true);
+        }
+        gtk_window.resize(width, height);
+        let radius = if window.label().starts_with("terminal-") {
+            17
+        } else {
+            let expansion = (f64::from(width - 78) / f64::from(392 - 78)).clamp(0.0, 1.0);
+            (22.0 - expansion).round() as i32
+        };
+        shape_xwayland_window(&gtk_window, width, height, radius);
+        webview_resized
     }
 
     fn monitor_index(window: &WebviewWindow, monitor_id: Option<&str>) -> Option<usize> {
@@ -147,6 +416,15 @@ mod linux {
         position_y: Option<i32>,
         namespace: &str,
     ) -> bool {
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
+            if let Ok(gtk_window) = window.gtk_window() {
+                gtk_window.set_type_hint(gtk::gdk::WindowTypeHint::Dock);
+                gtk_window.set_decorated(false);
+                gtk_window.set_keep_above(true);
+                gtk_window.set_skip_taskbar_hint(true);
+            }
+            return false;
+        }
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
             return false;
         }
@@ -214,7 +492,35 @@ mod linux {
                 (api.set_namespace)(pointer, namespace.as_ptr());
             }
             remember_layer_monitor(window, monitor_id, layer_scale);
+            remember_layer_position(
+                window,
+                position_x.unwrap_or_else(|| {
+                    (f64::from(left_margin.max(0)) * layer_scale).round() as i32
+                }),
+                position_y.unwrap_or_else(|| (f64::from(top_margin) * layer_scale).round() as i32),
+            );
         }
+        true
+    }
+
+    pub fn set_terminal_docked_shape(
+        window: &WebviewWindow,
+        width: i32,
+        height: i32,
+        docked: bool,
+    ) -> bool {
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() != Some("xwayland-fallback") {
+            return false;
+        }
+        let Ok(gtk_window) = window.gtk_window() else {
+            return false;
+        };
+        shape_xwayland_window(
+            &gtk_window,
+            width.max(1),
+            height.max(1),
+            if docked { 0 } else { 17 },
+        );
         true
     }
 
@@ -253,6 +559,30 @@ mod linux {
     }
 
     pub fn move_to(window: &WebviewWindow, x: i32, y: i32, monitor_id: Option<&str>) -> bool {
+        if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
+            let Ok(gtk_window) = window.gtk_window() else {
+                return false;
+            };
+            let monitors = window.available_monitors().unwrap_or_default();
+            let primary = window.primary_monitor().ok().flatten();
+            let Some(monitor) = super::select_monitor(&monitors, primary, monitor_id) else {
+                return false;
+            };
+            let target_x = monitor.position().x + x;
+            let target_y = monitor.position().y + y;
+            if window.label().starts_with("terminal-") {
+                if let Some(surface) = gtk_window.window() {
+                    if !move_xwayland_frame(&surface, target_x, target_y) {
+                        surface.move_(target_x, target_y);
+                    }
+                } else {
+                    gtk_window.move_(target_x, target_y);
+                }
+            } else {
+                gtk_window.move_(target_x, target_y);
+            }
+            return true;
+        }
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
             return false;
         }
@@ -272,6 +602,7 @@ mod linux {
             if let Some(scale) = cached_layer_scale(window, monitor_id) {
                 (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
                 (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+                remember_layer_position(window, x, y);
                 return true;
             }
             if let Some(display) = gtk::gdk::Display::default() {
@@ -286,14 +617,35 @@ mod linux {
                     remember_layer_monitor(window, monitor_id, scale);
                     (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
                     (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+                    remember_layer_position(window, x, y);
                     return true;
                 }
             }
             let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
             (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
             (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+            remember_layer_position(window, x, y);
         }
         true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct XwaylandDragTarget {
+    client: u64,
+}
+
+pub fn position(window: &tauri::WebviewWindow) -> Option<(i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::layer_position(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y))
     }
 }
 
@@ -302,6 +654,72 @@ pub fn forget_window(label: &str) {
     linux::forget_window(label);
     #[cfg(not(target_os = "linux"))]
     let _ = label;
+}
+
+pub fn xwayland_drag_target(window: &tauri::WebviewWindow) -> Option<XwaylandDragTarget> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::xwayland_drag_target(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+pub fn drag_snapshot_target(target: XwaylandDragTarget) -> Option<(bool, i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::drag_snapshot_target(target)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        None
+    }
+}
+
+pub fn drag_snapshot(window: &tauri::WebviewWindow) -> Option<(bool, i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::drag_snapshot(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+pub fn resize_surface(
+    window: &tauri::WebviewWindow,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux::resize_surface(window, width, height) {
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, width, height);
+    Ok(())
+}
+
+pub fn set_terminal_docked_shape(
+    window: &tauri::WebviewWindow,
+    width: i32,
+    height: i32,
+    docked: bool,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = linux::set_terminal_docked_shape(window, width, height, docked);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, width, height, docked);
 }
 
 pub(crate) fn monitor_identifier(monitors: &[tauri::Monitor], monitor: &tauri::Monitor) -> String {

@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,12 @@ struct DockPreviewEvent {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct NativeDragEndedEvent {
+    label: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalWindowState {
     pub label: String,
     pub session_id: String,
@@ -62,9 +68,18 @@ pub struct TerminalWindowState {
     pub height: i32,
     pub docked: bool,
     pub group_id: Option<String>,
+    pub connected_sides: Vec<DockSide>,
     pub monitor_id: String,
     pub layered: bool,
     pub scale: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalDragSnapshot {
+    pub pressed: bool,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -126,6 +141,16 @@ struct WindowTransition {
     to: TerminalWindowState,
 }
 
+#[derive(Clone, Debug)]
+struct MonitorBounds {
+    id: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+
 #[derive(Debug)]
 struct MoveUpdate {
     moving_labels: Vec<String>,
@@ -146,6 +171,7 @@ impl Placement {
             height: self.height,
             docked: self.group.is_some(),
             group_id: self.group.clone(),
+            connected_sides: Vec::new(),
             monitor_id: self.monitor_id.clone(),
             layered: self.layered,
             scale: self.scale,
@@ -157,6 +183,7 @@ impl Placement {
 pub struct TerminalWindows {
     placements: Arc<Mutex<HashMap<String, Placement>>>,
     settling: Arc<Mutex<HashSet<String>>>,
+    native_drags: Arc<Mutex<HashSet<String>>>,
 }
 
 impl TerminalWindows {
@@ -327,6 +354,8 @@ impl TerminalWindows {
         );
         if !layered {
             overlay::move_to(&window, x, y, Some(&resolved_monitor_id))?;
+        } else {
+            let _ = overlay::resize_surface(&window, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         }
         self.mark_configured(&label, layered);
         self.present_if_ready(&window, &label);
@@ -347,16 +376,18 @@ impl TerminalWindows {
                         .and_then(|window| window.is_visible().ok())
                         .unwrap_or(false)
             })
-            .map(Placement::state)
+            .map(|placement| state_with_connections(&placements, placement))
             .collect())
     }
 
     pub fn state(&self, label: &str) -> Result<TerminalWindowState, String> {
-        self.placements
+        let placements = self
+            .placements
             .lock()
-            .map_err(|_| "Não foi possível acessar o mini terminal".to_string())?
+            .map_err(|_| "Não foi possível acessar o mini terminal".to_string())?;
+        placements
             .get(label)
-            .map(Placement::state)
+            .map(|placement| state_with_connections(&placements, placement))
             .ok_or_else(|| "Mini terminal não encontrado".to_string())
     }
 
@@ -373,6 +404,118 @@ impl TerminalWindows {
     pub fn cancel_move(&self, app: &AppHandle, label: &str) -> Result<TerminalWindowState, String> {
         emit_dock_preview(app, label, None);
         self.state(label)
+    }
+
+    pub fn drag_snapshot(
+        &self,
+        app: &AppHandle,
+        label: &str,
+    ) -> Result<TerminalDragSnapshot, String> {
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        let (pressed, x, y) = overlay::drag_snapshot(&window)
+            .ok_or_else(|| "Estado do arraste indisponível".to_string())?;
+        Ok(TerminalDragSnapshot { pressed, x, y })
+    }
+
+    pub fn begin_native_drag(&self, app: &AppHandle, label: &str) -> Result<(), String> {
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        let target = overlay::xwayland_drag_target(&window)
+            .ok_or_else(|| "Arraste XWayland indisponível".to_string())?;
+        let monitors = monitor_bounds(&window)?;
+        let initial_position = window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y));
+
+        {
+            let mut active = self
+                .native_drags
+                .lock()
+                .map_err(|_| "Não foi possível iniciar o arraste".to_string())?;
+            if !active.insert(label.to_string()) {
+                return Ok(());
+            }
+        }
+
+        let registry = self.clone();
+        let app = app.clone();
+        let label = label.to_string();
+        let thread_label = label.clone();
+        std::thread::Builder::new()
+            .name("lume-xwayland-drag".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let mut last_position = initial_position;
+                let mut saw_pressed = false;
+                let mut saw_movement = false;
+                let mut failed_reads = 0;
+
+                loop {
+                    if started.elapsed() > Duration::from_secs(120) {
+                        break;
+                    }
+                    let Some((pressed, x, y)) = overlay::drag_snapshot_target(target) else {
+                        failed_reads += 1;
+                        if failed_reads >= 8 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(16));
+                        continue;
+                    };
+                    failed_reads = 0;
+                    saw_pressed |= pressed;
+                    let moved = last_position.is_some_and(|position| position != (x, y));
+                    if moved {
+                        saw_movement = true;
+                        let _ = registry.sync_native_position_on_monitors(
+                            &app,
+                            &thread_label,
+                            x,
+                            y,
+                            false,
+                            &monitors,
+                        );
+                    }
+                    last_position = Some((x, y));
+
+                    if !pressed && (saw_pressed || started.elapsed() > Duration::from_millis(180)) {
+                        if saw_movement {
+                            let _ = registry.sync_native_position_on_monitors(
+                                &app,
+                                &thread_label,
+                                x,
+                                y,
+                                true,
+                                &monitors,
+                            );
+                        }
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+
+                emit_dock_preview(&app, &thread_label, None);
+                if let Ok(mut active) = registry.native_drags.lock() {
+                    active.remove(&thread_label);
+                }
+                let _ = app.emit(
+                    "lume://terminal-native-drag-ended",
+                    NativeDragEndedEvent {
+                        label: thread_label,
+                    },
+                );
+            })
+            .map_err(|error| {
+                if let Ok(mut active) = self.native_drags.lock() {
+                    active.remove(&label);
+                }
+                error.to_string()
+            })?;
+        Ok(())
     }
 
     pub fn move_window(
@@ -415,7 +558,15 @@ impl TerminalWindows {
                 return Err(error);
             }
         };
-        emit_dock_preview(app, label, update.preview.clone());
+        emit_dock_preview(
+            app,
+            label,
+            if finalize {
+                None
+            } else {
+                update.preview.clone()
+            },
+        );
         if update.snapped {
             self.animate_native_windows(app, update.transitions);
             emit_windows_changed(app);
@@ -444,20 +595,29 @@ impl TerminalWindows {
         let window = app
             .get_webview_window(label)
             .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-        let monitor = window
-            .current_monitor()
-            .map_err(|error| error.to_string())?;
-        let monitor_position = monitor
-            .as_ref()
-            .map(|monitor| *monitor.position())
-            .unwrap_or_default();
-        let monitor_size = monitor.as_ref().map(|monitor| *monitor.size());
-        let monitor_scale = monitor
-            .as_ref()
-            .map(|monitor| monitor.scale_factor())
-            .unwrap_or(1.0);
-        let mut x = physical_x - monitor_position.x;
-        let mut y = physical_y - monitor_position.y;
+        let monitors = monitor_bounds(&window)?;
+        self.sync_native_position_on_monitors(
+            app, label, physical_x, physical_y, finalize, &monitors,
+        )
+    }
+
+    fn sync_native_position_on_monitors(
+        &self,
+        app: &AppHandle,
+        label: &str,
+        physical_x: i32,
+        physical_y: i32,
+        finalize: bool,
+        monitors: &[MonitorBounds],
+    ) -> Result<TerminalWindowState, String> {
+        if self.is_settling(label) {
+            return self.state(label);
+        }
+        let current = self.state(label)?;
+        let monitor = drag_monitor_for_point(monitors, physical_x, physical_y, &current.monitor_id)
+            .ok_or_else(|| "Nenhum monitor disponível".to_string())?;
+        let mut x = physical_x - monitor.x;
+        let mut y = physical_y - monitor.y;
         validate_coordinates(x, y)?;
 
         let update = {
@@ -465,33 +625,41 @@ impl TerminalWindows {
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível sincronizar o mini terminal".to_string())?;
-            if let (Some(size), Some(current)) = (monitor_size, placements.get(label)) {
+            if let Some(current) = placements.get(label) {
                 (x, y) = clamp_drag_to_monitor(
                     x,
                     y,
                     current.width,
                     current.height,
-                    size.width as i32,
-                    size.height as i32,
-                    monitor_scale,
+                    monitor.width as i32,
+                    monitor.height as i32,
+                    monitor.scale,
                 );
             }
             if let Some(current) = placements.get_mut(label) {
-                current.scale = monitor_scale;
-                if let Some(monitor) = monitor.as_ref() {
-                    if let Ok(monitors) = window.available_monitors() {
-                        current.monitor_id = overlay::monitor_identifier(&monitors, monitor);
-                    }
-                }
+                current.scale = monitor.scale;
+                current.monitor_id = monitor.id.clone();
             }
             update_placements(&mut placements, label, x, y, finalize)?
         };
-        emit_dock_preview(app, label, update.preview.clone());
+        emit_dock_preview(
+            app,
+            label,
+            if finalize {
+                None
+            } else {
+                update.preview.clone()
+            },
+        );
         if update.snapped {
             self.animate_native_windows(app, update.transitions);
             emit_windows_changed(app);
         } else {
-            let states = self.states_for_labels(&update.moving_labels)?;
+            let states = self
+                .states_for_labels(&update.moving_labels)?
+                .into_iter()
+                .filter(|state| state.label != label)
+                .collect::<Vec<_>>();
             move_native_windows(app, &states, false);
             if finalize {
                 emit_windows_changed(app);
@@ -584,6 +752,7 @@ impl TerminalWindows {
             .map(Placement::state)
             .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
         drop(placements);
+        move_native_windows(app, std::slice::from_ref(&state), false);
         emit_windows_changed(app);
         Ok(state)
     }
@@ -916,6 +1085,41 @@ fn selected_monitor(app: &AppHandle, monitor_id: Option<&str>) -> Option<(String
     Some((id, monitor))
 }
 
+fn monitor_bounds(window: &tauri::WebviewWindow) -> Result<Vec<MonitorBounds>, String> {
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    Ok(monitors
+        .iter()
+        .map(|monitor| MonitorBounds {
+            id: overlay::monitor_identifier(&monitors, monitor),
+            x: monitor.position().x,
+            y: monitor.position().y,
+            width: monitor.size().width,
+            height: monitor.size().height,
+            scale: monitor.scale_factor(),
+        })
+        .collect())
+}
+
+fn drag_monitor_for_point<'a>(
+    monitors: &'a [MonitorBounds],
+    x: i32,
+    y: i32,
+    preferred_id: &str,
+) -> Option<&'a MonitorBounds> {
+    monitors
+        .iter()
+        .find(|monitor| {
+            x >= monitor.x
+                && y >= monitor.y
+                && x < monitor.x + monitor.width as i32
+                && y < monitor.y + monitor.height as i32
+        })
+        .or_else(|| monitors.iter().find(|monitor| monitor.id == preferred_id))
+        .or_else(|| monitors.first())
+}
+
 fn clamp_drag_to_monitor(
     x: i32,
     y: i32,
@@ -947,6 +1151,48 @@ fn group_labels(placements: &HashMap<String, Placement>, current: &Placement) ->
             .collect(),
         None => vec![current.label.clone()],
     }
+}
+
+fn state_with_connections(
+    placements: &HashMap<String, Placement>,
+    current: &Placement,
+) -> TerminalWindowState {
+    let mut state = current.state();
+    let Some(group) = current.group.as_ref() else {
+        return state;
+    };
+    let current_width = physical_width(current);
+    let current_height = physical_height(current);
+    for other in placements
+        .values()
+        .filter(|other| other.label != current.label && other.group.as_ref() == Some(group))
+    {
+        let other_width = physical_width(other);
+        let other_height = physical_height(other);
+        let vertical_overlap =
+            (current.y + current_height).min(other.y + other_height) - current.y.max(other.y);
+        let horizontal_overlap =
+            (current.x + current_width).min(other.x + other_width) - current.x.max(other.x);
+        if vertical_overlap > 0 {
+            if (current.x + current_width - other.x).abs() <= 2 {
+                state.connected_sides.push(DockSide::Right);
+            }
+            if (other.x + other_width - current.x).abs() <= 2 {
+                state.connected_sides.push(DockSide::Left);
+            }
+        }
+        if horizontal_overlap > 0 {
+            if (current.y + current_height - other.y).abs() <= 2 {
+                state.connected_sides.push(DockSide::Bottom);
+            }
+            if (other.y + other_height - current.y).abs() <= 2 {
+                state.connected_sides.push(DockSide::Top);
+            }
+        }
+    }
+    state.connected_sides.sort_by_key(|side| *side as u8);
+    state.connected_sides.dedup();
+    state
 }
 
 fn shift(placements: &mut HashMap<String, Placement>, labels: &[String], dx: i32, dy: i32) {
@@ -997,7 +1243,7 @@ fn update_placements(
 
     let current = placements
         .get(label)
-        .map(Placement::state)
+        .map(|placement| state_with_connections(placements, placement))
         .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
     Ok(MoveUpdate {
         moving_labels,
@@ -1079,52 +1325,68 @@ fn snap(current: &Placement, other: &Placement) -> Option<DockPlan> {
     let current_height = physical_height(current);
     let other_width = physical_width(other);
     let other_height = physical_height(other);
+    let horizontal_direction = (current.x * 2 + current_width) - (other.x * 2 + other_width);
+    let vertical_direction = (current.y * 2 + current_height) - (other.y * 2 + other_height);
     let vertical_overlap =
         (current.y + current_height).min(other.y + other_height) - current.y.max(other.y);
     let horizontal_overlap =
         (current.x + current_width).min(other.x + other_width) - current.x.max(other.x);
-    let mut candidates = Vec::new();
-    if vertical_overlap > 48 {
-        candidates.push(DockPlan {
-            score: (current.x + current_width - other.x).abs(),
-            other_label: other.label.clone(),
-            side: DockSide::Left,
-            x: other.x - current_width,
-            y: other.y,
-            width: current.width,
-            height: other.height,
-        });
-        candidates.push(DockPlan {
-            score: (current.x - (other.x + other_width)).abs(),
-            other_label: other.label.clone(),
-            side: DockSide::Right,
-            x: other.x + other_width,
-            y: other.y,
-            width: current.width,
-            height: other.height,
-        });
+    let horizontal = || {
+        (vertical_overlap > 48).then(|| {
+            if horizontal_direction < 0 {
+                DockPlan {
+                    score: (current.x + current_width - other.x).abs(),
+                    other_label: other.label.clone(),
+                    side: DockSide::Left,
+                    x: other.x - current_width,
+                    y: other.y,
+                    width: current.width,
+                    height: other.height,
+                }
+            } else {
+                DockPlan {
+                    score: (current.x - (other.x + other_width)).abs(),
+                    other_label: other.label.clone(),
+                    side: DockSide::Right,
+                    x: other.x + other_width,
+                    y: other.y,
+                    width: current.width,
+                    height: other.height,
+                }
+            }
+        })
+    };
+    let vertical = || {
+        (horizontal_overlap > 48).then(|| {
+            if vertical_direction < 0 {
+                DockPlan {
+                    score: (current.y + current_height - other.y).abs(),
+                    other_label: other.label.clone(),
+                    side: DockSide::Top,
+                    x: other.x,
+                    y: other.y - current_height,
+                    width: other.width,
+                    height: current.height,
+                }
+            } else {
+                DockPlan {
+                    score: (current.y - (other.y + other_height)).abs(),
+                    other_label: other.label.clone(),
+                    side: DockSide::Bottom,
+                    x: other.x,
+                    y: other.y + other_height,
+                    width: other.width,
+                    height: current.height,
+                }
+            }
+        })
+    };
+
+    if horizontal_direction.abs() >= vertical_direction.abs() {
+        horizontal().or_else(vertical)
+    } else {
+        vertical().or_else(horizontal)
     }
-    if horizontal_overlap > 48 {
-        candidates.push(DockPlan {
-            score: (current.y + current_height - other.y).abs(),
-            other_label: other.label.clone(),
-            side: DockSide::Top,
-            x: other.x,
-            y: other.y - current_height,
-            width: other.width,
-            height: current.height,
-        });
-        candidates.push(DockPlan {
-            score: (current.y - (other.y + other_height)).abs(),
-            other_label: other.label.clone(),
-            side: DockSide::Bottom,
-            x: other.x,
-            y: other.y + other_height,
-            width: other.width,
-            height: current.height,
-        });
-    }
-    candidates.into_iter().min_by_key(|plan| plan.score)
 }
 
 fn physical_width(placement: &Placement) -> i32 {
@@ -1198,6 +1460,7 @@ fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWi
         height: interpolate(transition.from.height, transition.to.height),
         docked: transition.to.docked,
         group_id: transition.to.group_id.clone(),
+        connected_sides: transition.to.connected_sides.clone(),
         monitor_id: transition.to.monitor_id.clone(),
         layered: transition.to.layered,
         scale: transition.to.scale,
@@ -1217,7 +1480,14 @@ fn move_native_windows(app: &AppHandle, states: &[TerminalWindowState], resize: 
                     f64::from(target.width),
                     f64::from(target.height),
                 ));
+                let _ = overlay::resize_surface(&layer_window, target.width, target.height);
             }
+            overlay::set_terminal_docked_shape(
+                &layer_window,
+                target.width,
+                target.height,
+                target.docked,
+            );
             let _ = overlay::move_to(&layer_window, target.x, target.y, Some(&target.monitor_id));
         });
     }
@@ -1265,6 +1535,52 @@ mod tests {
         assert_eq!(plan.x, bottom.x);
         assert_eq!(plan.y + plan.height, bottom.y);
         assert_eq!(plan.width, bottom.width);
+    }
+
+    #[test]
+    fn docking_preview_follows_the_moving_terminal_side() {
+        let target = placement("target", 500, 500);
+        let cases = [
+            (164, 500, DockSide::Left),
+            (836, 500, DockSide::Right),
+            (500, 214, DockSide::Top),
+            (500, 786, DockSide::Bottom),
+        ];
+
+        for (x, y, expected) in cases {
+            let moving = placement("moving", x, y);
+            let plan = snap(&moving, &target).expect("prévia direcional");
+            assert_eq!(plan.side, expected);
+        }
+    }
+
+    #[test]
+    fn preview_does_not_create_a_group_until_drop() {
+        let left = placement("left", 164, 500);
+        let right = placement("right", 500, 500);
+        let mut placements =
+            HashMap::from([(left.label.clone(), left), (right.label.clone(), right)]);
+
+        let preview = update_placements(&mut placements, "left", 164, 500, false).expect("prévia");
+        assert!(preview.preview.is_some());
+        assert!(!preview.snapped);
+        assert!(placements
+            .values()
+            .all(|placement| placement.group.is_none()));
+
+        let dropped = update_placements(&mut placements, "left", 164, 500, true).expect("drop");
+        assert!(dropped.snapped);
+        assert!(placements
+            .values()
+            .all(|placement| placement.group.is_some()));
+        assert_eq!(
+            state_with_connections(&placements, &placements["left"]).connected_sides,
+            vec![DockSide::Right]
+        );
+        assert_eq!(
+            state_with_connections(&placements, &placements["right"]).connected_sides,
+            vec![DockSide::Left]
+        );
     }
 
     #[test]
@@ -1403,5 +1719,32 @@ mod tests {
         );
         assert_eq!(x, 1_488);
         assert_eq!(y, 710);
+    }
+
+    #[test]
+    fn xwayland_drag_selects_the_monitor_under_the_window() {
+        let monitors = [
+            MonitorBounds {
+                id: "left".into(),
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+                scale: 1.0,
+            },
+            MonitorBounds {
+                id: "right".into(),
+                x: 1_920,
+                y: 0,
+                width: 2_560,
+                height: 1_440,
+                scale: 1.25,
+            },
+        ];
+
+        let selected =
+            drag_monitor_for_point(&monitors, 2_100, 200, "left").expect("monitor direito");
+        assert_eq!(selected.id, "right");
+        assert_eq!(selected.scale, 1.25);
     }
 }

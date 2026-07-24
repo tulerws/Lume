@@ -30,6 +30,9 @@ export const defaultPreferences: Preferences = {
   projectProfiles: {},
   whiteboardLayouts: [],
   globalShortcut: "Ctrl+Shift+Space",
+  openShortcut: "Ctrl+Alt+Shift+L",
+  newSessionShortcut: "Ctrl+Alt+Shift+N",
+  whiteboardShortcut: "Ctrl+Alt+Shift+B",
 };
 
 export async function loadSessions(): Promise<AgentSession[]> {
@@ -63,6 +66,13 @@ export async function moveOverlay(
   monitorId?: string,
 ): Promise<void> {
   await invoke("move_overlay", { x: Math.round(x), y: Math.round(y), persist, monitorId });
+}
+
+export async function resizeOverlaySurface(width: number, height: number): Promise<void> {
+  await invoke("resize_overlay_surface", {
+    width: Math.max(1, Math.round(width)),
+    height: Math.max(1, Math.round(height)),
+  });
 }
 
 export async function submitPrompt(sessionId: string, prompt: string): Promise<void> {
@@ -120,6 +130,16 @@ export async function syncTerminalWindowPosition(
     y: Math.round(y),
     finalize,
   });
+}
+
+export async function loadTerminalDragSnapshot(
+  label: string,
+): Promise<{ pressed: boolean; x: number; y: number }> {
+  return invoke("terminal_drag_snapshot", { label });
+}
+
+export async function beginTerminalNativeDrag(label: string): Promise<void> {
+  await invoke("begin_terminal_native_drag", { label });
 }
 
 export async function resizeTerminalWindow(
@@ -189,9 +209,29 @@ export async function loadPreferences(): Promise<Preferences> {
   }
 }
 
+export async function loadDisplayBackend(): Promise<"native" | "xwayland-fallback"> {
+  if (!inDesktop()) return "native";
+  try {
+    return await invoke("display_backend");
+  } catch {
+    return "native";
+  }
+}
+
+export async function loadOverlayPosition(): Promise<{ x: number; y: number }> {
+  return invoke("get_overlay_position");
+}
+
 export async function savePreferences(preferences: Preferences): Promise<void> {
   if (!("__TAURI_INTERNALS__" in window)) return;
   await invoke("set_preferences", { preferences });
+}
+
+export async function takePendingShortcutAction(): Promise<
+  "open" | "palette" | "new-session" | "whiteboard" | null
+> {
+  if (!inDesktop()) return null;
+  return invoke("take_pending_shortcut_action");
 }
 
 export async function loadIntegrationStatuses(): Promise<IntegrationStatus[]> {

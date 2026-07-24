@@ -1,17 +1,20 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, SessionActivity, TerminalWindowState } from "$lib/domain";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
+  import LumeMascot from "$lib/LumeMascot.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
     beginLayeredTerminalResize,
+    beginTerminalNativeDrag,
     cancelTerminalWindowMove,
     closeTerminalWindow,
     decidePermission,
     finishLayeredTerminalResize,
+    loadDisplayBackend,
     loadPreferences,
     loadSessions,
     loadTerminalWindowState,
@@ -37,6 +40,8 @@
   let lastMove: { x: number; y: number } | null = null;
   let moveSyncRunning = false;
   let finalizeRequested = false;
+  let displayBackend = $state<"native" | "xwayland-fallback">("native");
+  let nativeDragActive = false;
   let dragState: {
     pointerId: number;
     startX: number;
@@ -66,6 +71,8 @@
   let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
   let terminateConfirm = $state(false);
   let terminating = $state(false);
+  let activeTab = $state<"chat" | "changes">("chat");
+  let outputElement = $state<HTMLDivElement | null>(null);
   let language = $state<Language>("en");
   let darkMode = $state<boolean | undefined>(undefined);
   let systemDark = $state(false);
@@ -88,6 +95,91 @@
   const readyForPrompt = $derived(
     Boolean(session && ["completed", "failed", "waiting_for_input"].includes(session.status)),
   );
+  const activities = $derived(session?.activities ?? []);
+  const changedFiles = $derived.by(() => {
+    const files = [
+      ...(session?.activities.flatMap((activity) => activity.files) ?? []),
+      ...(session?.results.flatMap((result) => result.files) ?? []),
+    ];
+    return [...new Set(files)];
+  });
+  const fileActivities = $derived(
+    session?.activities.filter((activity) => activity.kind === "file" && activity.detail) ?? [],
+  );
+  type ChatTurn = {
+    id: string;
+    prompt?: SessionActivity;
+    items: SessionActivity[];
+    files: string[];
+  };
+  const chatTurns = $derived.by<ChatTurn[]>(() => {
+    const turns: ChatTurn[] = [];
+    const ensureTurn = (id: string): ChatTurn => {
+      const turn: ChatTurn = { id, items: [], files: [] };
+      turns.push(turn);
+      return turn;
+    };
+    let current: ChatTurn | undefined;
+    for (const activity of activities) {
+      if (activity.kind === "prompt") {
+        current = ensureTurn(activity.id);
+        current.prompt = activity;
+        continue;
+      }
+      current ??= ensureTurn(`turn:${activity.id}`);
+      current.items.push(activity);
+      for (const file of activity.files) {
+        if (!current.files.includes(file)) current.files.push(file);
+      }
+    }
+    for (const result of session?.results ?? []) {
+      const resultTurn =
+        [...turns]
+          .reverse()
+          .find((turn) => !turn.prompt || turn.prompt.createdAt <= result.createdAt) ??
+        ensureTurn(`result:${result.id}`);
+      current = resultTurn;
+      for (const file of result.files) {
+        if (!resultTurn.files.includes(file)) resultTurn.files.push(file);
+      }
+      if (
+        result.response &&
+        !resultTurn.items.some(
+          (item) => item.kind === "message" && item.detail === result.response,
+        )
+      ) {
+        resultTurn.items.push({
+          id: `response:${result.id}`,
+          kind: "message",
+          title: "Resposta do agente",
+          detail: result.response,
+          status: "completed",
+          createdAt: result.createdAt,
+          files: [],
+        });
+      }
+    }
+    if (
+      session?.lastResponse &&
+      !turns.some((turn) =>
+        turn.items.some(
+          (item) => item.kind === "message" && item.detail === session?.lastResponse,
+        ),
+      )
+    ) {
+      current ??= ensureTurn(`response:${session.id}`);
+      current.items.push({
+        id: `response:${session.id}:${session.updatedAt}`,
+        kind: "message",
+        title: "Resposta do agente",
+        detail: session.lastResponse,
+        status: "completed",
+        createdAt: session.updatedAt,
+        files: [],
+      });
+    }
+    return turns;
+  });
 
   onMount(() => {
     let disposed = false;
@@ -96,6 +188,7 @@
     let stopResized: (() => void) | undefined;
     let stopPreferences: (() => void) | undefined;
     let stopDockPreview: (() => void) | undefined;
+    let stopNativeDragEnded: (() => void) | undefined;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -103,13 +196,15 @@
     syncSystemTheme(colorScheme);
     colorScheme.addEventListener("change", syncSystemTheme);
     void (async () => {
-      const [nextWindowState, nextPreferences] = await Promise.all([
+      const [nextWindowState, nextPreferences, nextDisplayBackend] = await Promise.all([
         loadTerminalWindowState(label),
         loadPreferences(),
+        loadDisplayBackend(),
       ]);
       windowState = nextWindowState;
       language = nextPreferences.language;
       darkMode = nextPreferences.darkMode;
+      displayBackend = nextDisplayBackend;
       await refresh();
       if (disposed) return;
       stopListening = await listen("lume://sessions-changed", () => void refresh());
@@ -135,6 +230,21 @@
           dockPreview = null;
         }
       });
+      stopNativeDragEnded = await listen<{ label: string }>(
+        "lume://terminal-native-drag-ended",
+        async ({ payload }) => {
+          if (payload.label !== label) return;
+          nativeDragActive = false;
+          dragging = false;
+          dockMovingLabel = null;
+          dockPreview = null;
+          try {
+            windowState = await loadTerminalWindowState(label);
+          } catch {
+            // The window may be closing.
+          }
+        },
+      );
       stopResized = await currentWindow.onResized(() => {
         if (settling) return;
         if (resizeDragState) return;
@@ -157,14 +267,43 @@
       stopResized?.();
       stopPreferences?.();
       stopDockPreview?.();
+      stopNativeDragEnded?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
     };
   });
 
   async function refresh() {
+    const shouldFollow = !outputElement ||
+      outputElement.scrollHeight - outputElement.scrollTop - outputElement.clientHeight < 32;
     const sessions = await loadSessions();
     session = sessions.find((item) => item.id === windowState?.sessionId) ?? null;
+    if (shouldFollow) {
+      await tick();
+      outputElement?.scrollTo({ top: outputElement.scrollHeight });
+    }
+  }
+
+  function activityMark(activity: SessionActivity) {
+    return {
+      prompt: "›",
+      message: "◆",
+      analysis: "···",
+      plan: "≡",
+      command: "$",
+      file: "±",
+      test: "✓",
+      tool: "⌁",
+      permission: "!",
+    }[activity.kind] ?? "·";
+  }
+
+  function activityTime(createdAt: number) {
+    return new Intl.DateTimeFormat(language, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(new Date(createdAt));
   }
 
   function sourceLabel(item: AgentSession) {
@@ -233,6 +372,21 @@
   function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
     if ((event.target as HTMLElement).closest("button, textarea")) return;
+    if (displayBackend === "xwayland-fallback") {
+      event.preventDefault();
+      dragging = true;
+      nativeDragActive = true;
+      dockMovingLabel = null;
+      dockPreview = null;
+      void beginTerminalNativeDrag(label)
+        .then(() => currentWindow.startDragging())
+        .catch((error) => {
+          nativeDragActive = false;
+          dragging = false;
+          message = String(error).replace(/^Error:\s*/, "");
+        });
+      return;
+    }
     const target = event.currentTarget as HTMLElement;
     target.setPointerCapture(event.pointerId);
     dragging = true;
@@ -265,6 +419,7 @@
   }
 
   function endDrag(event: PointerEvent) {
+    if (nativeDragActive) return;
     if (!dragState || dragState.pointerId !== event.pointerId) return;
     const target = event.currentTarget as HTMLElement;
     if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
@@ -494,6 +649,10 @@
       class:dock-right={dockPreview?.side === "right"}
       class:dock-top={dockPreview?.side === "top"}
       class:dock-bottom={dockPreview?.side === "bottom"}
+      class:joined-left={windowState?.connectedSides.includes("left")}
+      class:joined-right={windowState?.connectedSides.includes("right")}
+      class:joined-top={windowState?.connectedSides.includes("top")}
+      class:joined-bottom={windowState?.connectedSides.includes("bottom")}
       class="terminal-card"
     >
       {#if dockPreview?.targetLabel === label}
@@ -506,7 +665,7 @@
         onpointerup={endDrag}
         onpointercancel={cancelDrag}
       >
-        <LumeLogo size={25} />
+        <LumeMascot status={session.status} size={25} />
         <span class="agent-icon"><BrandIcon name={session.agent} size={16} /></span>
         <div class="identity">
           <strong>{session.agentLabel}</strong>
@@ -531,15 +690,18 @@
         </button>
       </header>
 
-      <div class="terminal-output">
+      <nav class="hub-tabs" aria-label={tr("Session details", "Detalhes da sessão")}>
+        <button class:active={activeTab === "chat"} type="button" onclick={() => (activeTab = "chat")}>
+          {tr("Chat", "Chat")} <span>{chatTurns.length}</span>
+        </button>
+        <button class:active={activeTab === "changes"} type="button" onclick={() => (activeTab = "changes")}>
+          {tr("Changes", "Alterações")} <span>{changedFiles.length}</span>
+        </button>
+      </nav>
+
+      <div class="terminal-output" bind:this={outputElement}>
         <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
         <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
-        {#if session.lastResponse}
-          <div class="final-response">
-            <strong>{tr("Final response", "Resposta final")}</strong>
-            <p>{session.lastResponse}</p>
-          </div>
-        {/if}
         {#if session.pendingPermission}
           <div class="permission">
             <strong>{displayText(language, session.pendingPermission.summary)}</strong>
@@ -552,12 +714,75 @@
               {/each}
             </div>
           </div>
-        {:else if !canSubmit}
-          <p class="hint">{tr("This source is monitored here, but prompts are sent from the source.", "Esta origem é acompanhada aqui, mas o envio continua nela.")}</p>
-        {:else if windowState?.docked}
-          <p class="hint docked">{tr("Docked · drag this terminal to move the group.", "Acoplado · arraste este terminal para mover o conjunto.")}</p>
+        {/if}
+
+        {#if activeTab === "chat"}
+          <div class="chat-feed">
+            {#each chatTurns as turn (turn.id)}
+              <article class="chat-turn">
+                {#if turn.prompt?.detail}
+                  <div class="chat-message user-message">
+                    <header>
+                      <strong>{tr("You", "Você")}</strong>
+                      <time>{activityTime(turn.prompt.createdAt)}</time>
+                    </header>
+                    <pre>{turn.prompt.detail}</pre>
+                  </div>
+                {/if}
+                {#each turn.items as item (item.id)}
+                  {#if item.kind === "message" && item.detail}
+                    <div class="chat-message agent-message">
+                      <header>
+                        <strong>{session.agentLabel}</strong>
+                        <time>{activityTime(item.createdAt)}</time>
+                      </header>
+                      <pre>{item.detail}</pre>
+                    </div>
+                  {:else if item.kind !== "file"}
+                    <details class="turn-trace">
+                      <summary>
+                        <span>{activityMark(item)}</span>
+                        {displayText(language, item.title)}
+                        <time>{activityTime(item.createdAt)}</time>
+                      </summary>
+                      {#if item.detail}<pre>{item.detail}</pre>{/if}
+                    </details>
+                  {/if}
+                {/each}
+                {#if turn.files.length}
+                  <div class="turn-files">
+                    <strong>{tr("Files changed in this prompt", "Arquivos alterados neste prompt")}</strong>
+                    <div>
+                      {#each turn.files as file}<code><span>±</span>{file}</code>{/each}
+                    </div>
+                  </div>
+                {/if}
+              </article>
+            {:else}
+              <p class="empty-state">{tr("Messages and agent activity will appear here in real time.", "As mensagens e a atividade do agente aparecerão aqui em tempo real.")}</p>
+            {/each}
+          </div>
         {:else}
-          <p class="hint">{tr("Move it close to another mini terminal to dock.", "Aproxime de outro mini terminal para acoplar.")}</p>
+          <section class="changes-panel">
+            <strong>{tr("All changed files", "Todos os arquivos alterados")}</strong>
+            {#if changedFiles.length}
+              <div class="change-list">
+                {#each changedFiles as file}<code><span>±</span>{file}</code>{/each}
+              </div>
+            {:else}
+              <p class="empty-state">{tr("No file changes were reported in this session.", "Nenhuma alteração de arquivo foi informada nesta sessão.")}</p>
+            {/if}
+            {#each fileActivities as activity (activity.id)}
+              <details class="change-diff">
+                <summary>{displayText(language, activity.title)}</summary>
+                <pre>{activity.detail}</pre>
+              </details>
+            {/each}
+          </section>
+        {/if}
+
+        {#if !canSubmit}
+          <p class="hint">{tr("This source is monitored here, but prompts are sent from the source.", "Esta origem é acompanhada aqui, mas o envio continua nela.")}</p>
         {/if}
         {#if terminateConfirm}
           <div class="terminate-confirm">
@@ -607,13 +832,20 @@
 
 <style>
   .terminal-window { width: 100%; height: 100%; }
-  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: rgba(248, 251, 249, 0.985); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; --chat-font-size: 9px; --chat-small-font-size: 8px; --chat-tiny-font-size: 7px; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: #f8fbf9; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+  @supports (width: 1cqw) {
+    .terminal-card { --chat-font-size: clamp(9px, calc(7px + 0.55cqw), 12px); --chat-small-font-size: clamp(8px, calc(6.2px + 0.5cqw), 10.5px); --chat-tiny-font-size: clamp(7px, calc(5.8px + 0.4cqw), 9px); }
+  }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
   .terminal-card.resizing { user-select: none; }
   .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.58); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.12); transform: scale(0.992); }
   .terminal-card.dock-target { border-color: rgba(65, 151, 111, 0.78); box-shadow: inset 0 0 0 3px rgba(75, 157, 120, 0.18); }
   .terminal-card.settling { border-color: rgba(69, 139, 108, 0.48); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.11); }
+  .terminal-card.joined-left { border-left-width: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+  .terminal-card.joined-right { border-right-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .terminal-card.joined-top { border-top-width: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
+  .terminal-card.joined-bottom { border-bottom-width: 0; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
   .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.62); border-radius: 13px; background: rgba(76, 161, 121, 0.075); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.48); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
   .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.68); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.32), rgba(77, 164, 121, 0.12)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.14); }
   .dock-silhouette span { position: absolute; z-index: 1; padding: 3px 6px; border-radius: 999px; color: #39755a; background: rgba(232, 246, 239, 0.9); font-size: 7px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
@@ -638,7 +870,11 @@
   .dock-button { color: #4a7564; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
-  .terminal-output { min-height: 0; flex: 1; padding: 10px 12px 7px; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 9px; }
+  .hub-tabs { min-height: 29px; padding: 4px 9px 0; display: flex; gap: 3px; border-bottom: 1px solid rgba(97, 119, 109, 0.09); }
+  .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 8px Inter, sans-serif; cursor: pointer; }
+  .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
+  .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: 7px; }
+  .terminal-output { min-height: 0; flex: 1; padding: 10px 12px 7px; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: var(--chat-font-size); }
   .terminal-output p { margin: 0 0 6px; line-height: 1.45; }
   .terminal-output p > span { color: #36a269; font-weight: 800; }
   .terminal-output i { color: #8a9690; font-style: normal; }
@@ -647,16 +883,42 @@
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
   .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
-  .final-response { margin: 8px 0; padding: 8px 9px; border: 1px solid rgba(74, 102, 89, 0.1); border-radius: 8px; background: rgba(67, 99, 84, 0.035); }
-  .final-response strong { display: block; margin-bottom: 5px; color: #648075; font: 760 8px Inter, sans-serif; letter-spacing: 0.05em; text-transform: uppercase; }
-  .final-response p { max-height: 180px; margin: 0; overflow-y: auto; color: #475750; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; scrollbar-width: thin; }
+  .chat-feed { margin: 9px 0 7px; display: grid; gap: 10px; }
+  .chat-turn { padding-bottom: 10px; display: grid; gap: 6px; border-bottom: 1px solid rgba(81, 105, 94, 0.09); }
+  .chat-message { max-width: 94%; padding: 7px 8px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
+  .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
+  .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
+  .chat-message header { display: flex; align-items: center; gap: 6px; }
+  .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
+  .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
+  .chat-message pre { margin: 5px 0 0; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .turn-trace { padding: 4px 6px; border-radius: 6px; background: rgba(72, 101, 88, 0.03); }
+  .turn-trace summary { display: flex; align-items: center; gap: 5px; color: #71817a; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
+  .turn-trace summary > span { width: 14px; color: #4f806a; text-align: center; }
+  .turn-trace summary time { margin-left: auto; color: #a0aaa5; font-weight: 500; }
+  .turn-trace pre { max-height: 180px; margin: 5px 0 0 19px; overflow: auto; color: #5c6b64; font: var(--chat-small-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .turn-files { padding: 7px 8px; border-left: 2px solid #4b9b73; border-radius: 0 7px 7px 0; background: rgba(55, 142, 98, 0.045); }
+  .turn-files > strong { display: block; margin-bottom: 5px; color: #4f775f; font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-transform: uppercase; }
+  .turn-files > div { display: grid; gap: 3px; }
+  .turn-files code { display: flex; gap: 5px; color: #496258; font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
+  .turn-files code span { color: #45906a; }
+  .privacy-note { padding-top: 6px; border-top: 1px solid rgba(81, 105, 94, 0.08); color: #9aa49f; font: var(--chat-tiny-font-size)/1.45 Inter, sans-serif; }
+  .empty-state { margin: 7px 0 10px !important; color: #909c96; font: var(--chat-small-font-size)/1.5 Inter, sans-serif; }
+  .changes-panel { margin-top: 9px; display: grid; gap: 7px; }
+  .changes-panel > strong { color: #6a7c73; font: 760 var(--chat-small-font-size) Inter, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
+  .change-list { display: grid; gap: 4px; }
+  .change-list code { padding: 5px 6px; display: flex; align-items: flex-start; gap: 6px; border-radius: 6px; color: #4f6158; background: rgba(70, 101, 86, 0.045); font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
+  .change-list span { color: #45906a; }
+  .change-diff { padding: 5px 6px; border: 1px solid rgba(78, 104, 92, 0.09); border-radius: 7px; }
+  .change-diff summary { color: #53685e; font: 720 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
+  .change-diff pre { max-height: 240px; margin: 6px 0 0; overflow: auto; color: #5b6b63; font: var(--chat-tiny-font-size)/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; white-space: pre; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
-  .permission strong { color: #5a4633; font: 700 9px/1.35 Inter, sans-serif; }
-  .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
+  .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
   .permission > div { display: flex; gap: 4px; }
   .permission button { min-height: 23px; padding: 0 7px; border: 1px solid rgba(82, 101, 93, 0.15); border-radius: 6px; color: #4b5d55; background: rgba(255, 255, 255, 0.58); font: 700 8px Inter, sans-serif; cursor: pointer; }
   .permission button.danger { color: #a64d4d; }
-  .hint { color: #89948f; font-size: 8px; }
+  .hint { color: #89948f; font-size: var(--chat-small-font-size); }
   .hint.docked { color: #4f7566; }
   .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 8px/1.35 Inter, sans-serif; }
   .terminate-confirm > span { min-width: 0; flex: 1; color: #7d5d58; }
@@ -664,7 +926,7 @@
   .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 7px Inter, sans-serif; cursor: pointer; }
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
-  textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: 9px/1.4 Inter, sans-serif; }
+  textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
   textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
   textarea:disabled { opacity: 0.58; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
@@ -684,7 +946,7 @@
   .loading { align-items: center; justify-content: center; gap: 9px; color: #78857f; font-size: 9px; }
 
   .terminal-window.dark { color-scheme: dark; }
-  .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: rgba(20, 29, 25, 0.97); }
+  .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: #141d19; }
   .terminal-window.dark .terminal-card.dock-moving,
   .terminal-window.dark .terminal-card.dock-target,
   .terminal-window.dark .terminal-card.settling { border-color: rgba(91, 186, 143, 0.5); box-shadow: inset 0 0 0 2px rgba(91, 186, 143, 0.1), inset 0 -10px 24px rgba(8, 21, 15, 0.18); }
@@ -699,10 +961,25 @@
   .terminal-window.dark .agent-icon,
   .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .source-badge { color: #a7b5ae; }
+  .terminal-window.dark .hub-tabs { border-color: rgba(190, 209, 200, 0.07); }
+  .terminal-window.dark .hub-tabs button { color: #84938c; }
+  .terminal-window.dark .hub-tabs button.active { color: #83c6a6; border-bottom-color: #59ad84; }
+  .terminal-window.dark .hub-tabs span { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
-  .terminal-window.dark .final-response { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
-  .terminal-window.dark .final-response strong { color: #91a89d; }
-  .terminal-window.dark .final-response p { color: #c3d0ca; }
+  .terminal-window.dark .chat-turn { border-color: rgba(205, 222, 213, 0.07); }
+  .terminal-window.dark .chat-message { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
+  .terminal-window.dark .chat-message.user-message { background: rgba(76, 169, 124, 0.09); }
+  .terminal-window.dark .chat-message header strong,
+  .terminal-window.dark .chat-message pre,
+  .terminal-window.dark .turn-trace pre,
+  .terminal-window.dark .turn-files code { color: #bdcbc4; }
+  .terminal-window.dark .turn-trace { background: rgba(218, 234, 226, 0.025); }
+  .terminal-window.dark .turn-files { border-color: #5bad83; background: rgba(91, 177, 137, 0.055); }
+  .terminal-window.dark .turn-files > strong { color: #8bc6a8; }
+  .terminal-window.dark .change-diff summary,
+  .terminal-window.dark .change-diff pre,
+  .terminal-window.dark .change-list code { color: #bdcbc4; }
+  .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
   .terminal-window.dark .permission strong { color: #dfc6ac; }
   .terminal-window.dark .permission code,

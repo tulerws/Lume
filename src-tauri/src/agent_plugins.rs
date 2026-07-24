@@ -77,6 +77,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
             hook_events: &[
                 "SessionStart",
                 "UserPromptSubmit",
+                "PreToolUse",
                 "PermissionRequest",
                 "PostToolUse",
                 "Stop",
@@ -90,6 +91,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
             hook_events: &[
                 "SessionStart",
                 "UserPromptSubmit",
+                "PreToolUse",
                 "PermissionRequest",
                 "PostToolUse",
                 "PostToolUseFailure",
@@ -107,6 +109,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
             hook_events: &[
                 "SessionStart",
                 "BeforeAgent",
+                "BeforeTool",
                 "Notification",
                 "AfterTool",
                 "AfterAgent",

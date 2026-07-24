@@ -261,6 +261,7 @@ mod tests {
                 files: Vec::new(),
                 tests: Vec::new(),
             }],
+            activities: Vec::new(),
         };
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");

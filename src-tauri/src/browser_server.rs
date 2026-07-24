@@ -298,6 +298,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
             .map(str::trim)
             .filter(|response| !response.is_empty())
             .map(|response| truncate(response, 32 * 1024)),
+        activity: None,
         wait_for_decision: false,
     })
 }

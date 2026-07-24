@@ -56,6 +56,17 @@ export interface AgentSession {
   pendingPermission?: PermissionRequest;
   lastResponse?: string;
   results: SessionResult[];
+  activities: SessionActivity[];
+}
+
+export interface SessionActivity {
+  id: string;
+  kind: "prompt" | "message" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission";
+  title: string;
+  detail?: string;
+  status: "running" | "completed" | "failed" | "waiting";
+  createdAt: number;
+  files: string[];
 }
 
 export interface SessionResult {
@@ -101,6 +112,9 @@ export interface Preferences {
   projectProfiles: Record<string, ProjectProfile>;
   whiteboardLayouts: WhiteboardLayout[];
   globalShortcut: string;
+  openShortcut: string;
+  newSessionShortcut: string;
+  whiteboardShortcut: string;
 }
 
 export interface ProjectProfile {
@@ -174,6 +188,7 @@ export interface TerminalWindowState {
   height: number;
   docked: boolean;
   groupId?: string;
+  connectedSides: Array<"left" | "right" | "top" | "bottom">;
   monitorId: string;
   layered: boolean;
   scale: number;

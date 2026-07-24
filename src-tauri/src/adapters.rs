@@ -6,7 +6,7 @@ use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System, Up
 use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        PermissionRequest, SessionSource,
+        PermissionRequest, SessionActivity, SessionSource,
     },
     event_server,
     state::now_millis,
@@ -56,6 +56,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         (_, "SessionStart") => HookEventKind::SessionStarted,
         ("codex", "UserPromptSubmit") | ("claude", "UserPromptSubmit") => HookEventKind::Running,
         ("gemini", "BeforeAgent") => HookEventKind::Running,
+        ("codex" | "claude", "PreToolUse") | ("gemini", "BeforeTool") => HookEventKind::Running,
         ("codex", "PostToolUse")
         | ("claude", "PostToolUse" | "PostToolUseFailure")
         | ("gemini", "AfterTool") => HookEventKind::Running,
@@ -108,6 +109,13 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     )
     .then(|| hook_response(raw))
     .flatten();
+    let activity = hook_activity(
+        provider,
+        hook_name.as_str(),
+        raw,
+        &session_id,
+        last_response.as_deref(),
+    );
 
     Some(HookEvent {
         event,
@@ -125,8 +133,129 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         permission_profile,
         permission,
         last_response,
+        activity,
         wait_for_decision: direct_response,
     })
+}
+
+fn hook_activity(
+    provider: &str,
+    hook_name: &str,
+    raw: &Value,
+    session_id: &str,
+    last_response: Option<&str>,
+) -> Option<SessionActivity> {
+    if matches!(hook_name, "UserPromptSubmit" | "BeforeAgent") {
+        let prompt = ["prompt", "user_prompt", "message"]
+            .into_iter()
+            .find_map(|key| string(raw, key));
+        return prompt.map(|prompt| SessionActivity {
+            id: format!("{provider}:{session_id}:prompt:{}", now_millis()),
+            kind: "prompt".into(),
+            title: "Prompt enviado".into(),
+            detail: Some(truncate(prompt.trim(), 16 * 1024)),
+            status: "completed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if matches!(hook_name, "Stop" | "AfterAgent") {
+        return last_response.map(|response| SessionActivity {
+            id: format!("{provider}:{session_id}:response:{}", now_millis()),
+            kind: "message".into(),
+            title: "Resposta do agente".into(),
+            detail: Some(truncate(response, 32 * 1024)),
+            status: "completed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if !matches!(
+        hook_name,
+        "PreToolUse" | "BeforeTool" | "PostToolUse" | "PostToolUseFailure" | "AfterTool"
+    ) {
+        return None;
+    }
+
+    let tool_name = string(raw, "tool_name")
+        .or_else(|| string(raw, "tool"))
+        .unwrap_or_else(|| "Ferramenta".into());
+    let input = raw.get("tool_input").or_else(|| raw.get("details"));
+    let resource = input
+        .and_then(resource_from_input)
+        .unwrap_or_else(|| tool_name.clone());
+    let lower_tool = tool_name.to_lowercase();
+    let lower_resource = resource.to_lowercase();
+    let is_command = lower_tool.contains("bash")
+        || lower_tool.contains("shell")
+        || lower_tool.contains("command");
+    let kind = if is_command && is_test_command(&lower_resource) {
+        "test"
+    } else if is_command {
+        "command"
+    } else if ["write", "edit", "patch", "file"]
+        .iter()
+        .any(|needle| lower_tool.contains(needle))
+    {
+        "file"
+    } else {
+        "tool"
+    };
+    let status = match hook_name {
+        "PreToolUse" | "BeforeTool" => "running",
+        "PostToolUseFailure" => "failed",
+        _ => "completed",
+    };
+    let result = raw
+        .get("tool_response")
+        .or_else(|| raw.get("tool_result"))
+        .or_else(|| raw.get("result"))
+        .and_then(|value| serde_json::to_string_pretty(value).ok());
+    let detail =
+        result.or_else(|| input.and_then(|value| serde_json::to_string_pretty(value).ok()));
+    let tool_id = string(raw, "tool_use_id")
+        .or_else(|| string(raw, "tool_call_id"))
+        .unwrap_or_else(|| now_millis().to_string());
+    let files = if kind == "file" {
+        input
+            .and_then(resource_from_input)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Some(SessionActivity {
+        id: format!("{provider}:{session_id}:tool:{tool_id}"),
+        kind: kind.into(),
+        title: truncate(&resource, 240),
+        detail: detail.map(|detail| truncate(&detail, 16 * 1024)),
+        status: status.into(),
+        created_at: now_millis(),
+        files,
+        append_detail: false,
+    })
+}
+
+fn is_test_command(command: &str) -> bool {
+    [
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "cargo test",
+        "dotnet test",
+        "go test",
+        "flutter test",
+        "pytest",
+        "vitest",
+        "jest",
+        "mvn test",
+        "gradle test",
+        "gradlew test",
+    ]
+    .iter()
+    .any(|pattern| command.contains(pattern))
 }
 
 fn permission_profile(
@@ -499,5 +628,54 @@ mod tests {
             event.last_response.as_deref(),
             Some("Resposta final do agente")
         );
+        assert_eq!(
+            event
+                .activity
+                .as_ref()
+                .map(|activity| activity.kind.as_str()),
+            Some("message")
+        );
+    }
+
+    #[test]
+    fn tool_hooks_expose_commands_and_files_as_activity() {
+        let command = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "cwd": "/work/project",
+                "hook_event_name": "PostToolUse",
+                "tool_use_id": "tool-1",
+                "tool_name": "Bash",
+                "tool_input": { "command": "npm test" },
+                "tool_response": { "output": "12 tests passed" }
+            }),
+        )
+        .expect("evento de comando")
+        .activity
+        .expect("atividade de comando");
+        assert_eq!(command.kind, "test");
+        assert_eq!(command.title, "npm test");
+        assert!(command
+            .detail
+            .as_deref()
+            .is_some_and(|value| value.contains("12 tests passed")));
+
+        let file = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "cwd": "/work/project",
+                "hook_event_name": "PreToolUse",
+                "tool_use_id": "tool-2",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": "/work/project/src/app.ts" }
+            }),
+        )
+        .expect("evento de arquivo")
+        .activity
+        .expect("atividade de arquivo");
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.files, vec!["/work/project/src/app.ts"]);
     }
 }

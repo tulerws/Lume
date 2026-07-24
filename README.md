@@ -14,6 +14,7 @@ Lume é uma sobreposição local e discreta para acompanhar agentes de IA no Win
 - monitor configurável e sobreposição Wayland por `gtk-layer-shell`;
 - cápsula arrastável com posição salva entre reinicializações;
 - Whiteboard com um mini terminal flutuante por sessão e acoplamento entre janelas;
+- hub por sessão com prompts, atividade em tempo real, comandos, ferramentas, diffs, arquivos, testes e respostas finais;
 - layouts nomeados do Whiteboard, restaurados para as sessões abertas correspondentes;
 - perfis por projeto com destino, monitor, posição, permissões, layout e agentes preferidos;
 - respostas finais com arquivos/verificações reportados e opção explícita de salvar como nota;
@@ -53,7 +54,7 @@ O Lume aparece no topo do monitor principal e também cria um ícone na bandeja.
 | Gemini CLI | Processos + hooks | Observação |
 | ChatGPT, Claude e Gemini web | Companion Chromium | Abrir a aba correta |
 
-O Lume só mostra botões que a sessão atual suporta. No Gemini e em sessões externas do Codex, a origem continua responsável pela decisão; o Lume não simula uma autorização que a integração não oferece. O composer envia diretamente para sessões Codex abertas pelo Lume e para páginas conectadas pelo Companion. Terminais externos permanecem somente para acompanhamento.
+O Lume só mostra botões que a sessão atual suporta. No Gemini e em sessões externas do Codex, a origem continua responsável pela decisão; o Lume não simula uma autorização que a integração não oferece. O hub mostra apenas a atividade observável entregue pelo App Server ou pelos hooks — incluindo resumos de raciocínio quando o agente os publica, nunca raciocínio privado. O conteúdo das sessões abertas permanece somente em memória e não é restaurado ao reiniciar.
 
 Depois de conectar o Codex pela primeira vez, abra `/hooks` no próprio Codex e confie no hook **Lume**. O Codex exige essa confirmação para hooks locais novos ou alterados.
 
@@ -72,6 +73,8 @@ Antes da próxima release, cadastre a chave privada de assinatura em **Settings 
 A versão 0.3.0 precisa ser instalada manualmente uma vez porque as versões anteriores ainda não contêm o atualizador. Depois disso, o Lume verifica novas versões ao iniciar e oferece a instalação em **Ajustes → Sobre**. No Linux, o AppImage é substituído no próprio local e o `.deb` pode pedir a autenticação do sistema durante a instalação.
 
 O `.deb` instala a dependência `libgtk-layer-shell0`. Ao usar o AppImage em Wayland, instale esse pacote no sistema para obter posicionamento nativo por monitor e o comportamento correto diante de tela cheia.
+
+No Fedora Workstation com GNOME Wayland, o Lume usa XWayland automaticamente porque o GNOME não oferece o protocolo Layer Shell. Esse fallback mantém o arraste e a posição salva da cápsula. Para testar o backend Wayland nativo mesmo nesse ambiente, inicie com `LUME_FORCE_NATIVE_WAYLAND=1`.
 
 ## Detectores externos
 

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env,
     fs::{self, File},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
@@ -17,10 +18,10 @@ use tauri::AppHandle;
 use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        SessionSource,
+        SessionActivity, SessionSource,
     },
     event_server,
-    state::AppState,
+    state::{now_millis, AppState},
 };
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
@@ -42,6 +43,8 @@ struct ObservedFile {
 
 #[derive(Debug, Deserialize)]
 struct CodexRecord {
+    #[serde(default)]
+    timestamp: Option<String>,
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -74,6 +77,8 @@ struct RecordPayload {
     sandbox_policy: Option<Value>,
     #[serde(default)]
     last_agent_message: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
@@ -246,6 +251,30 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
         if record.kind != "event_msg" {
             continue;
         }
+        if matches!(
+            record.payload.r#type.as_deref(),
+            Some("user_message" | "agent_message")
+        ) {
+            if let Some(message) = record
+                .payload
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+            {
+                let (kind, title) = if record.payload.r#type.as_deref() == Some("user_message") {
+                    ("prompt", "Prompt enviado")
+                } else {
+                    ("message", "Resposta do agente")
+                };
+                if let Some(event) =
+                    activity_event_for(file, kind, title, message, record.timestamp.as_deref())
+                {
+                    events.push(event);
+                }
+            }
+            continue;
+        }
         let (kind, label, last_response) = match record.payload.r#type.as_deref() {
             Some("task_started") => (HookEventKind::Running, "Rodando", None),
             Some("task_complete") => (
@@ -264,6 +293,33 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
         }
     }
     events
+}
+
+fn activity_event_for(
+    file: &ObservedFile,
+    kind: &str,
+    title: &str,
+    detail: &str,
+    timestamp: Option<&str>,
+) -> Option<HookEvent> {
+    let session = file.session.as_ref()?;
+    let mut hasher = DefaultHasher::new();
+    session.id.hash(&mut hasher);
+    kind.hash(&mut hasher);
+    detail.hash(&mut hasher);
+    timestamp.hash(&mut hasher);
+    let mut event = event_for(file, HookEventKind::Activity, title, None)?;
+    event.activity = Some(SessionActivity {
+        id: format!("codex-rollout:{:x}", hasher.finish()),
+        kind: kind.into(),
+        title: title.into(),
+        detail: response_text(detail),
+        status: "completed".into(),
+        created_at: now_millis(),
+        files: Vec::new(),
+        append_detail: false,
+    });
+    Some(event)
 }
 
 fn session_started_event(file: &ObservedFile) -> Option<HookEvent> {
@@ -299,6 +355,7 @@ fn event_for(
         permission_profile: Some(file.profile.clone().unwrap_or_else(default_profile)),
         permission: None,
         last_response: last_response.and_then(response_text),
+        activity: None,
         wait_for_decision: false,
     })
 }
@@ -497,6 +554,53 @@ mod tests {
         assert_eq!(events[0].source, Some(SessionSource::Vscode));
         assert_eq!(events[0].native_session_id.as_deref(), Some("chat-1"));
         assert_eq!(events[1].last_response.as_deref(), Some("Resposta pronta"));
+    }
+
+    #[test]
+    fn rollout_messages_become_chat_entries() {
+        let mut file = ObservedFile {
+            offset: 0,
+            session: Some(SessionMetadata {
+                id: "chat-1".into(),
+                cwd: Some("/work/lume".into()),
+                started_at: None,
+                source: SessionSource::Vscode,
+            }),
+            profile: None,
+        };
+        let records = vec![
+            record(
+                r#"{"timestamp":"2026-07-24T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Mostre os arquivos"}}"#,
+            ),
+            record(
+                r#"{"timestamp":"2026-07-24T10:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Alterei src/lib/TerminalWindow.svelte"}}"#,
+            ),
+        ];
+
+        let events = events_from_records(records, &mut file);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.kind.as_str()),
+            Some("prompt")
+        );
+        assert_eq!(
+            events[0]
+                .activity
+                .as_ref()
+                .and_then(|activity| activity.detail.as_deref()),
+            Some("Mostre os arquivos")
+        );
+        assert_eq!(
+            events[1]
+                .activity
+                .as_ref()
+                .map(|activity| activity.kind.as_str()),
+            Some("message")
+        );
     }
 
     #[test]

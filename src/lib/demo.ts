@@ -12,6 +12,7 @@ export const demoSessions: AgentSession[] = [
     startedAt: "2026-07-20T15:32:00-03:00",
     updatedAt: Date.now(),
     results: [],
+    activities: [],
     permissionProfile: {
       mode: "workspace_write",
       label: "Acesso ao projeto",
@@ -31,6 +32,7 @@ export const demoSessions: AgentSession[] = [
     startedAt: "2026-07-20T15:28:00-03:00",
     updatedAt: Date.now() - 12_000,
     results: [],
+    activities: [],
     permissionProfile: {
       mode: "read_only",
       label: "Somente leitura",
@@ -65,6 +67,7 @@ export const demoSessions: AgentSession[] = [
       files: ["references.md"],
       tests: [],
     }],
+    activities: [],
     permissionProfile: {
       mode: "full_access",
       label: "Sem acesso local",

@@ -86,6 +86,22 @@ pub struct SessionResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionActivity {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub append_detail: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResultNote {
     pub id: String,
     pub title: String,
@@ -120,6 +136,8 @@ pub struct AgentSession {
     pub last_response: Option<String>,
     #[serde(default)]
     pub results: Vec<SessionResult>,
+    #[serde(default)]
+    pub activities: Vec<SessionActivity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -204,6 +222,9 @@ pub struct Preferences {
     pub project_profiles: HashMap<String, ProjectProfile>,
     pub whiteboard_layouts: Vec<WhiteboardLayout>,
     pub global_shortcut: String,
+    pub open_shortcut: String,
+    pub new_session_shortcut: String,
+    pub whiteboard_shortcut: String,
 }
 
 impl Default for Preferences {
@@ -222,6 +243,9 @@ impl Default for Preferences {
             project_profiles: HashMap::new(),
             whiteboard_layouts: Vec::new(),
             global_shortcut: "Ctrl+Shift+Space".into(),
+            open_shortcut: "Ctrl+Alt+Shift+L".into(),
+            new_session_shortcut: "Ctrl+Alt+Shift+N".into(),
+            whiteboard_shortcut: "Ctrl+Alt+Shift+B".into(),
         }
     }
 }
@@ -231,6 +255,7 @@ impl Default for Preferences {
 pub enum HookEventKind {
     SessionStarted,
     Running,
+    Activity,
     PermissionRequest,
     WaitingForInput,
     Completed,
@@ -270,6 +295,8 @@ pub struct HookEvent {
     pub permission: Option<PermissionRequest>,
     #[serde(default)]
     pub last_response: Option<String>,
+    #[serde(default)]
+    pub activity: Option<SessionActivity>,
     #[serde(default)]
     pub wait_for_decision: bool,
 }

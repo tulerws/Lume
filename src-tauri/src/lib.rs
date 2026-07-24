@@ -3,6 +3,7 @@ mod agent_plugins;
 mod browser_server;
 mod codex_bridge;
 mod codex_sessions;
+mod desktop_shortcuts;
 mod discovery;
 mod domain;
 mod event_server;
@@ -14,7 +15,7 @@ mod state;
 mod store;
 mod terminal_windows;
 
-use std::io::Read;
+use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences, ResultNote};
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
@@ -26,7 +27,7 @@ use tauri::{
     AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 fn reveal_main_window(app: &AppHandle) {
@@ -34,6 +35,102 @@ fn reveal_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+struct PendingShortcutAction(Mutex<Option<String>>);
+
+fn shortcut_action_from_args(args: &[String]) -> Option<&str> {
+    (args.get(1).map(String::as_str) == Some("shortcut"))
+        .then(|| args.get(2).map(String::as_str))
+        .flatten()
+        .filter(|action| matches!(*action, "open" | "palette" | "new-session" | "whiteboard"))
+}
+
+#[tauri::command]
+fn take_pending_shortcut_action(
+    pending: State<'_, PendingShortcutAction>,
+) -> Result<Option<String>, String> {
+    pending
+        .0
+        .lock()
+        .map_err(|_| "Não foi possível ler o atalho inicial".to_string())
+        .map(|mut action| action.take())
+}
+
+fn shortcut_bindings(preferences: &Preferences) -> [(&str, &'static str, &'static str); 4] {
+    [
+        (&preferences.open_shortcut, "open", "Abrir o Lume"),
+        (
+            &preferences.global_shortcut,
+            "palette",
+            "Abrir a paleta de comandos",
+        ),
+        (
+            &preferences.new_session_shortcut,
+            "new-session",
+            "Abrir uma nova sessão",
+        ),
+        (
+            &preferences.whiteboard_shortcut,
+            "whiteboard",
+            "Abrir o whiteboard",
+        ),
+    ]
+}
+
+fn parsed_shortcut_bindings(
+    preferences: &Preferences,
+) -> Result<Vec<(Shortcut, &'static str, &'static str)>, String> {
+    let mut ids = HashSet::new();
+    shortcut_bindings(preferences)
+        .into_iter()
+        .map(|(value, action, label)| {
+            let shortcut = value
+                .parse::<Shortcut>()
+                .map_err(|_| format!("Atalho inválido para {label}: {value}"))?;
+            if !ids.insert(shortcut.id()) {
+                return Err(format!(
+                    "O atalho {value} está atribuído a mais de uma ação"
+                ));
+            }
+            Ok((shortcut, action, label))
+        })
+        .collect()
+}
+
+fn register_global_shortcuts(app: &AppHandle, preferences: &Preferences) -> Result<(), String> {
+    let bindings = parsed_shortcut_bindings(preferences)?;
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())?;
+    for (shortcut, action, label) in bindings {
+        if let Err(error) =
+            app.global_shortcut()
+                .on_shortcut(shortcut, move |app, _shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    reveal_main_window(app);
+                    let _ = app.emit("lume://shortcut", action);
+                })
+        {
+            let _ = app.global_shortcut().unregister_all();
+            return Err(format!("Não foi possível registrar {label}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_global_shortcuts(app: &AppHandle, preferences: &Preferences) -> Result<(), String> {
+    let native = register_global_shortcuts(app, preferences);
+    match desktop_shortcuts::configure(preferences) {
+        Ok(true) => Ok(()),
+        Ok(false) => native,
+        Err(desktop_error) => match native {
+            Ok(()) => Err(desktop_error),
+            Err(native_error) => Err(format!("{native_error}. {desktop_error}")),
+        },
     }
 }
 
@@ -106,11 +203,10 @@ fn submit_prompt(
     ) {
         return Err("Aguarde o agente terminar antes de enviar outro prompt".into());
     }
-    if session.source == domain::SessionSource::Web {
+    let result = if session.source == domain::SessionSource::Web {
         browser.request_prompt(session.id.clone(), prompt.to_string())?;
-        return browser.request_focus(session.id);
-    }
-    if session.agent == domain::AgentKind::Codex {
+        browser.request_focus(session.id.clone())
+    } else if session.agent == domain::AgentKind::Codex {
         let mut profile = session.permission_profile.clone();
         profile.can_respond_from_lume = true;
         profile.available_actions = vec![
@@ -120,49 +216,70 @@ fn submit_prompt(
         ];
         let thread_id = session
             .native_session_id
+            .clone()
             .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
-        return bridge.submit_prompt(&thread_id, prompt, profile, state.inner().clone(), app);
-    }
-    let agent = match session.agent {
-        domain::AgentKind::Claude => IntegrationKind::Claude,
-        domain::AgentKind::Gemini => IntegrationKind::Gemini,
-        domain::AgentKind::Codex => unreachable!(),
-        domain::AgentKind::Unknown => {
-            return Err("Este agente não oferece retomada direta pelo Lume".into());
-        }
-    };
-    let resume_id = session
-        .native_session_id
-        .ok_or_else(|| "A sessão não informou um identificador para retomada".to_string())?;
-    let working_directory = session
-        .working_directory
-        .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
-    let preferences = state.preferences()?;
-    let target = if session.source == domain::SessionSource::Vscode {
-        "vscode".to_string()
+        bridge.submit_prompt(
+            &thread_id,
+            prompt,
+            profile,
+            state.inner().clone(),
+            app.clone(),
+        )
     } else {
-        preferences.launch_target
+        let agent = match session.agent {
+            domain::AgentKind::Claude => IntegrationKind::Claude,
+            domain::AgentKind::Gemini => IntegrationKind::Gemini,
+            domain::AgentKind::Codex => unreachable!(),
+            domain::AgentKind::Unknown => {
+                return Err("Este agente não oferece retomada direta pelo Lume".into());
+            }
+        };
+        let resume_id = session
+            .native_session_id
+            .clone()
+            .ok_or_else(|| "A sessão não informou um identificador para retomada".to_string())?;
+        let working_directory = session
+            .working_directory
+            .clone()
+            .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
+        let preferences = state.preferences()?;
+        let target = if session.source == domain::SessionSource::Vscode {
+            "vscode".to_string()
+        } else {
+            preferences.launch_target
+        };
+        let executable = integrations::lume_executable()?;
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?;
+        launcher::launch(
+            LaunchRequest {
+                agent,
+                working_directory,
+                resume: true,
+                resume_id: Some(resume_id),
+                target,
+                initial_prompt: Some(prompt.to_string()),
+                permission_mode: None,
+                approval_policy: None,
+            },
+            &executable,
+            &app_data_dir,
+            None,
+        )
     };
-    let executable = integrations::lume_executable()?;
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    launcher::launch(
-        LaunchRequest {
-            agent,
-            working_directory,
-            resume: true,
-            resume_id: Some(resume_id),
-            target,
-            initial_prompt: Some(prompt.to_string()),
-            permission_mode: None,
-            approval_policy: None,
-        },
-        &executable,
-        &app_data_dir,
-        None,
-    )
+    result?;
+    state.record_activity(
+        &session.id,
+        "prompt",
+        "Prompt enviado pelo Lume",
+        Some(prompt.to_string()),
+        "completed",
+        Vec::new(),
+    )?;
+    let _ = app.emit("lume://sessions-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -228,6 +345,41 @@ fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
 }
 
 #[tauri::command]
+fn display_backend() -> &'static str {
+    #[cfg(target_os = "linux")]
+    if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback") {
+        return "xwayland-fallback";
+    }
+    "native"
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayPosition {
+    x: i32,
+    y: i32,
+}
+
+#[tauri::command]
+fn get_overlay_position(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<OverlayPosition, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Janela do Lume não encontrada".to_string())?;
+    if let Some((x, y)) = overlay::position(&window) {
+        return Ok(OverlayPosition { x, y });
+    }
+    let preferences = state.preferences()?;
+    let (x, y) = match (preferences.overlay_x, preferences.overlay_y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => overlay::default_position(&window, preferences.monitor_id.as_deref())?,
+    };
+    Ok(OverlayPosition { x, y })
+}
+
+#[tauri::command]
 fn set_preferences(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -236,6 +388,18 @@ fn set_preferences(
     let previous = state.preferences()?;
     let overlay_configuration_changed = previous.monitor_id != preferences.monitor_id
         || previous.show_over_fullscreen != preferences.show_over_fullscreen;
+    let shortcuts_changed = shortcut_bindings(&previous)
+        .iter()
+        .map(|binding| binding.0)
+        .ne(shortcut_bindings(&preferences)
+            .iter()
+            .map(|binding| binding.0));
+    if shortcuts_changed {
+        if let Err(error) = apply_global_shortcuts(&app, &preferences) {
+            let _ = apply_global_shortcuts(&app, &previous);
+            return Err(error);
+        }
+    }
     if preferences.autostart {
         app.autolaunch()
             .enable()
@@ -245,7 +409,12 @@ fn set_preferences(
             .disable()
             .map_err(|error| error.to_string())?;
     }
-    state.save_preferences(&preferences)?;
+    if let Err(error) = state.save_preferences(&preferences) {
+        if shortcuts_changed {
+            let _ = apply_global_shortcuts(&app, &previous);
+        }
+        return Err(error);
+    }
     if overlay_configuration_changed {
         let Some(window) = app.get_webview_window("main") else {
             return Ok(());
@@ -291,6 +460,19 @@ fn move_overlay(
     window
         .run_on_main_thread(move || {
             let _ = overlay::move_to(&window_for_move, x, y, monitor_id.as_deref());
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn resize_overlay_surface(app: AppHandle, width: i32, height: i32) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Janela do Lume não encontrada".to_string())?;
+    let window_for_resize = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let _ = overlay::resize_surface(&window_for_resize, width, height);
         })
         .map_err(|error| error.to_string())
 }
@@ -376,6 +558,24 @@ fn sync_terminal_window_position(
     finalize: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
     terminals.sync_native_position(&app, &label, x, y, finalize)
+}
+
+#[tauri::command]
+fn terminal_drag_snapshot(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::TerminalDragSnapshot, String> {
+    terminals.drag_snapshot(&app, &label)
+}
+
+#[tauri::command]
+fn begin_terminal_native_drag(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<(), String> {
+    terminals.begin_native_drag(&app, &label)
 }
 
 #[tauri::command]
@@ -563,25 +763,20 @@ fn launch_session(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_args = std::env::args().collect::<Vec<_>>();
+    let startup_shortcut_action = shortcut_action_from_args(&startup_args).map(str::to_string);
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
             reveal_main_window(app);
+            let action = shortcut_action_from_args(&args).unwrap_or("open");
+            let _ = app.emit("lume://shortcut", action);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        reveal_main_window(app);
-                        let _ = app.emit("lume://open-command-palette", ());
-                    }
-                })
-                .build(),
-        )
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -594,11 +789,7 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
-            let _ = app.global_shortcut().register(Shortcut::new(
-                Some(Modifiers::CONTROL | Modifiers::SHIFT),
-                Code::Space,
-            ));
+        .setup(move |app| {
             if let Ok(executable) = integrations::lume_executable() {
                 integrations::refresh_connected(&executable.to_string_lossy());
             }
@@ -608,6 +799,10 @@ pub fn run() {
                 .map_err(|error| error.to_string())?
                 .join("lume.sqlite3");
             let state = AppState::new(&database_path)?;
+            app.manage(PendingShortcutAction(Mutex::new(
+                startup_shortcut_action.clone(),
+            )));
+            let _ = apply_global_shortcuts(app.handle(), &state.preferences()?);
             app.manage(state.clone());
             let codex_bridge =
                 codex_bridge::CodexBridge::start(state.clone(), app.handle().clone())?;
@@ -691,8 +886,12 @@ pub fn run() {
             save_result_note,
             delete_result_note,
             get_preferences,
+            take_pending_shortcut_action,
+            display_backend,
+            get_overlay_position,
             set_preferences,
             move_overlay,
+            resize_overlay_surface,
             open_terminal_window,
             list_terminal_windows,
             get_terminal_window_state,
@@ -700,6 +899,8 @@ pub fn run() {
             move_terminal_window,
             cancel_terminal_window_move,
             sync_terminal_window_position,
+            terminal_drag_snapshot,
+            begin_terminal_native_drag,
             resize_terminal_window,
             begin_layered_terminal_resize,
             finish_layered_terminal_resize,
@@ -755,4 +956,38 @@ pub fn run_hook_client(provider: &str) -> i32 {
 
 pub fn run_terminal_payload(path: &str) -> i32 {
     launcher::run_terminal_payload(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_global_shortcuts_are_valid_and_unique() {
+        let bindings = parsed_shortcut_bindings(&Preferences::default()).expect("atalhos padrão");
+
+        assert_eq!(bindings.len(), 4);
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|(_, action, _)| *action)
+                .collect::<Vec<_>>(),
+            vec!["open", "palette", "new-session", "whiteboard"]
+        );
+    }
+
+    #[test]
+    fn repeated_global_shortcuts_are_rejected() {
+        let mut preferences = Preferences::default();
+        preferences.open_shortcut = preferences.global_shortcut.clone();
+
+        assert!(parsed_shortcut_bindings(&preferences).is_err());
+    }
+
+    #[test]
+    fn reads_shortcut_action_from_secondary_instance_arguments() {
+        let args = vec!["lume".into(), "shortcut".into(), "palette".into()];
+
+        assert_eq!(shortcut_action_from_args(&args), Some("palette"));
+    }
 }

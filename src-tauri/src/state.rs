@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,8 +11,8 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionResult, SessionSource,
-        SessionStatus,
+        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionActivity,
+        SessionResult, SessionSource, SessionStatus,
     },
     store::Store,
 };
@@ -18,12 +20,20 @@ use crate::{
 const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
 const WEB_SESSION_STALE_MS: i64 = 12_000;
 
+#[derive(Clone, Debug)]
+struct WorkspaceSnapshot {
+    root: PathBuf,
+    head: Option<String>,
+    files: HashMap<String, u64>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     sessions: Arc<Mutex<Vec<AgentSession>>>,
     store: Arc<Mutex<Store>>,
     decisions: Arc<(Mutex<HashMap<String, PermissionAction>>, Condvar)>,
     missing_process_scans: Arc<Mutex<HashMap<String, u8>>>,
+    workspace_snapshots: Arc<Mutex<HashMap<String, WorkspaceSnapshot>>>,
 }
 
 impl AppState {
@@ -42,6 +52,7 @@ impl AppState {
             store: Arc::new(Mutex::new(store)),
             decisions: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
             missing_process_scans: Arc::new(Mutex::new(HashMap::new())),
+            workspace_snapshots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -119,6 +130,41 @@ impl AppState {
         let mut sessions = deduplicated;
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
         Ok(sessions)
+    }
+
+    pub fn record_activity(
+        &self,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        detail: Option<String>,
+        status: &str,
+        files: Vec<String>,
+    ) -> Result<(), String> {
+        let now = now_millis();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível atualizar a atividade da sessão".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        remember_activity(
+            session,
+            SessionActivity {
+                id: format!("local:{session_id}:{now}"),
+                kind: kind.into(),
+                title: title.into(),
+                detail,
+                status: status.into(),
+                created_at: now,
+                files,
+                append_detail: false,
+            },
+        );
+        session.updated_at = now;
+        Ok(())
     }
 
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
@@ -351,6 +397,9 @@ impl AppState {
             .expect("a sessão acabou de ser inserida");
 
         apply_metadata(session, &event);
+        if let Some(activity) = event.activity.as_ref() {
+            remember_activity(session, activity.clone());
+        }
         session.updated_at = now;
         self.missing_process_scans
             .lock()
@@ -364,6 +413,37 @@ impl AppState {
                     .map(|permission| permission.id.clone())
             })
             .flatten();
+        if let Some(permission_id) = superseded_permission_id.as_ref() {
+            if let Some(activity) = session
+                .activities
+                .iter_mut()
+                .find(|activity| activity.id == format!("permission:{permission_id}"))
+            {
+                activity.status = "completed".into();
+            }
+        }
+        let starts_task = matches!(&event.event, HookEventKind::Running)
+            && !matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::PermissionRequired
+            );
+        if starts_task {
+            if let Some(snapshot) = workspace_snapshot(session.working_directory.as_deref()) {
+                self.workspace_snapshots
+                    .lock()
+                    .map_err(|_| "Não foi possível iniciar o rastreio de arquivos".to_string())?
+                    .insert(target_session_id.clone(), snapshot);
+            }
+        }
+        let finishes_task = matches!(
+            &event.event,
+            HookEventKind::Completed | HookEventKind::Failed | HookEventKind::SessionEnded
+        );
+        let observed_files = if finishes_task {
+            self.workspace_changes(&target_session_id, session.working_directory.as_deref())?
+        } else {
+            Vec::new()
+        };
 
         let permission_id = match event.event {
             HookEventKind::SessionStarted => {
@@ -379,6 +459,7 @@ impl AppState {
                 session.last_response = None;
                 None
             }
+            HookEventKind::Activity => None,
             HookEventKind::PermissionRequest => {
                 let permission = event
                     .permission
@@ -389,6 +470,26 @@ impl AppState {
                     .status_label
                     .unwrap_or_else(|| "Aguardando permissão".into());
                 session.pending_permission = Some(permission);
+                remember_activity(
+                    session,
+                    SessionActivity {
+                        id: format!("permission:{id}"),
+                        kind: "permission".into(),
+                        title: session
+                            .pending_permission
+                            .as_ref()
+                            .map(|permission| permission.summary.clone())
+                            .unwrap_or_else(|| "Permissão solicitada".into()),
+                        detail: session
+                            .pending_permission
+                            .as_ref()
+                            .map(|permission| permission.resource.clone()),
+                        status: "waiting".into(),
+                        created_at: now,
+                        files: Vec::new(),
+                        append_detail: false,
+                    },
+                );
                 Some(id)
             }
             HookEventKind::WaitingForInput => {
@@ -403,21 +504,58 @@ impl AppState {
                 session.status = SessionStatus::Completed;
                 session.status_label = event.status_label.unwrap_or_else(|| "Finalizado".into());
                 session.pending_permission = None;
+                for activity in session
+                    .activities
+                    .iter_mut()
+                    .filter(|activity| activity.status == "running")
+                {
+                    activity.status = "completed".into();
+                }
                 None
             }
             HookEventKind::Failed => {
                 session.status = SessionStatus::Failed;
                 session.status_label = event.status_label.unwrap_or_else(|| "Falhou".into());
                 session.pending_permission = None;
+                for activity in session
+                    .activities
+                    .iter_mut()
+                    .filter(|activity| activity.status == "running")
+                {
+                    activity.status = "failed".into();
+                }
                 None
             }
         };
 
+        if !observed_files.is_empty() {
+            remember_activity(
+                session,
+                SessionActivity {
+                    id: format!("workspace:{}:{now}", target_session_id),
+                    kind: "file".into(),
+                    title: if observed_files.len() == 1 {
+                        observed_files[0].clone()
+                    } else {
+                        format!("{} arquivos alterados", observed_files.len())
+                    },
+                    detail: None,
+                    status: if matches!(&event.event, HookEventKind::Failed) {
+                        "failed".into()
+                    } else {
+                        "completed".into()
+                    },
+                    created_at: now,
+                    files: observed_files.clone(),
+                    append_detail: false,
+                },
+            );
+        }
         if matches!(
             &event.event,
             HookEventKind::Completed | HookEventKind::SessionEnded
         ) {
-            remember_result(session, now);
+            remember_result(session, now, &observed_files);
         }
 
         let snapshot = session.clone();
@@ -459,6 +597,53 @@ impl AppState {
             store.add_history(&entry)?;
         }
         Ok(permission_id)
+    }
+
+    fn workspace_changes(
+        &self,
+        session_id: &str,
+        working_directory: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let baseline = self
+            .workspace_snapshots
+            .lock()
+            .map_err(|_| "Não foi possível concluir o rastreio de arquivos".to_string())?
+            .remove(session_id);
+        let Some(baseline) = baseline else {
+            return Ok(Vec::new());
+        };
+        let Some(current) = workspace_snapshot(working_directory) else {
+            return Ok(Vec::new());
+        };
+        if current.root != baseline.root {
+            return Ok(Vec::new());
+        }
+        let mut changed = current
+            .files
+            .iter()
+            .filter(|(path, fingerprint)| baseline.files.get(*path) != Some(*fingerprint))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        changed.extend(
+            baseline
+                .files
+                .keys()
+                .filter(|path| !current.files.contains_key(*path))
+                .cloned(),
+        );
+        if baseline.head != current.head {
+            if let (Some(before), Some(after)) = (baseline.head.as_deref(), current.head.as_deref())
+            {
+                changed.extend(git_paths(
+                    &current.root,
+                    &["diff", "--name-only", "-z", before, after],
+                ));
+            }
+        }
+        changed.sort();
+        changed.dedup();
+        changed.truncate(64);
+        Ok(changed)
     }
 
     pub fn resolve_permission(
@@ -510,6 +695,17 @@ impl AppState {
                 return Err("Use a origem da sessão para continuar".into());
             }
         };
+        if let Some(activity) = session
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == format!("permission:{permission_id}"))
+        {
+            activity.status = if action == PermissionAction::Deny {
+                "failed".into()
+            } else {
+                "completed".into()
+            };
+        }
 
         // O comando, caminho e payload deixam de existir assim que a decisão é tomada.
         session.pending_permission = None;
@@ -785,6 +981,7 @@ impl AppState {
                 pending_permission: None,
                 last_response: None,
                 results: Vec::new(),
+                activities: Vec::new(),
             };
             snapshots.push(session.clone());
             sessions.push(session);
@@ -900,10 +1097,77 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
         pending_permission: None,
         last_response: event.last_response.clone(),
         results: Vec::new(),
+        activities: event.activity.clone().into_iter().collect(),
     }
 }
 
-fn remember_result(session: &mut AgentSession, now: i64) {
+fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) {
+    if activity.kind == "prompt" {
+        if let Some(existing) = session.activities.iter_mut().rev().find(|existing| {
+            existing.kind == "prompt"
+                && existing.detail == activity.detail
+                && (existing.created_at - activity.created_at).abs() < 10_000
+        }) {
+            existing.status = activity.status;
+            return;
+        }
+    }
+    if activity.kind == "message" {
+        let duplicate = session.activities.iter().rposition(|existing| {
+            existing.kind == "message"
+                && existing.detail.as_deref().map(str::trim)
+                    == activity.detail.as_deref().map(str::trim)
+                && (existing.created_at - activity.created_at).abs() < 10_000
+        });
+        if let Some(index) = duplicate.filter(|index| {
+            !session.activities[index.saturating_add(1)..]
+                .iter()
+                .any(|existing| existing.kind == "prompt")
+        }) {
+            session.activities[index].status = activity.status;
+            for file in activity.files {
+                if !session.activities[index].files.contains(&file) {
+                    session.activities[index].files.push(file);
+                }
+            }
+            return;
+        }
+    }
+    if let Some(existing) = session
+        .activities
+        .iter_mut()
+        .find(|existing| existing.id == activity.id)
+    {
+        if activity.append_detail {
+            if let Some(delta) = activity.detail.take() {
+                let detail = existing.detail.get_or_insert_with(String::new);
+                detail.push_str(&delta);
+                *detail = detail.chars().take(32 * 1024).collect();
+            }
+            existing.status = activity.status;
+            for file in activity.files {
+                if !existing.files.contains(&file) {
+                    existing.files.push(file);
+                }
+            }
+            return;
+        }
+        activity.created_at = existing.created_at;
+        *existing = activity;
+    } else {
+        session.activities.push(activity);
+    }
+    session
+        .activities
+        .sort_by_key(|activity| activity.created_at);
+    if session.activities.len() > 160 {
+        session
+            .activities
+            .drain(..session.activities.len().saturating_sub(160));
+    }
+}
+
+fn remember_result(session: &mut AgentSession, now: i64, observed_files: &[String]) {
     let Some(response) = session
         .last_response
         .as_deref()
@@ -919,7 +1183,12 @@ fn remember_result(session: &mut AgentSession, now: i64) {
     {
         return;
     }
-    let (files, tests) = extract_result_artifacts(response);
+    let (mut files, tests) = extract_result_artifacts(response);
+    for file in observed_files {
+        if !files.contains(file) {
+            files.push(file.clone());
+        }
+    }
     session.results.push(SessionResult {
         id: format!("{}-result-{}", session.id, now),
         response: response.to_string(),
@@ -930,6 +1199,71 @@ fn remember_result(session: &mut AgentSession, now: i64) {
     if session.results.len() > 12 {
         session.results.drain(..session.results.len() - 12);
     }
+}
+
+fn workspace_snapshot(working_directory: Option<&str>) -> Option<WorkspaceSnapshot> {
+    let working_directory = Path::new(working_directory?);
+    let root = git_text(working_directory, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)?;
+    let head = git_text(&root, &["rev-parse", "HEAD"]);
+    let mut paths = git_paths(&root, &["diff", "--name-only", "-z"]);
+    paths.extend(git_paths(&root, &["diff", "--cached", "--name-only", "-z"]));
+    paths.extend(git_paths(
+        &root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    ));
+    paths.sort();
+    paths.dedup();
+    let files = paths
+        .into_iter()
+        .map(|path| {
+            let fingerprint = file_fingerprint(&root.join(&path));
+            (path, fingerprint)
+        })
+        .collect();
+    Some(WorkspaceSnapshot { root, head, files })
+}
+
+fn git_text(root: &Path, args: &[&str]) -> Option<String> {
+    let output = git_output(root, args)?;
+    let value = String::from_utf8_lossy(&output).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn git_paths(root: &Path, args: &[&str]) -> Vec<String> {
+    git_output(root, args)
+        .map(|output| {
+            output
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| String::from_utf8_lossy(path).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut command = crate::executables::command("git").ok()?;
+    let output = command.arg("-C").arg(root).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn file_fingerprint(path: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(metadata) = fs::metadata(path) {
+        metadata.len().hash(&mut hasher);
+        metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .hash(&mut hasher);
+        if metadata.len() <= 8 * 1024 * 1024 {
+            fs::read(path).ok().hash(&mut hasher);
+        }
+    } else {
+        "missing".hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
@@ -1024,6 +1358,9 @@ fn merge_results(target: &mut AgentSession, source: &AgentSession) {
     target.results.sort_by_key(|result| result.created_at);
     if target.results.len() > 12 {
         target.results.drain(..target.results.len() - 12);
+    }
+    for activity in &source.activities {
+        remember_activity(target, activity.clone());
     }
 }
 
@@ -1325,8 +1662,37 @@ mod tests {
             permission_profile: None,
             permission: None,
             last_response: None,
+            activity: None,
             wait_for_decision: false,
         }
+    }
+
+    #[test]
+    fn activity_updates_the_feed_without_changing_session_status() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:activity", 4242))
+            .expect("sessão");
+        let mut activity = started_event("claude:activity", 4242);
+        activity.event = HookEventKind::Activity;
+        activity.activity = Some(SessionActivity {
+            id: "tool-1".into(),
+            kind: "command".into(),
+            title: "npm test".into(),
+            detail: None,
+            status: "running".into(),
+            created_at: 10,
+            files: Vec::new(),
+            append_detail: false,
+        });
+        state.ingest(activity.clone()).expect("atividade iniciada");
+        activity.activity.as_mut().expect("atividade").status = "completed".into();
+        state.ingest(activity).expect("atividade concluída");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::WaitingForInput);
+        assert_eq!(session.activities.len(), 1);
+        assert_eq!(session.activities[0].status, "completed");
     }
 
     #[test]
@@ -1375,12 +1741,97 @@ mod tests {
     }
 
     #[test]
+    fn identical_agent_messages_from_two_sources_are_merged() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("codex:messages", 4242))
+            .expect("sessão");
+        for (id, created_at) in [("app-server", 10_000), ("rollout", 11_000)] {
+            let mut event = started_event("codex:messages", 4242);
+            event.event = HookEventKind::Activity;
+            event.activity = Some(SessionActivity {
+                id: id.into(),
+                kind: "message".into(),
+                title: "Resposta do agente".into(),
+                detail: Some("Resposta final".into()),
+                status: "completed".into(),
+                created_at,
+                files: Vec::new(),
+                append_detail: false,
+            });
+            state.ingest(event).expect("mensagem");
+        }
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "message")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn final_response_extracts_reported_files_and_checks() {
         let (files, tests) = extract_result_artifacts(
             "Alterei `src/state.rs` e `src/lib/lume.ts`.\n- `cargo test --lib`: passou",
         );
         assert_eq!(files, vec!["src/state.rs", "src/lib/lume.ts"]);
         assert_eq!(tests, vec!["cargo test --lib: passou"]);
+    }
+
+    #[test]
+    fn completed_task_reports_files_changed_since_it_started() {
+        let root = std::env::temp_dir().join(format!(
+            "lume-workspace-test-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&root).expect("diretório temporário");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Lume Test"]);
+        git(&["config", "user.email", "lume@example.invalid"]);
+        fs::write(root.join("tracked.txt"), "before\n").expect("arquivo inicial");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("claude:workspace", 4242);
+        event.working_directory = Some(root.to_string_lossy().into_owned());
+        state.ingest(event.clone()).expect("sessão");
+        event.event = HookEventKind::Running;
+        state.ingest(event.clone()).expect("início da tarefa");
+
+        fs::write(root.join("tracked.txt"), "after\n").expect("alteração");
+        fs::write(root.join("new.txt"), "new\n").expect("novo arquivo");
+        event.event = HookEventKind::Completed;
+        event.last_response = Some("Pronto".into());
+        state.ingest(event).expect("fim da tarefa");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        let files = session
+            .results
+            .first()
+            .map(|result| result.files.clone())
+            .expect("resultado");
+        assert_eq!(files, vec!["new.txt", "tracked.txt"]);
+        assert!(session.activities.iter().any(|activity| {
+            activity.kind == "file"
+                && activity.files == vec!["new.txt".to_string(), "tracked.txt".to_string()]
+        }));
+
+        fs::remove_dir_all(&root).expect("limpeza");
     }
 
     #[test]
@@ -1691,6 +2142,7 @@ mod tests {
                     permission_profile: None,
                     permission: None,
                     last_response: None,
+                    activity: None,
                     wait_for_decision: false,
                 })
                 .expect("chat do VS Code");

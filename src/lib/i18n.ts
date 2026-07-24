@@ -19,6 +19,19 @@ const englishDisplayText = new Map<string, string>([
   ["Encerrado", "Stopped"],
   ["Tarefa encerrada com erro", "Task failed"],
   ["Prompt enviado pelo Lume", "Prompt sent by Lume"],
+  ["Prompt enviado", "Prompt sent"],
+  ["Resposta do agente", "Agent response"],
+  ["Análise concluída", "Analysis completed"],
+  ["Analisando a solicitação", "Analyzing request"],
+  ["Resumo do raciocínio", "Reasoning summary"],
+  ["Saída do comando", "Command output"],
+  ["Alteração de arquivos", "File changes"],
+  ["Alterações da tarefa", "Task changes"],
+  ["Plano atualizado", "Plan updated"],
+  ["Arquivos alterados", "Files changed"],
+  ["Pesquisa na web", "Web search"],
+  ["Permissão solicitada", "Permission requested"],
+  ["Comando em execução", "Command running"],
   ["Continuando a tarefa", "Continuing task"],
   ["Permissão recusada", "Permission denied"],
   ["Sessão detectada", "Session detected"],
@@ -74,6 +87,12 @@ export function displayText(language: Language, value: string) {
   }
   if (/^\d+ eventos configurados$/.test(value)) {
     return value.replace(" eventos configurados", " events configured");
+  }
+  if (/^\d+ arquivos alterados$/.test(value)) {
+    return value.replace(" arquivos alterados", " files changed");
+  }
+  if (value.startsWith("Subagente · ")) {
+    return value.replace("Subagente · ", "Subagent · ");
   }
   if (value.endsWith(" não encontrado")) {
     return `${value.slice(0, -" não encontrado".length)} not found`;
