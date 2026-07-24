@@ -32,22 +32,26 @@ struct ProcessScan {
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
     thread::Builder::new()
         .name("lume-process-discovery".into())
-        .spawn(move || loop {
-            let plugins = agent_plugins::external_catalog(&app);
-            let scan = scan(&plugins);
-            if let Ok(changed) = state.reconcile_process_snapshot(scan.discovered, scan.live_pids) {
-                if changed {
-                    let _ = app.emit("lume://sessions-changed", ());
+        .spawn(move || {
+            let mut system = System::new();
+            loop {
+                let plugins = agent_plugins::external_catalog(&app);
+                let scan = scan(&mut system, &plugins);
+                if let Ok(changed) =
+                    state.reconcile_process_snapshot(scan.discovered, scan.live_pids)
+                {
+                    if changed {
+                        let _ = app.emit("lume://sessions-changed", ());
+                    }
                 }
+                thread::sleep(Duration::from_secs(2));
             }
-            thread::sleep(Duration::from_secs(1));
         })
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn scan(external_plugins: &[ExternalAgentPlugin]) -> ProcessScan {
-    let mut system = System::new();
+fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> ProcessScan {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,

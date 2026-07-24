@@ -63,7 +63,13 @@ fn shell_lookup(name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn shell_lookup(name: &str) -> Option<PathBuf> {
-    let output = Command::new("where.exe").arg(name).output().ok()?;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = Command::new("where.exe")
+        .arg(name)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -133,7 +139,9 @@ fn platform_command(path: &Path) -> Command {
             .creation_flags(CREATE_NO_WINDOW);
         command
     } else {
-        Command::new(path)
+        let mut command = Command::new(path);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
 }
 

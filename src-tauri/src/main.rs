@@ -8,11 +8,16 @@ fn should_use_xwayland_fallback(
     display: Option<&str>,
     force_native_wayland: bool,
 ) -> bool {
-    let is_gnome = desktop.split([':', ';']).map(str::trim).any(|part| {
+    let desktop_parts = desktop.split([':', ';']).map(str::trim).collect::<Vec<_>>();
+    let is_gnome = desktop_parts.iter().any(|part| {
         part.eq_ignore_ascii_case("gnome") || part.to_lowercase().starts_with("gnome-")
     });
+    let uses_native_gnome_backend = desktop_parts
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("ubuntu") || part.eq_ignore_ascii_case("pop"));
     session_type.eq_ignore_ascii_case("wayland")
         && is_gnome
+        && !uses_native_gnome_backend
         && display.is_some_and(|value| !value.trim().is_empty())
         && !force_native_wayland
 }
@@ -77,9 +82,19 @@ mod tests {
             Some(":0"),
             false
         ));
-        assert!(should_use_xwayland_fallback(
+    }
+
+    #[test]
+    fn keeps_native_backend_on_ubuntu_and_pop_gnome() {
+        assert!(!should_use_xwayland_fallback(
             "wayland",
             "ubuntu:GNOME",
+            Some(":1"),
+            false
+        ));
+        assert!(!should_use_xwayland_fallback(
+            "wayland",
+            "pop:GNOME",
             Some(":1"),
             false
         ));

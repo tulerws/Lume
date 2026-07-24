@@ -573,8 +573,11 @@ fn command_available(command: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn command_available(command: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     Command::new("where.exe")
         .arg(command)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .is_ok_and(|output| output.status.success())
 }

@@ -43,7 +43,6 @@
     decidePermission,
     defaultPreferences,
     deleteResultNote,
-    loadDisplayBackend,
     loadHistory,
     loadResultNotes,
     loadIntegrationStatuses,
@@ -98,6 +97,7 @@
   const compactSize = { width: 78, height: 44 };
   const expandedWidth = 392;
   const expandedMaxHeight = 560;
+  const expandedPanelMaxHeight = 544;
   const edgeAnchorThreshold = 18;
 
   let expanded = $state(!isTauri);
@@ -160,7 +160,6 @@
   let compactAnchorPosition: { x: number; y: number } | null = null;
   let overlayReady = $state(false);
   let monitorBounds = $state({ x: 0, y: 0, width: 1920, height: 1080, scale: 1 });
-  let displayBackend = $state<"native" | "xwayland-fallback">("native");
   let dragging = $state(false);
   let mascotAwake = $state(false);
   let mascotSleepTimer: ReturnType<typeof setTimeout> | undefined;
@@ -181,10 +180,6 @@
   let moveFrame: number | null = null;
   let pendingOverlayMove: { x: number; y: number } | null = null;
   let overlayMoveTask: Promise<void> | null = null;
-  let nativeDragStarted = false;
-  let nativeDragCompact = false;
-  let nativeDragFinishTimer: ReturnType<typeof setTimeout> | undefined;
-  let nativeDragSafetyTimer: ReturnType<typeof setTimeout> | undefined;
   let systemDark = $state(false);
 
   function tr(english: string, portuguese: string) {
@@ -308,7 +303,6 @@
     let stopListening: (() => void) | undefined;
     let stopTerminalListening: (() => void) | undefined;
     let stopShortcutListening: (() => void) | undefined;
-    let stopWindowMovedListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -331,12 +325,11 @@
       await positionWindow();
       overlayReady = true;
 
-      const [nextSessions, nextIntegrations, nextVscodeStatus, nextPlugins, nextDisplayBackend] = await Promise.all([
+      const [nextSessions, nextIntegrations, nextVscodeStatus, nextPlugins] = await Promise.all([
         loadSessions(),
         loadIntegrationStatuses(),
         loadVscodeStatus(),
         loadExternalPlugins(),
-        loadDisplayBackend(),
       ]);
       if (disposed) return;
       sessions = nextSessions;
@@ -345,7 +338,6 @@
       integrations = nextIntegrations;
       vscodeStatus = nextVscodeStatus;
       externalPlugins = nextPlugins;
-      displayBackend = nextDisplayBackend;
       selectedLayoutId = preferences.whiteboardLayouts[0]?.id ?? null;
       layoutName = preferences.whiteboardLayouts[0]?.name ?? "";
       selectedId =
@@ -363,20 +355,7 @@
         });
         const pendingShortcut = await takePendingShortcutAction();
         if (pendingShortcut) void runShortcutAction(pendingShortcut);
-        stopWindowMovedListening = await getCurrentWindow().onMoved(({ payload }) => {
-          if (!nativeDragStarted) return;
-          if (nativeDragCompact) suppressCompactToggle = true;
-          overlayPosition = clampOverlayPosition(
-            payload.x - monitorBounds.x,
-            payload.y - monitorBounds.y,
-          );
-          if (nativeDragFinishTimer) clearTimeout(nativeDragFinishTimer);
-          nativeDragFinishTimer = setTimeout(() => {
-            nativeDragFinishTimer = undefined;
-            void finishNativeOverlayDrag(payload.x, payload.y);
-          }, 180);
-        });
-        pollTimer = setInterval(() => void refreshSessions(false), 5_000);
+        pollTimer = setInterval(() => void refreshSessions(false), 15_000);
       }
     })();
 
@@ -385,7 +364,6 @@
       stopListening?.();
       stopTerminalListening?.();
       stopShortcutListening?.();
-      stopWindowMovedListening?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       window.removeEventListener("keydown", handleAppShortcut);
       window.removeEventListener("pointerup", finishOverlayDragFromWindow, true);
@@ -393,8 +371,6 @@
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
-      if (nativeDragFinishTimer) clearTimeout(nativeDragFinishTimer);
-      if (nativeDragSafetyTimer) clearTimeout(nativeDragSafetyTimer);
       if (pendingUpdate) void pendingUpdate.close();
     };
   });
@@ -700,11 +676,14 @@
 
   async function setOverlaySurfaceSize(width: number, height: number) {
     const size = new LogicalSize(width, height);
-    await Promise.allSettled([
-      getCurrentWindow().setSize(size),
-      getCurrentWebview().setSize(size),
-      resizeOverlaySurface(width, height),
-    ]);
+    const tasks: Promise<unknown>[] = [getCurrentWindow().setSize(size)];
+    if (isLinux) {
+      tasks.push(
+        getCurrentWebview().setSize(size),
+        resizeOverlaySurface(width, height),
+      );
+    }
+    await Promise.allSettled(tasks);
   }
 
   function morphEase(value: number) {
@@ -767,26 +746,6 @@
   function beginOverlayDrag(event: PointerEvent, compact = false) {
     if (!isTauri || !overlayReady || event.button !== 0 || morphing) return;
     if (!compact && (event.target as HTMLElement).closest("button, input, select, textarea")) {
-      return;
-    }
-    if (displayBackend === "xwayland-fallback") {
-      nativeDragStarted = true;
-      nativeDragCompact = compact;
-      dragging = true;
-      void getCurrentWindow()
-        .startDragging()
-        .catch(() => {
-          nativeDragStarted = false;
-          dragging = false;
-        });
-      if (nativeDragSafetyTimer) clearTimeout(nativeDragSafetyTimer);
-      nativeDragSafetyTimer = setTimeout(() => {
-        nativeDragSafetyTimer = undefined;
-        if (!nativeDragFinishTimer) {
-          nativeDragStarted = false;
-          dragging = false;
-        }
-      }, 1_200);
       return;
     }
     const target = event.currentTarget as HTMLElement;
@@ -875,63 +834,6 @@
     queueOverlayMove(overlayPosition.x, overlayPosition.y);
     await waitForOverlayMoves();
     await savePreferences(preferences);
-  }
-
-  async function finishNativeOverlayDrag(globalX: number, globalY: number) {
-    nativeDragStarted = false;
-    dragging = false;
-    if (nativeDragCompact) {
-      suppressCompactToggle = true;
-      setTimeout(() => {
-        suppressCompactToggle = false;
-      }, 300);
-    }
-    nativeDragCompact = false;
-    if (nativeDragSafetyTimer) {
-      clearTimeout(nativeDragSafetyTimer);
-      nativeDragSafetyTimer = undefined;
-    }
-    try {
-      const found = await availableMonitors();
-      const currentSize = expanded ? currentExpandedSize() : compactSize;
-      const centerX = globalX + (currentSize.width * monitorBounds.scale) / 2;
-      const centerY = globalY + (currentSize.height * monitorBounds.scale) / 2;
-      const monitorIndex = found.findIndex(
-        (monitor) =>
-          centerX >= monitor.position.x &&
-          centerX < monitor.position.x + monitor.size.width &&
-          centerY >= monitor.position.y &&
-          centerY < monitor.position.y + monitor.size.height,
-      );
-      const index = monitorIndex >= 0 ? monitorIndex : 0;
-      const monitor = found[index];
-      if (!monitor) return;
-      const scale = monitor.scaleFactor || 1;
-      monitorBounds = {
-        x: monitor.position.x,
-        y: monitor.position.y,
-        width: monitor.size.width,
-        height: monitor.size.height,
-        scale,
-      };
-      overlayPosition = clampOverlayPosition(
-        globalX - monitor.position.x,
-        globalY - monitor.position.y,
-      );
-      const persistedPosition = expanded
-        ? compactPositionFromExpanded(overlayPosition)
-        : overlayPosition;
-      compactAnchorPosition = expanded ? persistedPosition : null;
-      preferences = {
-        ...preferences,
-        monitorId: monitor.name ?? `monitor-${index}`,
-        overlayX: Math.round(persistedPosition.x),
-        overlayY: Math.round(persistedPosition.y),
-      };
-      await savePreferences(preferences);
-    } catch {
-      // O compositor já concluiu o movimento; persistir a posição é best effort.
-    }
   }
 
   function openSession(session: AgentSession) {
@@ -1232,6 +1134,26 @@
   }
 
   async function openView(nextView: View) {
+    if (
+      nextView === "settings" &&
+      isTauri &&
+      expanded &&
+      !morphing &&
+      expandedHeight < expandedPanelMaxHeight
+    ) {
+      const previousSize = currentExpandedSize();
+      const anchor =
+        compactAnchorPosition ?? compactPositionFromExpanded(overlayPosition, previousSize);
+      expandedHeight = expandedPanelMaxHeight;
+      compactAnchorPosition = anchor;
+      const target = currentExpandedSize();
+      const position = expandedPositionFromCompact(anchor, target);
+      await Promise.allSettled([
+        setOverlaySurfaceSize(target.width, target.height),
+        moveOverlay(position.x, position.y, false, preferences.monitorId),
+      ]);
+      overlayPosition = position;
+    }
     view = nextView;
     paletteOpen = false;
     selectedId = null;
@@ -1247,11 +1169,6 @@
     if (nextView === "settings") {
       selectedProfileKey ??= detectedProjects[0]?.key ?? null;
       settingsMessage = null;
-      [integrations, vscodeStatus, externalPlugins] = await Promise.all([
-        loadIntegrationStatuses(),
-        loadVscodeStatus(),
-        loadExternalPlugins(),
-      ]);
     }
   }
 
