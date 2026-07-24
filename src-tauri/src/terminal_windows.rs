@@ -302,7 +302,7 @@ impl TerminalWindows {
                 .skip_taskbar(true)
                 .shadow(false)
                 .resizable(true)
-                .visible(false)
+                .visible(cfg!(target_os = "windows"))
                 .on_page_load(move |window, payload| {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         ready_registry.mark_ready(&ready_label);
@@ -1014,8 +1014,7 @@ impl TerminalWindows {
             .ok()
             .and_then(|mut placements| {
                 let placement = placements.get_mut(label)?;
-                let ready_for_platform = placement.ready || cfg!(target_os = "windows");
-                if !ready_for_platform || !placement.configured || placement.presented {
+                if !placement.ready || !placement.configured || placement.presented {
                     return Some(false);
                 }
                 placement.presented = true;

@@ -672,7 +672,7 @@
     await tick();
 
     const tasks: Promise<unknown>[] = [
-      setOverlaySurfaceSize(geometry.width, geometry.height),
+      setOverlaySurfaceSize(geometry.width, geometry.height, true),
     ];
     if (geometry.x !== overlayPosition.x || geometry.y !== overlayPosition.y) {
       tasks.push(moveOverlay(geometry.x, geometry.y, false, preferences.monitorId));
@@ -681,10 +681,14 @@
     overlayPosition = { x: geometry.x, y: geometry.y };
   }
 
-  async function setOverlaySurfaceSize(width: number, height: number) {
+  async function setOverlaySurfaceSize(
+    width: number,
+    height: number,
+    syncLinuxSurface = false,
+  ) {
     const size = new LogicalSize(width, height);
     const tasks: Promise<unknown>[] = [getCurrentWindow().setSize(size)];
-    if (isLinux && displayBackend !== "native-gnome") {
+    if (isLinux && (displayBackend !== "native-gnome" || syncLinuxSurface)) {
       tasks.push(
         getCurrentWebview().setSize(size),
         resizeOverlaySurface(width, height),

@@ -22,6 +22,7 @@
     openSessionSource,
     resizeTerminalWindow,
     submitPrompt,
+    syncTerminalWindowPosition,
     terminateSession,
     undockTerminalWindow,
     type DisplayBackend,
@@ -43,6 +44,10 @@
   let finalizeRequested = false;
   let displayBackend = $state<DisplayBackend>("native");
   let nativeDragActive = false;
+  let nativeDragEndTimer: ReturnType<typeof setTimeout> | undefined;
+  let nativePosition: { x: number; y: number } | null = null;
+  let pendingNativeSync: { x: number; y: number; finalize: boolean } | null = null;
+  let nativeSyncRunning = false;
   let dragState: {
     pointerId: number;
     startX: number;
@@ -186,6 +191,7 @@
     let disposed = false;
     let stopListening: (() => void) | undefined;
     let stopWindowChanges: (() => void) | undefined;
+    let stopMoved: (() => void) | undefined;
     let stopResized: (() => void) | undefined;
     let stopPreferences: (() => void) | undefined;
     let stopDockPreview: (() => void) | undefined;
@@ -246,6 +252,16 @@
           }
         },
       );
+      stopMoved = await currentWindow.onMoved(({ payload }) => {
+        if (displayBackend !== "native-gnome" || !nativeDragActive) return;
+        nativePosition = { x: payload.x, y: payload.y };
+        queueNativePositionSync(payload.x, payload.y, false);
+        if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
+        nativeDragEndTimer = setTimeout(() => {
+          nativeDragEndTimer = undefined;
+          finishNativeGnomeDrag();
+        }, 450);
+      });
       stopResized = await currentWindow.onResized(() => {
         if (settling) return;
         if (resizeDragState) return;
@@ -265,12 +281,14 @@
       disposed = true;
       stopListening?.();
       stopWindowChanges?.();
+      stopMoved?.();
       stopResized?.();
       stopPreferences?.();
       stopDockPreview?.();
       stopNativeDragEnded?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
+      if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
     };
   });
 
@@ -392,18 +410,20 @@
       event.preventDefault();
       dragging = true;
       nativeDragActive = true;
+      nativePosition = null;
+      pendingNativeSync = null;
+      if (nativeDragEndTimer) {
+        clearTimeout(nativeDragEndTimer);
+        nativeDragEndTimer = undefined;
+      }
       dockMovingLabel = null;
       dockPreview = null;
       void currentWindow
         .startDragging()
         .catch((error) => {
+          nativeDragActive = false;
+          dragging = false;
           message = String(error).replace(/^Error:\s*/, "");
-        })
-        .finally(() => {
-          setTimeout(() => {
-            nativeDragActive = false;
-            dragging = false;
-          }, 300);
         });
       return;
     }
@@ -439,7 +459,10 @@
   }
 
   function endDrag(event: PointerEvent) {
-    if (nativeDragActive) return;
+    if (nativeDragActive) {
+      if (displayBackend === "native-gnome") finishNativeGnomeDrag();
+      return;
+    }
     if (!dragState || dragState.pointerId !== event.pointerId) return;
     const target = event.currentTarget as HTMLElement;
     if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
@@ -452,6 +475,49 @@
     }
     finalizeRequested = true;
     void flushMoves();
+  }
+
+  function queueNativePositionSync(x: number, y: number, finalize: boolean) {
+    pendingNativeSync = { x, y, finalize };
+    if (nativeSyncRunning) return;
+    void flushNativePositionSync();
+  }
+
+  async function flushNativePositionSync() {
+    nativeSyncRunning = true;
+    try {
+      while (pendingNativeSync) {
+        const next = pendingNativeSync;
+        pendingNativeSync = null;
+        windowState = await syncTerminalWindowPosition(
+          label,
+          next.x,
+          next.y,
+          next.finalize,
+        );
+      }
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      nativeSyncRunning = false;
+      if (pendingNativeSync) void flushNativePositionSync();
+    }
+  }
+
+  function finishNativeGnomeDrag() {
+    if (!nativeDragActive) return;
+    nativeDragActive = false;
+    dragging = false;
+    if (nativeDragEndTimer) {
+      clearTimeout(nativeDragEndTimer);
+      nativeDragEndTimer = undefined;
+    }
+    if (nativePosition) {
+      queueNativePositionSync(nativePosition.x, nativePosition.y, true);
+    } else {
+      dockMovingLabel = null;
+      dockPreview = null;
+    }
   }
 
   function cancelDrag(event: PointerEvent) {
