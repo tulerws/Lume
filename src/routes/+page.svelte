@@ -135,6 +135,8 @@
   let browserCompanionPath = $state<string | null>(null);
   let settingsMessage = $state<string | null>(null);
   let settingsMessageIsError = $state(false);
+  let resetConfirming = $state(false);
+  let resettingSettings = $state(false);
   let composerSessionId = $state<string | null>(null);
   let composerPrompt = $state("");
   let composerMessage = $state<string | null>(null);
@@ -1537,6 +1539,30 @@
     }
   }
 
+  async function resetSettings() {
+    if (!resetConfirming) {
+      resetConfirming = true;
+      settingsMessage = null;
+      return;
+    }
+    resettingSettings = true;
+    settingsMessage = null;
+    try {
+      preferences = { ...defaultPreferences };
+      await savePreferences(preferences);
+      if (isTauri) void emit("lume://preferences-changed", preferences);
+      selectedLayoutId = null;
+      layoutName = "";
+      resetConfirming = false;
+      await positionWindow();
+    } catch (error) {
+      settingsMessageIsError = true;
+      settingsMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      resettingSettings = false;
+    }
+  }
+
   function projectKey(value: string) {
     const normalized = value.trim().replaceAll("\\", "/").replace(/\/+$/, "");
     const identity = /^[a-z]:/i.test(normalized) ? normalized.toLowerCase() : normalized;
@@ -2448,6 +2474,20 @@
                 </div>
               {/if}
             </div>
+            <div class="settings-section-label preferences-label">{tr("Reset", "Redefinir")}</div>
+            <div class:confirming={resetConfirming} class="reset-settings-control">
+              {#if resetConfirming}
+                <span>{tr("Reset all Lume settings to their defaults?", "Redefinir todas as configurações do Lume para o padrão?")}</span>
+                <button type="button" onclick={() => (resetConfirming = false)}>{tr("Cancel", "Cancelar")}</button>
+                <button class="danger" disabled={resettingSettings} type="button" onclick={() => void resetSettings()}>
+                  {resettingSettings ? tr("Resetting…", "Redefinindo…") : tr("Reset", "Redefinir")}
+                </button>
+              {:else}
+                <button type="button" onclick={() => void resetSettings()}>
+                  {tr("Reset", "Redefinir")}
+                </button>
+              {/if}
+            </div>
             <span class:visible={savingSettings} class="save-state">{tr("Saving…", "Salvando…")}</span>
           </div>
         {/if}
@@ -2861,6 +2901,16 @@
   .terminate-agent-control.confirming button { min-height: 24px; padding: 0 7px; border: 1px solid rgba(91, 107, 100, 0.13); border-radius: 7px; color: #627068; background: rgba(255, 255, 255, 0.42); font-size: 8px; font-weight: 700; cursor: pointer; }
   .terminate-agent-control.confirming button.danger { border-color: rgba(166, 77, 77, 0.2); color: #a54c4c; }
   .terminate-agent-control button:disabled { opacity: 0.45; cursor: default; }
+  .reset-settings-control { display: flex; align-items: center; gap: 6px; }
+  .reset-settings-control > button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(165, 76, 76, 0.45); border-radius: 8px; color: #a54c4c; background: transparent; font-size: 10px; font-weight: 750; cursor: pointer; transition: transform 130ms ease, background 130ms ease; }
+  .reset-settings-control > button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(165, 76, 76, 0.1); }
+  .reset-settings-control.confirming { padding: 7px 8px; border: 1px solid rgba(165, 76, 76, 0.22); border-radius: 9px; background: rgba(165, 76, 76, 0.05); }
+  .reset-settings-control.confirming span { min-width: 0; flex: 1; color: #8a4340; font-size: 9px; font-weight: 650; line-height: 1.35; }
+  .reset-settings-control.confirming button { min-height: 24px; padding: 0 7px; border: 1px solid rgba(77, 91, 85, 0.3); border-radius: 7px; color: #4d5b55; background: transparent; font-size: 8px; font-weight: 750; cursor: pointer; transition: background 130ms ease; }
+  .reset-settings-control.confirming button:hover:not(:disabled) { background: rgba(77, 91, 85, 0.1); }
+  .reset-settings-control.confirming button.danger { border-color: rgba(165, 76, 76, 0.5); color: #a54c4c; }
+  .reset-settings-control.confirming button.danger:hover:not(:disabled) { background: rgba(165, 76, 76, 0.12); }
+  .reset-settings-control button:disabled { opacity: 0.45; cursor: default; }
 
   .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
