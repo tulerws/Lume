@@ -14,7 +14,7 @@ fn should_use_xwayland_fallback(
     });
     let uses_native_gnome_backend = desktop_parts
         .iter()
-        .any(|part| part.eq_ignore_ascii_case("ubuntu") || part.eq_ignore_ascii_case("pop"));
+        .any(|part| part.eq_ignore_ascii_case("pop"));
     session_type.eq_ignore_ascii_case("wayland")
         && is_gnome
         && !uses_native_gnome_backend
@@ -28,10 +28,10 @@ fn should_use_native_gnome_drag(session_type: &str, desktop: &str) -> bool {
     let is_gnome = desktop_parts.iter().any(|part| {
         part.eq_ignore_ascii_case("gnome") || part.to_lowercase().starts_with("gnome-")
     });
-    let is_ubuntu_or_pop = desktop_parts
+    let is_pop = desktop_parts
         .iter()
-        .any(|part| part.eq_ignore_ascii_case("ubuntu") || part.eq_ignore_ascii_case("pop"));
-    session_type.eq_ignore_ascii_case("wayland") && is_gnome && is_ubuntu_or_pop
+        .any(|part| part.eq_ignore_ascii_case("pop"));
+    session_type.eq_ignore_ascii_case("wayland") && is_gnome && is_pop
 }
 
 #[cfg(target_os = "linux")]
@@ -100,8 +100,8 @@ mod tests {
     }
 
     #[test]
-    fn keeps_native_backend_on_ubuntu_and_pop_gnome() {
-        assert!(!should_use_xwayland_fallback(
+    fn uses_position_compatible_backend_on_ubuntu_and_keeps_pop_native() {
+        assert!(should_use_xwayland_fallback(
             "wayland",
             "ubuntu:GNOME",
             Some(":1"),
@@ -113,7 +113,7 @@ mod tests {
             Some(":1"),
             false
         ));
-        assert!(should_use_native_gnome_drag("wayland", "ubuntu:GNOME"));
+        assert!(!should_use_native_gnome_drag("wayland", "ubuntu:GNOME"));
         assert!(should_use_native_gnome_drag("wayland", "pop:GNOME"));
         assert!(!should_use_native_gnome_drag("wayland", "COSMIC"));
         assert!(!should_use_native_gnome_drag("x11", "ubuntu:GNOME"));
