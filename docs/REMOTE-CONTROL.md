@@ -965,9 +965,7 @@ O que a v2 traz — relay para acesso fora da rede, push por FCM, serviço em pr
 
 ## Impacto na documentação existente
 
-Estes dois documentos passam a conter afirmação falsa quando a funcionalidade é ativada, e precisam de correção antes do lançamento da v0.5.4:
+Os dois documentos que continham afirmação falsa foram corrigidos, e vale registrar que a correção **atrasou**: as versões 0.5.0 a 0.5.3 foram publicadas com um servidor de rede no ar enquanto o `PRIVACY.md` ainda dizia "todos os serviços usam apenas loopback" e "o aplicativo não possui servidor remoto".
 
-- **`PRIVACY.md`**, seção *Comunicação*: a frase "Todos os serviços usam apenas loopback" e "O aplicativo não possui servidor remoto" deixam de valer para quem parear um aparelho. O texto precisa descrever a porta 43140, dizer que ela só existe com aparelho pareado, e explicar o que trafega — inclusive que conteúdo de permissão, que não é gravado em disco no desktop, é transmitido ao celular e lá fica em cache.
-- **`PRODUCT.md`**: a seção de experiência ganha o controle remoto, e a de plataformas ganha o Android.
-
-As alterações estão listadas aqui, mas não foram aplicadas. Elas devem entrar junto do código, não antes.
+- **`PRIVACY.md`**, seção *Comunicação*: separa os quatro serviços de loopback, que existem sempre, da porta 43140, que só existe com aparelho pareado ou tela de pareamento aberta. Descreve o que trafega e declara sem rodeio o ponto que mais muda para o usuário: **o conteúdo de um pedido de permissão não é gravado em disco no desktop, mas é transmitido ao celular e lá fica em cache**. Parear estende a superfície de onde esse conteúdo existe, e essa é a decisão que a pessoa toma ao parear. Fecha dizendo que nada da seção se aplica a quem nunca parear.
+- **`PRODUCT.md`**: a experiência principal ganha o celular pareado e a natureza explícita e revogável do pareamento; as plataformas ganham o Android 8+, com a ressalva de que ele é cliente e não decide nada.

@@ -19,6 +19,8 @@ Lume acompanha sessões de agentes de IA que já estejam abertas ou que tenham s
 - Perfis por projeto podem definir destino, monitor, posição da cápsula, permissões de novas sessões, layout e agentes preferidos.
 - `Ctrl+Shift+Space` abre uma paleta global para navegar entre telas, sessões e ações.
 - Detectores externos declarativos podem ser instalados por manifesto JSON e entram em vigor sem reiniciar.
+- Um celular pareado por QR espelha as sessões ao vivo e permite responder permissão, enviar prompt, encerrar um agente e ler o histórico — sem serviço de nuvem, sem conta, e sem sair da rede local.
+- O pareamento é explícito e revogável: a porta de rede só existe enquanto houver aparelho pareado, e revogar derrota a credencial e derruba a conexão.
 
 ## Estados normalizados
 
@@ -47,6 +49,7 @@ O conteúdo detalhado da permissão permanece apenas na memória enquanto a deci
 - Pop!_OS e outras distribuições Linux modernas.
 - X11/XWayland pela janela Tauri.
 - Wayland nativo por um backend de posicionamento `layer-shell` quando o compositor oferecer o protocolo.
+- **Android 8 ou mais recente**, como cliente do desktop. O aplicativo não descobre agentes nem executa nada por conta própria: quem decide o que é permitido continua sendo a máquina onde o agente roda.
 
 ## Integrações iniciais
 
