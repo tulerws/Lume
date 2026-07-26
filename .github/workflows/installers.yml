@@ -45,8 +45,21 @@ jobs:
           tagName: v__VERSION__
           releaseName: Lume v__VERSION__
           generateReleaseNotes: true
-          releaseDraft: false
-          prerelease: false
+          # Disparo manual produz **rascunho**; só a tag produz release de verdade.
+          #
+          # Sem esta distinção o `workflow_dispatch` criaria a tag `v__VERSION__`
+          # e publicaria — e release publicado vira "Latest" na hora, que é
+          # exatamente o endereço que os dois atualizadores consultam
+          # (`releases/latest/download/latest.json` no desktop e
+          # `mobile-latest.json` no Android). Um disparo para conferir um build
+          # atualizaria toda a base instalada dos dois produtos.
+          #
+          # Rascunho não cria a tag, não aparece para quem não tem acesso de
+          # escrita, e fica fora de "Latest". O `prerelease` acompanha como
+          # segunda barreira: se alguém publicar o rascunho por engano, ele ainda
+          # assim não assume o posto que os atualizadores leem.
+          releaseDraft: ${{ github.ref_type != 'tag' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
           args: --bundles ${{ matrix.bundles }}
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
@@ -161,6 +174,7 @@ jobs:
 
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
           echo "manifesto=$RUNNER_TEMP/mobile-latest.json" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # Confere que o `versionCode` do APK supera o da última versão publicada.
       # Um número que não sobe faz o Android recusar a instalação como retrocesso
@@ -193,14 +207,17 @@ jobs:
             ${{ steps.ativos.outputs.apk }}
             ${{ steps.ativos.outputs.manifesto }}
 
-      # Só numa tag. Num `workflow_dispatch` o job constrói, testa, confere a
-      # assinatura e a subida de versão, mas não publica — serve de ensaio
-      # completo sem criar release.
+      # Anexa ao mesmo lugar em que os instaladores de desktop foram parar: o
+      # release na tag, o rascunho no disparo manual. Assim o APK e os bundles
+      # ficam numa página só, em vez de espalhados entre a aba de execuções e a
+      # de releases.
+      #
+      # O upload acima continua existindo de propósito: se este passo falhar, o
+      # APK ainda é recuperável pela execução do workflow.
       - name: Anexa ao release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "${{ steps.ativos.outputs.tag }}" \
             "${{ steps.ativos.outputs.apk }}" \
             "${{ steps.ativos.outputs.manifesto }}" --clobber
