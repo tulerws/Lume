@@ -24,7 +24,7 @@ Cada escolha aqui foi feita contra alternativas concretas. Os motivos ficam regi
 
 | Camada | Escolha | Motivo |
 | --- | --- | --- |
-| Rede e TLS | **OkHttp** + `okhttp-tls` | `HandshakeCertificates.Builder().addTrustedCertificate(cert)` expressa exatamente "confie somente neste certificado", sem `X509TrustManager` escrito à mão. O `CertificatePinner` **não** resolve certificado self-signed: o pin só é conferido depois que a cadeia valida contra uma âncora de confiança, e self-signed falha antes disso. WebSocket é nativo da biblioteca. Exige também um `hostnameVerifier` próprio — ver abaixo. |
+| Rede e TLS | **OkHttp** + `X509TrustManager` próprio | WebSocket é nativo da biblioteca. A confiança **não** sai de nada pronto: o celular tem 32 bytes de hash, não o certificado, e nenhum mecanismo padrão do Android aceita isso. Ver [Os três portões](#os-três-portões-e-a-ordem-importa). |
 | Leitura de QR | **CameraX** + **ML Kit *bundled*** (`com.google.mlkit:barcode-scanning`) | ler o QR é o primeiro gesto do produto. A variante via Play Services baixa o modelo sob demanda e, enquanto não baixou, **não retorna nada** — falha silenciosa justamente na estreia. A *bundled* funciona sem Play Services e sem rede, custando alguns MB no APK. |
 | Cache | **Room**, sem cifra adicional | o armazenamento do aplicativo já é *credential-encrypted* pelo FBE do Android, isolado por UID e, com backup desligado, fora da nuvem. SQLCipher acrescentaria binário nativo, gestão de passphrase e uma classe nova de falha na abertura do banco, para cobrir o que o sistema já cobre. |
 | Credencial | chave **AES/GCM no Android Keystore** cifrando um blob em **DataStore** | `EncryptedSharedPreferences` foi descontinuado (`security-crypto:1.1.0-alpha07`), com histórico de corrupção de keyset em alguns OEMs — que se manifesta como "o aplicativo perdeu o pareamento sozinho". A chave no Keystore tem respaldo de hardware e não é exportável. |
@@ -36,23 +36,88 @@ Cada escolha aqui foi feita contra alternativas concretas. Os motivos ficam regi
 
 `compileSdk` e `targetSdk` seguem em 36, como no scaffold. Hilt e Room exigem KSP no build.
 
-### Confiança: âncora e verificador
+O `okhttp-tls` continua útil, mas **só como dependência de teste**: o `HeldCertificate` gera os certificados errados de que os casos negativos do trust manager precisam. Em produção ele não entra.
 
-O `addTrustedCertificate` resolve **metade** do problema. Ele torna o certificado do Lume uma âncora de confiança, e aí o OkHttp valida a cadeia — que passa — **e o hostname** contra o SAN, pelo `OkHostnameVerifier` padrão. O aplicativo conecta em `192.168.0.14:43140`; se aquele IP não estiver no SAN, o handshake morre com `Hostname not verified`.
+### Os três portões, e a ordem importa
 
-O certificado do desktop é imutável e o IP dele não é. Os dois não coexistem. A decisão, com o raciocínio completo, está em [REMOTE-CONTROL.md](REMOTE-CONTROL.md#o-san-é-decorativo): **o SAN é decorativo e a identidade é a chave**.
+O desktop abre uma porta que não é loopback. O celular precisa ter certeza de que fala com **aquele** computador e não com alguém no meio da rede. Como o certificado é autoassinado, não existe autoridade para atestar nada: a única coisa verificável é a chave, e por isso o QR carrega o hash dela.
 
-No cliente, isso são duas peças:
+Num aperto de mão TLS o cliente pode recusar em três lugares, e eles rodam em momentos diferentes:
+
+| Portão | Pergunta | Quando roda |
+| --- | --- | --- |
+| `X509TrustManager` | esta cadeia vem de alguém confiável? | **durante** o aperto de mão |
+| `HostnameVerifier` | o certificado é para o nome que disquei? | logo depois |
+| `CertificatePinner` | a chave é uma das que eu esperava? | depois de o aperto de mão dar certo |
+
+**A terceira linha decide o desenho.** Um certificado autoassinado morre no primeiro portão e nunca chega ao terceiro. Fixar a chave e confiar na chave são momentos diferentes, e é por isso que nenhum caminho pronto serve:
+
+| Caminho | Por que não serve |
+| --- | --- |
+| `CertificatePinner` | roda depois do aperto de mão, que já falhou |
+| `NetworkSecurityConfig`, o que o Google recomenda | precisa do certificado como **arquivo, em tempo de compilação**. Cada desktop gera o seu na primeira ativação, e o celular só descobre qual é ao ler o QR, na casa do usuário. Não há arquivo para empacotar |
+| `HandshakeCertificates` do `okhttp-tls` | `addTrustedCertificate` precisa do **certificado inteiro**. O QR carrega 32 bytes de hash |
+
+Sobra uma opção: um `X509TrustManager` próprio, comparando o SHA-256 do certificado apresentado com o fingerprint fixado. Ele é **mais estrito** que uma âncora de confiança comum — não aceita autoridade nenhuma, aceita uma chave.
+
+#### O hash é do certificado, não da chave pública
+
+`remote_identity.rs:73` calcula `SHA-256` sobre o **DER do certificado inteiro**, e o teste `fingerprint_covers_the_whole_certificate` fixa isso. Em Kotlin é `cert.encoded`, nunca `cert.publicKey.encoded`.
+
+Errar aqui não dá erro de compilação nem mensagem útil: os dois hashes têm 32 bytes, a comparação simplesmente nunca bate, e a falha chega ao usuário como "não conecta". Fixar o certificado em vez da SPKI também significa que trocar o certificado invalida o pareamento — o que é aceitável porque ele é gerado uma vez e nunca renovado.
+
+#### As duas peças
+
+```kotlin
+class PinnedTrustManager(private val pinned: ByteArray) : X509TrustManager {
+    override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {
+        val presented = chain?.firstOrNull()
+            ?: throw CertificateException("O servidor não apresentou certificado")
+        val digest = MessageDigest.getInstance("SHA-256").digest(presented.encoded)
+        if (!MessageDigest.isEqual(digest, pinned)) {
+            throw CertificateException("Certificado não é o do desktop pareado")
+        }
+    }
+
+    // O servidor nunca autentica o celular por TLS: quem faz isso é o token.
+    override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) =
+        throw CertificateException("Cliente não é autenticado por certificado")
+
+    // Vazio, e não `null`: `null` provoca NPE em código de plataforma.
+    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+}
+```
+
+E o verificador de nome, que **também** é trocado:
 
 ```kotlin
 OkHttpClient.Builder()
-    .sslSocketFactory(handshake.sslSocketFactory(), handshake.trustManager)
-    .hostnameVerifier { _, session -> fingerprintOf(session.peerCertificates.first()) == pinned }
+    .sslSocketFactory(sslContextWith(trustManager).socketFactory, trustManager)
+    .hostnameVerifier { _, session ->
+        MessageDigest.isEqual(fingerprintOf(session.peerCertificates.first()), pinned)
+    }
 ```
 
-O verificador **não** devolve `true`. Ele faz uma comparação real, contra o fingerprint que veio no QR — a mesma que o `addTrustedCertificate` já garante, agora explícita e independente do nome. Um verificador que retornasse `true` incondicionalmente seria exatamente a falha que este desenho evita, e é por isso que o caso negativo é teste obrigatório.
+O certificado do desktop é imutável e o IP dele não é: DHCP renova, o notebook sai do Wi-Fi para a Ethernet, sobe VPN. O `OkHostnameVerifier` padrão mataria o aperto de mão com `Hostname not verified` no primeiro desses eventos, e o pareamento pareceria ter se perdido sozinho. O raciocínio completo está em [REMOTE-CONTROL.md](REMOTE-CONTROL.md#o-san-é-decorativo): **o SAN é decorativo e a identidade é a chave**.
 
-Sem essa peça, trocar de rede desconecta o aparelho e o pareamento parece ter se perdido sozinho.
+Trocá-lo não é afrouxar. Num certificado autoassinado o nome é autodeclarado e não prova nada; a chave prova. O verificador repete a comparação do portão 1 de propósito — assim não existe `return true` em lugar nenhum da árvore, e um refatoramento que troque o trust manager por engano ainda encontra uma recusa real no caminho.
+
+#### O modo de falha que importa
+
+Segurança de rede quase nunca falha com barulho. Método vazio, `return true`, exceção engolida — **todos significam "aprovado"**, e o aplicativo conecta, abre e passa nos testes. O levantamento clássico sobre isso encontrou validação quebrada nos SDKs da Amazon e da PayPal e em aplicativos de banco; nenhum tinha sintoma.
+
+Daí a regra, que vale para os dois portões acima: **num portão de confiança, tudo que não é recusa explícita é aprovação.** Em consequência, o caso negativo é teste obrigatório, e é o único que distingue um verificador correto de um desligado.
+
+Uma nota de implementação com o mesmo espírito: `chain` pode vir vazia. `chain[0]` lançaria `ArrayIndexOutOfBoundsException`, que aborta o aperto de mão e portanto falha fechado — mas por acidente, não por decisão. O `firstOrNull()` acima transforma isso em recusa explícita.
+
+#### O que o servidor garante deste lado
+
+Duas coisas verificadas em `remote_server.rs::tls_config`, e é nelas que o código acima se apoia:
+
+- **A cadeia tem exatamente um certificado.** É `with_single_cert(vec![certificate], key)`, sem intermediário. Então `chain.first()` é a folha, é o único elemento, e é sobre ele que o fingerprint foi calculado. Não há caso de cadeia longa a tratar.
+- **O servidor nunca pede certificado do cliente.** É `with_no_client_auth()`, e quem autentica o celular é o token no cabeçalho `Authorization`. Por isso `checkClientTrusted` pode lançar sem ressalva: se algum dia ele for chamado, algo mudou no servidor e a recusa é a resposta certa.
+
+TLS 1.2 está habilitado no `rustls` (feature `tls12`) justamente porque 1.3 só é padrão a partir da API 29, e o `minSdk` aqui é 26.
 
 ## Estrutura
 
@@ -67,7 +132,7 @@ android/app/src/main/java/lume/ai/
 │   ├── local/                  Room: entidade, DAO, banco, retenção
 │   ├── remote/
 │   │   ├── LumeClient.kt       WebSocket OkHttp, reconexão, keepalive
-│   │   ├── PinnedTrust.kt      HandshakeCertificates a partir do fingerprint
+│   │   ├── PinnedTrust.kt      X509TrustManager que compara SHA-256(cert.encoded)
 │   │   ├── protocol/           Envelope e mensagens do protocolo v1
 │   │   └── PairingUri.kt       parser de lume://pair
 │   ├── ConnectionManager.kt    dono da conexão e do StateFlow<ConnectionState>
@@ -147,7 +212,8 @@ Testável sem aparelho:
 - **Parser do QR**: URI válida, versão desconhecida, campo ausente, fingerprint malformado, lista de candidatos vazia.
 - **Protocolo**: ida e volta de serialização do envelope e de cada mensagem, contra fixtures geradas pelo lado Rust — é o teste que pega divergência entre as duas implementações antes do usuário.
 - **Delta**: aplicar `updated`/`removed` sobre um cache conhecido, incluindo delta para sessão que não existe localmente.
-- **Pinning**: `HandshakeCertificates` aceitando o certificado correto e **recusando** um certificado diferente. O caso negativo é o que importa; sem ele, o pinning pode estar desligado sem ninguém perceber.
+- **Trust manager**: aceitando o certificado do desktop e **recusando** (a) um certificado diferente, (b) um certificado válido para uma autoridade pública, (c) cadeia vazia. Os três negativos são o teste; o positivo passaria com `checkServerTrusted` de corpo vazio.
+- **Escopo do fingerprint**: que a comparação é sobre `cert.encoded` e **não** sobre `cert.publicKey.encoded`. Um teste com fixture gerada pelo lado Rust pega isto de uma vez; sem ele, o erro só aparece como "não conecta".
 - **Verificador de hostname**: aceitando quando o fingerprint bate com hostname que não consta do SAN — que é o caso normal, com IP variável — e **recusando** quando o fingerprint não bate, ainda que o hostname confira. Os dois casos juntos provam que a decisão saiu do nome e foi para a chave. Só o primeiro passaria com um verificador que devolve `true`.
 
 Exige aparelho físico:

@@ -192,9 +192,13 @@ O certificado é **imutável** e o endereço IP da máquina **não é**: o DHCP 
 A saída não é regerar o certificado. É parar de usar o nome como identidade.
 
 - O certificado leva no SAN `lume.local`, o nome da máquina e os IPs do momento. Isso existe para mensagem de erro legível e para ferramenta de diagnóstico — não para decidir confiança.
-- O aplicativo Android substitui o `hostnameVerifier` do OkHttp por um que compara o **SHA-256 do certificado apresentado** com o fingerprint fixado no pareamento.
+- O aplicativo Android substitui **os dois primeiros portões** do TLS por comparação de fingerprint: um `X509TrustManager` próprio e um `hostnameVerifier` próprio. Ver [Os três portões](ANDROID.md#os-três-portões-e-a-ordem-importa).
 
 Isso não afrouxa a verificação, troca-a por uma mais forte. Num certificado self-signed o nome é auto-declarado: ninguém o assina, ninguém o atesta, e verificá-lo não prova nada. A única coisa verificável é a chave — que é exatamente o que o QR transportou.
+
+**Trocar só o verificador de nome não bastaria, e este documento já afirmou que bastava.** O verificador de nome é o segundo portão; o certificado autoassinado é recusado no primeiro, pelo trust manager, antes de qualquer nome ser conferido. E nenhum mecanismo pronto do Android resolve o primeiro portão a partir de um hash: o `CertificatePinner` roda depois do aperto de mão, o `NetworkSecurityConfig` exige o certificado empacotado em tempo de compilação, e o `HandshakeCertificates` exige o certificado inteiro. O celular tem 32 bytes.
+
+Uma consequência para este lado do cabo: o fingerprint é o **SHA-256 do DER do certificado**, não da chave pública. Os dois têm 32 bytes, e trocá-los não dá erro — só faz a comparação nunca bater.
 
 É também o que continua de pé na v2. Com um relay no caminho, o hostname da conexão será o do relay, e nenhum SAN emitido pelo desktop bateria com ele. Um desenho preso a nome exigiria reemissão; este não exige nada.
 
@@ -864,7 +868,7 @@ O último ponto é o ganho real. Com comparação de mensagens, um motivo novo c
 Segue em aberto:
 
 - **Comportamento de `tungstenite` sobre `rustls` com espera curta.** O padrão do projeto (`codex_bridge.rs:190-213`) lê com `set_read_timeout(45ms)` e engole `WouldBlock | TimedOut | Interrupted`. Sobre TCP puro isso é trivial; sobre TLS o estouro pode cair no meio de um registro, e o `accept_hdr` pode devolver `HandshakeError::Interrupted(MidHandshake)` exigindo retomada em vez de erro. O `rustls` guarda estado parcial na `ServerConnection` justamente para isso, mas "foi desenhado para" e "funciona no nosso laço" são coisas diferentes. É o que o teste do keepalive existe para descobrir.
-- **Fixação do certificado no OkHttp** com `HandshakeCertificates` mais o `hostnameVerifier` por fingerprint, contra um certificado gerado por `rcgen` — duas bibliotecas de ecossistemas diferentes concordando sobre o mesmo arquivo.
+- **Fixação do certificado no OkHttp** — agora com `X509TrustManager` próprio mais `hostnameVerifier` próprio, e não com `HandshakeCertificates`, que exigiria o certificado inteiro. O que falta verificar é `rcgen` e a plataforma Android concordando sobre o mesmo DER: se o certificado que o `rustls` apresenta produz, em `cert.encoded` do lado Kotlin, exatamente os bytes que o desktop hasheou. Um teste com fixture gerada pelo lado Rust resolve isso sem aparelho.
 - **Alcance real** entre aparelho físico e desktop na rede do usuário, incluindo a máquina em Ethernet e o celular em Wi-Fi.
 
 ### Primeiro incremento: o listener
