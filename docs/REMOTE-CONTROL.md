@@ -560,6 +560,7 @@ Por isso:
 | `permission.resolve` | `{ sessionId, permissionId, action }` | chama `AppState::resolve_permission` |
 | `prompt.submit` | `{ sessionId, prompt }` | mesma rotina de `submit_prompt` |
 | `history.list` | `{ limit, before }` | lê o histórico sanitizado; ver [Histórico](#histórico) |
+| `session.terminate` | `{ sessionId }` | encerra o processo do agente; ver [Encerrar de longe](#encerrar-de-longe) |
 
 `action` usa os valores de `PermissionAction`: `allow_once`, `allow_session`, `deny`, `open_source`. `open_source` não faz sentido remotamente — abriria uma janela na máquina onde o usuário não está — e é recusado com `action_not_available` **mesmo quando aparece em `availableActions`**.
 
@@ -735,6 +736,25 @@ O terceiro caso é o que exige atenção: enviar um prompt do celular para uma s
 
 Vale também no remoto a regra existente: prompt é recusado se a sessão está em `running` ou `permission_required` (`session_busy`).
 
+#### Encerrar de longe
+
+Parar um agente em fuga enquanto o usuário está longe da máquina é a premissa do produto, e é a ação que mais justifica o controle remoto existir depois de aprovar permissão.
+
+**Por que é permitido, sendo destrutivo.** O celular já aprova permissão — o que autoriza um comando arbitrário que o agente propôs — e já envia prompt, que instrui o agente a fazer qualquer coisa. Encerrar é estritamente menos poderoso que os dois. Recusá-lo por ser destrutivo seria incoerente com o que já está exposto.
+
+| Motivo | `code` | Repetir vale? |
+| --- | --- | --- |
+| sessão não existe | `session_not_found` | não |
+| origem sem processo isolado (VS Code, navegador) | `action_not_available` | **nunca** |
+| sessão sem `process_id` | `action_not_available` | **nunca** |
+| falha ao matar o processo | `internal` | não |
+
+As duas de `action_not_available` dizem que **aquela** sessão jamais poderá ser encerrada daqui, e não que a tentativa falhou: o aplicativo deve esconder o botão em vez de oferecê-lo. A razão é concreta — VS Code e navegador hospedam o agente no próprio processo, e matá-lo fecharia o editor ou o navegador inteiro do usuário.
+
+**O rastro vai para o histórico, não para uma atividade.** É a única das três ações em que isso acontece, e não é inconsistência: `mark_process_terminated` remove a sessão da lista, então não sobra onde pendurar atividade. O resumo do histórico passa a ser `Agente encerrado pelo Lume (Pixel 8)`.
+
+O delta que sai em seguida traz a sessão em `removed`.
+
 #### Do motivo ao código, em `prompt.submit`
 
 `send_prompt` é rotina única: a interface do desktop e o servidor remoto chamam **a mesma função**, e a diferença é apenas o nome do aparelho que entra no rastro. O rastro e o aviso de mudança acontecem dentro dela, então o servidor remoto não os repete.
@@ -762,10 +782,13 @@ O limite de 16 KB é medido em **bytes**, não em caracteres: é o tamanho que t
 Toda ação vinda do celular registra atividade com atribuição do aparelho, no mesmo formato sanitizado de hoje:
 
 ```
-Prompt enviado pelo Lume (Pixel 8)
-Permissão concedida pelo Lume (Pixel 8)
-Permissão recusada pelo Lume (Pixel 8)
+Prompt enviado pelo Lume (Pixel 8)        ← atividade da sessão
+Permissão concedida pelo Lume (Pixel 8)   ← atividade da sessão
+Permissão recusada pelo Lume (Pixel 8)    ← atividade da sessão
+Agente encerrado pelo Lume (Pixel 8)      ← resumo do histórico
 ```
+
+O encerramento é o único que vai para o histórico em vez de para uma atividade, porque a sessão deixa de existir no ato.
 
 O nome sai da tabela `remote_devices` e é lido **uma vez por conexão**, não por ação: ele não muda enquanto a conexão vive, porque renomear um aparelho exige parear de novo. Nome ausente cai em `Celular` e não derruba nada — o token já foi conferido antes do upgrade, e perder o rastro é muito menos grave que recusar uma decisão por causa de uma leitura de nome.
 

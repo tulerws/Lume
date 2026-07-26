@@ -297,7 +297,15 @@ impl AppState {
             .delete_result_note(id)
     }
 
-    pub fn mark_process_terminated(&self, process_id: u32) -> Result<bool, String> {
+    /// `origin` nomeia o aparelho quando o encerramento veio do celular.
+    ///
+    /// Entra no resumo do histórico, e não numa atividade da sessão, porque a
+    /// sessão deixa de existir aqui — não sobra onde pendurar o rastro.
+    pub fn mark_process_terminated(
+        &self,
+        process_id: u32,
+        origin: Option<&str>,
+    ) -> Result<bool, String> {
         let now = now_millis();
         let mut sessions = self
             .sessions
@@ -323,7 +331,10 @@ impl AppState {
                 agent_label: session.agent_label.clone(),
                 project: session.project.clone(),
                 event: "completed".into(),
-                summary: "Agente encerrado pelo Lume".into(),
+                summary: match origin {
+                    Some(device) => format!("Agente encerrado pelo Lume ({device})"),
+                    None => "Agente encerrado pelo Lume".to_string(),
+                },
                 created_at: now,
             });
         }
@@ -2145,7 +2156,7 @@ mod tests {
         second.native_session_id = Some("native-chat-2".into());
         state.ingest(second).expect("segundo chat");
 
-        assert!(state.mark_process_terminated(4242).expect("encerramento"));
+        assert!(state.mark_process_terminated(4242, None).expect("encerramento"));
 
         assert!(state.sessions().expect("sessões").is_empty());
         assert_eq!(state.history(10).expect("histórico").len(), 2);

@@ -31,6 +31,7 @@ use crate::{
     history_page::{self, Cursor},
     domain::{
         AgentSession, PermissionAction, PermissionDenial, PromptRefusal, RemoteDevice,
+        TerminationRefusal,
     },
     pairing::{self, Pairing},
     remote_identity::RemoteIdentity,
@@ -97,8 +98,16 @@ pub struct RemoteConfig {
 /// vinda da rede precisa de exatamente duas. A trait diz quais, e o teste
 /// implementa uma versão falsa sem tocar em Tauri.
 ///
-/// Uma terceira responsabilidade aqui é sinal de que a conexão está ganhando
-/// poder demais, e merece discussão antes de virar método.
+/// O aviso que estava aqui — "uma terceira responsabilidade é sinal de que a
+/// conexão está ganhando poder demais" — cumpriu o papel: `terminate_session`
+/// entrou depois dessa discussão, e não por acidente.
+///
+/// O que a decidiu: o celular **já** aprova permissão, o que autoriza um comando
+/// arbitrário que o agente propôs, e **já** envia prompt, que instrui o agente a
+/// fazer qualquer coisa. Encerrar é estritamente menos poderoso que os dois.
+/// Recusá-lo por ser destrutivo seria incoerente com o que já está exposto.
+///
+/// O aviso continua valendo para a quarta.
 pub trait Desktop: Send + Sync {
     /// Avisa que uma sessão mudou por ação do celular.
     ///
@@ -118,6 +127,16 @@ pub trait Desktop: Send + Sync {
         prompt: &str,
         device: &str,
     ) -> Result<(), PromptRefusal>;
+
+    /// Encerra o processo do agente, pela mesma rotina do desktop.
+    ///
+    /// `device` entra no resumo do histórico, e não numa atividade: a sessão
+    /// deixa de existir no encerramento.
+    fn terminate_session(
+        &self,
+        session_id: &str,
+        device: &str,
+    ) -> Result<(), TerminationRefusal>;
 }
 
 impl RemoteConfig {
@@ -242,6 +261,12 @@ struct ListHistory {
     /// Ausente ou nulo pede a página mais recente.
     #[serde(default)]
     before: Option<Cursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminateSession {
+    session_id: String,
 }
 
 #[derive(Deserialize)]
@@ -1053,6 +1078,7 @@ fn dispatch(
         "permission.resolve" => decide_permission(socket, config, device, incoming),
         "prompt.submit" => deliver_prompt(socket, config, device, incoming),
         "history.list" => list_history(socket, config, incoming),
+        "session.terminate" => stop_session(socket, config, device, incoming),
         other => {
             // O tipo volta saneado. Ele veio de fora, e ecoar texto de entrada
             // sem limite de tamanho nem filtro de controle é como se constroem
@@ -1275,6 +1301,70 @@ fn deliver_prompt(
     )
 }
 
+/// Traduz a recusa de encerramento no código que o aplicativo trata.
+fn termination_code(refusal: &TerminationRefusal) -> &'static str {
+    match refusal {
+        TerminationRefusal::SessionNotFound => "session_not_found",
+        // As duas dizem que **esta** sessão nunca poderá ser encerrada daqui, e
+        // não que a tentativa falhou. O aplicativo deve esconder o botão.
+        TerminationRefusal::SharedProcess | TerminationRefusal::NoProcess => {
+            "action_not_available"
+        }
+        TerminationRefusal::Internal(_) => "internal",
+    }
+}
+
+/// O encerramento pedido pelo celular.
+///
+/// A sessão some da lista como efeito, então o delta que sai em seguida a traz
+/// em `removed`. O rastro fica no histórico, com o nome do aparelho.
+fn stop_session(
+    socket: &mut Socket,
+    config: &RemoteConfig,
+    device: &Device,
+    incoming: Incoming,
+) -> Result<(), String> {
+    let request: TerminateSession = match serde_json::from_value(incoming.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return send_error(
+                socket,
+                incoming.id.as_deref(),
+                "invalid_request",
+                &format!("Encerramento incompleto: {error}"),
+            )
+        }
+    };
+
+    if let Err(refusal) = config
+        .desktop
+        .terminate_session(&request.session_id, &device.name)
+    {
+        let message = match &refusal {
+            TerminationRefusal::Internal(detail) => {
+                eprintln!("Encerramento remoto não aconteceu: {detail}");
+                "Falha interna ao encerrar a sessão".to_string()
+            }
+            other => other.to_string(),
+        };
+        return send_error(
+            socket,
+            incoming.id.as_deref(),
+            termination_code(&refusal),
+            &message,
+        );
+    }
+
+    send(
+        socket,
+        &Envelope {
+            kind: "result",
+            id: incoming.id,
+            payload: Acknowledged { ok: true },
+        },
+    )
+}
+
 /// O rastro da decisão, com atribuição ao aparelho.
 ///
 /// Fica no formato sanitizado de sempre — quem decidiu e o quê, sem comando,
@@ -1446,6 +1536,8 @@ mod tests {
         revision: Arc<AtomicU64>,
         prompts: Arc<Mutex<Vec<(String, String, String)>>>,
         refusal: Arc<Mutex<Option<PromptRefusal>>>,
+        terminations: Arc<Mutex<Vec<(String, String)>>>,
+        termination_refusal: Arc<Mutex<Option<TerminationRefusal>>>,
     }
 
     impl Desktop for FakeDesktop {
@@ -1475,6 +1567,24 @@ mod tests {
                 }
             }
         }
+
+        fn terminate_session(
+            &self,
+            session_id: &str,
+            device: &str,
+        ) -> Result<(), TerminationRefusal> {
+            self.terminations
+                .lock()
+                .expect("registro")
+                .push((session_id.to_string(), device.to_string()));
+            match self.termination_refusal.lock().expect("recusa").clone() {
+                Some(refusal) => Err(refusal),
+                None => {
+                    self.announce();
+                    Ok(())
+                }
+            }
+        }
     }
 
     struct Server {
@@ -1491,6 +1601,8 @@ mod tests {
         prompts: Arc<Mutex<Vec<(String, String, String)>>>,
         /// Posto pelo teste para o próximo prompt ser recusado.
         refusal: Arc<Mutex<Option<PromptRefusal>>>,
+        terminations: Arc<Mutex<Vec<(String, String)>>>,
+        termination_refusal: Arc<Mutex<Option<TerminationRefusal>>>,
     }
 
     fn paired_device(id: &str) -> RemoteDevice {
@@ -1521,6 +1633,8 @@ mod tests {
         let revision = Arc::new(AtomicU64::new(0));
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let refusal = Arc::new(Mutex::new(None));
+        let terminations = Arc::new(Mutex::new(Vec::new()));
+        let termination_refusal = Arc::new(Mutex::new(None));
         let config = Arc::new(RemoteConfig::new(
             state.clone(),
             pairing.clone(),
@@ -1532,6 +1646,8 @@ mod tests {
                 revision: revision.clone(),
                 prompts: prompts.clone(),
                 refusal: refusal.clone(),
+                terminations: terminations.clone(),
+                termination_refusal: termination_refusal.clone(),
             }),
         ));
 
@@ -1553,6 +1669,8 @@ mod tests {
             revision,
             prompts,
             refusal,
+            terminations,
+            termination_refusal,
         }
     }
 
@@ -2461,6 +2579,94 @@ mod tests {
 
         ask(&mut socket, "req-2", "history.list", serde_json::json!({}));
         assert_eq!(read_envelope(&mut socket)["type"], "result");
+    }
+
+    #[test]
+    fn a_termination_from_the_device_reaches_the_single_routine() {
+        let server = test_server();
+        server.state.ingest(started_event("s-1")).expect("sessão");
+        let mut socket = mirrored(&server);
+
+        ask(
+            &mut socket,
+            "req-1",
+            "session.terminate",
+            serde_json::json!({ "sessionId": "s-1" }),
+        );
+
+        let result = read_envelope(&mut socket);
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["id"], "req-1");
+
+        // O aparelho vai junto: é ele que aparece no histórico como
+        // "Agente encerrado pelo Lume (Pixel de teste)".
+        assert_eq!(
+            server.terminations.lock().expect("registro").clone(),
+            vec![("s-1".to_string(), "Pixel de teste".to_string())]
+        );
+    }
+
+    #[test]
+    fn every_termination_refusal_carries_its_own_code() {
+        // As duas de processo dizem que **esta** sessão nunca poderá ser
+        // encerrada daqui, e não que a tentativa falhou.
+        let expected = [
+            (TerminationRefusal::SessionNotFound, "session_not_found"),
+            (TerminationRefusal::SharedProcess, "action_not_available"),
+            (TerminationRefusal::NoProcess, "action_not_available"),
+        ];
+
+        let server = test_server();
+        server.state.ingest(started_event("s-1")).expect("sessão");
+        let mut socket = mirrored(&server);
+
+        for (refusal, code) in expected {
+            *server.termination_refusal.lock().expect("recusa") = Some(refusal.clone());
+            ask(
+                &mut socket,
+                "req",
+                "session.terminate",
+                serde_json::json!({ "sessionId": "s-1" }),
+            );
+
+            let error = read_envelope(&mut socket);
+            assert_eq!(error["type"], "error", "recusa {refusal:?}");
+            assert_eq!(error["payload"]["code"], code, "recusa {refusal:?}");
+            assert_eq!(error["payload"]["message"], refusal.to_string());
+        }
+    }
+
+    #[test]
+    fn a_failed_termination_does_not_leak_the_detail() {
+        let server = test_server();
+        server.state.ingest(started_event("s-1")).expect("sessão");
+        let mut socket = mirrored(&server);
+
+        *server.termination_refusal.lock().expect("recusa") = Some(
+            TerminationRefusal::Internal("kill 4242: /proc/4242/stat: No such file".into()),
+        );
+        ask(
+            &mut socket,
+            "req-1",
+            "session.terminate",
+            serde_json::json!({ "sessionId": "s-1" }),
+        );
+
+        let error = read_envelope(&mut socket);
+        assert_eq!(error["payload"]["code"], "internal");
+        let message = error["payload"]["message"].as_str().expect("mensagem");
+        assert!(!message.contains("/proc/"), "vazou: {message}");
+    }
+
+    #[test]
+    fn an_incomplete_termination_is_refused_without_reaching_the_desktop() {
+        let server = test_server();
+        let mut socket = mirrored(&server);
+
+        ask(&mut socket, "req-1", "session.terminate", serde_json::json!({}));
+
+        assert_eq!(read_envelope(&mut socket)["payload"]["code"], "invalid_request");
+        assert!(server.terminations.lock().expect("registro").is_empty());
     }
 
     /// O caminho de produção, ponta a ponta: a função que **todos** os pontos de

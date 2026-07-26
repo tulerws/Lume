@@ -25,6 +25,7 @@ use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
     AgentSession, HistoryEntry, PermissionAction, Preferences, PromptRefusal, ResultNote,
+    TerminationRefusal,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -356,23 +357,42 @@ fn terminate_session(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
+    // Casca fina sobre `stop_session`, a mesma rotina que o servidor remoto
+    // chama. `None` na origem porque a ação nasceu aqui mesmo.
+    stop_session(&app, &state, &session_id, None).map_err(|refusal| refusal.to_string())
+}
+
+/// Encerra o processo de uma sessão. **Único caminho**, usado pela interface do
+/// desktop e pelo controle remoto.
+///
+/// `origin` é o nome do aparelho quando a ação veio do celular. Ele entra no
+/// **resumo do histórico**, e não numa atividade da sessão como nas outras
+/// ações: a sessão deixa de existir dentro de `mark_process_terminated`, e não
+/// sobra onde pendurar o rastro.
+fn stop_session(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    origin: Option<&str>,
+) -> Result<(), TerminationRefusal> {
     let session = state
-        .sessions()?
+        .sessions()
+        .map_err(TerminationRefusal::Internal)?
         .into_iter()
         .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        .ok_or(TerminationRefusal::SessionNotFound)?;
+    // VS Code e navegador hospedam o agente no próprio processo: matá-lo
+    // fecharia o editor ou o navegador inteiro do usuário.
     if session.source != domain::SessionSource::Cli {
-        return Err(
-            "Esta integração não possui um processo isolado; o Lume não fechará o editor ou navegador inteiro"
-                .into(),
-        );
+        return Err(TerminationRefusal::SharedProcess);
     }
-    let process_id = session
-        .process_id
-        .ok_or_else(|| "A sessão não possui um processo associado".to_string())?;
-    discovery::terminate_agent_process(process_id, &session.agent)?;
-    state.mark_process_terminated(process_id)?;
-    remote_server::announce_sessions_changed(&app);
+    let process_id = session.process_id.ok_or(TerminationRefusal::NoProcess)?;
+    discovery::terminate_agent_process(process_id, &session.agent)
+        .map_err(TerminationRefusal::Internal)?;
+    state
+        .mark_process_terminated(process_id, origin)
+        .map_err(TerminationRefusal::Internal)?;
+    remote_server::announce_sessions_changed(app);
     Ok(())
 }
 
@@ -791,6 +811,19 @@ impl remote_server::Desktop for RemoteDesktop {
             &self.app.state::<browser_server::BrowserControl>(),
             session_id,
             prompt,
+            Some(device),
+        )
+    }
+
+    fn terminate_session(
+        &self,
+        session_id: &str,
+        device: &str,
+    ) -> Result<(), TerminationRefusal> {
+        stop_session(
+            &self.app,
+            &self.app.state::<AppState>(),
+            session_id,
             Some(device),
         )
     }

@@ -91,6 +91,37 @@ impl std::fmt::Display for PermissionDenial {
     }
 }
 
+/// Por que uma sessão não foi encerrada.
+///
+/// Mesma razão de [`PermissionDenial`] e [`PromptRefusal`] existirem: o celular
+/// precisa distinguir "esta sessão sumiu" de "esta sessão nunca poderá ser
+/// encerrada daqui". A segunda diz ao aplicativo para esconder o botão, e não
+/// para tentar de novo.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminationRefusal {
+    SessionNotFound,
+    /// Integração que divide o processo com o editor ou o navegador. Encerrar
+    /// fecharia o VS Code ou o Chrome inteiro, não o agente.
+    SharedProcess,
+    NoProcess,
+    Internal(String),
+}
+
+impl std::fmt::Display for TerminationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str("Sessão não encontrada"),
+            Self::SharedProcess => formatter.write_str(
+                "Esta integração não possui um processo isolado; o Lume não fechará o editor ou navegador inteiro",
+            ),
+            Self::NoProcess => {
+                formatter.write_str("A sessão não possui um processo associado")
+            }
+            Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
 /// Por que um prompt não foi enviado.
 ///
 /// Mesma razão de [`PermissionDenial`] existir: o celular precisa saber a
@@ -467,6 +498,24 @@ mod tests {
         assert_eq!(
             PermissionDenial::Internal("Não foi possível salvar a decisão".into()).to_string(),
             "Não foi possível salvar a decisão"
+        );
+    }
+
+    /// E para o encerramento. `stop_session` foi extraído do comando do Tauri
+    /// pelo mesmo motivo, e também sem licença para mudar o texto do desktop.
+    #[test]
+    fn the_termination_wording_is_unchanged() {
+        assert_eq!(
+            TerminationRefusal::SessionNotFound.to_string(),
+            "Sessão não encontrada"
+        );
+        assert_eq!(
+            TerminationRefusal::SharedProcess.to_string(),
+            "Esta integração não possui um processo isolado; o Lume não fechará o editor ou navegador inteiro"
+        );
+        assert_eq!(
+            TerminationRefusal::NoProcess.to_string(),
+            "A sessão não possui um processo associado"
         );
     }
 
