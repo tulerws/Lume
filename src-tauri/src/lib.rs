@@ -346,7 +346,7 @@ fn send_prompt(
         )
         .map_err(PromptRefusal::Internal)?;
     // Serve o webview e o contador de revisão de uma vez.
-    let _ = app.emit(remote_server::SESSIONS_CHANGED, ());
+    remote_server::announce_sessions_changed(app);
     Ok(())
 }
 
@@ -372,7 +372,7 @@ fn terminate_session(
         .ok_or_else(|| "A sessão não possui um processo associado".to_string())?;
     discovery::terminate_agent_process(process_id, &session.agent)?;
     state.mark_process_terminated(process_id)?;
-    let _ = app.emit("lume://sessions-changed", ());
+    remote_server::announce_sessions_changed(&app);
     Ok(())
 }
 
@@ -773,7 +773,7 @@ impl RemoteDesktop {
 
 impl remote_server::Desktop for RemoteDesktop {
     fn announce(&self) {
-        let _ = self.app.emit(remote_server::SESSIONS_CHANGED, ());
+        remote_server::announce_sessions_changed(&self.app);
     }
 
     fn submit_prompt(

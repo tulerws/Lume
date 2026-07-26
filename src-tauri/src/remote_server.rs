@@ -18,7 +18,7 @@ use rustls::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tungstenite::{
     accept_hdr_with_config,
     handshake::server::{ErrorResponse, Request, Response},
@@ -408,6 +408,24 @@ impl RemoteServer {
 /// Cinco pontos do código o emitem, e nenhum deles precisou mudar para o
 /// controle remoto existir.
 pub const SESSIONS_CHANGED: &str = "lume://sessions-changed";
+
+/// Anuncia que a lista de sessões mudou.
+///
+/// **Todo ponto de emissão passa por aqui**, e isso não é organização: é o que
+/// sustenta o controle remoto. `emit` entrega tanto aos webviews quanto aos
+/// ouvintes de Rust; `emit_to` e `emit_filter` aplicam o filtro de alvo também
+/// aos de Rust, e trocar um pelo outro — otimização plausível para reduzir
+/// tráfego ao webview — faria o servidor remoto parar de receber, sem erro e
+/// sem aviso.
+///
+/// Com cinco pontos de emissão espalhados, essa regra dependia de todo mundo
+/// lembrar dela. Com um ponto só, existe um lugar para acertar e um lugar para
+/// revisar.
+pub fn announce_sessions_changed<R: tauri::Runtime>(app: &AppHandle<R>) {
+    // O erro é ignorado de propósito: emitir falha quando o aplicativo está
+    // encerrando, e não há o que fazer a respeito nem quem escutar.
+    let _ = app.emit(SESSIONS_CHANGED, ());
+}
 
 /// Liga o contador de revisão ao evento de sessões.
 ///
@@ -2443,6 +2461,23 @@ mod tests {
 
         ask(&mut socket, "req-2", "history.list", serde_json::json!({}));
         assert_eq!(read_envelope(&mut socket)["type"], "result");
+    }
+
+    /// O caminho de produção, ponta a ponta: a função que **todos** os pontos de
+    /// emissão chamam alcança o ouvinte que move o contador.
+    ///
+    /// O teste seguinte cobre a outra metade — que a constante confere com a
+    /// string escrita à mão. Um sem o outro deixa passar metade da corrente.
+    #[test]
+    fn the_announcement_reaches_the_counter() {
+        let app = tauri::test::mock_app();
+        let server = RemoteServer::default();
+        let revision = server.revision();
+        watch_sessions(app.handle(), revision.clone());
+
+        announce_sessions_changed(app.handle());
+
+        assert_eq!(revision.load(Ordering::Relaxed), 1);
     }
 
     /// O elo que nenhum tipo garante: `emit` do Rust alcançando um ouvinte de

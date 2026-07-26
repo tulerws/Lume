@@ -7,7 +7,7 @@ use std::{
 use sysinfo::{
     get_current_pid, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::{
     agent_plugins::{self, ExternalAgentPlugin},
@@ -41,7 +41,7 @@ pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
                     state.reconcile_process_snapshot(scan.discovered, scan.live_pids)
                 {
                     if changed {
-                        let _ = app.emit("lume://sessions-changed", ());
+                        crate::remote_server::announce_sessions_changed(&app);
                     }
                 }
                 thread::sleep(Duration::from_secs(2));
