@@ -46,6 +46,8 @@ Ou seja: parear um aparelho estende a superfície de onde esse conteúdo existe.
 
 **Se você nunca parear um celular, nada desta seção se aplica ao seu Lume.**
 
+> Se você pareou um celular nas versões 0.5.0 a 0.5.3, aquele desenho pedia a instalação de uma autoridade certificadora no aparelho. Ela **não** é mais usada e convém removê-la: [guia de migração](MIGRATION-0.5.4.md).
+
 ## Decisões
 
 Uma ação direta só é exibida quando o adaptador informa `canRespondFromLume` e inclui a ação em `availableActions`. A decisão é vinculada ao identificador da permissão e da sessão; respostas fora desse par são recusadas.
