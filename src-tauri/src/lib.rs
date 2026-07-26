@@ -8,6 +8,7 @@ mod discovery;
 mod domain;
 mod event_server;
 mod executables;
+mod history_page;
 mod integrations;
 mod launcher;
 mod overlay;

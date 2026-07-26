@@ -28,6 +28,7 @@ use tungstenite::{
 };
 
 use crate::{
+    history_page::{self, Cursor},
     domain::{
         AgentSession, PermissionAction, PermissionDenial, PromptRefusal, RemoteDevice,
     },
@@ -231,6 +232,16 @@ struct ResolvePermission {
     session_id: String,
     permission_id: String,
     action: PermissionAction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListHistory {
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Ausente ou nulo pede a página mais recente.
+    #[serde(default)]
+    before: Option<Cursor>,
 }
 
 #[derive(Deserialize)]
@@ -1023,6 +1034,7 @@ fn dispatch(
     match incoming.kind.as_str() {
         "permission.resolve" => decide_permission(socket, config, device, incoming),
         "prompt.submit" => deliver_prompt(socket, config, device, incoming),
+        "history.list" => list_history(socket, config, incoming),
         other => {
             // O tipo volta saneado. Ele veio de fora, e ecoar texto de entrada
             // sem limite de tamanho nem filtro de controle é como se constroem
@@ -1114,6 +1126,62 @@ fn decide_permission(
             kind: "result",
             id: incoming.id,
             payload: Acknowledged { ok: true },
+        },
+    )
+}
+
+/// Uma página do histórico.
+///
+/// Único pedido do celular que **não** muda nada: nem rastro, nem aviso, nem
+/// nome de aparelho. Por isso também é o único que não passa pelo [`Desktop`] —
+/// `AppState::history` já é método comum, e o servidor remoto o chama direto.
+///
+/// O histórico é o dado de menor risco do produto: evento, resumo, agente,
+/// projeto e horário, sem comando, caminho ou payload. É o `PRIVACY.md` que
+/// manda, e nada aqui acrescenta campo.
+fn list_history(
+    socket: &mut Socket,
+    config: &RemoteConfig,
+    incoming: Incoming,
+) -> Result<(), String> {
+    let request: ListHistory = match serde_json::from_value(incoming.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return send_error(
+                socket,
+                incoming.id.as_deref(),
+                "invalid_request",
+                &format!("Consulta de histórico inválida: {error}"),
+            )
+        }
+    };
+
+    // A janela inteira, sempre: não há offset em `store.rs::history`, então
+    // paginar é recortar em memória o que já foi lido.
+    let window = match config.state.history(history_page::CEILING) {
+        Ok(window) => window,
+        Err(detail) => {
+            eprintln!("Histórico remoto não foi lido: {detail}");
+            return send_error(
+                socket,
+                incoming.id.as_deref(),
+                "internal",
+                "Falha interna ao ler o histórico",
+            );
+        }
+    };
+
+    let page = history_page::page(
+        window,
+        request.before.as_ref(),
+        request.limit.unwrap_or(history_page::DEFAULT_LIMIT),
+    );
+    send(
+        socket,
+        &Envelope {
+            kind: "result",
+            id: incoming.id,
+            payload: page,
         },
     )
 }
@@ -2238,6 +2306,143 @@ mod tests {
 
         assert_eq!(read_envelope(&mut socket)["payload"]["code"], "invalid_request");
         assert!(server.prompts.lock().expect("registro").is_empty());
+    }
+
+    /// Encerrar a sessão é o que grava histórico (`history_for_event`), então o
+    /// teste produz entradas pelo caminho de produção em vez de escrever no
+    /// banco por fora.
+    fn finish(server: &Server, session_id: &str) {
+        server.state.ingest(started_event(session_id)).expect("sessão");
+        let mut ended = started_event(session_id);
+        ended.event = HookEventKind::Completed;
+        server.state.ingest(ended).expect("encerra");
+    }
+
+    #[test]
+    fn the_history_comes_back_as_a_result() {
+        let server = test_server();
+        finish(&server, "s-1");
+        let mut socket = mirrored(&server);
+
+        ask(&mut socket, "req-1", "history.list", serde_json::json!({}));
+
+        let result = read_envelope(&mut socket);
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["id"], "req-1");
+
+        let entries = result["payload"]["entries"]
+            .as_array()
+            .expect("array de entradas");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["sessionId"], "s-1");
+        assert_eq!(entries[0]["event"], "completed");
+        // Sem mais o que devolver, e o fim é o fim de verdade.
+        assert!(result["payload"]["nextCursor"].is_null());
+        assert_eq!(result["payload"]["atCeiling"], false);
+
+        // O histórico é o dado de menor risco do produto, e continua sendo:
+        // nada de comando, caminho ou payload atravessa aqui. O que importa é
+        // quais campos existem, e não a ordem deles — o `serde_json::Value`
+        // guarda objeto em `BTreeMap`, então a ordem no cabo é alfabética e
+        // afirmá-la seria testar a biblioteca em vez do nosso código.
+        let mut carried: Vec<&str> = entries[0]
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        carried.sort_unstable();
+        let mut expected = vec![
+            "id",
+            "sessionId",
+            "agentLabel",
+            "project",
+            "event",
+            "summary",
+            "createdAt",
+        ];
+        expected.sort_unstable();
+        assert_eq!(carried, expected, "campo a mais ou a menos no histórico");
+    }
+
+    #[test]
+    fn the_cursor_walks_the_history_without_repeating() {
+        let server = test_server();
+        for index in 0..5 {
+            finish(&server, &format!("s-{index}"));
+        }
+        let mut socket = mirrored(&server);
+
+        ask(&mut socket, "req-1", "history.list", serde_json::json!({ "limit": 2 }));
+        let first = read_envelope(&mut socket);
+        let cursor = first["payload"]["nextCursor"].clone();
+        assert!(!cursor.is_null(), "faltou cursor: {first}");
+
+        ask(
+            &mut socket,
+            "req-2",
+            "history.list",
+            serde_json::json!({ "limit": 2, "before": cursor }),
+        );
+        let second = read_envelope(&mut socket);
+
+        let page_of = |value: &serde_json::Value| -> Vec<String> {
+            value["payload"]["entries"]
+                .as_array()
+                .expect("entradas")
+                .iter()
+                .map(|entry| entry["id"].as_str().expect("id").to_string())
+                .collect()
+        };
+        let (first_ids, second_ids) = (page_of(&first), page_of(&second));
+
+        assert_eq!(first_ids.len(), 2);
+        assert_eq!(second_ids.len(), 2);
+        assert!(
+            first_ids.iter().all(|id| !second_ids.contains(id)),
+            "páginas se repetiram: {first_ids:?} e {second_ids:?}"
+        );
+    }
+
+    #[test]
+    fn the_history_is_never_pushed_on_its_own() {
+        let server = test_server();
+        let mut socket = mirrored(&server);
+
+        // Uma entrada nova nasce, e com ela um delta de sessão. O histórico
+        // acompanha o mesmo evento, mas só chega quando pedido: empurrá-lo
+        // duplicaria tráfego por uma tela que quase ninguém está olhando.
+        finish(&server, "s-1");
+        server.revision.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(read_envelope(&mut socket)["type"], "sessions.delta");
+
+        socket
+            .get_mut()
+            .sock
+            .set_read_timeout(Some(READ_POLL * 8))
+            .expect("prazo de leitura");
+        assert!(
+            matches!(socket.read(), Err(tungstenite::Error::Io(_))),
+            "o histórico não deveria chegar sozinho"
+        );
+    }
+
+    #[test]
+    fn a_malformed_history_request_keeps_the_connection() {
+        let server = test_server();
+        finish(&server, "s-1");
+        let mut socket = mirrored(&server);
+
+        ask(
+            &mut socket,
+            "req-1",
+            "history.list",
+            serde_json::json!({ "before": { "createdAt": "ontem" } }),
+        );
+        assert_eq!(read_envelope(&mut socket)["payload"]["code"], "invalid_request");
+
+        ask(&mut socket, "req-2", "history.list", serde_json::json!({}));
+        assert_eq!(read_envelope(&mut socket)["type"], "result");
     }
 
     /// O elo que nenhum tipo garante: `emit` do Rust alcançando um ouvinte de

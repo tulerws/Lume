@@ -656,19 +656,38 @@ Ele é **requisição e resposta, nunca empurrado**. As entradas nascem dos mesm
 
 | Campo | Regra |
 | --- | --- |
-| `entries` | `HistoryEntry[]` em ordem decrescente de `createdAt`, desempatada por `id` decrescente |
+| `entries` | `HistoryEntry[]` em ordem decrescente de `createdAt`, desempatada por `id` decrescente. Os sete campos de `HistoryEntry` e nada mais |
 | `nextCursor` | cursor da próxima página, ou `null` quando não há mais o que devolver |
 | `atCeiling` | `true` quando `nextCursor` é nulo por causa do teto do servidor, não por fim real dos dados |
 
+#### Quem ordena é o servidor, não a consulta
+
+`Store::history` faz `ORDER BY created_at DESC` **sem desempate**. Entre registros do mesmo milissegundo a ordem que o SQLite devolve é indefinida e pode variar entre execuções — e este projeto já teve dois registros no mesmo milissegundo.
+
+Confiar nessa ordem quebraria a paginação de um jeito difícil de enxergar: um cursor pousado exatamente sobre um empate pularia ou repetiria entrada entre páginas, dependendo de como a consulta seguinte resolvesse o empate. O `history_page` reordena por `(createdAt, id)` decrescente antes de recortar, o que custa uma comparação por registro numa janela de no máximo 200.
+
+Três testes existem só por causa disto: `the_incoming_order_does_not_matter` embaralha a janela antes de paginar, `entries_in_the_same_instant_break_the_tie_by_id` fixa o critério, e `the_cursor_resumes_across_a_tie_without_gap_or_repeat` põe a fronteira da página no meio de três registros do mesmo instante e confere que as duas páginas cobrem tudo uma vez cada.
+
+Levantar o desempate para o SQL seria mudança em `store.rs`, que o histórico do desktop não precisa. Fica no servidor remoto, que é quem pagina.
+
 #### Teto de 200 entradas
 
-`AppState::history` limita a consulta a `limit.min(200)` e `Store::history` ordena por `created_at DESC` sem offset — não existe paginação real na camada de persistência.
+`AppState::history` limita a consulta a `limit.min(200)` e `Store::history` ordena sem offset — não existe paginação real na camada de persistência.
 
 O servidor remoto, portanto, lê a janela dos **200 registros mais recentes** e pagina em memória sobre ela: aplica o cursor (`createdAt` menor que o do cursor, ou igual com `id` menor — o desempate por `id` importa porque este projeto já teve colisão de identificadores no mesmo milissegundo) e devolve `limit` itens.
 
 A consequência é que o celular nunca alcança mais que os 200 registros mais recentes. Isso é **paridade com o desktop**, que opera sob o mesmo teto, e não uma limitação nova. O campo `atCeiling` existe para que o aplicativo diga "estes são os 200 registros mais recentes" em vez de sugerir que o histórico acabou ali.
 
 Levantar esse teto exigiria offset em `store.rs::history` — mudança no núcleo, deliberadamente fora do escopo desta versão.
+
+O `atCeiling` tem um **falso positivo assumido**: com exatamente 200 registros no banco, a leitura devolve 200 e o servidor não distingue "bateu no teto" de "acabaram os dados". Ele erra para o lado seguro — nunca afirma que o histórico acabou quando pode haver mais.
+
+Duas defesas menores, pelo mesmo princípio de não induzir o aplicativo ao erro:
+
+- `limit` é preso entre 1 e 100. Uma página de zero entradas com `nextCursor` nulo seria lida como "o histórico está vazio".
+- `nextCursor` serializa como `null` em vez de sumir do JSON, para o aplicativo distinguir "acabou" de "campo esquecido".
+
+Cursor que o aplicativo guardou de um registro já expulso da janela dos 200 continua válido: a comparação é por valor, não por posição, e devolve o que for mais antigo que ele.
 
 ### Erros
 
