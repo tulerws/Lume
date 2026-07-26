@@ -40,6 +40,104 @@ pub enum AccessMode {
     Custom,
 }
 
+/// Por que uma decisão de permissão foi recusada.
+///
+/// Existe tipada, e não como texto, porque o controle remoto precisa traduzir
+/// cada motivo num código que o aplicativo trata de forma **diferente**:
+/// `permission_gone` é situação normal — "respondida em outro aparelho" — e
+/// `action_not_available` é erro de cliente. Com `String` no lugar, a tradução
+/// seria comparação de mensagem, e reescrever uma frase mudaria o comportamento
+/// do celular sem erro de compilação e sem aviso.
+///
+/// O `Display` reproduz **exatamente** o texto que o desktop já mostrava antes
+/// desta tipagem existir, e o teste `the_desktop_wording_is_unchanged` prende
+/// cada frase.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PermissionDenial {
+    SessionNotFound,
+    NoPendingPermission,
+    PermissionMismatch,
+    ActionNotAllowed,
+    SourceIsNotLume,
+    /// Abrir a origem não é decisão de permissão: é navegação, e o desktop a
+    /// intercepta antes de chegar ao backend.
+    OpenSourceIsNotADecision,
+    /// Falha de infraestrutura — cadeado envenenado, escrita no banco. A
+    /// mensagem serve ao desktop; o celular recebe só o código `internal`.
+    Internal(String),
+}
+
+impl std::fmt::Display for PermissionDenial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str("Sessão não encontrada"),
+            Self::NoPendingPermission => {
+                formatter.write_str("A sessão não possui uma permissão pendente")
+            }
+            Self::PermissionMismatch => {
+                formatter.write_str("A permissão não corresponde à sessão")
+            }
+            Self::ActionNotAllowed => {
+                formatter.write_str("Esta ação não é permitida pela configuração da sessão")
+            }
+            Self::SourceIsNotLume => {
+                formatter.write_str("Esta origem deve ser aberta na interface original")
+            }
+            Self::OpenSourceIsNotADecision => {
+                formatter.write_str("Use a origem da sessão para continuar")
+            }
+            Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// Por que um prompt não foi enviado.
+///
+/// Mesma razão de [`PermissionDenial`] existir: o celular precisa saber a
+/// diferença entre "espere o agente terminar" (`session_busy`, e ele tenta de
+/// novo depois) e "esta sessão não tem como retomar" (`action_not_available`, e
+/// o botão não devia existir). O `Display` reproduz o texto que o comando do
+/// Tauri já devolvia, e `the_prompt_wording_is_unchanged` prende cada frase.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PromptRefusal {
+    Empty,
+    TooLarge,
+    SessionNotFound,
+    /// Agente ocupado. É recusa temporária, e a única aqui que vale repetir.
+    SessionBusy,
+    CodexThreadMissing,
+    AgentWithoutResume,
+    ResumeIdMissing,
+    WorkingDirectoryMissing,
+    Internal(String),
+}
+
+impl std::fmt::Display for PromptRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("Digite um prompt antes de enviar"),
+            Self::TooLarge => formatter.write_str("O prompt excede o limite local de 16 KB"),
+            Self::SessionNotFound => formatter.write_str("Sessão não encontrada"),
+            Self::SessionBusy => {
+                formatter.write_str("Aguarde o agente terminar antes de enviar outro prompt")
+            }
+            Self::CodexThreadMissing => {
+                formatter.write_str("A sessão do Codex não informou a thread")
+            }
+            Self::AgentWithoutResume => {
+                formatter.write_str("Este agente não oferece retomada direta pelo Lume")
+            }
+            Self::ResumeIdMissing => {
+                formatter.write_str("A sessão não informou um identificador para retomada")
+            }
+            Self::WorkingDirectoryMissing => {
+                formatter.write_str("A sessão não informou a pasta do projeto")
+            }
+            Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionAction {
@@ -150,6 +248,32 @@ pub struct HistoryEntry {
     pub event: String,
     pub summary: String,
     pub created_at: i64,
+}
+
+/// Aparelho autorizado a controlar este Lume remotamente.
+///
+/// **O hash do token não está aqui, e é de propósito.** Este tipo é serializado
+/// para a interface; credencial, mesmo em forma de hash, não pode viajar junto
+/// por descuido. Quem precisa do hash pede explicitamente ao `Store`.
+/// Espelho de `RemoteStatus` em `src/lib/domain.ts`. Campo que mudar aqui muda
+/// lá, ou a linha em Ajustes passa a mentir sem ninguém perceber.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteStatus {
+    pub available: bool,
+    pub enabled: bool,
+    pub port: u16,
+    pub paired_devices: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDevice {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub created_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -304,6 +428,84 @@ pub struct HookEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tipar o erro do `resolve_permission` foi mudança para o controle remoto,
+    /// e ela não tinha permissão de mexer no que o desktop mostra. Estas são as
+    /// frases exatas que `AppState::resolve_permission` devolvia como `String`
+    /// antes de `PermissionDenial` existir.
+    #[test]
+    fn the_desktop_wording_is_unchanged() {
+        let cases = [
+            (PermissionDenial::SessionNotFound, "Sessão não encontrada"),
+            (
+                PermissionDenial::NoPendingPermission,
+                "A sessão não possui uma permissão pendente",
+            ),
+            (
+                PermissionDenial::PermissionMismatch,
+                "A permissão não corresponde à sessão",
+            ),
+            (
+                PermissionDenial::ActionNotAllowed,
+                "Esta ação não é permitida pela configuração da sessão",
+            ),
+            (
+                PermissionDenial::SourceIsNotLume,
+                "Esta origem deve ser aberta na interface original",
+            ),
+            (
+                PermissionDenial::OpenSourceIsNotADecision,
+                "Use a origem da sessão para continuar",
+            ),
+        ];
+        for (denial, expected) in cases {
+            assert_eq!(denial.to_string(), expected);
+        }
+
+        // A falha de infraestrutura carrega a mensagem de quem falhou, sem
+        // moldura em volta: era o que o `?` produzia antes.
+        assert_eq!(
+            PermissionDenial::Internal("Não foi possível salvar a decisão".into()).to_string(),
+            "Não foi possível salvar a decisão"
+        );
+    }
+
+    /// Mesma coisa para o prompt: extrair `send_prompt` do comando do Tauri não
+    /// tinha permissão de mudar o que o usuário do desktop lê.
+    #[test]
+    fn the_prompt_wording_is_unchanged() {
+        let cases = [
+            (PromptRefusal::Empty, "Digite um prompt antes de enviar"),
+            (
+                PromptRefusal::TooLarge,
+                "O prompt excede o limite local de 16 KB",
+            ),
+            (PromptRefusal::SessionNotFound, "Sessão não encontrada"),
+            (
+                PromptRefusal::SessionBusy,
+                "Aguarde o agente terminar antes de enviar outro prompt",
+            ),
+            (
+                PromptRefusal::CodexThreadMissing,
+                "A sessão do Codex não informou a thread",
+            ),
+            (
+                PromptRefusal::AgentWithoutResume,
+                "Este agente não oferece retomada direta pelo Lume",
+            ),
+            (
+                PromptRefusal::ResumeIdMissing,
+                "A sessão não informou um identificador para retomada",
+            ),
+            (
+                PromptRefusal::WorkingDirectoryMissing,
+                "A sessão não informou a pasta do projeto",
+            ),
+        ];
+        for (refusal, expected) in cases {
+            assert_eq!(refusal.to_string(), expected);
+        }
+    }
 
     #[test]
     fn notifications_only_fire_on_meaningful_task_transitions() {

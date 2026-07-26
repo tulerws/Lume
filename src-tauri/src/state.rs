@@ -11,8 +11,9 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionActivity,
-        SessionResult, SessionSource, SessionStatus,
+        PermissionAction, PermissionDenial, PermissionProfile, Preferences, RemoteDevice,
+        ResultNote,
+        SessionActivity, SessionResult, SessionSource, SessionStatus,
     },
     store::Store,
 };
@@ -172,6 +173,54 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível acessar o histórico".to_string())?
             .history(limit.min(200))
+    }
+
+    // Sem consumidor até a janela de pareamento existir; os testes já o cobrem.
+    #[allow(dead_code)]
+    pub fn remote_devices(&self) -> Result<Vec<RemoteDevice>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível acessar os aparelhos".to_string())?
+            .remote_devices()
+    }
+
+    pub fn remote_device_credentials(&self) -> Result<Vec<(String, String)>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível acessar os aparelhos".to_string())?
+            .remote_device_credentials()
+    }
+
+    pub fn register_remote_device(
+        &self,
+        device: &RemoteDevice,
+        token_hash: &str,
+    ) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível registrar o aparelho".to_string())?
+            .add_remote_device(device, token_hash)
+    }
+
+    pub fn revoke_remote_device(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível revogar o aparelho".to_string())?
+            .remove_remote_device(id)
+    }
+
+    pub fn touch_remote_device(&self, id: &str) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível atualizar o aparelho".to_string())?
+            .touch_remote_device(id, now_millis())
+    }
+
+    pub fn remote_device_count(&self) -> Result<usize, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível contar os aparelhos".to_string())?
+            .count_remote_devices()
     }
 
     pub fn preferences(&self) -> Result<Preferences, String> {
@@ -646,38 +695,41 @@ impl AppState {
         Ok(changed)
     }
 
+    /// Devolve `PermissionDenial` e não `String` porque o controle remoto traduz
+    /// cada motivo num código de protocolo que o celular trata de forma
+    /// diferente. O `Display` do erro reproduz o texto de antes, então o webview
+    /// não vê diferença nenhuma.
     pub fn resolve_permission(
         &self,
         session_id: &str,
         permission_id: &str,
         action: PermissionAction,
-    ) -> Result<(), String> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "Não foi possível acessar as sessões".to_string())?;
+    ) -> Result<(), PermissionDenial> {
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            PermissionDenial::Internal("Não foi possível acessar as sessões".into())
+        })?;
 
         let session = sessions
             .iter_mut()
             .find(|session| session.id == session_id)
-            .ok_or_else(|| "Sessão não encontrada".to_string())?;
+            .ok_or(PermissionDenial::SessionNotFound)?;
         let pending = session
             .pending_permission
             .as_ref()
-            .ok_or_else(|| "A sessão não possui uma permissão pendente".to_string())?;
+            .ok_or(PermissionDenial::NoPendingPermission)?;
 
         if pending.id != permission_id {
-            return Err("A permissão não corresponde à sessão".into());
+            return Err(PermissionDenial::PermissionMismatch);
         }
         if !session
             .permission_profile
             .available_actions
             .contains(&action)
         {
-            return Err("Esta ação não é permitida pela configuração da sessão".into());
+            return Err(PermissionDenial::ActionNotAllowed);
         }
         if !session.permission_profile.can_respond_from_lume {
-            return Err("Esta origem deve ser aberta na interface original".into());
+            return Err(PermissionDenial::SourceIsNotLume);
         }
 
         let (event, summary) = match action {
@@ -692,7 +744,7 @@ impl AppState {
                 ("permission_allowed", "Permissão concedida")
             }
             PermissionAction::OpenSource => {
-                return Err("Use a origem da sessão para continuar".into());
+                return Err(PermissionDenial::OpenSourceIsNotADecision);
             }
         };
         if let Some(activity) = session
@@ -722,18 +774,21 @@ impl AppState {
         };
         drop(sessions);
 
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| "Não foi possível salvar a decisão".to_string())?;
-        store.save_session(&snapshot)?;
-        store.add_history(&history)?;
+        let store = self.store.lock().map_err(|_| {
+            PermissionDenial::Internal("Não foi possível salvar a decisão".into())
+        })?;
+        store
+            .save_session(&snapshot)
+            .map_err(PermissionDenial::Internal)?;
+        store
+            .add_history(&history)
+            .map_err(PermissionDenial::Internal)?;
         drop(store);
 
         let (decisions, changed) = &*self.decisions;
-        let mut values = decisions
-            .lock()
-            .map_err(|_| "Não foi possível entregar a decisão".to_string())?;
+        let mut values = decisions.lock().map_err(|_| {
+            PermissionDenial::Internal("Não foi possível entregar a decisão".into())
+        })?;
         values.insert(permission_id.into(), action);
         changed.notify_all();
         Ok(())

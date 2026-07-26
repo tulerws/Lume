@@ -11,13 +11,20 @@ mod executables;
 mod integrations;
 mod launcher;
 mod overlay;
+mod pairing;
+mod qr_generator;
+mod remote_identity;
+mod remote_server;
+mod session_mirror;
 mod state;
 mod store;
 mod terminal_windows;
 
 use std::{collections::HashSet, io::Read, sync::Mutex};
 
-use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences, ResultNote};
+use domain::{
+    AgentSession, HistoryEntry, PermissionAction, Preferences, PromptRefusal, ResultNote,
+};
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
 use state::AppState;
@@ -146,7 +153,11 @@ fn resolve_permission(
     permission_id: String,
     action: PermissionAction,
 ) -> Result<(), String> {
-    state.resolve_permission(&session_id, &permission_id, action)
+    // O webview continua recebendo texto: o `Display` de `PermissionDenial`
+    // reproduz palavra por palavra o que esta função já devolvia.
+    state
+        .resolve_permission(&session_id, &permission_id, action)
+        .map_err(|denial| denial.to_string())
 }
 
 #[tauri::command]
@@ -185,26 +196,73 @@ fn submit_prompt(
     session_id: String,
     prompt: String,
 ) -> Result<(), String> {
+    // Casca fina sobre `send_prompt`, que é a mesma rotina que o servidor remoto
+    // chama. `None` na origem porque a ação nasceu aqui mesmo.
+    send_prompt(&app, &state, &bridge, &browser, &session_id, &prompt, None)
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// As recusas que não dependem de nada além do estado das sessões.
+///
+/// Separada de [`send_prompt`] para poder ser testada: `send_prompt` exige um
+/// `AppHandle`, que só existe dentro de um Tauri em execução. O que sobrou aqui
+/// é justamente o que o protocolo expõe ao celular — `payload_too_large`,
+/// `session_busy`, `session_not_found` — e roda com estado em memória.
+fn accept_prompt(
+    state: &AppState,
+    session_id: &str,
+    prompt: &str,
+) -> Result<AgentSession, PromptRefusal> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
-        return Err("Digite um prompt antes de enviar".into());
+        return Err(PromptRefusal::Empty);
     }
+    // Em bytes, e não em caracteres: é o tamanho que trafega e o que a linha de
+    // comando do agente vai receber.
     if prompt.len() > 16 * 1024 {
-        return Err("O prompt excede o limite local de 16 KB".into());
+        return Err(PromptRefusal::TooLarge);
     }
     let session = state
-        .sessions()?
+        .sessions()
+        .map_err(PromptRefusal::Internal)?
         .into_iter()
         .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        .ok_or(PromptRefusal::SessionNotFound)?;
     if matches!(
         session.status,
         domain::SessionStatus::Running | domain::SessionStatus::PermissionRequired
     ) {
-        return Err("Aguarde o agente terminar antes de enviar outro prompt".into());
+        return Err(PromptRefusal::SessionBusy);
     }
+    Ok(session)
+}
+
+/// Envia um prompt para uma sessão. **Único caminho**, usado pela interface do
+/// desktop e pelo controle remoto.
+///
+/// `origin` é o nome do aparelho quando a ação veio do celular, e entra no
+/// rastro. Ausente significa que ela nasceu no próprio desktop.
+///
+/// Devolve `PromptRefusal` e não `String` porque o controle remoto traduz cada
+/// motivo num código de protocolo que o aplicativo trata de forma diferente —
+/// `session_busy` vale nova tentativa, `action_not_available` não. O `Display`
+/// reproduz o texto de antes, então o webview não vê diferença.
+#[allow(clippy::too_many_arguments)]
+fn send_prompt(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &codex_bridge::CodexBridge,
+    browser: &browser_server::BrowserControl,
+    session_id: &str,
+    prompt: &str,
+    origin: Option<&str>,
+) -> Result<(), PromptRefusal> {
+    let session = accept_prompt(state, session_id, prompt)?;
+    let prompt = prompt.trim();
     let result = if session.source == domain::SessionSource::Web {
-        browser.request_prompt(session.id.clone(), prompt.to_string())?;
+        browser
+            .request_prompt(session.id.clone(), prompt.to_string())
+            .map_err(PromptRefusal::Internal)?;
         browser.request_focus(session.id.clone())
     } else if session.agent == domain::AgentKind::Codex {
         let mut profile = session.permission_profile.clone();
@@ -217,12 +275,12 @@ fn submit_prompt(
         let thread_id = session
             .native_session_id
             .clone()
-            .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
+            .ok_or(PromptRefusal::CodexThreadMissing)?;
         bridge.submit_prompt(
             &thread_id,
             prompt,
             profile,
-            state.inner().clone(),
+            state.clone(),
             app.clone(),
         )
     } else {
@@ -231,28 +289,28 @@ fn submit_prompt(
             domain::AgentKind::Gemini => IntegrationKind::Gemini,
             domain::AgentKind::Codex => unreachable!(),
             domain::AgentKind::Unknown => {
-                return Err("Este agente não oferece retomada direta pelo Lume".into());
+                return Err(PromptRefusal::AgentWithoutResume);
             }
         };
         let resume_id = session
             .native_session_id
             .clone()
-            .ok_or_else(|| "A sessão não informou um identificador para retomada".to_string())?;
+            .ok_or(PromptRefusal::ResumeIdMissing)?;
         let working_directory = session
             .working_directory
             .clone()
-            .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
-        let preferences = state.preferences()?;
+            .ok_or(PromptRefusal::WorkingDirectoryMissing)?;
+        let preferences = state.preferences().map_err(PromptRefusal::Internal)?;
         let target = if session.source == domain::SessionSource::Vscode {
             "vscode".to_string()
         } else {
             preferences.launch_target
         };
-        let executable = integrations::lume_executable()?;
+        let executable = integrations::lume_executable().map_err(PromptRefusal::Internal)?;
         let app_data_dir = app
             .path()
             .app_data_dir()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PromptRefusal::Internal(error.to_string()))?;
         launcher::launch(
             LaunchRequest {
                 agent,
@@ -269,16 +327,25 @@ fn submit_prompt(
             None,
         )
     };
-    result?;
-    state.record_activity(
-        &session.id,
-        "prompt",
-        "Prompt enviado pelo Lume",
-        Some(prompt.to_string()),
-        "completed",
-        Vec::new(),
-    )?;
-    let _ = app.emit("lume://sessions-changed", ());
+    result.map_err(PromptRefusal::Internal)?;
+    // O rastro nomeia o aparelho quando a ação veio de fora. Sem isso, com dois
+    // celulares pareados, "prompt enviado" não diz de onde.
+    let title = match origin {
+        Some(device) => format!("Prompt enviado pelo Lume ({device})"),
+        None => "Prompt enviado pelo Lume".to_string(),
+    };
+    state
+        .record_activity(
+            &session.id,
+            "prompt",
+            &title,
+            Some(prompt.to_string()),
+            "completed",
+            Vec::new(),
+        )
+        .map_err(PromptRefusal::Internal)?;
+    // Serve o webview e o contador de revisão de uma vez.
+    let _ = app.emit(remote_server::SESSIONS_CHANGED, ());
     Ok(())
 }
 
@@ -671,6 +738,147 @@ fn vscode_status() -> CompanionStatus {
 }
 
 #[tauri::command]
+fn remote_status(
+    state: State<'_, AppState>,
+    server: State<'_, remote_server::RemoteServer>,
+) -> Result<domain::RemoteStatus, String> {
+    Ok(domain::RemoteStatus {
+        available: true,
+        enabled: server.is_running(),
+        port: remote_server::REMOTE_CONTROL_PORT,
+        paired_devices: state.remote_device_count()?,
+    })
+}
+
+/// Abre a janela de pareamento: garante o listener, gera o código e devolve o
+/// QR já desenhado.
+///
+/// O listener sobe **antes** do código ser gerado. Na ordem inversa, existiria
+/// um instante em que o QR na tela aponta para uma porta fechada.
+/// A ponte entre uma conexão remota e o resto do Lume.
+///
+/// Guarda o `AppHandle` e busca o estado gerenciado na hora do uso, em vez de
+/// clonar cada dependência na criação: o `AppHandle` já é o caminho oficial para
+/// alcançá-las, e cópias antecipadas seriam mais uma coisa a manter em sincronia.
+struct RemoteDesktop {
+    app: AppHandle,
+}
+
+impl RemoteDesktop {
+    fn boxed(app: AppHandle) -> Box<dyn remote_server::Desktop> {
+        Box::new(Self { app })
+    }
+}
+
+impl remote_server::Desktop for RemoteDesktop {
+    fn announce(&self) {
+        let _ = self.app.emit(remote_server::SESSIONS_CHANGED, ());
+    }
+
+    fn submit_prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        device: &str,
+    ) -> Result<(), PromptRefusal> {
+        // A mesma função que o comando do Tauri chama. Não há caminho remoto
+        // paralelo: o que muda é só a atribuição no rastro.
+        send_prompt(
+            &self.app,
+            &self.app.state::<AppState>(),
+            &self.app.state::<codex_bridge::CodexBridge>(),
+            &self.app.state::<browser_server::BrowserControl>(),
+            session_id,
+            prompt,
+            Some(device),
+        )
+    }
+}
+
+#[tauri::command]
+fn remote_pairing_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: State<'_, remote_server::RemoteServer>,
+) -> Result<pairing::Invitation, String> {
+    server.ensure_started(&app, &state, RemoteDesktop::boxed(app.clone()))?;
+
+    let identity = remote_identity::RemoteIdentity::load_or_create(
+        &remote_server::identity_directory(&app)?,
+    )?;
+    let code = server.pairing().begin()?;
+    let hosts = remote_identity::local_addresses();
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "Lume".to_string());
+
+    // A lista devolvida é a que sobreviveu ao orçamento de densidade, e é ela
+    // que a tela exibe: oferecer para digitação um endereço que o QR não
+    // carrega seria pior que não oferecer nenhum.
+    let (uri, hosts) = pairing::invite_uri_within_budget(&pairing::Invite {
+        code,
+        fingerprint: identity.fingerprint(),
+        port: remote_server::REMOTE_CONTROL_PORT,
+        hosts,
+        hostname: hostname.clone(),
+    })?;
+
+    Ok(pairing::Invitation {
+        qr_svg: qr_generator::to_svg(&qr_generator::encode(&uri)?),
+        hostname,
+        hosts: hosts.iter().map(ToString::to_string).collect(),
+        port: remote_server::REMOTE_CONTROL_PORT,
+        expires_in_seconds: server
+            .pairing()
+            .remaining()
+            .map(|remaining| remaining.as_secs())
+            .unwrap_or(0),
+    })
+}
+
+#[tauri::command]
+fn remote_pairing_status(
+    state: State<'_, AppState>,
+    server: State<'_, remote_server::RemoteServer>,
+) -> Result<pairing::PairingProgress, String> {
+    let remaining = server.pairing().remaining();
+    Ok(pairing::PairingProgress {
+        active: remaining.is_some(),
+        expires_in_seconds: remaining.map(|left| left.as_secs()).unwrap_or(0),
+        paired_devices: state.remote_device_count()?,
+    })
+}
+
+/// Fecha a janela do QR e, se não sobrou nada para servir, derruba a porta.
+#[tauri::command]
+fn remote_pairing_cancel(
+    state: State<'_, AppState>,
+    server: State<'_, remote_server::RemoteServer>,
+) -> Result<(), String> {
+    server.pairing().cancel();
+    server.stop_if_idle(&state)
+}
+
+#[tauri::command]
+fn remote_devices(state: State<'_, AppState>) -> Result<Vec<domain::RemoteDevice>, String> {
+    state.remote_devices()
+}
+
+/// Revoga o aparelho. A linha some e, com ela, a única forma de o token voltar
+/// a valer.
+///
+/// A conexão viva daquele aparelho cai sozinha em até um ciclo de ping, quando
+/// o `keepalive` reconsulta a tabela e não se encontra mais nela. Revogado o
+/// último, a porta é fechada.
+#[tauri::command]
+fn remote_revoke_device(
+    state: State<'_, AppState>,
+    server: State<'_, remote_server::RemoteServer>,
+    id: String,
+) -> Result<(), String> {
+    state.revoke_remote_device(&id)?;
+    server.stop_if_idle(&state)
+}
+
+#[tauri::command]
 fn configure_vscode(app: AppHandle, enabled: bool) -> Result<(), String> {
     let bundled = app
         .path()
@@ -817,6 +1025,28 @@ pub fn run() {
             app.manage(terminal_windows::TerminalWindows::default());
             discovery::start(state.clone(), app.handle().clone())?;
             overlay::start_fullscreen_guard(state.clone(), app.handle().clone())?;
+            // Gerenciado pelo Tauri porque os comandos do QR e o handshake
+            // precisam da mesma instância: uma cópia teria outra sessão de
+            // pareamento, e o código na tela nunca conferiria.
+            app.manage(remote_server::RemoteServer::default());
+            // Registrado no arranque e nunca removido, mesmo com o servidor
+            // desligado: um contador que ninguém lê custa um incremento por
+            // mudança de sessão, e amarrar seu ciclo de vida ao do listener
+            // criaria a janela em que o servidor sobe antes de haver ouvinte.
+            remote_server::watch_sessions(
+                app.handle(),
+                app.state::<remote_server::RemoteServer>().revision(),
+            );
+            // Sem aparelho pareado isto não abre porta alguma. Falha ao subir o
+            // servidor remoto não pode impedir o Lume de abrir.
+            if let Err(error) = remote_server::start_if_paired(
+                app.handle(),
+                &state,
+                &app.state::<remote_server::RemoteServer>(),
+                RemoteDesktop::boxed(app.handle().clone()),
+            ) {
+                eprintln!("Servidor remoto não iniciou: {error}");
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 let preferences = state.preferences()?;
@@ -913,6 +1143,12 @@ pub fn run() {
             configure_integration,
             vscode_status,
             configure_vscode,
+            remote_status,
+            remote_pairing_start,
+            remote_pairing_status,
+            remote_pairing_cancel,
+            remote_devices,
+            remote_revoke_device,
             reveal_browser_companion,
             list_external_plugins,
             install_external_plugin,
@@ -963,6 +1199,91 @@ pub fn run_terminal_payload(path: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::{AgentKind, HookEvent, HookEventKind, SessionSource, SessionStatus};
+
+    fn state_with_session(status: HookEventKind) -> AppState {
+        let state = AppState::new(std::path::Path::new(":memory:")).expect("estado em memória");
+        state
+            .ingest(HookEvent {
+                event: status,
+                session_id: "s-1".into(),
+                agent: AgentKind::Claude,
+                agent_label: Some("Claude".into()),
+                project: Some("Lume".into()),
+                source: Some(SessionSource::Cli),
+                source_app: None,
+                status_label: Some("Sessão detectada".into()),
+                started_at: None,
+                process_id: None,
+                native_session_id: Some("nativa-1".into()),
+                working_directory: Some("/home/lume/projetos/Lume".into()),
+                permission_profile: None,
+                permission: None,
+                last_response: None,
+                activity: None,
+                wait_for_decision: false,
+            })
+            .expect("sessão");
+        state
+    }
+
+    #[test]
+    fn a_prompt_needs_content() {
+        let state = state_with_session(HookEventKind::WaitingForInput);
+
+        assert_eq!(
+            accept_prompt(&state, "s-1", "   \n  ").unwrap_err(),
+            PromptRefusal::Empty
+        );
+    }
+
+    #[test]
+    fn a_prompt_above_sixteen_kilobytes_is_refused() {
+        let state = state_with_session(HookEventKind::WaitingForInput);
+        let limit = 16 * 1024;
+
+        // Na borda exata ele passa; um byte além, não. O limite é em bytes
+        // porque é o tamanho que trafega e o que a linha de comando recebe.
+        assert!(accept_prompt(&state, "s-1", &"a".repeat(limit)).is_ok());
+        assert_eq!(
+            accept_prompt(&state, "s-1", &"a".repeat(limit + 1)).unwrap_err(),
+            PromptRefusal::TooLarge
+        );
+    }
+
+    #[test]
+    fn a_prompt_for_an_unknown_session_is_refused() {
+        let state = state_with_session(HookEventKind::WaitingForInput);
+
+        assert_eq!(
+            accept_prompt(&state, "fantasma", "rode os testes").unwrap_err(),
+            PromptRefusal::SessionNotFound
+        );
+    }
+
+    #[test]
+    fn a_busy_agent_does_not_take_another_prompt() {
+        let state = state_with_session(HookEventKind::Running);
+        assert_eq!(
+            state.sessions().expect("sessões")[0].status,
+            SessionStatus::Running
+        );
+
+        // A regra já existia no desktop, e vale igual no remoto: dois prompts em
+        // voo na mesma sessão embaralham a conversa do agente.
+        assert_eq!(
+            accept_prompt(&state, "s-1", "rode os testes").unwrap_err(),
+            PromptRefusal::SessionBusy
+        );
+    }
+
+    #[test]
+    fn an_idle_session_accepts_the_prompt() {
+        let state = state_with_session(HookEventKind::WaitingForInput);
+
+        let accepted = accept_prompt(&state, "s-1", "  rode os testes  ").expect("aceito");
+        assert_eq!(accepted.id, "s-1");
+    }
 
     #[test]
     fn default_global_shortcuts_are_valid_and_unique() {

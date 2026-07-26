@@ -179,6 +179,38 @@ export interface CompanionStatus {
   detail: string;
 }
 
+export interface RemoteStatus {
+  available: boolean;
+  enabled: boolean;
+  port: number;
+  pairedDevices: number;
+}
+
+/// Espelho de `RemoteDevice` em `src-tauri/src/domain.rs`. Sem credencial, e
+/// esse silêncio é deliberado: o hash do token nunca chega ao webview.
+export interface RemoteDevice {
+  id: string;
+  name: string;
+  platform: string;
+  createdAt: number;
+  lastSeenAt?: number;
+}
+
+/// O QR já desenhado. Nem o código nem a URI vêm aqui — só os módulos.
+export interface PairingInvitation {
+  qrSvg: string;
+  hostname: string;
+  hosts: string[];
+  port: number;
+  expiresInSeconds: number;
+}
+
+export interface PairingProgress {
+  active: boolean;
+  expiresInSeconds: number;
+  pairedDevices: number;
+}
+
 export interface TerminalWindowState {
   label: string;
   sessionId: string;

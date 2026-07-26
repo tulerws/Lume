@@ -17,6 +17,7 @@
     | "brave"
     | "browsers"
     | "terminal"
+    | "mobile"
     | "unknown";
 
   let { name, size = 18 }: { name: Brand; size?: number } = $props();
@@ -56,6 +57,11 @@
     <svg class="terminal" viewBox="0 0 24 24" aria-hidden="true">
       <path d="m5 7 5 5-5 5M16 7v10" />
     </svg>
+  {:else if name === "mobile"}
+    <svg class="mobile" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="7" y="2.5" width="10" height="19" rx="2.5" />
+      <path d="M10.5 18.6h3" />
+    </svg>
   {:else}
     <svg class="unknown" viewBox="0 0 24 24" aria-hidden="true">
       <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4" />
@@ -92,6 +98,14 @@
     stroke-linecap: round;
     stroke-linejoin: round;
     stroke-width: 2;
+  }
+
+  .mobile {
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.6;
   }
 
   .browsers { width: calc(var(--brand-size) * 1.28); }

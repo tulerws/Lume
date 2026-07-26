@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::domain::{AgentSession, HistoryEntry, Preferences, ResultNote};
+use crate::domain::{AgentSession, HistoryEntry, Preferences, RemoteDevice, ResultNote};
 
 pub struct Store {
     connection: Connection,
@@ -48,6 +48,14 @@ impl Store {
                     files TEXT NOT NULL,
                     tests TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS remote_devices (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    last_seen_at INTEGER
                  );",
             )
             .map_err(|error| error.to_string())?;
@@ -196,6 +204,97 @@ impl Store {
         Ok(())
     }
 
+    /// Aparelhos pareados, sem credencial. É o que a interface lista.
+    // Sem consumidor até a janela de pareamento existir; os testes já o cobrem.
+    #[allow(dead_code)]
+    pub fn remote_devices(&self) -> Result<Vec<RemoteDevice>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, name, platform, created_at, last_seen_at
+                 FROM remote_devices ORDER BY created_at ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RemoteDevice {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    platform: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_seen_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    /// Pares `(id, hash)` para autenticação.
+    ///
+    /// Devolve **todos** os hashes em vez de aceitar um `WHERE token_hash = ?`:
+    /// a comparação de texto do SQLite não é de tempo constante, e a promessa
+    /// de tempo constante é parte da especificação. Quem compara é o servidor.
+    pub fn remote_device_credentials(&self) -> Result<Vec<(String, String)>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, token_hash FROM remote_devices")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub fn add_remote_device(&self, device: &RemoteDevice, token_hash: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO remote_devices
+                 (id, name, platform, token_hash, created_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    device.id,
+                    device.name,
+                    device.platform,
+                    token_hash,
+                    device.created_at,
+                    device.last_seen_at
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Remove o aparelho. Devolve `true` quando havia o que remover, para que
+    /// quem revoga saiba se precisa derrubar conexão viva.
+    pub fn remove_remote_device(&self, id: &str) -> Result<bool, String> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM remote_devices WHERE id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        Ok(removed > 0)
+    }
+
+    pub fn touch_remote_device(&self, id: &str, at: i64) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE remote_devices SET last_seen_at = ?2 WHERE id = ?1",
+                params![id, at],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn count_remote_devices(&self) -> Result<usize, String> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM remote_devices", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count.max(0) as usize)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn purge_history(&self, older_than: i64) -> Result<(), String> {
         self.connection
             .execute("DELETE FROM history WHERE created_at < ?1", [older_than])
@@ -217,7 +316,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         AccessMode, AgentKind, PermissionAction, PermissionProfile, PermissionRequest,
-        SessionSource, SessionStatus,
+        RemoteDevice, SessionSource, SessionStatus,
     };
 
     #[test]
@@ -305,6 +404,75 @@ mod tests {
 
         store.delete_result_note(&note.id).expect("remove nota");
         assert!(store.result_notes(10).expect("notas vazias").is_empty());
+    }
+
+    fn device(id: &str) -> RemoteDevice {
+        RemoteDevice {
+            id: id.into(),
+            name: "Celular".into(),
+            platform: "android".into(),
+            created_at: 10,
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn remote_devices_round_trip_without_exposing_the_credential() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        store
+            .add_remote_device(&device("aparelho-1"), "hash-do-token")
+            .expect("registra aparelho");
+
+        let listed = store.remote_devices().expect("lista aparelhos");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Celular");
+        assert!(listed[0].last_seen_at.is_none());
+        // O tipo devolvido à interface não tem campo de credencial. Se um dia
+        // alguém acrescentar um, este arquivo precisa ser revisitado.
+        let serialized = serde_json::to_string(&listed[0]).expect("json");
+        assert!(!serialized.contains("hash-do-token"));
+        assert!(!serialized.contains("token"));
+
+        let credentials = store.remote_device_credentials().expect("credenciais");
+        assert_eq!(credentials, vec![("aparelho-1".into(), "hash-do-token".into())]);
+    }
+
+    #[test]
+    fn revoking_a_device_removes_its_credential() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        store
+            .add_remote_device(&device("aparelho-1"), "hash-do-token")
+            .expect("registra aparelho");
+
+        assert!(store.remove_remote_device("aparelho-1").expect("revoga"));
+        assert_eq!(store.count_remote_devices().expect("contagem"), 0);
+        assert!(store
+            .remote_device_credentials()
+            .expect("credenciais")
+            .is_empty());
+        assert!(
+            !store.remove_remote_device("aparelho-1").expect("revoga"),
+            "revogar o que não existe precisa dizer que nada mudou"
+        );
+    }
+
+    #[test]
+    fn last_seen_is_recorded_without_touching_the_credential() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        store
+            .add_remote_device(&device("aparelho-1"), "hash-do-token")
+            .expect("registra aparelho");
+
+        store
+            .touch_remote_device("aparelho-1", 4242)
+            .expect("atualiza último acesso");
+
+        let listed = store.remote_devices().expect("lista aparelhos");
+        assert_eq!(listed[0].last_seen_at, Some(4242));
+        assert_eq!(
+            store.remote_device_credentials().expect("credenciais")[0].1,
+            "hash-do-token"
+        );
     }
 
     #[test]

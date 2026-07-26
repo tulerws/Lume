@@ -5,8 +5,12 @@ import type {
   HistoryEntry,
   IntegrationDiagnostic,
   IntegrationStatus,
+  PairingInvitation,
+  PairingProgress,
   PermissionAction,
   Preferences,
+  RemoteDevice,
+  RemoteStatus,
   ResultNote,
   RestoredTerminalPlacement,
   ExternalAgentPlugin,
@@ -296,6 +300,47 @@ export async function configureVscode(enabled: boolean): Promise<void> {
 
 export async function revealBrowserCompanion(): Promise<string> {
   return invoke<string>("reveal_browser_companion");
+}
+
+export const remoteControlPort = 43140;
+
+const remoteUnavailable: RemoteStatus = {
+  available: false,
+  enabled: false,
+  port: remoteControlPort,
+  pairedDevices: 0,
+};
+
+export async function loadRemoteStatus(): Promise<RemoteStatus> {
+  if (!inDesktop()) return { ...remoteUnavailable };
+  try {
+    return await invoke<RemoteStatus>("remote_status");
+  } catch {
+    return { ...remoteUnavailable };
+  }
+}
+
+/// Sobe o servidor remoto e abre uma janela de pareamento. Cada chamada
+/// substitui o código anterior, que deixa de valer no mesmo instante.
+export async function startPairing(): Promise<PairingInvitation> {
+  return invoke<PairingInvitation>("remote_pairing_start");
+}
+
+export async function loadPairingProgress(): Promise<PairingProgress> {
+  return invoke<PairingProgress>("remote_pairing_status");
+}
+
+export async function cancelPairing(): Promise<void> {
+  await invoke("remote_pairing_cancel");
+}
+
+export async function loadRemoteDevices(): Promise<RemoteDevice[]> {
+  if (!inDesktop()) return [];
+  return invoke<RemoteDevice[]>("remote_devices");
+}
+
+export async function revokeRemoteDevice(id: string): Promise<void> {
+  await invoke("remote_revoke_device", { id });
 }
 
 export async function loadExternalPlugins(): Promise<ExternalAgentPlugin[]> {

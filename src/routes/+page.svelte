@@ -28,8 +28,11 @@
     HistoryEntry,
     IntegrationDiagnostic,
     IntegrationStatus,
+    PairingInvitation,
     PermissionAction,
     Preferences,
+    RemoteDevice,
+    RemoteStatus,
     ResultNote,
     SessionStatus,
     TerminalWindowState,
@@ -48,8 +51,14 @@
     loadResultNotes,
     loadIntegrationStatuses,
     loadOverlayPosition,
+    loadPairingProgress,
     loadPreferences,
+    loadRemoteDevices,
+    loadRemoteStatus,
     loadSessions,
+    startPairing,
+    cancelPairing,
+    revokeRemoteDevice,
     loadTerminalWindows,
     loadExternalPlugins,
     openSessionSource,
@@ -68,6 +77,7 @@
     takePendingShortcutAction,
     terminateSession,
     revealPluginDirectory,
+    remoteControlPort,
     type DisplayBackend,
   } from "$lib/lume";
 
@@ -129,6 +139,23 @@
   let diagnosingIntegration = $state<IntegrationStatus["kind"] | null>(null);
   let integrationDiagnostics = $state<Partial<Record<IntegrationStatus["kind"], IntegrationDiagnostic>>>({});
   let configuringVscode = $state(false);
+  let remoteStatus = $state<RemoteStatus>({
+    available: false,
+    enabled: false,
+    port: remoteControlPort,
+    pairedDevices: 0,
+  });
+  let pairingOpen = $state(false);
+  let pairingInvitation = $state<PairingInvitation | null>(null);
+  let pairingSeconds = $state(0);
+  let pairingMessage = $state<string | null>(null);
+  let pairedDevices = $state<RemoteDevice[]>([]);
+  let pairedJustNow = $state<string | null>(null);
+  let revokingDevice = $state<string | null>(null);
+  // Contagem de aparelhos no momento em que a tela abriu. É subindo acima dela
+  // que a interface descobre que alguém pareou.
+  let pairingBaseline = 0;
+  let pairingTimer: ReturnType<typeof setInterval> | undefined;
   let launcherOpen = $state(false);
   let launching = $state<IntegrationStatus["kind"] | null>(null);
   let launchError = $state<string | null>(null);
@@ -193,6 +220,136 @@
 
   function shown(value: string) {
     return displayText(preferences.language, value);
+  }
+
+  function remoteDetail() {
+    if (!remoteStatus.available) {
+      return tr(
+        "Follow sessions and answer permissions from your phone.",
+        "Acompanhe as sessões e responda permissões pelo celular.",
+      );
+    }
+    if (remoteStatus.pairedDevices === 0) {
+      return tr("Show a QR code to pair your phone.", "Exiba um QR Code para parear o celular.");
+    }
+    const devices =
+      remoteStatus.pairedDevices === 1
+        ? tr("1 paired device", "1 aparelho pareado")
+        : tr(`${remoteStatus.pairedDevices} paired devices`, `${remoteStatus.pairedDevices} aparelhos pareados`);
+    const serverState = remoteStatus.enabled
+      ? tr(`listening on port ${remoteStatus.port}`, `ouvindo na porta ${remoteStatus.port}`)
+      : tr("server off", "servidor desligado");
+    return `${devices} · ${serverState}`;
+  }
+
+  async function openPairing() {
+    if (!remoteStatus.available) return;
+    pairingOpen = true;
+    pairedJustNow = null;
+    pairingMessage = null;
+    await refreshPairedDevices();
+    pairingBaseline = pairedDevices.length;
+    await renewPairingCode();
+    startPairingTimer();
+  }
+
+  /// Fecha a tela. O `cancel` no backend encerra a sessão e, se não sobrou
+  /// aparelho nem janela aberta, derruba a porta — é aqui que o servidor para
+  /// de existir para quem só olhou e desistiu.
+  async function closePairing() {
+    stopPairingTimer();
+    pairingOpen = false;
+    pairingInvitation = null;
+    pairedJustNow = null;
+    pairingMessage = null;
+    try {
+      await cancelPairing();
+    } catch {
+      // Fechar a tela não pode falhar por causa do servidor.
+    }
+    remoteStatus = await loadRemoteStatus();
+  }
+
+  async function renewPairingCode() {
+    try {
+      pairingInvitation = await startPairing();
+      pairingSeconds = pairingInvitation.expiresInSeconds;
+      pairingMessage = null;
+      pairedJustNow = null;
+      remoteStatus = await loadRemoteStatus();
+    } catch (error) {
+      pairingInvitation = null;
+      pairingMessage = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function startPairingTimer() {
+    stopPairingTimer();
+    pairingTimer = setInterval(() => void tickPairing(), 1_000);
+  }
+
+  function stopPairingTimer() {
+    if (pairingTimer !== undefined) clearInterval(pairingTimer);
+    pairingTimer = undefined;
+  }
+
+  /// Uma consulta por segundo enquanto a tela está aberta: ela move a contagem
+  /// regressiva e é também como se descobre que alguém pareou.
+  async function tickPairing() {
+    if (!pairingOpen) return;
+    let progress;
+    try {
+      progress = await loadPairingProgress();
+    } catch {
+      return;
+    }
+
+    // Pareamento bem-sucedido vem antes de qualquer outra leitura: o código foi
+    // consumido, então a sessão também aparece como inativa, e tratar isso como
+    // expiração geraria um código novo por cima da confirmação.
+    if (progress.pairedDevices > pairingBaseline) {
+      stopPairingTimer();
+      await refreshPairedDevices();
+      pairedJustNow = pairedDevices[pairedDevices.length - 1]?.name ?? null;
+      pairingBaseline = progress.pairedDevices;
+      pairingInvitation = null;
+      remoteStatus = await loadRemoteStatus();
+      return;
+    }
+
+    pairingSeconds = progress.expiresInSeconds;
+    if (!progress.active) await renewPairingCode();
+  }
+
+  async function refreshPairedDevices() {
+    try {
+      pairedDevices = await loadRemoteDevices();
+    } catch {
+      pairedDevices = [];
+    }
+  }
+
+  async function revokeDevice(device: RemoteDevice) {
+    revokingDevice = device.id;
+    pairingMessage = null;
+    try {
+      await revokeRemoteDevice(device.id);
+      await refreshPairedDevices();
+      pairingBaseline = pairedDevices.length;
+      // Revogar quem acabou de parear apaga a confirmação: manter "conectado"
+      // na tela depois de desconectar seria a interface mentindo.
+      if (pairedJustNow === device.name) pairedJustNow = null;
+      remoteStatus = await loadRemoteStatus();
+    } catch (error) {
+      pairingMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      revokingDevice = null;
+    }
+  }
+
+  function countdown(seconds: number) {
+    const safe = Math.max(0, seconds);
+    return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
   }
 
   function currentExpandedSize() {
@@ -379,6 +536,7 @@
       window.removeEventListener("pointercancel", finishOverlayDragFromWindow, true);
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
+      stopPairingTimer();
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
       if (pendingUpdate) void pendingUpdate.close();
     };
@@ -605,6 +763,9 @@
       selectedId = null;
       view = "sessions";
       launcherOpen = false;
+      // Recolher o painel encerra o pareamento: um QR que ninguém está vendo
+      // não deve manter porta de rede aberta.
+      if (pairingOpen) void closePairing();
     }
     morphing = null;
   }
@@ -1159,6 +1320,9 @@
   }
 
   async function openView(nextView: View) {
+    // Navegar para qualquer lugar sai da tela de pareamento, inclusive voltar
+    // para os próprios Ajustes pelo rodapé.
+    if (pairingOpen) await closePairing();
     if (
       nextView === "settings" &&
       isTauri &&
@@ -1194,6 +1358,7 @@
     if (nextView === "settings") {
       selectedProfileKey ??= detectedProjects[0]?.key ?? null;
       settingsMessage = null;
+      remoteStatus = await loadRemoteStatus();
     }
   }
 
@@ -2136,9 +2301,93 @@
             {/each}
             <p class="privacy-note">{tr("Commands, paths, and permission contents are not stored.", "Comandos, caminhos e conteúdos de permissões não são guardados.")}</p>
           </div>
+        {:else if pairingOpen}
+          <div class="settings pairing" in:fade={{ duration: 150 }}>
+            <button class="pairing-back" type="button" onclick={() => void closePairing()}>
+              <span aria-hidden="true">←</span>
+              {tr("Connect to mobile", "Conectar ao dispositivo móvel")}
+            </button>
+
+            {#if pairedJustNow}
+              <div class="pairing-stage paired" transition:fade={{ duration: 140 }}>
+                <span class="agent-avatar agent-mobile"><BrandIcon name="mobile" size={22} /></span>
+                <strong>{tr(`${pairedJustNow} is connected`, `${pairedJustNow} conectado`)}</strong>
+                <p>{tr("It will receive sessions while the app is open.", "Ele receberá as sessões enquanto o aplicativo estiver aberto.")}</p>
+                <button type="button" onclick={() => void openPairing()}>
+                  {tr("Pair another device", "Parear outro aparelho")}
+                </button>
+              </div>
+            {:else if pairingInvitation}
+              <!-- SVG gerado pelo próprio backend a partir da matriz do QR: sem
+                   entrada de terceiros, sem script, e o código de pareamento
+                   existe ali apenas como módulos, nunca como texto. -->
+              <div class="pairing-stage">
+                <div class="qr-frame">{@html pairingInvitation.qrSvg}</div>
+                <p class="qr-hint">{tr("Read it with the Lume app on your phone.", "Leia com o aplicativo Lume no celular.")}</p>
+                <p class:urgent={pairingSeconds <= 20} class="qr-countdown">
+                  {tr(`Expires in ${countdown(pairingSeconds)}`, `Expira em ${countdown(pairingSeconds)}`)}
+                </p>
+              </div>
+
+              <div class="settings-section-label preferences-label">{tr("Or type it in the app", "Ou digite no aplicativo")}</div>
+              <div class="pairing-manual">
+                <strong>{pairingInvitation.hostname}</strong>
+                {#each pairingInvitation.hosts as host}
+                  <span>{host}<small>{tr("port", "porta")} {pairingInvitation.port}</small></span>
+                {:else}
+                  <span class="empty">{tr("No reachable address on this machine.", "Nenhum endereço alcançável nesta máquina.")}</span>
+                {/each}
+              </div>
+            {:else}
+              <div class="pairing-stage">
+                <p class="qr-hint">{tr("Preparing the code…", "Preparando o código…")}</p>
+              </div>
+            {/if}
+
+            {#if pairingMessage}
+              <p class="settings-feedback error" transition:fade>{pairingMessage}</p>
+            {/if}
+
+            <div class="settings-section-label preferences-label">{tr("Paired devices", "Aparelhos pareados")}</div>
+            {#each pairedDevices as device (device.id)}
+              <div class="integration-row">
+                <span class="agent-avatar agent-mobile"><BrandIcon name="mobile" size={17} /></span>
+                <div>
+                  <strong>{device.name}</strong>
+                  <span>
+                    {device.platform}
+                    {#if device.lastSeenAt} · {relativeTime(device.lastSeenAt)}{/if}
+                  </span>
+                </div>
+                <button
+                  class="danger"
+                  disabled={revokingDevice === device.id}
+                  type="button"
+                  onclick={() => void revokeDevice(device)}
+                >{revokingDevice === device.id ? "…" : tr("Revoke", "Revogar")}</button>
+              </div>
+            {:else}
+              <p class="profile-empty">{tr("No device paired yet.", "Nenhum aparelho pareado ainda.")}</p>
+            {/each}
+            <p class="privacy-note">{tr("Traffic is encrypted and each device gets its own credential. Revoking removes it here and disconnects it.", "O tráfego é cifrado e cada aparelho recebe credencial própria. Revogar remove aqui e desconecta.")}</p>
+          </div>
         {:else}
           <div class="settings" in:fade={{ duration: 150 }}>
-            <div class="settings-section-label">{tr("Agents", "Agentes")}</div>
+            <div class="settings-section-label">{tr("Mobile", "Dispositivo móvel")}</div>
+            <div class="integration-row">
+              <span class="agent-avatar agent-mobile"><BrandIcon name="mobile" size={19} /></span>
+              <div>
+                <strong>{tr("Connect to mobile", "Conectar ao dispositivo móvel")}</strong>
+                <span>{remoteDetail()}</span>
+              </div>
+              <button
+                class:connected={remoteStatus.pairedDevices > 0}
+                disabled={!remoteStatus.available}
+                type="button"
+                onclick={() => void openPairing()}
+              >{remoteStatus.pairedDevices > 0 ? tr("Manage", "Gerenciar") : tr("Connect", "Conectar")}</button>
+            </div>
+            <div class="settings-section-label preferences-label">{tr("Agents", "Agentes")}</div>
             {#each integrations as integration}
               {@const diagnostic = integrationDiagnostics[integration.kind]}
               <div class="integration-row">
@@ -2812,6 +3061,7 @@
   .agent-gemini { color: #6e73ca; background: #eef0fb; }
   .agent-vscode { color: #287aa9; background: #edf6fb; }
   .agent-browser { color: #52615a; background: #f1f3f2; }
+  .agent-mobile { color: #4e7567; background: #ecf3ef; }
   .agent-unknown { color: #48534f; background: #e2e7e4; }
 
   .session-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -2981,6 +3231,30 @@
   .privacy-note { margin: 14px 12px 0; color: #8c9691; font-size: 9px; line-height: 1.45; text-align: center; }
 
   .settings { padding: 5px 16px 20px; }
+  .pairing-back { display: flex; align-items: center; gap: 6px; width: 100%; padding: 9px 0 8px; border: 0; color: #5d6d66; background: transparent; font-size: 10px; font-weight: 700; text-align: left; cursor: pointer; }
+  .pairing-back:hover { color: #35423d; }
+  .pairing-back span { font-size: 12px; line-height: 1; }
+  .pairing-stage { display: grid; justify-items: center; gap: 9px; padding: 6px 0 4px; }
+  /* O QR precisa de largura: 61 módulos com a zona de silêncio, e cada um deles
+     com uns 4 px é o que uma câmera de celular lê com folga. Abaixo disso a
+     leitura começa a depender de sorte. */
+  .qr-frame { width: 252px; height: 252px; padding: 0; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(27, 42, 35, 0.1); }
+  .qr-frame :global(svg) { width: 100%; height: 100%; display: block; }
+  .qr-hint { margin: 0; color: #7d8a84; font-size: 9px; text-align: center; }
+  .qr-countdown { margin: 0; padding: 3px 9px; border-radius: 999px; color: #5d7568; background: rgba(78, 105, 93, 0.075); font-size: 9px; font-weight: 720; font-variant-numeric: tabular-nums; }
+  .qr-countdown.urgent { color: #9b663d; background: rgba(177, 115, 65, 0.1); }
+  .pairing-stage.paired { gap: 7px; padding: 22px 0 18px; }
+  .pairing-stage.paired strong { color: #35423d; font-size: 12px; }
+  .pairing-stage.paired p { margin: 0; max-width: 250px; color: #7d8a84; font-size: 9px; line-height: 1.45; text-align: center; }
+  .pairing-stage.paired button { min-height: 27px; margin-top: 5px; padding: 0 11px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 8px; color: #577064; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: background 150ms ease; }
+  .pairing-stage.paired button:hover { background: rgba(82, 112, 99, 0.06); }
+  .pairing-manual { display: grid; gap: 4px; padding: 3px 0 2px; }
+  .pairing-manual strong { color: #35423d; font-size: 10px; }
+  .pairing-manual span { display: flex; align-items: baseline; gap: 7px; color: #46524d; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 9px; }
+  .pairing-manual small { color: #97a19c; font-family: inherit; font-size: 8px; }
+  .pairing-manual .empty { color: #97a19c; font-family: inherit; }
+  .integration-row button.danger { border-color: rgba(165, 76, 76, 0.35); color: #a54c4c; }
+  .integration-row button.danger:hover:not(:disabled) { background: rgba(165, 76, 76, 0.09); }
   .settings-section-label { padding: 9px 0 5px; color: #929c97; font-size: 9px; font-weight: 750; letter-spacing: 0.07em; text-transform: uppercase; }
   .settings-section-label.preferences-label { padding-top: 17px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
@@ -3126,7 +3400,22 @@
   .overlay-shell.dark .board-intro p,
   .overlay-shell.dark .terminal-picker-copy small,
   .overlay-shell.dark .history-row span,
-  .overlay-shell.dark .settings-feedback { color: #adbab4; }
+  .overlay-shell.dark .settings-feedback,
+  .overlay-shell.dark .qr-hint,
+  .overlay-shell.dark .pairing-stage.paired p { color: #adbab4; }
+  .overlay-shell.dark .pairing-back { color: #b3c1ba; }
+  .overlay-shell.dark .pairing-back:hover { color: #e3ebe7; }
+  .overlay-shell.dark .pairing-stage.paired strong,
+  .overlay-shell.dark .pairing-manual strong { color: #e3ebe7; }
+  .overlay-shell.dark .pairing-manual span { color: #c3d0ca; }
+  .overlay-shell.dark .pairing-manual small,
+  .overlay-shell.dark .pairing-manual .empty { color: #93a09a; }
+  .overlay-shell.dark .qr-countdown { color: #b9cbc0; background: rgba(198, 218, 208, 0.07); }
+  .overlay-shell.dark .qr-countdown.urgent { color: #dfaa78; background: rgba(223, 170, 120, 0.12); }
+  .overlay-shell.dark .pairing-stage.paired button { color: #bdcbc4; border-color: rgba(207, 223, 215, 0.14); }
+  /* O QR nunca inverte: fundo claro no escuro é deliberado, porque leitor de
+     Android assume polaridade normal. Ver docs/REMOTE-CONTROL.md. */
+  .overlay-shell.dark .qr-frame { box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35); }
   .overlay-shell.dark .settings-feedback.error { color: #d68d8d; }
   .overlay-shell.dark .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
   .overlay-shell.dark .update-card p.error { color: #d68d8d; }

@@ -1,6 +1,6 @@
 [package]
 name = "lume"
-version = "0.4.13"
+version = "0.5.4"
 description = "Monitor local e discreto para agentes de IA no Windows e Linux"
 authors = ["tulerws"]
 edition = "2021"
@@ -33,6 +33,24 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 sysinfo = "0.39.6"
 tungstenite = "0.30.0"
 notify = "8.2.0"
+# `default-features = false` não é estilo: as features padrão do rustls ligam
+# `aws_lc_rs`, e o reqwest do plugin de atualização já liga `ring`. Com as duas
+# ativas, CryptoProvider::from_crate_features devolve None e o rustls entra em
+# pânico em runtime — inclusive no caminho do atualizador. Ver docs/REMOTE-CONTROL.md.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
+# Entropia do sistema operacional, sem PRNG no meio: código de pareamento e
+# token de aparelho são segredos, não números pseudoaleatórios.
+getrandom = "0.3"
+base64 = "0.22"
+percent-encoding = "2"
+# Sem features: as opcionais trazem `resvg` para rasterizar, e o SVG é gerado
+# aqui a partir da matriz. Medido 6x mais rápido que o `qrcode` na URI de
+# pareamento — ver docs/REMOTE-CONTROL.md.
+fast_qr = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
@@ -42,3 +60,14 @@ x11-dl = "2.21"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"
+# A feature `test` do Tauri traz `mock_app`, e ela existe por um teste só: o que
+# prova que `emit` alcança um ouvinte de Rust. É o elo que o REMOTE-CONTROL.md
+# aponta como o que quebra em silêncio. Fica em dev-dependencies, e o resolver v2
+# do edition 2021 mantém a feature fora do binário de produção.
+tauri = { version = "2", features = ["test"] }
+# Leitor de QR independente do codificador. Existe para uma coisa só: provar
+# que o que o Lume desenha é lido de volta como o texto original.
+rqrr = { version = "0.10", default-features = false }
