@@ -224,6 +224,30 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .message:empty { display: none; }
 .message.error { color: var(--red); }
 
+.pair-install-prompt {
+  margin-top: 14px;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  border: 1px solid rgba(104, 184, 135, 0.22);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(145deg, rgba(104, 184, 135, 0.1), var(--surface));
+}
+.pair-install-prompt > img { width: 44px; height: 44px; border-radius: 12px; }
+.pair-install-prompt > span { min-width: 0; display: grid; gap: 3px; }
+.pair-install-prompt small { color: #8fd0aa; font-size: 9px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+.pair-install-prompt strong { font-size: 13px; }
+.pair-install-prompt p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.pair-install-prompt .primary-button {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
 .android-install-card {
   width: min(calc(100% - 36px), 464px);
   margin: -14px auto calc(32px + env(safe-area-inset-bottom));
@@ -606,6 +630,26 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .scope-list small { color: var(--muted); font-size: 11px; font-weight: 730; }
 #device-scopes { display: flex; flex-wrap: wrap; gap: 5px; }
 #device-scopes span { padding: 5px 7px; border-radius: 7px; color: #94bea8; background: var(--green-soft); font-size: 10px; font-weight: 800; text-transform: capitalize; }
+
+.device-download-button {
+  min-height: 66px;
+  margin-top: 9px;
+  padding: 13px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(104, 184, 135, 0.2);
+  border-radius: 17px;
+  color: var(--text);
+  background: var(--green-soft);
+  text-decoration: none;
+}
+.device-download-button > span:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.device-download-button strong { font-size: 13px; }
+.device-download-button small { color: var(--muted); font-size: 11px; line-height: 1.35; }
+.device-download-button em { color: #8fd0aa; font-size: 10px; font-style: normal; font-weight: 800; }
+.device-download-button:active { transform: translateY(1px); }
 
 .mobile-update-card {
   padding: 13px;

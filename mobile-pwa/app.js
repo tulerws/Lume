@@ -21,6 +21,8 @@ const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
 const androidInstallCard = document.querySelector("#android-install-card");
+const pairInstallPrompt = document.querySelector("#pair-install-prompt");
+const mobileApkDeviceDownload = document.querySelector("#mobile-apk-device-download");
 const pwaInstallButton = document.querySelector("#pwa-install-button");
 const mobileUpdateCard = document.querySelector("#mobile-update-card");
 const mobileUpdateButton = document.querySelector("#mobile-update-button");
@@ -102,7 +104,10 @@ function nativePlatform() {
 function updateInstallOptions() {
   const isAndroidBrowser = /Android/i.test(navigator.userAgent);
   const isNative = window.Capacitor?.isNativePlatform?.() || nativePlatform() !== "web";
-  androidInstallCard.hidden = !isAndroidBrowser || isNative || Boolean(token);
+  pairInstallPrompt.hidden = !pairingCode || !isAndroidBrowser || isNative;
+  androidInstallCard.hidden =
+    Boolean(pairingCode) || !isAndroidBrowser || isNative || Boolean(token);
+  mobileApkDeviceDownload.hidden = isNative || !isAndroidBrowser;
   pwaInstallButton.hidden = !deferredInstallPrompt;
 }
 
@@ -571,7 +576,7 @@ async function showDashboard() {
   emptyAuthView.hidden = true;
   appContent.hidden = false;
   loadingView.hidden = false;
-  androidInstallCard.hidden = true;
+  updateInstallOptions();
   document.querySelector("#refresh-button").hidden = false;
   updateSecurityControls();
   await refreshSnapshot();

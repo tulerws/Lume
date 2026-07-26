@@ -169,7 +169,7 @@ impl MobileGateway {
 
 fn random_secret(bytes: usize) -> Result<String, String> {
     let mut value = vec![0_u8; bytes];
-    getrandom::fill(&mut value).map_err(|error| error.to_string())?;
+    getrandom::getrandom(&mut value).map_err(|error| error.to_string())?;
     Ok(URL_SAFE_NO_PAD.encode(value))
 }
 

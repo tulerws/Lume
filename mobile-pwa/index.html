@@ -36,6 +36,19 @@
           <button class="primary-button" type="submit">Connect securely</button>
           <p id="pair-message" class="message" aria-live="polite"></p>
         </form>
+        <aside id="pair-install-prompt" class="pair-install-prompt" hidden>
+          <img src="/lume-mobile-icon.svg" alt="" />
+          <span>
+            <small>Lume for Android</small>
+            <strong>Take your agents with you</strong>
+            <p>Install the native app, then return here to finish pairing.</p>
+          </span>
+          <a
+            class="primary-button"
+            href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
+            rel="noopener"
+          >Download the app</a>
+        </aside>
         <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>End-to-end local. No Lume cloud account required.</p>
       </section>
 
@@ -142,6 +155,18 @@
               <i id="mobile-update-progress" hidden></i>
             </footer>
           </article>
+          <a
+            id="mobile-apk-device-download"
+            class="device-download-button"
+            href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
+            rel="noopener"
+          >
+            <span class="setting-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 20h14" /></svg>
+            </span>
+            <span><strong>Download Android app</strong><small>Install the latest signed APK from the official Lume release.</small></span>
+            <em>Download</em>
+          </a>
           <h2 class="section-title">Preferences</h2>
           <div class="preference-list">
             <button id="biometric-button" type="button">

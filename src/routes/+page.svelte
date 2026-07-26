@@ -2263,93 +2263,107 @@
           </div>
         {:else}
           <div class="settings" in:fade={{ duration: 150 }}>
-            <div class="settings-section-label">{tr("Agents", "Agentes")}</div>
-            {#each integrations as integration}
-              {@const diagnostic = integrationDiagnostics[integration.kind]}
-              <div class="integration-row">
-                <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
-                <div>
-                  <strong>{integration.label}</strong>
-                  <span>{shown(integration.detail)}</span>
-                </div>
-                <div class="integration-actions">
-                  <button
-                    class="diagnose-button"
-                    disabled={diagnosingIntegration !== null}
-                    type="button"
-                    onclick={() => runIntegrationDiagnostic(integration)}
-                  >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
-                  <button
-                    class:connected={integration.configured}
-                    disabled={!integration.installed || configuringIntegration === integration.kind}
-                    type="button"
-                    onclick={() => toggleIntegration(integration)}
-                  >
-                    {configuringIntegration === integration.kind
-                      ? "…"
-                      : integration.configured
-                        ? tr("Connected", "Conectado")
-                        : tr("Connect", "Conectar")}
-                  </button>
-                </div>
-              </div>
-              {#if diagnostic}
-                <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
-                  {#each diagnostic.checks as check (check.id)}
-                    <div class="diagnostic-check status-{check.status}">
-                      <i aria-hidden="true"></i>
-                      <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
+            <details class="settings-section" open>
+              <summary class="settings-section-label">{tr("Agents", "Agentes")}</summary>
+              <div class="settings-section-content">
+                {#each integrations as integration}
+                  {@const diagnostic = integrationDiagnostics[integration.kind]}
+                  <div class="integration-row">
+                    <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
+                    <div>
+                      <strong>{integration.label}</strong>
+                      <span>{shown(integration.detail)}</span>
                     </div>
-                  {/each}
-                </div>
-              {/if}
-            {/each}
-            <div class="settings-section-label preferences-label">{tr("External detectors", "Detectores externos")}</div>
-            {#each externalPlugins as plugin (plugin.id)}
-              <div class="integration-row external-plugin-row">
-                <span class="agent-avatar agent-unknown"><BrandIcon name="unknown" size={17} /></span>
-                <div><strong>{plugin.name}</strong><span>{plugin.executable} · {plugin.id}</span></div>
-                <button type="button" onclick={() => uninstallExternalPlugin(plugin.id)}>{tr("Remove", "Remover")}</button>
+                    <div class="integration-actions">
+                      <button
+                        class="diagnose-button"
+                        disabled={diagnosingIntegration !== null}
+                        type="button"
+                        onclick={() => runIntegrationDiagnostic(integration)}
+                      >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
+                      <button
+                        class:connected={integration.configured}
+                        disabled={!integration.installed || configuringIntegration === integration.kind}
+                        type="button"
+                        onclick={() => toggleIntegration(integration)}
+                      >
+                        {configuringIntegration === integration.kind
+                          ? "…"
+                          : integration.configured
+                            ? tr("Connected", "Conectado")
+                            : tr("Connect", "Conectar")}
+                      </button>
+                    </div>
+                  </div>
+                  {#if diagnostic}
+                    <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
+                      {#each diagnostic.checks as check (check.id)}
+                        <div class="diagnostic-check status-{check.status}">
+                          <i aria-hidden="true"></i>
+                          <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                {/each}
               </div>
-            {:else}
-              <p class="profile-empty">{tr("Install a JSON manifest to monitor another CLI process.", "Instale um manifesto JSON para monitorar outro processo CLI.")}</p>
-            {/each}
-            <div class="plugin-actions">
-              <button disabled={installingPlugin} type="button" onclick={addExternalPlugin}>{installingPlugin ? "…" : tr("Install manifest", "Instalar manifesto")}</button>
-              <button type="button" onclick={openPluginFolder}>{tr("Open folder", "Abrir pasta")}</button>
-            </div>
-            {#if pluginMessage}<p class="browser-path">{pluginMessage}</p>{/if}
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("External detectors", "Detectores externos")}</summary>
+              <div class="settings-section-content">
+                {#each externalPlugins as plugin (plugin.id)}
+                  <div class="integration-row external-plugin-row">
+                    <span class="agent-avatar agent-unknown"><BrandIcon name="unknown" size={17} /></span>
+                    <div><strong>{plugin.name}</strong><span>{plugin.executable} · {plugin.id}</span></div>
+                    <button type="button" onclick={() => uninstallExternalPlugin(plugin.id)}>{tr("Remove", "Remover")}</button>
+                  </div>
+                {:else}
+                  <p class="profile-empty">{tr("Install a JSON manifest to monitor another CLI process.", "Instale um manifesto JSON para monitorar outro processo CLI.")}</p>
+                {/each}
+                <div class="plugin-actions">
+                  <button disabled={installingPlugin} type="button" onclick={addExternalPlugin}>{installingPlugin ? "…" : tr("Install manifest", "Instalar manifesto")}</button>
+                  <button type="button" onclick={openPluginFolder}>{tr("Open folder", "Abrir pasta")}</button>
+                </div>
+                {#if pluginMessage}<p class="browser-path">{pluginMessage}</p>{/if}
+              </div>
+            </details>
             {#if settingsMessage}
               <p class:error={settingsMessageIsError} class="settings-feedback" transition:fade>
                 {settingsMessage}
               </p>
             {/if}
-            <div class="settings-section-label preferences-label">Interface</div>
-            <div class="integration-row">
-              <span class="agent-avatar agent-vscode"><BrandIcon name="vscode" size={19} /></span>
-              <div>
-                <strong>VS Code Companion</strong>
-                <span>{shown(vscodeStatus.detail)}</span>
+            <details class="settings-section">
+              <summary class="settings-section-label">Interface</summary>
+              <div class="settings-section-content">
+                <div class="integration-row">
+                  <span class="agent-avatar agent-vscode"><BrandIcon name="vscode" size={19} /></span>
+                  <div>
+                    <strong>VS Code Companion</strong>
+                    <span>{shown(vscodeStatus.detail)}</span>
+                  </div>
+                  <button
+                    class:connected={vscodeStatus.configured}
+                    disabled={!vscodeStatus.installed || configuringVscode}
+                    type="button"
+                    onclick={toggleVscode}
+                  >{configuringVscode ? "…" : vscodeStatus.configured ? tr("Connected", "Conectado") : tr("Connect", "Conectar")}</button>
+                </div>
+                <div class="integration-row browser-row">
+                  <span class="agent-avatar agent-browser"><BrandIcon name="browsers" size={21} /></span>
+                  <div>
+                    <strong>Chrome, Edge & Brave</strong>
+                    <span>{tr("Load the folder as an unpacked extension.", "Carregue a pasta como extensão descompactada.")}</span>
+                  </div>
+                  <button type="button" onclick={openBrowserCompanion}>{tr("Open folder", "Abrir pasta")}</button>
+                </div>
+                {#if browserCompanionPath}
+                  <p class="browser-path" transition:fade>{browserCompanionPath}</p>
+                {/if}
               </div>
-              <button
-                class:connected={vscodeStatus.configured}
-                disabled={!vscodeStatus.installed || configuringVscode}
-                type="button"
-                onclick={toggleVscode}
-              >{configuringVscode ? "…" : vscodeStatus.configured ? tr("Connected", "Conectado") : tr("Connect", "Conectar")}</button>
-            </div>
-            <div class="integration-row browser-row">
-              <span class="agent-avatar agent-browser"><BrandIcon name="browsers" size={21} /></span>
-              <div>
-                <strong>Chrome, Edge & Brave</strong>
-                <span>{tr("Load the folder as an unpacked extension.", "Carregue a pasta como extensão descompactada.")}</span>
-              </div>
-              <button type="button" onclick={openBrowserCompanion}>{tr("Open folder", "Abrir pasta")}</button>
-            </div>
-            {#if browserCompanionPath}
-              <p class="browser-path" transition:fade>{browserCompanionPath}</p>
-            {/if}
-            <div class="settings-section-label preferences-label">{tr("Preferences", "Preferências")}</div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Preferences", "Preferências")}</summary>
+              <div class="settings-section-content">
             <label class="field-row">
               <span><strong>{tr("Language", "Idioma")}</strong><small>{tr("Lume interface language.", "Idioma da interface do Lume.")}</small></span>
               <select
@@ -2450,26 +2464,34 @@
                 {/each}
               </div>
             </div>
-            <div class="settings-section-label preferences-label">{tr("Keyboard shortcuts", "Atalhos de teclado")}</div>
-            {#each [
-              ["openShortcut", tr("Open Lume", "Abrir o Lume"), tr("Shows and expands the overlay.", "Exibe e expande a sobreposição.")],
-              ["globalShortcut", tr("Command palette", "Paleta de comandos"), tr("Search actions and active agents.", "Busca ações e agentes ativos.")],
-              ["newSessionShortcut", tr("New session", "Nova sessão"), tr("Opens the agent launcher.", "Abre o iniciador de agentes.")],
-              ["whiteboardShortcut", "Whiteboard", tr("Opens the floating terminal hub.", "Abre o hub de terminais flutuantes.")],
-            ] as shortcut}
-              <label class="field-row shortcut-row">
-                <span><strong>{shortcut[1]}</strong><small>{shortcut[2]}</small></span>
-                <input
-                  class="shortcut-input"
-                  readonly
-                  aria-label={shortcut[1]}
-                  value={preferences[shortcut[0] as ShortcutPreferenceKey]}
-                  onfocus={(event) => event.currentTarget.select()}
-                  onkeydown={(event) => captureShortcut(event, shortcut[0] as ShortcutPreferenceKey)}
-                />
-              </label>
-            {/each}
-            <div class="settings-section-label preferences-label">{tr("Project profiles", "Perfis por projeto")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Keyboard shortcuts", "Atalhos de teclado")}</summary>
+              <div class="settings-section-content">
+                {#each [
+                  ["openShortcut", tr("Open Lume", "Abrir o Lume"), tr("Shows and expands the overlay.", "Exibe e expande a sobreposição.")],
+                  ["globalShortcut", tr("Command palette", "Paleta de comandos"), tr("Search actions and active agents.", "Busca ações e agentes ativos.")],
+                  ["newSessionShortcut", tr("New session", "Nova sessão"), tr("Opens the agent launcher.", "Abre o iniciador de agentes.")],
+                  ["whiteboardShortcut", "Whiteboard", tr("Opens the floating terminal hub.", "Abre o hub de terminais flutuantes.")],
+                ] as shortcut}
+                  <label class="field-row shortcut-row">
+                    <span><strong>{shortcut[1]}</strong><small>{shortcut[2]}</small></span>
+                    <input
+                      class="shortcut-input"
+                      readonly
+                      aria-label={shortcut[1]}
+                      value={preferences[shortcut[0] as ShortcutPreferenceKey]}
+                      onfocus={(event) => event.currentTarget.select()}
+                      onkeydown={(event) => captureShortcut(event, shortcut[0] as ShortcutPreferenceKey)}
+                    />
+                  </label>
+                {/each}
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Project profiles", "Perfis por projeto")}</summary>
+              <div class="settings-section-content">
             {#if detectedProjects.length > 0}
               <label class="field-row">
                 <span><strong>{tr("Project", "Projeto")}</strong><small>{tr("Overrides only for this project.", "Ajustes somente para este projeto.")}</small></span>
@@ -2562,8 +2584,12 @@
             {:else}
               <p class="profile-empty">{tr("Profiles appear after a project is detected.", "Os perfis aparecem depois que um projeto é detectado.")}</p>
             {/if}
-            <div class="settings-section-label preferences-label">{tr("Mobile access", "Acesso mobile")}</div>
-            <div class="mobile-access-card">
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Mobile access", "Acesso mobile")}</summary>
+              <div class="settings-section-content">
+                <div class="mobile-access-card">
               <div class="mobile-access-header">
                 <div>
                   <strong>{tr("Local network gateway", "Gateway da rede local")}</strong>
@@ -2624,36 +2650,40 @@
               {#if mobileMessage}
                 <p class:error={mobileMessageIsError} class="mobile-message">{mobileMessage}</p>
               {/if}
-            </div>
-            {#if pairedDevices.length}
-              <div class="paired-devices">
-                {#each pairedDevices as device (device.id)}
-                  <div>
-                    <span>
-                      <strong>{device.name}</strong>
-                      <small>{device.lastSeenAt ? relativeTime(device.lastSeenAt) : tr("Not used yet", "Ainda não utilizado")}</small>
-                      <span class="device-scopes">
-                        {#each [
-                          ["prompt", tr("Prompts", "Prompts")],
-                          ["approve", tr("Approvals", "Aprovações")],
-                          ["terminate", tr("Stop agents", "Encerrar agentes")],
-                        ] as option}
-                          <button
-                            class:active={device.scopes.includes(option[0] as MobileScope)}
-                            disabled={mobileBusy}
-                            type="button"
-                            onclick={() => void togglePairedDeviceScope(device, option[0] as MobileScope)}
-                          >{option[1]}</button>
-                        {/each}
-                      </span>
-                    </span>
-                    <button disabled={mobileBusy} type="button" onclick={() => void removePairedDevice(device.id)}>{tr("Revoke", "Revogar")}</button>
+                </div>
+                {#if pairedDevices.length}
+                  <div class="paired-devices">
+                    {#each pairedDevices as device (device.id)}
+                      <div>
+                        <span>
+                          <strong>{device.name}</strong>
+                          <small>{device.lastSeenAt ? relativeTime(device.lastSeenAt) : tr("Not used yet", "Ainda não utilizado")}</small>
+                          <span class="device-scopes">
+                            {#each [
+                              ["prompt", tr("Prompts", "Prompts")],
+                              ["approve", tr("Approvals", "Aprovações")],
+                              ["terminate", tr("Stop agents", "Encerrar agentes")],
+                            ] as option}
+                              <button
+                                class:active={device.scopes.includes(option[0] as MobileScope)}
+                                disabled={mobileBusy}
+                                type="button"
+                                onclick={() => void togglePairedDeviceScope(device, option[0] as MobileScope)}
+                              >{option[1]}</button>
+                            {/each}
+                          </span>
+                        </span>
+                        <button disabled={mobileBusy} type="button" onclick={() => void removePairedDevice(device.id)}>{tr("Revoke", "Revogar")}</button>
+                      </div>
+                    {/each}
                   </div>
-                {/each}
+                {/if}
               </div>
-            {/if}
-            <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
-            <div class="update-card" aria-live="polite">
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("About", "Sobre")}</summary>
+              <div class="settings-section-content">
+                <div class="update-card" aria-live="polite">
               <div class="update-main">
                 <LumeLogo size={30} />
                 <div class="update-copy">
@@ -2688,21 +2718,27 @@
                   <span style:width={`${updateProgress ?? 24}%`}></span>
                 </div>
               {/if}
-            </div>
-            <div class="settings-section-label preferences-label">{tr("Reset", "Redefinir")}</div>
-            <div class:confirming={resetConfirming} class="reset-settings-control">
-              {#if resetConfirming}
-                <span>{tr("Reset all Lume settings to their defaults?", "Redefinir todas as configurações do Lume para o padrão?")}</span>
-                <button type="button" onclick={() => (resetConfirming = false)}>{tr("Cancel", "Cancelar")}</button>
-                <button class="danger" disabled={resettingSettings} type="button" onclick={() => void resetSettings()}>
-                  {resettingSettings ? tr("Resetting…", "Redefinindo…") : tr("Reset", "Redefinir")}
-                </button>
-              {:else}
-                <button type="button" onclick={() => void resetSettings()}>
-                  {tr("Reset", "Redefinir")}
-                </button>
-              {/if}
-            </div>
+                </div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Reset", "Redefinir")}</summary>
+              <div class="settings-section-content">
+                <div class:confirming={resetConfirming} class="reset-settings-control">
+                  {#if resetConfirming}
+                    <span>{tr("Reset all Lume settings to their defaults?", "Redefinir todas as configurações do Lume para o padrão?")}</span>
+                    <button type="button" onclick={() => (resetConfirming = false)}>{tr("Cancel", "Cancelar")}</button>
+                    <button class="danger" disabled={resettingSettings} type="button" onclick={() => void resetSettings()}>
+                      {resettingSettings ? tr("Resetting…", "Redefinindo…") : tr("Reset", "Redefinir")}
+                    </button>
+                  {:else}
+                    <button type="button" onclick={() => void resetSettings()}>
+                      {tr("Reset", "Redefinir")}
+                    </button>
+                  {/if}
+                </div>
+              </div>
+            </details>
             <span class:visible={savingSettings} class="save-state">{tr("Saving…", "Salvando…")}</span>
           </div>
         {/if}
@@ -3198,6 +3234,33 @@
   .settings { padding: 5px 16px 20px; }
   .settings-section-label { padding: 9px 0 5px; color: #929c97; font-size: 9px; font-weight: 750; letter-spacing: 0.07em; text-transform: uppercase; }
   .settings-section-label.preferences-label { padding-top: 17px; }
+  .settings-section { border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .settings-section > .settings-section-label {
+    min-height: 39px;
+    padding: 0 2px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  .settings-section > .settings-section-label::-webkit-details-marker { display: none; }
+  .settings-section > .settings-section-label::after {
+    content: "+";
+    color: #7d8d85;
+    font-size: 15px;
+    font-weight: 450;
+    letter-spacing: 0;
+    transition: color 130ms ease, transform 130ms ease;
+  }
+  .settings-section[open] > .settings-section-label::after {
+    content: "−";
+    color: #4f7463;
+    transform: rotate(180deg);
+  }
+  .settings-section > .settings-section-label:hover { color: #66766f; }
+  .settings-section-content { padding: 0 1px 6px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .integration-row .agent-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: 10px; }
   .integration-row > div:not(.integration-actions) { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -3377,6 +3440,8 @@
   .overlay-shell.dark .history-row,
   .overlay-shell.dark .setting-row,
   .overlay-shell.dark .field-row { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .settings-section { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .settings-section[open] > .settings-section-label::after { color: #8eb9a5; }
   .overlay-shell.dark .session-row:hover,
   .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
   .overlay-shell.dark .project-name,
