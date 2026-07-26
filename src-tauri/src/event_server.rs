@@ -78,12 +78,54 @@ pub fn publish_event(
         .find(|session| session.id == event.session_id)
         .map(|session| session.status);
     let notification = notification_for(&event, previous_status.as_ref());
+    // Mesma decisão, dois transportes: `should_notify` continua sendo o único
+    // lugar que decide o que merece aviso, e trocar quem entrega não mexe nela.
+    let notice = notice_for(&event, previous_status.as_ref());
     let permission_id = state.ingest(event)?;
     crate::remote_server::announce_sessions_changed(app);
+    if let Some(notice) = notice {
+        crate::remote_server::announce_notice(app, notice);
+    }
     if let Some((title, body)) = notification {
         let _ = app.notification().builder().title(title).body(body).show();
     }
     Ok(permission_id)
+}
+
+/// O mesmo aviso, em dado estruturado, para os aparelhos pareados.
+///
+/// Não repete a decisão: delega a `should_notify` como o `notification_for`
+/// logo abaixo. O celular recebe os campos e escreve o texto na língua dele.
+fn notice_for(
+    event: &HookEvent,
+    previous_status: Option<&crate::domain::SessionStatus>,
+) -> Option<crate::remote_server::Notice> {
+    if !crate::domain::should_notify(&event.event, previous_status) {
+        return None;
+    }
+    let kind = match event.event {
+        crate::domain::HookEventKind::PermissionRequest => "permission_request",
+        crate::domain::HookEventKind::Completed => "completed",
+        crate::domain::HookEventKind::Failed => "failed",
+        _ => return None,
+    };
+    Some(crate::remote_server::Notice {
+        kind,
+        session_id: event.session_id.clone(),
+        agent_label: event
+            .agent_label
+            .clone()
+            .unwrap_or_else(|| match event.agent {
+                crate::domain::AgentKind::Codex => "Codex".into(),
+                crate::domain::AgentKind::Claude => "Claude".into(),
+                crate::domain::AgentKind::Gemini => "Gemini".into(),
+                crate::domain::AgentKind::Unknown => "Agente".into(),
+            }),
+        project: event
+            .project
+            .clone()
+            .unwrap_or_else(|| "sessão local".to_string()),
+    })
 }
 
 fn notification_for(

@@ -512,6 +512,23 @@ A serialização segue a do backend: **camelCase**, igual ao que `serde` já emi
 
 `kind` em `notify` acompanha `HookEventKind`: `permission_request`, `completed`, `failed`.
 
+#### Uma decisão, dois transportes
+
+`domain.rs::should_notify` continua sendo o **único** lugar que decide o que merece aviso. O toast do desktop e a mensagem `notify` são dois transportes que leem a mesma decisão, e nenhum dos dois a reimplementa — é o que permite trocar quem entrega o alerta na v2 sem tocar na regra.
+
+O aviso carrega **dado estruturado, não texto pronto**: o desktop mostra `Lume · Permissão necessária`, e o celular recebe `kind` mais os campos e escreve na língua dele.
+
+#### Aviso não é estado, e por isso não usa o contador
+
+O [contador de revisão](#contador-de-revisão-e-não-um-canal-por-conexão) pode coalescer dez mudanças numa só porque só interessa o valor final. **Dois pedidos de permissão são dois avisos**, e engolir um perde informação que não volta.
+
+Então os avisos vivem numa fila circular de **32 entradas**, compartilhada por todas as conexões, com número de sequência. Cada conexão guarda o último que viu e drena o que veio depois — sem registro de quem está conectado, como no resto do módulo.
+
+Duas consequências, ambas assumidas:
+
+- **Conexão nova começa no aviso mais recente, não em zero.** Entrar não pode despejar no celular a fila de tudo que aconteceu enquanto ele estava desligado.
+- **Conexão parada além do teto perde os mais antigos.** É perda aceitável: aviso de tarefa concluída há muito tempo não ajuda ninguém, e o `sessions.delta` entrega o estado atual de qualquer forma.
+
 #### A sessão que trafega é podada
 
 O tipo é `AgentSession`, o mesmo de `domain.rs` e o mesmo que o webview recebe — mas os campos pesados vão cortados. **Isto não é escolha de estilo, é o que faz a mensagem caber.**

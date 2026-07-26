@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     rc::Rc,
@@ -81,6 +82,8 @@ pub struct RemoteConfig {
     /// processou e refaz o diff quando o número anda. Ver
     /// [`send_delta`] e o `REMOTE-CONTROL.md`.
     revision: Arc<AtomicU64>,
+    /// Ver [`Notices`].
+    notices: Arc<Notices>,
     /// O que a conexão pode pedir ao resto do Lume. Ver [`Desktop`].
     desktop: Box<dyn Desktop>,
 }
@@ -147,6 +150,7 @@ impl RemoteConfig {
         hostname: String,
         shutdown: Arc<AtomicBool>,
         revision: Arc<AtomicU64>,
+        notices: Arc<Notices>,
         desktop: Box<dyn Desktop>,
     ) -> Self {
         Self {
@@ -156,6 +160,7 @@ impl RemoteConfig {
             hostname,
             shutdown,
             revision,
+            notices,
             desktop,
         }
     }
@@ -301,6 +306,9 @@ pub struct RemoteServer {
     /// contador órfão depois do primeiro desligamento e as conexões seguintes
     /// nunca mais receberiam delta — silenciosamente.
     revision: Arc<AtomicU64>,
+    /// Pelo mesmo motivo do contador: registrada uma vez, viva enquanto o
+    /// processo viver.
+    notices: Arc<Notices>,
 }
 
 /// O que existe enquanto o listener está no ar.
@@ -315,6 +323,7 @@ impl Default for RemoteServer {
             pairing: Arc::new(Pairing::default()),
             running: Mutex::new(None),
             revision: Arc::new(AtomicU64::new(0)),
+            notices: Arc::new(Notices::default()),
         }
     }
 }
@@ -332,6 +341,7 @@ impl RemoteServer {
     pub fn revision(&self) -> Arc<AtomicU64> {
         self.revision.clone()
     }
+
 
     pub fn is_running(&self) -> bool {
         self.running
@@ -358,6 +368,7 @@ impl RemoteServer {
                 sysinfo::System::host_name().unwrap_or_else(|| "Lume".to_string()),
                 shutdown.clone(),
                 self.revision.clone(),
+                self.notices.clone(),
                 desktop,
             ));
             listen(REMOTE_CONTROL_PORT, tls, config, shutdown)
@@ -433,6 +444,86 @@ impl RemoteServer {
 /// Cinco pontos do código o emitem, e nenhum deles precisou mudar para o
 /// controle remoto existir.
 pub const SESSIONS_CHANGED: &str = "lume://sessions-changed";
+
+/// Quantos avisos a fila guarda.
+///
+/// Conexão parada por mais que isto perde os mais antigos. É perda aceitável:
+/// aviso velho de tarefa já concluída não ajuda ninguém, e o `sessions.delta`
+/// entrega o estado atual de qualquer forma.
+const MAX_NOTICES: usize = 32;
+
+/// Um aviso destinado aos aparelhos pareados.
+///
+/// Carrega dado estruturado, e não o título já escrito que o desktop mostra:
+/// quem traduz para a língua do usuário é o aplicativo.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    /// Acompanha `HookEventKind`: `permission_request`, `completed`, `failed`.
+    pub kind: &'static str,
+    pub session_id: String,
+    pub agent_label: String,
+    pub project: String,
+}
+
+/// Fila circular de avisos, compartilhada por todas as conexões vivas.
+///
+/// **Aviso não é estado, e por isso não cabe no contador de revisão.** O delta
+/// pode coalescer dez mudanças numa só porque só interessa o valor final; dois
+/// pedidos de permissão são dois avisos, e engolir um perde a informação.
+///
+/// Cada conexão guarda o número do último que viu e drena o que veio depois.
+/// Como no resto deste módulo, não existe registro de quem está conectado.
+#[derive(Default)]
+pub struct Notices {
+    entries: Mutex<VecDeque<(u64, Notice)>>,
+    next: AtomicU64,
+}
+
+impl Notices {
+    pub fn push(&self, notice: Notice) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let sequence = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        entries.push_back((sequence, notice));
+        while entries.len() > MAX_NOTICES {
+            entries.pop_front();
+        }
+    }
+
+    /// O número do aviso mais recente.
+    ///
+    /// Uma conexão nova começa daqui, e não do zero: entrar não pode despejar
+    /// no celular a fila inteira de avisos que já aconteceram.
+    pub fn latest(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    fn since(&self, seen: u64) -> Vec<(u64, Notice)> {
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(sequence, _)| *sequence > seen)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Enfileira um aviso para os aparelhos pareados.
+///
+/// Silencioso quando não há servidor remoto gerenciado — o que acontece nos
+/// testes que exercitam a ingestão sem subir um aplicativo Tauri. Deixar de
+/// avisar o celular não pode impedir o desktop de processar o evento.
+pub fn announce_notice<R: tauri::Runtime>(app: &AppHandle<R>, notice: Notice) {
+    if let Some(server) = app.try_state::<RemoteServer>() {
+        server.notices.push(notice);
+    }
+}
 
 /// Anuncia que a lista de sessões mudou.
 ///
@@ -665,7 +756,10 @@ fn handle(
     // de herdar o que a conexão anterior achava que tinha entregue.
     let mut mirror = Mirror::new();
     send_snapshot(&mut socket, &config, &mut mirror)?;
-    serve(&mut socket, &config, &device, &mut mirror)
+    // Começa no aviso mais recente, e não em zero: entrar não pode despejar no
+    // celular a fila de avisos que aconteceram enquanto ele estava desligado.
+    let seen = config.notices.latest();
+    serve(&mut socket, &config, &device, &mut mirror, seen)
 }
 
 /// Um aparelho revogado deixa de existir na tabela; é a mesma verificação que a
@@ -1388,6 +1482,32 @@ fn record_trail(config: &RemoteConfig, device: &Device, request: &ResolvePermiss
     }
 }
 
+/// Drena os avisos que apareceram desde o último olhar.
+///
+/// Um envelope por aviso: dois pedidos de permissão são duas mensagens, e o
+/// aplicativo decide se agrupa na bandeja do sistema.
+fn send_notices(
+    socket: &mut Socket,
+    config: &RemoteConfig,
+    seen: &mut u64,
+) -> Result<(), String> {
+    if config.notices.latest() == *seen {
+        return Ok(());
+    }
+    for (sequence, notice) in config.notices.since(*seen) {
+        send(
+            socket,
+            &Envelope {
+                kind: "notify",
+                id: None,
+                payload: notice,
+            },
+        )?;
+        *seen = (*seen).max(sequence);
+    }
+    Ok(())
+}
+
 fn send_ready(socket: &mut Socket, config: &RemoteConfig) -> Result<(), String> {
     send(
         socket,
@@ -1438,6 +1558,7 @@ fn serve(
     config: &RemoteConfig,
     device: &Device,
     mirror: &mut Mirror,
+    mut seen_notice: u64,
 ) -> Result<(), String> {
     socket
         .get_mut()
@@ -1471,6 +1592,7 @@ fn serve(
         // Antes do ping e da leitura: o que o usuário está esperando ver é a
         // sessão mudando, não o keepalive.
         send_delta(socket, config, mirror)?;
+        send_notices(socket, config, &mut seen_notice)?;
 
         if last_ping.elapsed() >= PING_INTERVAL {
             if missed >= MAX_MISSED_PONGS {
@@ -1597,6 +1719,8 @@ mod tests {
         /// bate nele à mão: assim o caminho do delta é exercitado sem precisar
         /// de um aplicativo Tauri em execução para emitir o evento.
         revision: Arc<AtomicU64>,
+        /// A fila de avisos, para o teste enfileirar à mão.
+        notices: Arc<Notices>,
         /// O que o celular pediu ao desktop: sessão, prompt e aparelho.
         prompts: Arc<Mutex<Vec<(String, String, String)>>>,
         /// Posto pelo teste para o próximo prompt ser recusado.
@@ -1633,6 +1757,7 @@ mod tests {
         let revision = Arc::new(AtomicU64::new(0));
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let refusal = Arc::new(Mutex::new(None));
+        let notices = Arc::new(Notices::default());
         let terminations = Arc::new(Mutex::new(Vec::new()));
         let termination_refusal = Arc::new(Mutex::new(None));
         let config = Arc::new(RemoteConfig::new(
@@ -1642,6 +1767,7 @@ mod tests {
             "maquina-de-teste".to_string(),
             shutdown.clone(),
             revision.clone(),
+            notices.clone(),
             Box::new(FakeDesktop {
                 revision: revision.clone(),
                 prompts: prompts.clone(),
@@ -1667,6 +1793,7 @@ mod tests {
             pairing,
             shutdown,
             revision,
+            notices,
             prompts,
             refusal,
             terminations,
@@ -2667,6 +2794,98 @@ mod tests {
 
         assert_eq!(read_envelope(&mut socket)["payload"]["code"], "invalid_request");
         assert!(server.terminations.lock().expect("registro").is_empty());
+    }
+
+    fn notice(session_id: &str, kind: &'static str) -> Notice {
+        Notice {
+            kind,
+            session_id: session_id.to_string(),
+            agent_label: "Claude".to_string(),
+            project: "Lume".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_notice_reaches_the_device() {
+        let server = test_server();
+        let mut socket = mirrored(&server);
+
+        server.notices.push(notice("s-1", "permission_request"));
+
+        let envelope = read_envelope(&mut socket);
+        assert_eq!(envelope["type"], "notify");
+        // Sem `id`: é mensagem iniciada pelo servidor, não resposta.
+        assert!(envelope["id"].is_null());
+        assert_eq!(envelope["payload"]["kind"], "permission_request");
+        assert_eq!(envelope["payload"]["sessionId"], "s-1");
+        assert_eq!(envelope["payload"]["agentLabel"], "Claude");
+        assert_eq!(envelope["payload"]["project"], "Lume");
+    }
+
+    #[test]
+    fn two_notices_are_two_messages() {
+        let server = test_server();
+        let mut socket = mirrored(&server);
+
+        // O contrário do delta, que coalesce: dois pedidos de permissão são
+        // dois avisos, e engolir um perde a informação.
+        server.notices.push(notice("s-1", "permission_request"));
+        server.notices.push(notice("s-2", "permission_request"));
+
+        assert_eq!(read_envelope(&mut socket)["payload"]["sessionId"], "s-1");
+        assert_eq!(read_envelope(&mut socket)["payload"]["sessionId"], "s-2");
+    }
+
+    #[test]
+    fn a_new_connection_does_not_receive_the_backlog() {
+        let server = test_server();
+
+        // Avisos de enquanto o celular estava desligado.
+        for index in 0..5 {
+            server.notices.push(notice(&format!("velha-{index}"), "completed"));
+        }
+
+        let mut socket = mirrored(&server);
+        socket
+            .get_mut()
+            .sock
+            .set_read_timeout(Some(READ_POLL * 8))
+            .expect("prazo de leitura");
+        assert!(
+            matches!(socket.read(), Err(tungstenite::Error::Io(_))),
+            "entrar não pode despejar a fila inteira no aparelho"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_fell_behind_the_ceiling_does_not_get_stuck() {
+        let server = test_server();
+        let mut socket = mirrored(&server);
+
+        // Mais avisos que o teto da fila. Os mais antigos são descartados antes
+        // de esta conexão olhar, e ela recebe só o que sobreviveu — perda
+        // aceitável, porque aviso de tarefa já concluída não ajuda ninguém e o
+        // `sessions.delta` entrega o estado atual de qualquer forma.
+        for index in 0..(MAX_NOTICES + 10) {
+            server.notices.push(notice(&format!("s-{index}"), "completed"));
+        }
+
+        let mut received = 0;
+        socket
+            .get_mut()
+            .sock
+            .set_read_timeout(Some(READ_POLL * 8))
+            .expect("prazo de leitura");
+        while let Ok(message) = socket.read() {
+            if message.is_text() {
+                received += 1;
+            }
+        }
+        assert_eq!(received, MAX_NOTICES, "recebe o que sobreviveu na fila");
+
+        // E continua viva: um aviso novo depois disso chega.
+        server.notices.push(notice("depois", "failed"));
+        assert_eq!(read_envelope(&mut socket)["payload"]["sessionId"], "depois");
     }
 
     /// O caminho de produção, ponta a ponta: a função que **todos** os pontos de

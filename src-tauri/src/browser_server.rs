@@ -140,9 +140,28 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                     let label = event.agent_label.clone().unwrap_or_else(|| "Agente".into());
                     let project = event.project.clone().unwrap_or_else(|| "sessão web".into());
                     let event_kind = event.event.clone();
+                    let session = session_id.clone();
                     state.ingest(event)?;
                     crate::remote_server::announce_sessions_changed(&app);
+                    // Uma decisão, dois transportes: o toast desta máquina e o
+                    // aviso para os aparelhos pareados.
                     if notification {
+                        if let Some(kind) = match event_kind {
+                            HookEventKind::PermissionRequest => Some("permission_request"),
+                            HookEventKind::Failed => Some("failed"),
+                            HookEventKind::Completed => Some("completed"),
+                            _ => None,
+                        } {
+                            crate::remote_server::announce_notice(
+                                &app,
+                                crate::remote_server::Notice {
+                                    kind,
+                                    session_id: session,
+                                    agent_label: label.clone(),
+                                    project: project.clone(),
+                                },
+                            );
+                        }
                         let title = match event_kind {
                             HookEventKind::PermissionRequest => "Lume · Ação necessária",
                             HookEventKind::Failed => "Lume · Erro na sessão",
