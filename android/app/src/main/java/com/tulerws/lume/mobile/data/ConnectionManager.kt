@@ -440,7 +440,23 @@ class ConnectionManager @Inject constructor(
                 // acrescentado bloqueio de tela, arquivo corrompido. Sem captura,
                 // isso fechava o aplicativo **no `pair.accepted`** — o ponto que
                 // o comentário abaixo descreve como impossível de repetir.
-            }.getOrDefault(false)
+            }.getOrDefault(false).also { gravou ->
+                // Encerra a conexão do pareamento assim que a credencial existe.
+                //
+                // Sem isto o pareamento **terminava e a tela não saía do estado de
+                // carregando**. `umaTentativa` espera o `collect` do canal, e esse
+                // `collect` só volta quando a conexão morre: a credencial era
+                // gravada, o desktop registrava o aparelho, e `parear()` seguia
+                // suspensa para sempre atendendo a conexão. Só reabrir o
+                // aplicativo destravava, porque aí a credencial já estava no disco.
+                //
+                // Fechar aqui é o que o comentário de `parear()` sempre descreveu:
+                // esta conexão foi autenticada pelo **código**, o código acabou de
+                // ser consumido, e quem assume é o laço com o **token**. O custo é
+                // um aperto de mão a mais, na rede local, logo depois de a pessoa
+                // ter apontado a câmera.
+                if (gravou) canal?.fechar()
+            }
             is MensagemDoServidor.Desconhecida -> Unit
         }
         return false
