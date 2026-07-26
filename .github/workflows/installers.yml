@@ -41,6 +41,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           LDAI_RUNTIME_FILE: ${{ runner.temp }}/runtime-x86_64
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '--cfg getrandom_backend="windows_legacy"' || '' }}
         with:
           tagName: v__VERSION__
           releaseName: Lume v__VERSION__
