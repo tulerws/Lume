@@ -224,6 +224,27 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .message:empty { display: none; }
 .message.error { color: var(--red); }
 
+.scan-pairing-button {
+  width: 100%;
+  min-height: 68px;
+  margin-bottom: 12px;
+  padding: 13px 15px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(104, 184, 135, 0.28);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  background: linear-gradient(145deg, rgba(104, 184, 135, 0.13), var(--surface));
+  text-align: left;
+}
+.scan-pairing-button svg { width: 27px; height: 27px; color: #88cba2; }
+.scan-pairing-button span { display: grid; gap: 3px; }
+.scan-pairing-button strong { font-size: 14px; }
+.scan-pairing-button small { color: var(--muted); font-size: 11px; }
+.scan-pairing-button:active { transform: translateY(1px); }
+.scan-pairing-button:disabled { opacity: 0.55; }
+
 .pair-install-prompt {
   margin-top: 14px;
   padding: 14px;

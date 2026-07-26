@@ -7,11 +7,12 @@ const mobileManifestUrl =
   "https://github.com/tulerws/Lume/releases/latest/download/mobile-latest.json";
 const mobileUpdateInterval = 6 * 60 * 60 * 1000;
 const params = new URLSearchParams(location.search);
-const pairingCode = params.get("code");
+let pairingCode = params.get("code");
 const pairView = document.querySelector("#pair-view");
 const pairForm = document.querySelector("#pair-form");
 const pairMessage = document.querySelector("#pair-message");
 const emptyAuthView = document.querySelector("#empty-auth-view");
+const scanPairingButton = document.querySelector("#scan-pairing-qr");
 const dashboard = document.querySelector("#dashboard");
 const appContent = document.querySelector("#app-content");
 const loadingView = document.querySelector("#loading-view");
@@ -101,9 +102,68 @@ function nativePlatform() {
   return window.Capacitor?.getPlatform?.() || "web";
 }
 
+function parsePairingTarget(rawValue) {
+  let value = String(rawValue || "").trim();
+  if (value.startsWith("intent://")) {
+    value = `lume://${value
+      .slice("intent://".length)
+      .split("#Intent;", 1)[0]}`;
+  }
+
+  try {
+    const url = new URL(value);
+    const gateway = url.protocol === "lume:"
+      ? url.searchParams.get("gateway")
+      : url.origin;
+    const code = url.searchParams.get("code");
+    if (!gateway?.startsWith("https://") || !code) return null;
+    return { gateway: gateway.replace(/\/+$/, ""), code };
+  } catch {
+    return null;
+  }
+}
+
+function applyPairingTarget(target) {
+  apiBase = target.gateway;
+  pairingCode = target.code;
+  localStorage.setItem(baseKey, apiBase);
+  pairMessage.textContent = "";
+  pairMessage.className = "message";
+  document.querySelector("#manual-gateway").value = apiBase;
+  document.querySelector("#manual-code").value = pairingCode;
+  showEntryView();
+}
+
+function handlePairingUrl(url) {
+  const target = parsePairingTarget(url);
+  if (!target) return false;
+  applyPairingTarget(target);
+  return true;
+}
+
+async function initializePairingDeepLinks() {
+  let handled = pairingCode && location.protocol === "https:"
+    ? handlePairingUrl(location.href)
+    : false;
+  const appPlugin = window.Capacitor?.Plugins?.App;
+  if (!appPlugin) return handled;
+
+  await appPlugin.addListener("appUrlOpen", ({ url }) => {
+    handlePairingUrl(url);
+  });
+  try {
+    const launch = await appPlugin.getLaunchUrl();
+    handled = handlePairingUrl(launch?.url) || handled;
+  } catch {
+    // The warm-start listener remains active even if no launch URL is available.
+  }
+  return handled;
+}
+
 function updateInstallOptions() {
   const isAndroidBrowser = /Android/i.test(navigator.userAgent);
   const isNative = window.Capacitor?.isNativePlatform?.() || nativePlatform() !== "web";
+  scanPairingButton.hidden = !(isNative && nativePlatform() === "android");
   pairInstallPrompt.hidden = !pairingCode || !isAndroidBrowser || isNative;
   androidInstallCard.hidden =
     Boolean(pairingCode) || !isAndroidBrowser || isNative || Boolean(token);
@@ -637,6 +697,39 @@ document.querySelectorAll(".filter-bar button").forEach((button) => {
     if (currentSnapshot) renderSessions(currentSnapshot, false);
   });
 });
+scanPairingButton.addEventListener("click", async () => {
+  const scanner = window.Capacitor?.Plugins?.CapacitorBarcodeScanner;
+  const message = document.querySelector("#manual-pair-form .message");
+  if (!scanner) {
+    message.textContent = "QR scanner is unavailable. Restart the app and try again.";
+    message.className = "message error";
+    return;
+  }
+
+  scanPairingButton.disabled = true;
+  message.textContent = "";
+  message.className = "message";
+  try {
+    const result = await scanner.scanBarcode({
+      hint: 0,
+      scanInstructions: "Scan the QR code shown in Lume Desktop",
+      scanButton: false,
+      cameraDirection: 1,
+      scanOrientation: 3,
+      cancelButtonAccessibilityLabel: "Cancel",
+      android: { scanningLibrary: "mlkit" },
+    });
+    if (!handlePairingUrl(result.ScanResult)) {
+      throw new Error("This is not a valid Lume pairing QR code.");
+    }
+  } catch (error) {
+    const detail = String(error?.message || error);
+    message.textContent = /cancel/i.test(detail) ? "Scan cancelled." : detail;
+    message.className = /cancel/i.test(detail) ? "message" : "message error";
+  } finally {
+    scanPairingButton.disabled = false;
+  }
+});
 document.querySelector("#manual-pair-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const gateway = document.querySelector("#manual-gateway").value.trim().replace(/\/+$/, "");
@@ -765,6 +858,12 @@ if ("serviceWorker" in navigator) {
     .then((registration) => registration.update())
     .catch(() => undefined);
 }
-void initializeMobileUpdates();
-if (token) showDashboard();
-else showEntryView();
+async function startApp() {
+  const pairingHandled = await initializePairingDeepLinks();
+  void initializeMobileUpdates();
+  if (pairingHandled) return;
+  if (token) await showDashboard();
+  else showEntryView();
+}
+
+void startApp();
