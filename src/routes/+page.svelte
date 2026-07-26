@@ -1179,16 +1179,6 @@
     }
   }
 
-  function mobilePairingQrPayload(webUrl: string) {
-    const url = new URL(webUrl);
-    const query = new URLSearchParams({
-      gateway: url.origin,
-      version: url.searchParams.get("version") ?? "1",
-      code: url.searchParams.get("code") ?? "",
-    });
-    return `intent://pair?${query.toString()}#Intent;scheme=lume;package=com.tulerws.lume.mobile;S.browser_fallback_url=${encodeURIComponent(webUrl)};end`;
-  }
-
   async function toggleMobileAccess() {
     if (!isTauri || mobileBusy) return;
     mobileBusy = true;
@@ -1201,7 +1191,7 @@
         : await enableMobileGateway();
       if (mobileStatus.networkReachable) {
         pairingOffer = await beginMobilePairing();
-        pairingQr = await QRCode.toDataURL(mobilePairingQrPayload(pairingOffer.payload), {
+        pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
           width: 156,
           margin: 1,
           errorCorrectionLevel: "M",
@@ -1229,7 +1219,7 @@
     mobileMessage = null;
     try {
       pairingOffer = await beginMobilePairing();
-      pairingQr = await QRCode.toDataURL(mobilePairingQrPayload(pairingOffer.payload), {
+      pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
         width: 156,
         margin: 1,
         errorCorrectionLevel: "M",

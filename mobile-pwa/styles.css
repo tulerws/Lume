@@ -268,6 +268,14 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
   justify-content: center;
   text-decoration: none;
 }
+.pair-download-link {
+  grid-column: 1 / -1;
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 750;
+  text-align: center;
+  text-decoration: none;
+}
 
 .android-install-card {
   width: min(calc(100% - 36px), 464px);

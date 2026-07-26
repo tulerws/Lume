@@ -23,6 +23,7 @@ const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
 const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
+const openLumeMobile = document.querySelector("#open-lume-mobile");
 const mobileApkDeviceDownload = document.querySelector("#mobile-apk-device-download");
 const pwaInstallButton = document.querySelector("#pwa-install-button");
 const mobileUpdateCard = document.querySelector("#mobile-update-card");
@@ -123,6 +124,29 @@ function parsePairingTarget(rawValue) {
   }
 }
 
+function pairingIntentUrl(target) {
+  const query = new URLSearchParams({
+    gateway: target.gateway,
+    code: target.code,
+  });
+  return `intent://pair?${query.toString()}#Intent;scheme=lume;package=com.tulerws.lume.mobile;end`;
+}
+
+function prepareNativePairingLaunch(target) {
+  const isAndroidBrowser = /Android/i.test(navigator.userAgent);
+  const isNative = window.Capacitor?.isNativePlatform?.() || nativePlatform() !== "web";
+  if (!isAndroidBrowser || isNative) return;
+
+  const intentUrl = pairingIntentUrl(target);
+  openLumeMobile.href = intentUrl;
+  const attemptKey = `lume-pairing-launch-${target.code}`;
+  if (sessionStorage.getItem(attemptKey)) return;
+  sessionStorage.setItem(attemptKey, "1");
+  setTimeout(() => {
+    location.href = intentUrl;
+  }, 120);
+}
+
 function applyPairingTarget(target) {
   apiBase = target.gateway;
   pairingCode = target.code;
@@ -132,6 +156,7 @@ function applyPairingTarget(target) {
   document.querySelector("#manual-gateway").value = apiBase;
   document.querySelector("#manual-code").value = pairingCode;
   showEntryView();
+  prepareNativePairingLaunch(target);
 }
 
 function handlePairingUrl(url) {
