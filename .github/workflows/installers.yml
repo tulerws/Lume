@@ -16,7 +16,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             bundles: deb,appimage,rpm
-          - os: windows-latest
+          - os: windows-2022
             bundles: nsis
     runs-on: ${{ matrix.os }}
     steps:
