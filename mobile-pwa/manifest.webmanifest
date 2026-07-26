@@ -1,0 +1,18 @@
+{
+  "name": "Lume Mobile",
+  "short_name": "Lume",
+  "description": "Monitor AI agents running on your computer.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101713",
+  "theme_color": "#15211c",
+  "icons": [
+    {
+      "src": "/lume-mobile-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

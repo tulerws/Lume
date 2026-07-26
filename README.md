@@ -41,8 +41,10 @@ The [latest GitHub release](https://github.com/tulerws/Lume/releases/latest) pro
 - Debian/Ubuntu package (`.deb`)
 - Fedora/RHEL package (`.rpm`)
 - Portable Linux AppImage
+- Android application (`Lume-Mobile.apk`)
 
 Lume checks for updates automatically and lets you install them from **Settings → About**.
+Lume Mobile checks the signed Android release automatically and verifies its SHA-256 hash before opening the system installer. The PWA refreshes its cached application files automatically. iOS updates remain managed by TestFlight or the App Store.
 
 ## Run in development
 
@@ -108,6 +110,8 @@ npm run tauri build
 Linux bundles are written to `src-tauri/target/release/bundle`. The **Installers** GitHub Actions workflow builds `.deb`, `.rpm`, AppImage, and Windows NSIS packages, creates the GitHub Release, signs updater artifacts, and publishes the `latest.json` manifest.
 
 Before publishing a release, configure `TAURI_SIGNING_PRIVATE_KEY` in **Settings → Secrets and variables → Actions**. The public key belongs in the application configuration; the private key must never be committed. Update the version in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, then push a `v*` tag.
+
+Android releases also require `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` as GitHub Actions secrets. Keep a secure backup of that keystore: Android only accepts automatic updates signed by the same certificate as the installed application.
 
 ## External detectors
 

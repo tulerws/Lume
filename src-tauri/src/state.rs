@@ -11,8 +11,8 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionActivity,
-        SessionResult, SessionSource, SessionStatus,
+        PairedDevice, PermissionAction, PermissionProfile, Preferences, ResultNote,
+        SessionActivity, SessionResult, SessionSource, SessionStatus,
     },
     store::Store,
 };
@@ -248,6 +248,52 @@ impl AppState {
             .delete_result_note(id)
     }
 
+    pub fn save_mobile_device(
+        &self,
+        device: &PairedDevice,
+        token_hash: &str,
+    ) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível salvar o dispositivo".to_string())?
+            .save_mobile_device(device, token_hash)
+    }
+
+    pub fn mobile_devices(&self) -> Result<Vec<PairedDevice>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível acessar os dispositivos".to_string())?
+            .mobile_devices()
+    }
+
+    pub fn authenticate_mobile_device(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PairedDevice>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível autenticar o dispositivo".to_string())?
+            .mobile_device_for_token_hash(token_hash, now_millis())
+    }
+
+    pub fn revoke_mobile_device(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível revogar o dispositivo".to_string())?
+            .revoke_mobile_device(id)
+    }
+
+    pub fn set_mobile_device_scopes(
+        &self,
+        id: &str,
+        scopes: &[crate::domain::MobileScope],
+    ) -> Result<bool, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível atualizar o dispositivo".to_string())?
+            .set_mobile_device_scopes(id, scopes)
+    }
+
     pub fn mark_process_terminated(&self, process_id: u32) -> Result<bool, String> {
         let now = now_millis();
         let mut sessions = self
@@ -351,24 +397,55 @@ impl AppState {
                     .find(|session| session.id == event.session_id)
                     .map(|session| session.id.clone())
             });
-        let provisional_ids = sessions
+        let exact_provisional_ids = sessions
             .iter()
             .filter(|session| {
                 is_provisional_process(session)
                     && session.agent == event.agent
-                    && (event
+                    && event
                         .process_id
                         .is_some_and(|process_id| session.process_id == Some(process_id))
-                        || (event.source == Some(SessionSource::Vscode)
-                            && ((session.source == SessionSource::Vscode
-                                && event.working_directory.is_none())
-                                || same_directory(
-                                    session.working_directory.as_deref(),
-                                    event.working_directory.as_deref(),
-                                ))))
             })
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
+        let contextual_provisional_ids = exact_provisional_ids
+            .is_empty()
+            .then(|| {
+                sessions
+                    .iter()
+                    .filter(|session| {
+                        is_provisional_process(session)
+                            && session.agent == event.agent
+                            && match event.source.as_ref() {
+                                Some(SessionSource::Cli) => {
+                                    session.source == SessionSource::Cli
+                                        && same_directory(
+                                            session.working_directory.as_deref(),
+                                            event.working_directory.as_deref(),
+                                        )
+                                }
+                                Some(SessionSource::Vscode) => {
+                                    (session.source == SessionSource::Vscode
+                                        && event.working_directory.is_none())
+                                        || same_directory(
+                                            session.working_directory.as_deref(),
+                                            event.working_directory.as_deref(),
+                                        )
+                                }
+                                _ => false,
+                            }
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let provisional_ids = if !exact_provisional_ids.is_empty() {
+            exact_provisional_ids
+        } else if contextual_provisional_ids.len() == 1 {
+            contextual_provisional_ids
+        } else {
+            Vec::new()
+        };
 
         let target_session_id = if let Some(existing_id) = existing_session_id {
             sessions.retain(|session| {
@@ -1860,6 +1937,27 @@ mod tests {
             .load_sessions()
             .expect("persistência");
         assert!(persisted.is_empty());
+    }
+
+    #[test]
+    fn cli_hook_without_pid_reuses_the_only_process_in_the_project() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("processo provisório");
+        let mut event = started_event("claude:session-without-pid", 4242);
+        event.process_id = None;
+
+        state.ingest(event).expect("hook");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:session-without-pid");
+        assert_eq!(sessions[0].process_id, Some(4242));
+        assert_eq!(
+            sessions[0].native_session_id.as_deref(),
+            Some("native-session")
+        );
     }
 
     #[test]

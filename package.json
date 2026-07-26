@@ -1,6 +1,6 @@
 {
   "name": "lume",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "description": "Monitor local e discreto para agentes de IA no Windows e Linux.",
   "type": "module",
   "scripts": {
@@ -10,10 +10,16 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "build:vscode": "node scripts/package-vscode.mjs",
+    "mobile:sync": "cap sync",
+    "mobile:android": "cap open android",
+    "mobile:ios": "cap open ios",
     "tauri": "tauri"
   },
   "license": "MIT",
   "dependencies": {
+    "@capacitor/android": "^8.4.2",
+    "@capacitor/core": "^8.4.2",
+    "@capacitor/ios": "^8.4.2",
     "@iconify-icons/logos": "^1.2.36",
     "@iconify/svelte": "^5.2.2",
     "@tauri-apps/api": "^2",
@@ -21,13 +27,16 @@
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "qrcode": "^1.5.4",
     "simple-icons": "^16.27.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.4.2",
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tauri-apps/cli": "^2",
+    "@types/qrcode": "^1.5.6",
     "@vscode/vsce": "^3.9.2",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",

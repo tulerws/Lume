@@ -179,9 +179,41 @@ export interface CompanionStatus {
   detail: string;
 }
 
+export type MobileScope = "monitor" | "prompt" | "approve" | "terminate";
+
+export interface MobileGatewayStatus {
+  running: boolean;
+  address: string;
+  networkReachable: boolean;
+  transport: string;
+  caInstallUrl: string;
+  caFingerprint: string;
+}
+
+export interface MobilePairingOffer {
+  protocolVersion: number;
+  code: string;
+  expiresAt: number;
+  payload: string;
+}
+
+export interface PairedDevice {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt?: number;
+  scopes: MobileScope[];
+}
+
 export interface TerminalWindowState {
   label: string;
   sessionId: string;
+  sessionNativeId?: string;
+  sessionProcessId?: number;
+  sessionAgent: AgentKind;
+  sessionSource: AgentSession["source"];
+  sessionProject: string;
+  sessionWorkingDirectory?: string;
   x: number;
   y: number;
   width: number;

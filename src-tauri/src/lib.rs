@@ -3,6 +3,7 @@ mod agent_plugins;
 mod browser_server;
 mod codex_bridge;
 mod codex_sessions;
+mod control;
 mod desktop_shortcuts;
 mod discovery;
 mod domain;
@@ -10,7 +11,10 @@ mod event_server;
 mod executables;
 mod integrations;
 mod launcher;
+mod mobile_gateway;
+mod mobile_server;
 mod overlay;
+mod protocol;
 mod state;
 mod store;
 mod terminal_windows;
@@ -140,13 +144,94 @@ fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String
 }
 
 #[tauri::command]
+fn get_hub_snapshot(state: State<'_, AppState>) -> Result<protocol::HubSnapshot, String> {
+    Ok(protocol::HubSnapshot::new(state.sessions()?))
+}
+
+#[tauri::command]
+fn begin_mobile_pairing(
+    gateway: State<'_, mobile_gateway::MobileGateway>,
+    server: State<'_, mobile_server::MobileServer>,
+) -> Result<mobile_gateway::PairingOffer, String> {
+    if !server.status().network_reachable {
+        return Err("Ative o acesso pela rede local antes de parear um dispositivo".into());
+    }
+    gateway.begin_pairing()
+}
+
+#[tauri::command]
+fn get_mobile_gateway_status(
+    server: State<'_, mobile_server::MobileServer>,
+) -> mobile_server::MobileServerStatus {
+    server.status()
+}
+
+#[tauri::command]
+fn enable_mobile_gateway(
+    server: State<'_, mobile_server::MobileServer>,
+) -> Result<mobile_server::MobileServerStatus, String> {
+    server.enable_network()
+}
+
+#[tauri::command]
+fn disable_mobile_gateway(
+    server: State<'_, mobile_server::MobileServer>,
+) -> Result<mobile_server::MobileServerStatus, String> {
+    server.disable_network()
+}
+
+#[tauri::command]
+fn list_paired_devices(
+    state: State<'_, AppState>,
+    gateway: State<'_, mobile_gateway::MobileGateway>,
+) -> Result<Vec<domain::PairedDevice>, String> {
+    gateway.devices(state.inner())
+}
+
+#[tauri::command]
+fn revoke_paired_device(
+    state: State<'_, AppState>,
+    gateway: State<'_, mobile_gateway::MobileGateway>,
+    id: String,
+) -> Result<bool, String> {
+    gateway.revoke(state.inner(), &id)
+}
+
+#[tauri::command]
+fn set_paired_device_scopes(
+    state: State<'_, AppState>,
+    gateway: State<'_, mobile_gateway::MobileGateway>,
+    id: String,
+    scopes: Vec<domain::MobileScope>,
+) -> Result<bool, String> {
+    gateway.set_scopes(state.inner(), &id, scopes)
+}
+
+#[tauri::command]
+fn execute_hub_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    browser: State<'_, browser_server::BrowserControl>,
+    request: protocol::HubCommandRequest,
+) -> protocol::HubCommandResponse {
+    control::execute_hub_command(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        browser.inner(),
+        request,
+    )
+}
+
+#[tauri::command]
 fn resolve_permission(
     state: State<'_, AppState>,
     session_id: String,
     permission_id: String,
     action: PermissionAction,
 ) -> Result<(), String> {
-    state.resolve_permission(&session_id, &permission_id, action)
+    control::resolve_permission(state.inner(), &session_id, &permission_id, action)
 }
 
 #[tauri::command]
@@ -155,25 +240,7 @@ fn open_session_source(
     browser: State<'_, browser_server::BrowserControl>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = state
-        .sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
-    match session.source {
-        domain::SessionSource::Web => browser.request_focus(session.id),
-        domain::SessionSource::Vscode => {
-            let directory = session
-                .working_directory
-                .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
-            integrations::code_command()
-                .args(["--reuse-window", &directory])
-                .spawn()
-                .map_err(|error| format!("Não foi possível abrir o VS Code: {error}"))?;
-            Ok(())
-        }
-        _ => Err("O sistema não permite focar com segurança esta janela de terminal".into()),
-    }
+    control::open_session_source(state.inner(), browser.inner(), &session_id)
 }
 
 #[tauri::command]
@@ -185,101 +252,14 @@ fn submit_prompt(
     session_id: String,
     prompt: String,
 ) -> Result<(), String> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return Err("Digite um prompt antes de enviar".into());
-    }
-    if prompt.len() > 16 * 1024 {
-        return Err("O prompt excede o limite local de 16 KB".into());
-    }
-    let session = state
-        .sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
-    if matches!(
-        session.status,
-        domain::SessionStatus::Running | domain::SessionStatus::PermissionRequired
-    ) {
-        return Err("Aguarde o agente terminar antes de enviar outro prompt".into());
-    }
-    let result = if session.source == domain::SessionSource::Web {
-        browser.request_prompt(session.id.clone(), prompt.to_string())?;
-        browser.request_focus(session.id.clone())
-    } else if session.agent == domain::AgentKind::Codex {
-        let mut profile = session.permission_profile.clone();
-        profile.can_respond_from_lume = true;
-        profile.available_actions = vec![
-            PermissionAction::AllowOnce,
-            PermissionAction::AllowSession,
-            PermissionAction::Deny,
-        ];
-        let thread_id = session
-            .native_session_id
-            .clone()
-            .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
-        bridge.submit_prompt(
-            &thread_id,
-            prompt,
-            profile,
-            state.inner().clone(),
-            app.clone(),
-        )
-    } else {
-        let agent = match session.agent {
-            domain::AgentKind::Claude => IntegrationKind::Claude,
-            domain::AgentKind::Gemini => IntegrationKind::Gemini,
-            domain::AgentKind::Codex => unreachable!(),
-            domain::AgentKind::Unknown => {
-                return Err("Este agente não oferece retomada direta pelo Lume".into());
-            }
-        };
-        let resume_id = session
-            .native_session_id
-            .clone()
-            .ok_or_else(|| "A sessão não informou um identificador para retomada".to_string())?;
-        let working_directory = session
-            .working_directory
-            .clone()
-            .ok_or_else(|| "A sessão não informou a pasta do projeto".to_string())?;
-        let preferences = state.preferences()?;
-        let target = if session.source == domain::SessionSource::Vscode {
-            "vscode".to_string()
-        } else {
-            preferences.launch_target
-        };
-        let executable = integrations::lume_executable()?;
-        let app_data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?;
-        launcher::launch(
-            LaunchRequest {
-                agent,
-                working_directory,
-                resume: true,
-                resume_id: Some(resume_id),
-                target,
-                initial_prompt: Some(prompt.to_string()),
-                permission_mode: None,
-                approval_policy: None,
-            },
-            &executable,
-            &app_data_dir,
-            None,
-        )
-    };
-    result?;
-    state.record_activity(
-        &session.id,
-        "prompt",
-        "Prompt enviado pelo Lume",
-        Some(prompt.to_string()),
-        "completed",
-        Vec::new(),
-    )?;
-    let _ = app.emit("lume://sessions-changed", ());
-    Ok(())
+    control::submit_prompt(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        browser.inner(),
+        &session_id,
+        &prompt,
+    )
 }
 
 #[tauri::command]
@@ -288,24 +268,7 @@ fn terminate_session(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = state
-        .sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
-    if session.source != domain::SessionSource::Cli {
-        return Err(
-            "Esta integração não possui um processo isolado; o Lume não fechará o editor ou navegador inteiro"
-                .into(),
-        );
-    }
-    let process_id = session
-        .process_id
-        .ok_or_else(|| "A sessão não possui um processo associado".to_string())?;
-    discovery::terminate_agent_process(process_id, &session.agent)?;
-    state.mark_process_terminated(process_id)?;
-    let _ = app.emit("lume://sessions-changed", ());
-    Ok(())
+    control::terminate_session(&app, state.inner(), &session_id)
 }
 
 #[tauri::command]
@@ -814,6 +777,20 @@ pub fn run() {
             let browser_control = browser_server::BrowserControl::default();
             browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;
             app.manage(browser_control);
+            let mobile_gateway = mobile_gateway::MobileGateway::default();
+            let mobile_server =
+                mobile_server::MobileServer::start_loopback(
+                    state.clone(),
+                    mobile_gateway.clone(),
+                    app.handle().clone(),
+                    database_path.parent().unwrap_or(&database_path),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    mobile_server::MobileServer::default()
+                });
+            app.manage(mobile_gateway);
+            app.manage(mobile_server);
             app.manage(terminal_windows::TerminalWindows::default());
             discovery::start(state.clone(), app.handle().clone())?;
             overlay::start_fullscreen_guard(state.clone(), app.handle().clone())?;
@@ -879,6 +856,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            get_hub_snapshot,
+            execute_hub_command,
+            begin_mobile_pairing,
+            get_mobile_gateway_status,
+            enable_mobile_gateway,
+            disable_mobile_gateway,
+            list_paired_devices,
+            revoke_paired_device,
+            set_paired_device_scopes,
             resolve_permission,
             open_session_source,
             submit_prompt,

@@ -8,6 +8,13 @@
   import LumeMascot from "$lib/LumeMascot.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
+    mergeFileChanges,
+    summarizeFileChanges,
+    type FileChangeSummary,
+  } from "$lib/fileChanges";
+  import { sessionCapabilities } from "$lib/sessionCapabilities";
+  import { resolveTerminalSession } from "$lib/sessionIdentity";
+  import {
     beginLayeredTerminalResize,
     beginTerminalNativeDrag,
     cancelTerminalWindowMove,
@@ -33,6 +40,8 @@
   type ResizeDirection = "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest";
   let windowState = $state<TerminalWindowState | null>(null);
   let session = $state<AgentSession | null>(null);
+  let initializationError = $state<string | null>(null);
+  let initializationRun = 0;
   let prompt = $state("");
   let message = $state<string | null>(null);
   let sending = $state(false);
@@ -91,32 +100,55 @@
     return localize(language, english, portuguese);
   }
 
-  const canSubmit = $derived(
-    Boolean(
-      session &&
-        (session.source === "web" ||
-          (session.agent !== "unknown" && session.nativeSessionId)),
-    ),
-  );
+  const capabilities = $derived(session ? sessionCapabilities(session) : null);
+  const canSubmit = $derived(Boolean(capabilities?.canPrompt));
   const readyForPrompt = $derived(
     Boolean(session && ["completed", "failed", "waiting_for_input"].includes(session.status)),
   );
+
+  function promptUnavailableText() {
+    if (capabilities?.promptUnavailableReason === "session_not_connected") {
+      return tr(
+        "Waiting for this session to connect to Lume",
+        "Aguardando esta sessão se conectar ao Lume",
+      );
+    }
+    if (capabilities?.promptUnavailableReason === "working_directory_missing") {
+      return tr(
+        "The project folder is unavailable for resuming this session",
+        "A pasta do projeto está indisponível para retomar esta sessão",
+      );
+    }
+    return tr(
+      "This agent does not support prompts through Lume yet",
+      "Este agente ainda não aceita prompts pelo Lume",
+    );
+  }
+
   const activities = $derived(session?.activities ?? []);
+  function activityChanges(activity: SessionActivity): FileChangeSummary[] {
+    return summarizeFileChanges(
+      activity.detail ?? "",
+      activity.files,
+      session?.workingDirectory,
+    );
+  }
   const changedFiles = $derived.by(() => {
-    const files = [
-      ...(session?.activities.flatMap((activity) => activity.files) ?? []),
-      ...(session?.results.flatMap((result) => result.files) ?? []),
-    ];
-    return [...new Set(files)];
+    const files: FileChangeSummary[] = [];
+    for (const activity of activities) mergeFileChanges(files, activityChanges(activity));
+    for (const result of session?.results ?? []) {
+      mergeFileChanges(
+        files,
+        summarizeFileChanges("", result.files, session?.workingDirectory),
+      );
+    }
+    return files;
   });
-  const fileActivities = $derived(
-    session?.activities.filter((activity) => activity.kind === "file" && activity.detail) ?? [],
-  );
   type ChatTurn = {
     id: string;
     prompt?: SessionActivity;
     items: SessionActivity[];
-    files: string[];
+    files: FileChangeSummary[];
   };
   const chatTurns = $derived.by<ChatTurn[]>(() => {
     const turns: ChatTurn[] = [];
@@ -134,9 +166,7 @@
       }
       current ??= ensureTurn(`turn:${activity.id}`);
       current.items.push(activity);
-      for (const file of activity.files) {
-        if (!current.files.includes(file)) current.files.push(file);
-      }
+      mergeFileChanges(current.files, activityChanges(activity));
     }
     for (const result of session?.results ?? []) {
       const resultTurn =
@@ -145,9 +175,10 @@
           .find((turn) => !turn.prompt || turn.prompt.createdAt <= result.createdAt) ??
         ensureTurn(`result:${result.id}`);
       current = resultTurn;
-      for (const file of result.files) {
-        if (!resultTurn.files.includes(file)) resultTurn.files.push(file);
-      }
+      mergeFileChanges(
+        resultTurn.files,
+        summarizeFileChanges("", result.files, session?.workingDirectory),
+      );
       if (
         result.response &&
         !resultTurn.items.some(
@@ -203,18 +234,22 @@
     syncSystemTheme(colorScheme);
     colorScheme.addEventListener("change", syncSystemTheme);
     void (async () => {
-      const [nextWindowState, nextPreferences, nextDisplayBackend] = await Promise.all([
-        loadTerminalWindowState(label),
+      const [nextPreferences, nextDisplayBackend] = await Promise.all([
         loadPreferences(),
         loadDisplayBackend(),
       ]);
-      windowState = nextWindowState;
       language = nextPreferences.language;
       darkMode = nextPreferences.darkMode;
       displayBackend = nextDisplayBackend;
-      await refresh();
+      await initializeTerminal();
       if (disposed) return;
-      stopListening = await listen("lume://sessions-changed", () => void refresh());
+      stopListening = await listen("lume://sessions-changed", () => {
+        if (session && windowState) {
+          void refresh();
+        } else {
+          void initializeTerminal();
+        }
+      });
       stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
         try {
           windowState = await loadTerminalWindowState(label);
@@ -292,11 +327,35 @@
     };
   });
 
+  async function initializeTerminal() {
+    const run = ++initializationRun;
+    initializationError = null;
+    let lastError = tr(
+      "The session is no longer available.",
+      "A sessão não está mais disponível.",
+    );
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        windowState = await loadTerminalWindowState(label);
+        await refresh();
+        if (session) {
+          return;
+        }
+      } catch (error) {
+        lastError = String(error).replace(/^Error:\s*/, "");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120 + attempt * 80));
+      if (run !== initializationRun) return;
+    }
+    if (run !== initializationRun) return;
+    initializationError = lastError;
+  }
+
   async function refresh() {
     const shouldFollow = !outputElement ||
       outputElement.scrollHeight - outputElement.scrollTop - outputElement.clientHeight < 32;
     const sessions = await loadSessions();
-    session = sessions.find((item) => item.id === windowState?.sessionId) ?? null;
+    session = windowState ? resolveTerminalSession(windowState, sessions) ?? null : null;
     if (shouldFollow) {
       await tick();
       outputElement?.scrollTo({ top: outputElement.scrollHeight });
@@ -839,7 +898,9 @@
                   <div class="turn-files">
                     <strong>{tr("Files changed in this prompt", "Arquivos alterados neste prompt")}</strong>
                     <div>
-                      {#each turn.files as file}<code><span>±</span>{file}</code>{/each}
+                      {#each turn.files as file}
+                        <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                      {/each}
                     </div>
                   </div>
                 {/if}
@@ -853,17 +914,13 @@
             <strong>{tr("All changed files", "Todos os arquivos alterados")}</strong>
             {#if changedFiles.length}
               <div class="change-list">
-                {#each changedFiles as file}<code><span>±</span>{file}</code>{/each}
+                {#each changedFiles as file}
+                  <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                {/each}
               </div>
             {:else}
               <p class="empty-state">{tr("No file changes were reported in this session.", "Nenhuma alteração de arquivo foi informada nesta sessão.")}</p>
             {/if}
-            {#each fileActivities as activity (activity.id)}
-              <details class="change-diff">
-                <summary>{displayText(language, activity.title)}</summary>
-                <pre>{activity.detail}</pre>
-              </details>
-            {/each}
           </section>
         {/if}
 
@@ -893,7 +950,7 @@
           disabled={!canSubmit || !readyForPrompt || sending}
           rows="2"
           aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
-          placeholder={!canSubmit ? tr("Prompt unavailable for this source", "Envio indisponível nesta origem") : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
+          placeholder={!canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
         ></textarea>
         {#if canSubmit}
           <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label={tr("Send prompt", "Enviar prompt")}>
@@ -910,6 +967,15 @@
       <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
       <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
       <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+    </section>
+  {:else if initializationError}
+    <section class="terminal-card loading">
+      <LumeLogo size={34} />
+      <span>{initializationError}</span>
+      <div class="loading-actions">
+        <button type="button" onclick={() => void initializeTerminal()}>{tr("Try again", "Tentar novamente")}</button>
+        <button type="button" onclick={() => void closeTerminal()}>{tr("Close", "Fechar")}</button>
+      </div>
     </section>
   {:else}
     <section class="terminal-card loading"><LumeLogo size={34} /><span>{tr("Connecting to session…", "Conectando à sessão…")}</span></section>
@@ -986,18 +1052,19 @@
   .turn-files { padding: 7px 8px; border-left: 2px solid #4b9b73; border-radius: 0 7px 7px 0; background: rgba(55, 142, 98, 0.045); }
   .turn-files > strong { display: block; margin-bottom: 5px; color: #4f775f; font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-transform: uppercase; }
   .turn-files > div { display: grid; gap: 3px; }
-  .turn-files code { display: flex; gap: 5px; color: #496258; font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
-  .turn-files code span { color: #45906a; }
+  .turn-files code { display: flex; gap: 6px; color: #496258; font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
+  .turn-files code .file-path { min-width: 0; flex: 1; color: inherit; }
+  .turn-files code .added,
+  .change-list code .added { color: #45906a; }
+  .turn-files code .removed,
+  .change-list code .removed { color: #b46161; }
   .privacy-note { padding-top: 6px; border-top: 1px solid rgba(81, 105, 94, 0.08); color: #9aa49f; font: var(--chat-tiny-font-size)/1.45 Inter, sans-serif; }
   .empty-state { margin: 7px 0 10px !important; color: #909c96; font: var(--chat-small-font-size)/1.5 Inter, sans-serif; }
   .changes-panel { margin-top: 9px; display: grid; gap: 7px; }
   .changes-panel > strong { color: #6a7c73; font: 760 var(--chat-small-font-size) Inter, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
   .change-list { display: grid; gap: 4px; }
   .change-list code { padding: 5px 6px; display: flex; align-items: flex-start; gap: 6px; border-radius: 6px; color: #4f6158; background: rgba(70, 101, 86, 0.045); font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
-  .change-list span { color: #45906a; }
-  .change-diff { padding: 5px 6px; border: 1px solid rgba(78, 104, 92, 0.09); border-radius: 7px; }
-  .change-diff summary { color: #53685e; font: 720 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
-  .change-diff pre { max-height: 240px; margin: 6px 0 0; overflow: auto; color: #5b6b63; font: var(--chat-tiny-font-size)/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; white-space: pre; }
+  .change-list code .file-path { min-width: 0; flex: 1; color: inherit; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
@@ -1029,7 +1096,9 @@
   .resize-sw::after { bottom: 3px; left: 3px; border-bottom: 1px solid #668276; border-left: 1px solid #668276; }
   .resize-se { right: 0; bottom: 0; cursor: nwse-resize; }
   .resize-se::after { right: 3px; bottom: 3px; border-right: 1px solid #668276; border-bottom: 1px solid #668276; }
-  .loading { align-items: center; justify-content: center; gap: 9px; color: #78857f; font-size: 9px; }
+  .loading { align-items: center; justify-content: center; gap: 9px; padding: 18px; color: #78857f; font-size: 9px; text-align: center; }
+  .loading-actions { display: flex; gap: 6px; }
+  .loading-actions button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 8px; color: #4d6f61; background: rgba(255, 255, 255, 0.55); font-size: 8px; font-weight: 720; cursor: pointer; }
 
   .terminal-window.dark { color-scheme: dark; }
   .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: #141d19; }
@@ -1062,8 +1131,6 @@
   .terminal-window.dark .turn-trace { background: rgba(218, 234, 226, 0.025); }
   .terminal-window.dark .turn-files { border-color: #5bad83; background: rgba(91, 177, 137, 0.055); }
   .terminal-window.dark .turn-files > strong { color: #8bc6a8; }
-  .terminal-window.dark .change-diff summary,
-  .terminal-window.dark .change-diff pre,
   .terminal-window.dark .change-list code { color: #bdcbc4; }
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }

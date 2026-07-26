@@ -2,7 +2,9 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::domain::{AgentSession, HistoryEntry, Preferences, ResultNote};
+use crate::domain::{
+    AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote,
+};
 
 pub struct Store {
     connection: Connection,
@@ -48,6 +50,14 @@ impl Store {
                     files TEXT NOT NULL,
                     tests TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS mobile_devices (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    last_seen_at INTEGER,
+                    scopes TEXT NOT NULL
                  );",
             )
             .map_err(|error| error.to_string())?;
@@ -169,6 +179,114 @@ impl Store {
             .execute("DELETE FROM result_notes WHERE id = ?1", [id])
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn save_mobile_device(
+        &self,
+        device: &PairedDevice,
+        token_hash: &str,
+    ) -> Result<(), String> {
+        let scopes = serde_json::to_string(&device.scopes).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO mobile_devices
+                 (id, name, token_hash, created_at, last_seen_at, scopes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    device.id,
+                    device.name,
+                    token_hash,
+                    device.created_at,
+                    device.last_seen_at,
+                    scopes,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn mobile_devices(&self) -> Result<Vec<PairedDevice>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, name, created_at, last_seen_at, scopes
+                 FROM mobile_devices ORDER BY created_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let scopes: String = row.get(4)?;
+                Ok(PairedDevice {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_seen_at: row.get(3)?,
+                    scopes: serde_json::from_str::<Vec<MobileScope>>(&scopes)
+                        .unwrap_or_else(|_| vec![MobileScope::Monitor]),
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub fn mobile_device_for_token_hash(
+        &self,
+        token_hash: &str,
+        seen_at: i64,
+    ) -> Result<Option<PairedDevice>, String> {
+        let result = self.connection.query_row(
+            "SELECT id, name, created_at, last_seen_at, scopes
+             FROM mobile_devices WHERE token_hash = ?1",
+            [token_hash],
+            |row| {
+                let scopes: String = row.get(4)?;
+                Ok(PairedDevice {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_seen_at: row.get(3)?,
+                    scopes: serde_json::from_str::<Vec<MobileScope>>(&scopes)
+                        .unwrap_or_else(|_| vec![MobileScope::Monitor]),
+                })
+            },
+        );
+        match result {
+            Ok(mut device) => {
+                self.connection
+                    .execute(
+                        "UPDATE mobile_devices SET last_seen_at = ?1 WHERE id = ?2",
+                        params![seen_at, device.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                device.last_seen_at = Some(seen_at);
+                Ok(Some(device))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn revoke_mobile_device(&self, id: &str) -> Result<bool, String> {
+        self.connection
+            .execute("DELETE FROM mobile_devices WHERE id = ?1", [id])
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_mobile_device_scopes(
+        &self,
+        id: &str,
+        scopes: &[MobileScope],
+    ) -> Result<bool, String> {
+        let scopes = serde_json::to_string(scopes).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "UPDATE mobile_devices SET scopes = ?1 WHERE id = ?2",
+                params![scopes, id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
     }
 
     pub fn load_preferences(&self) -> Result<Preferences, String> {

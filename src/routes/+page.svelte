@@ -8,6 +8,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { check, type Update } from "@tauri-apps/plugin-updater";
+  import QRCode from "qrcode";
   import {
     availableMonitors,
     getCurrentWindow,
@@ -20,6 +21,8 @@
   import LumeMascot from "$lib/LumeMascot.svelte";
   import TerminalWindow from "$lib/TerminalWindow.svelte";
   import { displayText, localize } from "$lib/i18n";
+  import { sessionCapabilities } from "$lib/sessionCapabilities";
+  import { resolveTerminalSession, terminalMatchesSession } from "$lib/sessionIdentity";
   import type {
     AgentKind,
     AgentSession,
@@ -28,6 +31,10 @@
     HistoryEntry,
     IntegrationDiagnostic,
     IntegrationStatus,
+    MobileGatewayStatus,
+    MobilePairingOffer,
+    MobileScope,
+    PairedDevice,
     PermissionAction,
     Preferences,
     ResultNote,
@@ -39,7 +46,9 @@
   import {
     configureIntegration,
     configureVscode,
+    beginMobilePairing,
     diagnoseIntegration,
+    disableMobileGateway,
     decidePermission,
     defaultPreferences,
     deleteResultNote,
@@ -47,7 +56,9 @@
     loadHistory,
     loadResultNotes,
     loadIntegrationStatuses,
+    loadMobileGatewayStatus,
     loadOverlayPosition,
+    loadPairedDevices,
     loadPreferences,
     loadSessions,
     loadTerminalWindows,
@@ -60,6 +71,7 @@
     installExternalPlugin,
     removeExternalPlugin,
     revealBrowserCompanion,
+    revokePairedDevice,
     launchAgentSession,
     savePreferences,
     saveResultNote,
@@ -67,6 +79,8 @@
     submitPrompt,
     takePendingShortcutAction,
     terminateSession,
+    enableMobileGateway,
+    setPairedDeviceScopes,
     revealPluginDirectory,
     type DisplayBackend,
   } from "$lib/lume";
@@ -186,6 +200,14 @@
   let pendingOverlayMove: { x: number; y: number } | null = null;
   let overlayMoveTask: Promise<void> | null = null;
   let systemDark = $state(false);
+  let mobileStatus = $state<MobileGatewayStatus | null>(null);
+  let pairedDevices = $state<PairedDevice[]>([]);
+  let pairingOffer = $state<MobilePairingOffer | null>(null);
+  let pairingQr = $state<string | null>(null);
+  let mobileBusy = $state(false);
+  let mobileMessage = $state<string | null>(null);
+  let mobileMessageIsError = $state(false);
+  const mobileApkUrl = "https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk";
 
   function tr(english: string, portuguese: string) {
     return localize(preferences.language, english, portuguese);
@@ -908,20 +930,6 @@
     return sessionCapabilities(session).canTerminate;
   }
 
-  function sessionCapabilities(session: AgentSession) {
-    return {
-      canPrompt:
-        session.source === "web" ||
-        (session.agent !== "unknown" && Boolean(session.nativeSessionId)),
-      canApprove: Boolean(
-        session.pendingPermission && session.permissionProfile.canRespondFromLume,
-      ),
-      canTerminate: session.source === "cli" && Boolean(session.processId),
-      canOpenSource: session.source === "web" || session.source === "vscode",
-      canReadResults: session.results.length > 0 || Boolean(session.lastResponse),
-    };
-  }
-
   async function copyResult(resultId: string, response: string) {
     try {
       await navigator.clipboard.writeText(response);
@@ -1022,7 +1030,7 @@
       id,
       name,
       terminals: terminalWindows.flatMap((terminal) => {
-        const session = sessions.find((item) => item.id === terminal.sessionId);
+        const session = resolveTerminalSession(terminal, sessions);
         return session
           ? [{
               agent: session.agent,
@@ -1119,7 +1127,7 @@
   }
 
   function terminalIsOpen(session: AgentSession) {
-    return terminalWindows.some((terminal) => terminal.sessionId === session.id);
+    return terminalWindows.some((terminal) => terminalMatchesSession(terminal, session));
   }
 
   async function handlePermission(session: AgentSession, action: PermissionAction) {
@@ -1155,6 +1163,122 @@
       selectedId = null;
     } catch (error) {
       permissionError = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function refreshMobileSettings() {
+    if (!isTauri) return;
+    try {
+      [mobileStatus, pairedDevices] = await Promise.all([
+        loadMobileGatewayStatus(),
+        loadPairedDevices(),
+      ]);
+    } catch (error) {
+      mobileMessageIsError = true;
+      mobileMessage = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function toggleMobileAccess() {
+    if (!isTauri || mobileBusy) return;
+    mobileBusy = true;
+    mobileMessage = null;
+    pairingOffer = null;
+    pairingQr = null;
+    try {
+      mobileStatus = mobileStatus?.networkReachable
+        ? await disableMobileGateway()
+        : await enableMobileGateway();
+      if (mobileStatus.networkReachable) {
+        pairingOffer = await beginMobilePairing();
+        pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
+          width: 156,
+          margin: 1,
+          errorCorrectionLevel: "M",
+          color: { dark: "#14241d", light: "#ffffff" },
+        });
+      }
+      mobileMessageIsError = false;
+      mobileMessage = mobileStatus.networkReachable
+        ? tr(
+            "Local network access is active. Install the certificate on the phone before pairing.",
+            "O acesso pela rede local está ativo. Instale o certificado no telefone antes de parear.",
+          )
+        : tr("Mobile access is off.", "O acesso mobile está desativado.");
+    } catch (error) {
+      mobileMessageIsError = true;
+      mobileMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      mobileBusy = false;
+    }
+  }
+
+  async function createMobilePairing() {
+    if (!isTauri || mobileBusy) return;
+    mobileBusy = true;
+    mobileMessage = null;
+    try {
+      pairingOffer = await beginMobilePairing();
+      pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
+        width: 156,
+        margin: 1,
+        errorCorrectionLevel: "M",
+        color: { dark: "#14241d", light: "#ffffff" },
+      });
+      mobileMessageIsError = false;
+    } catch (error) {
+      mobileMessageIsError = true;
+      mobileMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      mobileBusy = false;
+    }
+  }
+
+  async function removePairedDevice(id: string) {
+    if (mobileBusy) return;
+    mobileBusy = true;
+    mobileMessage = null;
+    try {
+      await revokePairedDevice(id);
+      pairedDevices = await loadPairedDevices();
+      mobileMessageIsError = false;
+      mobileMessage = tr("Device access revoked.", "Acesso do dispositivo revogado.");
+    } catch (error) {
+      mobileMessageIsError = true;
+      mobileMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      mobileBusy = false;
+    }
+  }
+
+  async function togglePairedDeviceScope(device: PairedDevice, scope: MobileScope) {
+    if (mobileBusy || scope === "monitor") return;
+    mobileBusy = true;
+    mobileMessage = null;
+    const scopes = device.scopes.includes(scope)
+      ? device.scopes.filter((value) => value !== scope)
+      : [...device.scopes, scope];
+    try {
+      await setPairedDeviceScopes(device.id, scopes);
+      pairedDevices = await loadPairedDevices();
+      mobileMessageIsError = false;
+      mobileMessage = tr("Device permissions updated.", "Permissões do dispositivo atualizadas.");
+    } catch (error) {
+      mobileMessageIsError = true;
+      mobileMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      mobileBusy = false;
+    }
+  }
+
+  async function copyMobileValue(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      mobileMessageIsError = false;
+      mobileMessage = tr("Copied.", "Copiado.");
+    } catch {
+      mobileMessageIsError = true;
+      mobileMessage = tr("Could not copy this value.", "Não foi possível copiar este valor.");
     }
   }
 
@@ -1194,6 +1318,7 @@
     if (nextView === "settings") {
       selectedProfileKey ??= detectedProjects[0]?.key ?? null;
       settingsMessage = null;
+      await refreshMobileSettings();
     }
   }
 
@@ -2437,6 +2562,96 @@
             {:else}
               <p class="profile-empty">{tr("Profiles appear after a project is detected.", "Os perfis aparecem depois que um projeto é detectado.")}</p>
             {/if}
+            <div class="settings-section-label preferences-label">{tr("Mobile access", "Acesso mobile")}</div>
+            <div class="mobile-access-card">
+              <div class="mobile-access-header">
+                <div>
+                  <strong>{tr("Local network gateway", "Gateway da rede local")}</strong>
+                  <span>{tr("Off by default. Only paired devices can read your sessions.", "Desativado por padrão. Apenas dispositivos pareados podem ler suas sessões.")}</span>
+                </div>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    checked={mobileStatus?.networkReachable ?? false}
+                    disabled={!isTauri || mobileBusy}
+                    onchange={() => void toggleMobileAccess()}
+                  />
+                  <span></span>
+                </label>
+              </div>
+              {#if !isTauri}
+                <p class="mobile-message">{tr("Open the floating Lume desktop app to enable mobile access.", "Abra o aplicativo desktop flutuante do Lume para ativar o acesso mobile.")}</p>
+              {/if}
+              {#if mobileBusy}
+                <p class="mobile-message">{tr("Starting the secure gateway…", "Iniciando o gateway seguro…")}</p>
+              {/if}
+              {#if mobileStatus?.networkReachable}
+                <div class="mobile-address">
+                  <span><strong>HTTPS</strong><code>{mobileStatus.address}</code></span>
+                  <button type="button" onclick={() => void copyMobileValue(mobileStatus?.address ?? "")}>{tr("Copy", "Copiar")}</button>
+                </div>
+                <div class="mobile-certificate">
+                  <span>
+                    <strong>{tr("1. Trust the Lume certificate on your phone", "1. Confie no certificado do Lume no telefone")}</strong>
+                    <code>{mobileStatus.caInstallUrl}</code>
+                    <small>{tr("Fingerprint", "Impressão digital")}: {mobileStatus.caFingerprint}</small>
+                  </span>
+                  <button type="button" onclick={() => void copyMobileValue(mobileStatus?.caInstallUrl ?? "")}>{tr("Copy link", "Copiar link")}</button>
+                </div>
+                <div class="mobile-apk">
+                  <span>
+                    <strong>{tr("2. Install Lume on Android", "2. Instale o Lume no Android")}</strong>
+                    <code>{mobileApkUrl}</code>
+                    <small>{tr("The app checks future releases automatically.", "O aplicativo verifica as próximas versões automaticamente.")}</small>
+                  </span>
+                  <button type="button" onclick={() => void copyMobileValue(mobileApkUrl)}>{tr("Copy link", "Copiar link")}</button>
+                </div>
+                <div class="mobile-pair-action">
+                  <span><strong>{tr("3. Pair the phone", "3. Pareie o telefone")}</strong><small>{tr("The QR code expires in two minutes and can be used once.", "O QR Code expira em dois minutos e só pode ser usado uma vez.")}</small></span>
+                  <button disabled={mobileBusy} type="button" onclick={() => void createMobilePairing()}>{pairingOffer ? tr("New code", "Novo código") : tr("Show QR", "Mostrar QR")}</button>
+                </div>
+                {#if pairingOffer && pairingQr}
+                  <div class="mobile-pairing" transition:fade={{ duration: 140 }}>
+                    <img src={pairingQr} alt={tr("Lume mobile pairing QR code", "QR Code de pareamento mobile do Lume")} />
+                    <span>
+                      <strong>{tr("One-time code", "Código de uso único")}</strong>
+                      <code>{pairingOffer.code}</code>
+                      <small>{tr("Expires", "Expira")} {new Date(pairingOffer.expiresAt).toLocaleTimeString()}</small>
+                    </span>
+                  </div>
+                {/if}
+              {/if}
+              {#if mobileMessage}
+                <p class:error={mobileMessageIsError} class="mobile-message">{mobileMessage}</p>
+              {/if}
+            </div>
+            {#if pairedDevices.length}
+              <div class="paired-devices">
+                {#each pairedDevices as device (device.id)}
+                  <div>
+                    <span>
+                      <strong>{device.name}</strong>
+                      <small>{device.lastSeenAt ? relativeTime(device.lastSeenAt) : tr("Not used yet", "Ainda não utilizado")}</small>
+                      <span class="device-scopes">
+                        {#each [
+                          ["prompt", tr("Prompts", "Prompts")],
+                          ["approve", tr("Approvals", "Aprovações")],
+                          ["terminate", tr("Stop agents", "Encerrar agentes")],
+                        ] as option}
+                          <button
+                            class:active={device.scopes.includes(option[0] as MobileScope)}
+                            disabled={mobileBusy}
+                            type="button"
+                            onclick={() => void togglePairedDeviceScope(device, option[0] as MobileScope)}
+                          >{option[1]}</button>
+                        {/each}
+                      </span>
+                    </span>
+                    <button disabled={mobileBusy} type="button" onclick={() => void removePairedDevice(device.id)}>{tr("Revoke", "Revogar")}</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
             <div class="update-card" aria-live="polite">
               <div class="update-main">
@@ -3059,6 +3274,48 @@
     box-shadow: 0 0 0 2px rgba(74, 122, 102, 0.08);
   }
   .profile-empty { margin: 5px 1px 2px; color: #89938f; font-size: 9px; line-height: 1.45; }
+  .mobile-access-card { padding: 11px; display: grid; gap: 9px; border: 1px solid rgba(92, 111, 103, 0.11); border-radius: 13px; background: rgba(84, 111, 99, 0.035); }
+  .mobile-access-header,
+  .mobile-address,
+  .mobile-certificate,
+  .mobile-apk,
+  .mobile-pair-action,
+  .mobile-pairing,
+  .paired-devices > div { display: flex; align-items: center; gap: 9px; }
+  .mobile-access-header > div,
+  .mobile-pair-action > span,
+  .mobile-certificate > span,
+  .mobile-apk > span,
+  .paired-devices span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .mobile-access-card strong,
+  .paired-devices strong { color: #35423d; font-size: 9px; }
+  .mobile-access-card span,
+  .mobile-access-card small,
+  .paired-devices small { color: #89938f; font-size: 8px; line-height: 1.4; }
+  .mobile-address,
+  .mobile-certificate,
+  .mobile-apk,
+  .mobile-pair-action { padding-top: 8px; border-top: 1px solid rgba(92, 111, 103, 0.09); }
+  .mobile-address > span { min-width: 0; flex: 1; display: flex; align-items: center; gap: 6px; }
+  .mobile-address code,
+  .mobile-certificate code { overflow: hidden; color: #53665d; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-apk code { overflow: hidden; color: #53665d; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-certificate small { overflow-wrap: anywhere; }
+  .mobile-access-card button,
+  .paired-devices button { min-height: 25px; padding: 0 7px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 7px; color: #577064; background: transparent; font-size: 8px; font-weight: 680; cursor: pointer; }
+  .mobile-access-card button:disabled,
+  .paired-devices button:disabled { cursor: default; opacity: 0.5; }
+  .mobile-pairing { align-items: flex-start; padding: 8px; border-radius: 9px; background: rgba(255, 255, 255, 0.5); }
+  .mobile-pairing img { width: 92px; height: 92px; border-radius: 5px; image-rendering: pixelated; }
+  .mobile-pairing > span { min-width: 0; display: grid; gap: 5px; }
+  .mobile-pairing code { color: #31483e; font-size: 9px; overflow-wrap: anywhere; }
+  .mobile-message { margin: 0; color: #61756b; font-size: 8px; line-height: 1.4; }
+  .mobile-message.error { color: #a34f4f; }
+  .paired-devices { margin-top: 6px; display: grid; }
+  .paired-devices > div { min-height: 58px; padding: 6px 0; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .device-scopes { margin-top: 3px; display: flex !important; flex-wrap: wrap; gap: 3px !important; }
+  .device-scopes button { min-height: 21px; padding: 0 5px; color: #85928c; border-color: transparent; font-size: 7px; }
+  .device-scopes button.active { color: #3f715c; border-color: rgba(70, 128, 103, 0.15); background: rgba(70, 128, 103, 0.07); }
   .update-card { padding: 12px; border: 1px solid rgba(92, 111, 103, 0.11); border-radius: 13px; background: rgba(84, 111, 99, 0.035); }
   .update-main { display: flex; align-items: center; gap: 9px; }
   .update-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -3129,6 +3386,18 @@
   .overlay-shell.dark .settings-feedback { color: #adbab4; }
   .overlay-shell.dark .settings-feedback.error { color: #d68d8d; }
   .overlay-shell.dark .update-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .mobile-access-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .mobile-access-card strong,
+  .overlay-shell.dark .paired-devices strong { color: #dce7e1; }
+  .overlay-shell.dark .mobile-access-card span,
+  .overlay-shell.dark .mobile-access-card small,
+  .overlay-shell.dark .paired-devices small { color: #aebdb5; }
+  .overlay-shell.dark .mobile-apk code { color: #aebdb5; }
+  .overlay-shell.dark .mobile-pairing { background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .mobile-access-card button,
+  .overlay-shell.dark .paired-devices button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); }
+  .overlay-shell.dark .device-scopes button { color: #94a39c; border-color: transparent; }
+  .overlay-shell.dark .device-scopes button.active { color: #91c7ae; border-color: rgba(116, 191, 157, 0.16); background: rgba(92, 161, 130, 0.09); }
   .overlay-shell.dark .update-card p.error { color: #d68d8d; }
   .overlay-shell.dark .diagnostic-card,
   .overlay-shell.dark .result-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.035); }

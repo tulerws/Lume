@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Lume</string>
+    <string name="title_activity_main">Lume</string>
+    <string name="package_name">com.tulerws.lume.mobile</string>
+    <string name="custom_url_scheme">com.tulerws.lume.mobile</string>
+</resources>

@@ -1,10 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  HubCommandRequest,
+  HubCommandResponse,
+  HubSnapshot,
+} from "$lib/hubProtocol";
+import type {
   AgentSession,
   CompanionStatus,
   HistoryEntry,
   IntegrationDiagnostic,
   IntegrationStatus,
+  MobileGatewayStatus,
+  MobilePairingOffer,
+  MobileScope,
+  PairedDevice,
   PermissionAction,
   Preferences,
   ResultNote,
@@ -41,6 +50,47 @@ export async function loadSessions(): Promise<AgentSession[]> {
   } catch {
     return inDesktop() ? [] : structuredClone(demoSessions);
   }
+}
+
+export async function loadHubSnapshot(): Promise<HubSnapshot> {
+  return invoke<HubSnapshot>("get_hub_snapshot");
+}
+
+export async function loadMobileGatewayStatus(): Promise<MobileGatewayStatus> {
+  return invoke<MobileGatewayStatus>("get_mobile_gateway_status");
+}
+
+export async function enableMobileGateway(): Promise<MobileGatewayStatus> {
+  return invoke<MobileGatewayStatus>("enable_mobile_gateway");
+}
+
+export async function disableMobileGateway(): Promise<MobileGatewayStatus> {
+  return invoke<MobileGatewayStatus>("disable_mobile_gateway");
+}
+
+export async function beginMobilePairing(): Promise<MobilePairingOffer> {
+  return invoke<MobilePairingOffer>("begin_mobile_pairing");
+}
+
+export async function loadPairedDevices(): Promise<PairedDevice[]> {
+  return invoke<PairedDevice[]>("list_paired_devices");
+}
+
+export async function revokePairedDevice(id: string): Promise<boolean> {
+  return invoke<boolean>("revoke_paired_device", { id });
+}
+
+export async function setPairedDeviceScopes(
+  id: string,
+  scopes: MobileScope[],
+): Promise<boolean> {
+  return invoke<boolean>("set_paired_device_scopes", { id, scopes });
+}
+
+export async function executeHubCommand(
+  request: HubCommandRequest,
+): Promise<HubCommandResponse> {
+  return invoke<HubCommandResponse>("execute_hub_command", { request });
 }
 
 export async function decidePermission(

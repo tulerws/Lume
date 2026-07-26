@@ -49,6 +49,25 @@ pub enum PermissionAction {
     OpenSource,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileScope {
+    Monitor,
+    Prompt,
+    Approve,
+    Terminate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedDevice {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub scopes: Vec<MobileScope>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionProfile {

@@ -11,7 +11,10 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 
-use crate::{domain::AgentSession, overlay};
+use crate::{
+    domain::{AgentKind, AgentSession, SessionSource},
+    overlay,
+};
 
 const TERMINAL_WIDTH: i32 = 336;
 const TERMINAL_HEIGHT: i32 = 286;
@@ -62,6 +65,12 @@ struct NativeDragEndedEvent {
 pub struct TerminalWindowState {
     pub label: String,
     pub session_id: String,
+    pub session_native_id: Option<String>,
+    pub session_process_id: Option<u32>,
+    pub session_agent: AgentKind,
+    pub session_source: SessionSource,
+    pub session_project: String,
+    pub session_working_directory: Option<String>,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -98,6 +107,12 @@ pub struct RestoredTerminalPlacement {
 struct Placement {
     label: String,
     session_id: String,
+    session_native_id: Option<String>,
+    session_process_id: Option<u32>,
+    session_agent: AgentKind,
+    session_source: SessionSource,
+    session_project: String,
+    session_working_directory: Option<String>,
     x: i32,
     y: i32,
     width: i32,
@@ -165,6 +180,12 @@ impl Placement {
         TerminalWindowState {
             label: self.label.clone(),
             session_id: self.session_id.clone(),
+            session_native_id: self.session_native_id.clone(),
+            session_process_id: self.session_process_id,
+            session_agent: self.session_agent.clone(),
+            session_source: self.session_source.clone(),
+            session_project: self.session_project.clone(),
+            session_working_directory: self.session_working_directory.clone(),
             x: self.x,
             y: self.y,
             width: self.width,
@@ -264,6 +285,12 @@ impl TerminalWindows {
         let placement = Placement {
             label: label.clone(),
             session_id: session.id.clone(),
+            session_native_id: session.native_session_id.clone(),
+            session_process_id: session.process_id,
+            session_agent: session.agent.clone(),
+            session_source: session.source.clone(),
+            session_project: session.project.clone(),
+            session_working_directory: session.working_directory.clone(),
             x,
             y,
             width: TERMINAL_WIDTH,
@@ -1455,6 +1482,12 @@ fn interpolate_state(transition: &WindowTransition, progress: f64) -> TerminalWi
     TerminalWindowState {
         label: transition.to.label.clone(),
         session_id: transition.to.session_id.clone(),
+        session_native_id: transition.to.session_native_id.clone(),
+        session_process_id: transition.to.session_process_id,
+        session_agent: transition.to.session_agent.clone(),
+        session_source: transition.to.session_source.clone(),
+        session_project: transition.to.session_project.clone(),
+        session_working_directory: transition.to.session_working_directory.clone(),
         x: interpolate(transition.from.x, transition.to.x),
         y: interpolate(transition.from.y, transition.to.y),
         width: interpolate(transition.from.width, transition.to.width),
@@ -1502,6 +1535,12 @@ mod tests {
         Placement {
             label: label.into(),
             session_id: label.into(),
+            session_native_id: Some(label.into()),
+            session_process_id: None,
+            session_agent: AgentKind::Codex,
+            session_source: SessionSource::Cli,
+            session_project: "Lume".into(),
+            session_working_directory: Some("/work/lume".into()),
             x,
             y,
             width: TERMINAL_WIDTH,

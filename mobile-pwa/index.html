@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#15211c" />
+    <meta name="description" content="Monitor your local AI agents through Lume." />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/lume-mobile-icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Lume Mobile</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <img class="brand-logo" src="/lume-mobile-icon.svg" alt="" />
+        <span class="brand-copy"><strong>Lume</strong><small>Agent hub</small></span>
+        <span class="connection-pill"><i id="connection-dot" aria-hidden="true"></i><span id="connection-label">Local</span></span>
+        <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh sessions">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" /></svg>
+        </button>
+      </header>
+
+      <section id="pair-view" class="pair-view" hidden>
+        <div class="hero">
+          <img class="hero-logo" src="/lume-mobile-icon.svg" alt="Lume" />
+          <span class="step-pill">Secure pairing</span>
+          <h1>Connect to your Lume</h1>
+          <p>This one-time code links only this device. Your sessions stay on your local network.</p>
+        </div>
+        <form id="pair-form" class="surface-form">
+          <label>
+            <span>Device name</span>
+            <input id="device-name" maxlength="80" autocomplete="name" required />
+          </label>
+          <button class="primary-button" type="submit">Connect securely</button>
+          <p id="pair-message" class="message" aria-live="polite"></p>
+        </form>
+        <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>End-to-end local. No Lume cloud account required.</p>
+      </section>
+
+      <section id="empty-auth-view" class="empty-auth" hidden>
+        <div class="hero compact-hero">
+          <img class="hero-logo" src="/lume-mobile-icon.svg" alt="Lume" />
+          <span class="step-pill">Private connection</span>
+          <h1>Pair with your computer</h1>
+          <p>Open <strong>Lume → Settings → Mobile access</strong>, then scan the QR code or enter the connection details below.</p>
+        </div>
+        <form id="manual-pair-form" class="surface-form">
+          <label>
+            <span>HTTPS gateway</span>
+            <input id="manual-gateway" inputmode="url" placeholder="https://192.168.1.10:43124" required />
+          </label>
+          <label>
+            <span>One-time code</span>
+            <input id="manual-code" autocomplete="one-time-code" required />
+          </label>
+          <label>
+            <span>Device name</span>
+            <input id="manual-device-name" maxlength="80" value="Lume Mobile" required />
+          </label>
+          <button class="primary-button" type="submit">Connect securely</button>
+          <p class="form-hint"><span>1</span>Install and trust the Lume certificate before pairing.</p>
+          <p class="message" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section id="android-install-card" class="android-install-card" hidden>
+        <img src="/lume-mobile-icon.svg" alt="" />
+        <span>
+          <small>Android application</small>
+          <strong>Install Lume on this phone</strong>
+          <p>Use the native app for a faster launch and automatic update checks.</p>
+        </span>
+        <button id="pwa-install-button" class="secondary-button" type="button" hidden>Install web app</button>
+        <a
+          id="android-apk-download"
+          class="primary-button"
+          href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
+          rel="noopener"
+        >Download APK</a>
+      </section>
+
+      <div id="app-content" hidden>
+        <section id="dashboard" class="screen">
+          <div class="page-heading">
+            <span><small>Live workspace</small><h1>Your agents</h1></span>
+            <time id="updated-at">Connecting…</time>
+          </div>
+          <div class="summary">
+            <article class="summary-primary">
+              <span class="summary-icon running-icon"><i></i><i></i><i></i></span>
+              <span><strong id="active-count">0</strong><small>Active now</small></span>
+            </article>
+            <article>
+              <span class="summary-icon attention-icon">!</span>
+              <span><strong id="attention-count">0</strong><small>Need attention</small></span>
+            </article>
+          </div>
+          <div class="filter-bar" role="tablist" aria-label="Filter sessions">
+            <button class="active" data-filter="all" type="button">All</button>
+            <button data-filter="running" type="button">Running</button>
+            <button data-filter="attention" type="button">Attention</button>
+            <button data-filter="completed" type="button">Done</button>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
+
+        <section id="results-screen" class="screen" hidden>
+          <div class="page-heading">
+            <span><small>Recent work</small><h1>Results</h1></span>
+          </div>
+          <div id="results-list" class="results-list"></div>
+        </section>
+
+        <section id="device-screen" class="screen" hidden>
+          <div class="page-heading">
+            <span><small>Local controls</small><h1>Device</h1></span>
+          </div>
+          <article class="device-card">
+            <div class="device-identity">
+              <img src="/lume-mobile-icon.svg" alt="" />
+              <span><strong id="paired-device-name">This phone</strong><small id="device-connection">Secure local connection</small></span>
+              <i class="verified-mark" aria-label="Paired">✓</i>
+            </div>
+            <div class="scope-list">
+              <span><small>Granted access</small><div id="device-scopes"></div></span>
+            </div>
+          </article>
+          <h2 class="section-title">Software</h2>
+          <article id="mobile-update-card" class="mobile-update-card">
+            <span class="setting-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" /></svg>
+            </span>
+            <span>
+              <strong>Lume Mobile</strong>
+              <small id="mobile-update-detail">Updates are checked automatically.</small>
+            </span>
+            <button id="mobile-update-button" type="button">Check now</button>
+            <footer>
+              <span id="mobile-version-label">Reading version…</span>
+              <i id="mobile-update-progress" hidden></i>
+            </footer>
+          </article>
+          <h2 class="section-title">Preferences</h2>
+          <div class="preference-list">
+            <button id="biometric-button" type="button">
+              <span class="setting-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z" /></svg></span>
+              <span><strong>Device verification</strong><small>Confirm remote actions with your device</small></span>
+              <em>Off</em>
+            </button>
+            <button id="notification-button" type="button">
+              <span class="setting-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 7h18s-3 0-3-7M10 20h4" /></svg></span>
+              <span><strong>Notifications</strong><small>Task completion, errors and approvals</small></span>
+              <em>Off</em>
+            </button>
+          </div>
+          <button id="disconnect-button" class="danger-button" type="button">Disconnect this device</button>
+        </section>
+
+        <nav class="bottom-nav" aria-label="Main navigation">
+          <button class="active" data-view="sessions" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="3" /><circle cx="16" cy="16" r="3" /><path d="M11 8h5a3 3 0 0 1 3 3v2M13 16H8a3 3 0 0 1-3-3v-2" /></svg>
+            <span>Agents</span>
+          </button>
+          <button data-view="results" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
+            <span>Results</span>
+          </button>
+          <button data-view="device" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M10 18h4" /></svg>
+            <span>Device</span>
+          </button>
+        </nav>
+      </div>
+
+      <div id="loading-view" class="loading-view" hidden>
+        <img src="/lume-mobile-icon.svg" alt="" />
+        <span></span>
+        <p>Connecting to Lume…</p>
+      </div>
+      <div id="dashboard-message" class="toast" aria-live="polite"></div>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

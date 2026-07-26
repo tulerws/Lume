@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
@@ -79,7 +79,7 @@ pub fn publish_event(
         .map(|session| session.status);
     let notification = notification_for(&event, previous_status.as_ref());
     let permission_id = state.ingest(event)?;
-    let _ = app.emit("lume://sessions-changed", ());
+    crate::protocol::emit_sessions_changed(app);
     if let Some((title, body)) = notification {
         let _ = app.notification().builder().title(title).body(body).show();
     }

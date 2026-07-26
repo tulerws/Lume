@@ -52,3 +52,71 @@ jobs:
           updaterJsonPreferNsis: true
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: lume-[platform]-[arch]-[bundle]
+
+  mobile-android:
+    name: Android mobile
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Android signing configuration
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+            echo "::warning::Android signing secrets are missing; the mobile APK was not published."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/lume-mobile.jks"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "keystore=$RUNNER_TEMP/lume-mobile.jks" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.signing.outputs.configured == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        if: steps.signing.outputs.configured == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build signed Android application
+        if: steps.signing.outputs.configured == 'true'
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.signing.outputs.keystore }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          npm ci
+          npm run mobile:sync
+          ./android/gradlew -p android assembleRelease --no-daemon
+      - name: Prepare mobile release assets
+        if: steps.signing.outputs.configured == 'true'
+        id: assets
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package version $version."
+            exit 1
+          fi
+          apk="$RUNNER_TEMP/Lume-Mobile.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "$apk"
+          node scripts/mobile-release-manifest.mjs \
+            --version "$version" \
+            --apk "$apk" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --output "$RUNNER_TEMP/mobile-latest.json"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "manifest=$RUNNER_TEMP/mobile-latest.json" >> "$GITHUB_OUTPUT"
+      - name: Publish mobile release assets
+        if: steps.signing.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.assets.outputs.apk }}" "${{ steps.assets.outputs.manifest }}" --clobber

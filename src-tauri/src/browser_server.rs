@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
@@ -141,7 +141,7 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                     let project = event.project.clone().unwrap_or_else(|| "sessão web".into());
                     let event_kind = event.event.clone();
                     state.ingest(event)?;
-                    let _ = app.emit("lume://sessions-changed", ());
+                    crate::protocol::emit_sessions_changed(&app);
                     if notification {
                         let title = match event_kind {
                             HookEventKind::PermissionRequest => "Lume · Ação necessária",
