@@ -1,0 +1,19 @@
+*.iml
+.gradle
+/local.properties
+
+# O scaffold ignorava sete arquivos soltos dentro de `/.idea/` e deixava o resto
+# passar — `git status` já mostrava `android/.idea/` como não rastreado. Ignorar o
+# diretório inteiro evita levar configuração de IDE para o repositório, incluindo
+# caminho absoluto da máquina de quem gerou o projeto.
+/.idea/
+
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Saída de compilação do Kotlin fora de `/build`.
+.kotlin/

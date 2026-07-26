@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Regra para Android 11 e anteriores (`android:fullBackupContent`).
+
+    Exclui tudo, explicitamente. Com `allowBackup="false"` no manifest isto já
+    seria inerte, e é essa a intenção: se alguém religar o backup um dia, o
+    padrão que encontra é "nada sai daqui" em vez de "tudo sai". O conteúdo em
+    questão é comando, caminho absoluto e resposta de agente.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="external" path="." />
+</full-backup-content>

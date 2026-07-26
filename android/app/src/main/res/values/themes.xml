@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Tema da janela, não do conteúdo. Quem pinta o conteúdo é o Compose, em
+    `ui/theme/Theme.kt`.
+
+    O `windowBackground` existe para o intervalo entre a janela aparecer e o
+    primeiro quadro do Compose ser desenhado. Sem ele o padrão do sistema é
+    branco, e no tema escuro isso produz um lampejo claro na abertura — o mesmo
+    defeito que `values-night/themes.xml` corrige do outro lado.
+-->
+<resources>
+    <style name="Theme.Lume" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/lume_surface</item>
+    </style>
+</resources>

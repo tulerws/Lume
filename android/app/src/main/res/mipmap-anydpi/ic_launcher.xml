@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Três camadas, como manda `docs/MOBILE-UI-DESIGN.md`.
+
+    O scaffold apontava `monochrome` para o mesmo arquivo do `foreground`. Isso
+    compila e está errado: o sistema usa só o alfa da camada monocromática, e o
+    `foreground` colorido tem alfa preenchido em toda a arte — o ícone tematizado
+    sairia como um borrão sólido no formato do glifo, sem desenho interno.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

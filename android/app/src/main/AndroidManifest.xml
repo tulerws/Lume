@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Nenhuma permissão é declarada nesta fase. INTERNET, ACCESS_NETWORK_STATE e
+        CAMERA entram junto do código que as usa: permissão declarada antes do uso
+        anuncia no aparelho uma capacidade que o aplicativo ainda não tem.
+
+        Atributos de `application` que carregam decisão, e não configuração:
+
+        · `allowBackup="false"` mais as duas regras de extração vazias — o cache
+          guarda comando, caminho absoluto e resposta de agente, e isso não sobe
+          para nuvem nenhuma. Só desligar `allowBackup` não cobre a transferência
+          entre aparelhos do Android 12+; por isso as duas regras também.
+
+        · `usesCleartextTraffic="false"` — o aplicativo só fala WSS. Tentativa em
+          claro é erro de programação, e este atributo faz o erro falhar alto em
+          vez de vazar comando e caminho em texto puro pela rede local.
+    -->
+
+    <application
+        android:name=".LumeApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:usesCleartextTraffic="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Lume">
+        <!--
+            Sem `android:label` aqui: a activity herda o rótulo da aplicação, e
+            repeti-lo só cria dois lugares para o nome do aplicativo divergir.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Lume"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

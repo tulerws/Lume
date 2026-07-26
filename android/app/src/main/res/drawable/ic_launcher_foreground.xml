@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Camada da frente do ícone adaptativo: só o glifo, sem o fundo do SVG.
+
+    ## A conta do enquadramento
+
+    A tela do ícone adaptativo tem 108dp, e o sistema garante visível apenas os
+    66dp centrais — o resto pode ser recortado por qualquer máscara de
+    fabricante, e é usado pelas animações de paralaxe do lançador.
+
+    O glifo ocupa, na grade de 512, x de 96 a 416 e y de 96 a 448. Logo mede
+    320 × 352 e está centrado em (256, 272) — deslocado 16 para baixo do centro
+    da tela, porque a arte tem mais massa embaixo.
+
+    · Zona segura na grade: 66/108 × 512 = 312,9
+    · Escala para caber o maior lado: 312,9 / 352 = 0,889
+    · Correção de centro: translateY = 256 − 272 = −16
+
+    O grupo aplica a escala em torno de (256, 272), o que mantém o glifo no lugar
+    enquanto encolhe, e só então desloca. Inverter a ordem tiraria a arte do
+    centro pela mesma quantidade que a escala reduz.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:pivotX="256"
+        android:pivotY="272"
+        android:scaleX="0.889"
+        android:scaleY="0.889"
+        android:translateY="-16">
+        <path
+            android:fillColor="#2B4A3D"
+            android:pathData="M96,128h32V96h256v32h32v32h32v160H256v32h128v64h-32v32H192v-32h-64v-32H96z" />
+        <path
+            android:fillColor="#68B887"
+            android:pathData="M128,160h32v-32h192v32h32v32h32v96H224v32h-32v64h-32v-32h-32z" />
+        <path
+            android:fillColor="#83C99E"
+            android:pathData="M160,160h160v32h-160z" />
+        <path
+            android:fillColor="#F2F8F5"
+            android:pathData="M304,176h64v64h-64z" />
+        <path
+            android:fillColor="#1D342B"
+            android:pathData="M336,192h32v32h-32z" />
+        <path
+            android:fillColor="#29493C"
+            android:pathData="M384,256h32v16h-32z" />
+        <path
+            android:fillColor="#172720"
+            android:pathData="M224,288h192v32H256v32h-32z" />
+        <path
+            android:fillColor="#F2F8F5"
+            android:pathData="M320,320h32v24h-32z" />
+    </group>
+</vector>

@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Textos em português do Brasil — os que aparecem no arquivo de design.
+
+    Regra de escrita, herdada de `docs/MOBILE-UI-DESIGN.md`: verbo no infinitivo e
+    a mesma palavra do início ao fim. O botão "Permitir uma vez" produz o registro
+    "Permissão concedida"; se um dia virar "Autorizar", o registro vira
+    "Autorização concedida" junto. Erro diz o que houve e o que fazer, sem pedir
+    desculpa. E nada de jargão: o usuário lê "conexão" e "aparelho", nunca
+    "WebSocket", "handshake" ou "token".
+-->
+<resources>
+    <string name="app_name">Lume</string>
+
+    <!-- Barra inferior -->
+    <string name="nav_sessoes">Sessões</string>
+    <string name="nav_historico">Histórico</string>
+    <string name="nav_ajustes">Ajustes</string>
+
+    <!-- Estado da conexão -->
+    <string name="conexao_conectado">Conectado</string>
+    <string name="conexao_conectando">Conectando</string>
+    <string name="conexao_sem">Sem conexão</string>
+    <string name="conexao_faixa_offline">Sem conexão com %1$s · mostrando o último estado conhecido</string>
+    <string name="conexao_ultimo_estado">Último estado conhecido · %1$s</string>
+
+    <!-- Estado da sessão -->
+    <string name="estado_executando">Executando</string>
+    <string name="estado_aguardando_permissao">Aguardando permissão</string>
+    <string name="estado_aguardando_resposta">Aguardando resposta</string>
+    <string name="estado_concluido">Concluído</string>
+    <string name="estado_falhou">Falhou</string>
+
+    <!-- Tempo relativo -->
+    <string name="tempo_agora">agora</string>
+    <string name="tempo_minutos">há %d min</string>
+    <string name="tempo_horas">há %d h</string>
+    <string name="tempo_dias">há %d d</string>
+
+    <!-- Sessões -->
+    <!--
+        `many` é obrigatório em português desde que o CLDR passou a distinguir a
+        forma de milhão ("1,5 milhão de sessões"). Aqui as três formas coincidem,
+        porque o substantivo não muda — mas omitir a categoria é erro de lint, e a
+        omissão viraria fallback silencioso numa contagem grande.
+    -->
+    <plurals name="sessoes_resumo_permissao">
+        <item quantity="one">%d pedindo permissão</item>
+        <item quantity="many">%d pedindo permissão</item>
+        <item quantity="other">%d pedindo permissão</item>
+    </plurals>
+    <plurals name="sessoes_resumo_executando">
+        <item quantity="one">%d executando</item>
+        <item quantity="many">%d executando</item>
+        <item quantity="other">%d executando</item>
+    </plurals>
+    <string name="sessoes_resumo_ocioso">Nenhum agente ativo</string>
+    <string name="sessoes_vazio_titulo">Nenhum agente rodando</string>
+    <string name="sessoes_vazio_corpo">Assim que um começar, ele aparece aqui.</string>
+
+    <!-- Erro de conexão -->
+    <string name="erro_titulo">Sem conexão com %1$s</string>
+    <string name="erro_corpo">Verifique se o computador está ligado e na mesma rede.</string>
+    <string name="erro_tentar_novamente">Tentar de novo</string>
+
+    <!-- Sessão -->
+    <string name="sessao_atividade">Atividade</string>
+    <string name="risco_alto">Risco alto</string>
+    <string name="risco_medio">Risco médio</string>
+    <string name="risco_baixo">Risco baixo</string>
+
+    <!-- Bloco de permissão -->
+    <string name="permissao_permitir_uma_vez">Permitir uma vez</string>
+    <string name="permissao_confirmar">Confirmar permitir</string>
+    <string name="permissao_confirmar_contagem">%1$ds</string>
+    <string name="permissao_permitir_sessao">Permitir na sessão</string>
+    <string name="permissao_recusar">Recusar</string>
+    <string name="permissao_respondida_titulo">Respondida em outro dispositivo</string>
+    <string name="permissao_concedida">Permissão concedida</string>
+    <string name="permissao_recusada">Permissão recusada</string>
+    <string name="permissao_somente_observacao">Esta sessão só pode ser acompanhada pelo Lume</string>
+
+    <!-- Campo de prompt -->
+    <string name="prompt_dica">Escrever para o %1$s…</string>
+    <string name="prompt_desabilitado_executando">Aguarde o agente terminar</string>
+    <string name="prompt_desabilitado_permissao">Responda a permissão primeiro</string>
+    <string name="prompt_aviso_terminal">Isto abre um terminal no computador</string>
+    <string name="prompt_enviar">Enviar</string>
+
+    <!-- Afordâncias -->
+    <string name="acao_voltar">Voltar</string>
+    <string name="acao_fechar">Fechar</string>
+
+    <!-- Histórico -->
+    <string name="historico_titulo">Histórico</string>
+    <string name="historico_hoje">Hoje</string>
+    <string name="historico_ontem">Ontem</string>
+    <string name="historico_teto">Estes são os 200 registros mais recentes</string>
+    <string name="historico_vazio_titulo">Nada registrado ainda</string>
+    <string name="historico_vazio_corpo">A atividade dos agentes aparece aqui depois de acontecer.</string>
+    <string name="historico_carregando">Carregando…</string>
+    <string name="evento_concluido">Sessão concluída</string>
+    <string name="evento_falhou">Sessão falhou</string>
+
+    <!-- Ajustes -->
+    <string name="ajustes_titulo">Ajustes</string>
+    <string name="ajustes_aparelho">Aparelho</string>
+    <string name="ajustes_aparelho_detalhe">Mesma rede · pareado em %1$s</string>
+    <string name="ajustes_esquecer">Esquecer este aparelho</string>
+    <string name="ajustes_esquecer_titulo">Esquecer %1$s?</string>
+    <string name="ajustes_esquecer_corpo">O cache e o pareamento são apagados. Para usar este celular de novo é preciso parear outra vez.</string>
+    <string name="ajustes_esquecer_confirmar">Esquecer</string>
+    <string name="acao_cancelar">Cancelar</string>
+    <string name="ajustes_tema">Tema</string>
+    <string name="tema_claro">Claro</string>
+    <string name="tema_escuro">Escuro</string>
+    <string name="tema_sistema">Sistema</string>
+    <string name="ajustes_avisos">Avisos</string>
+    <string name="avisos_permissao">Pedidos de permissão</string>
+    <string name="avisos_concluida">Sessão concluída</string>
+    <string name="ajustes_sobre">Sobre</string>
+    <string name="sobre_versao">Versão %1$s</string>
+
+    <!-- Seção Demonstração, só em build de depuração -->
+    <string name="ajustes_demonstracao">Demonstração</string>
+    <string name="demo_conectado">Conectado</string>
+    <string name="demo_vazio">Vazio</string>
+    <string name="demo_sem_conexao">Sem conexão</string>
+    <string name="demo_erro">Erro</string>
+
+    <!-- Pareamento -->
+    <string name="pareamento_instrucao">Aponte para o código que aparece no aplicativo do computador</string>
+    <string name="pareamento_manual">Digitar endereço</string>
+    <string name="pareamento_exige_qr">O pareamento exige ler o código. Digitar endereço só ajuda depois que ele foi lido.</string>
+    <string name="manual_titulo">Digitar endereço</string>
+    <string name="manual_endereco">Endereço</string>
+    <string name="manual_porta">Porta</string>
+    <string name="manual_conectar">Conectar</string>
+    <string name="manual_explicacao">O código de pareamento e o certificado viajam só dentro do QR. Esta tela diz apenas onde conectar.</string>
+    <string name="manual_erro_endereco">Informe um endereço</string>
+    <string name="manual_erro_porta">Porta entre 1 e 65535</string>
+</resources>

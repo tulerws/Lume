@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Camada monocromática, para o ícone tematizado do Android 13+.
+
+    O sistema descarta a cor e usa **só o alfa**, pintando o resultado com a cor
+    do tema do usuário. Por isso aqui vai a silhueta — o contorno externo do
+    glifo — e não as oito camadas do ícone colorido: aquelas, achatadas num
+    alfa só, produziriam exatamente a mesma silhueta, com oito vezes o custo de
+    desenho e nenhuma diferença visível.
+
+    O olho fica de fora pelo mesmo motivo: recortá-lo exigiria um caminho com
+    regra de preenchimento par-ímpar, e um vazado de 32 unidades numa arte de
+    312 vira ruído no tamanho em que este ícone é visto.
+
+    O enquadramento repete o de `ic_launcher_foreground.xml` — a conta está lá.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:pivotX="256"
+        android:pivotY="272"
+        android:scaleX="0.889"
+        android:scaleY="0.889"
+        android:translateY="-16">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M96,128h32V96h256v32h32v32h32v160H256v32h128v64h-32v32H192v-32h-64v-32H96z" />
+    </group>
+</vector>

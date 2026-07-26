@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Textos em inglês. O português está em `values-pt-rBR/strings.xml`.
+
+    Por que o inglês é o arquivo padrão, num repositório cujo código e cujos
+    comentários são em português: `values/` não é "o idioma do projeto", é o que o
+    Android mostra quando o aparelho não pede nenhum dos idiomas traduzidos. Um
+    aparelho em francês precisa cair em algum lugar, e cair em português seria
+    pior do que cair em inglês.
+
+    Os nomes das chaves seguem em português, como o resto do repositório. A única
+    exceção é `app_name`, que é convenção da plataforma e é lida por ferramenta.
+
+    Quem escolhe o idioma é o sistema — não há seletor em Ajustes, e essa ausência
+    é decisão do design, não esquecimento.
+-->
+<resources>
+    <string name="app_name">Lume</string>
+
+    <!-- Barra inferior -->
+    <string name="nav_sessoes">Sessions</string>
+    <string name="nav_historico">History</string>
+    <string name="nav_ajustes">Settings</string>
+
+    <!-- Estado da conexão -->
+    <string name="conexao_conectado">Connected</string>
+    <string name="conexao_conectando">Connecting</string>
+    <string name="conexao_sem">No connection</string>
+    <string name="conexao_faixa_offline">No connection to %1$s · showing the last known state</string>
+    <string name="conexao_ultimo_estado">Last known state · %1$s</string>
+
+    <!--
+        Estado da sessão. Derivado do enum `SessionStatus`, nunca do campo
+        `statusLabel` que o backend envia: aquele é texto livre em pt-BR, de
+        comprimento imprevisível, e a linha de sessão tem 72dp de altura fixa.
+    -->
+    <string name="estado_executando">Running</string>
+    <string name="estado_aguardando_permissao">Waiting for permission</string>
+    <string name="estado_aguardando_resposta">Waiting for input</string>
+    <string name="estado_concluido">Completed</string>
+    <string name="estado_falhou">Failed</string>
+
+    <!--
+        Tempo relativo. Formato curto porque divide uma linha de 72dp com o rótulo
+        de estado; a hora absoluta (14:21) aparece na atividade, onde o que
+        importa é quando aconteceu, não há quanto tempo.
+    -->
+    <string name="tempo_agora">just now</string>
+    <string name="tempo_minutos">%d min ago</string>
+    <string name="tempo_horas">%d h ago</string>
+    <string name="tempo_dias">%d d ago</string>
+
+    <!-- Sessões -->
+    <plurals name="sessoes_resumo_permissao">
+        <item quantity="one">%d waiting for permission</item>
+        <item quantity="other">%d waiting for permission</item>
+    </plurals>
+    <plurals name="sessoes_resumo_executando">
+        <item quantity="one">%d running</item>
+        <item quantity="other">%d running</item>
+    </plurals>
+    <string name="sessoes_resumo_ocioso">No agents active</string>
+    <string name="sessoes_vazio_titulo">No agents running</string>
+    <string name="sessoes_vazio_corpo">As soon as one starts, it appears here.</string>
+
+    <!-- Erro de conexão -->
+    <string name="erro_titulo">No connection to %1$s</string>
+    <string name="erro_corpo">Check that the computer is on and on the same network.</string>
+    <string name="erro_tentar_novamente">Try again</string>
+
+    <!-- Sessão -->
+    <string name="sessao_atividade">Activity</string>
+    <string name="risco_alto">High risk</string>
+    <string name="risco_medio">Medium risk</string>
+    <string name="risco_baixo">Low risk</string>
+
+    <!-- Bloco de permissão -->
+    <string name="permissao_permitir_uma_vez">Allow once</string>
+    <string name="permissao_confirmar">Confirm allow</string>
+    <string name="permissao_confirmar_contagem">%1$ds</string>
+    <string name="permissao_permitir_sessao">Allow for session</string>
+    <string name="permissao_recusar">Deny</string>
+    <string name="permissao_respondida_titulo">Answered on another device</string>
+    <string name="permissao_concedida">Permission granted</string>
+    <string name="permissao_recusada">Permission denied</string>
+    <string name="permissao_somente_observacao">This session can only be watched from Lume</string>
+
+    <!-- Campo de prompt -->
+    <string name="prompt_dica">Write to %1$s…</string>
+    <string name="prompt_desabilitado_executando">Wait for the agent to finish</string>
+    <string name="prompt_desabilitado_permissao">Answer the permission first</string>
+    <string name="prompt_aviso_terminal">This opens a terminal on the computer</string>
+    <string name="prompt_enviar">Send</string>
+
+    <!-- Afordâncias -->
+    <string name="acao_voltar">Back</string>
+    <string name="acao_fechar">Close</string>
+
+    <!-- Histórico -->
+    <string name="historico_titulo">History</string>
+    <string name="historico_hoje">Today</string>
+    <string name="historico_ontem">Yesterday</string>
+    <string name="historico_teto">These are the 200 most recent records</string>
+    <string name="historico_vazio_titulo">Nothing recorded yet</string>
+    <string name="historico_vazio_corpo">Agent activity shows up here after it happens.</string>
+    <string name="historico_carregando">Loading…</string>
+    <!--
+        Rótulos de evento. Derivados do código em `HistoryEntry.event`, nunca do
+        `summary` que o backend manda em pt-BR — mesma regra do estado de sessão.
+        "Permissão concedida/recusada" reusa as chaves do bloco de permissão: é a
+        mesma palavra do botão ao registro, como manda o documento de design.
+    -->
+    <string name="evento_concluido">Session completed</string>
+    <string name="evento_falhou">Session failed</string>
+
+    <!-- Ajustes -->
+    <string name="ajustes_titulo">Settings</string>
+    <string name="ajustes_aparelho">Device</string>
+    <string name="ajustes_aparelho_detalhe">Same network · paired on %1$s</string>
+    <string name="ajustes_esquecer">Forget this device</string>
+    <string name="ajustes_esquecer_titulo">Forget %1$s?</string>
+    <string name="ajustes_esquecer_corpo">The cache and the pairing are erased. To use this phone again you have to pair from scratch.</string>
+    <string name="ajustes_esquecer_confirmar">Forget</string>
+    <string name="acao_cancelar">Cancel</string>
+    <string name="ajustes_tema">Theme</string>
+    <string name="tema_claro">Light</string>
+    <string name="tema_escuro">Dark</string>
+    <string name="tema_sistema">System</string>
+    <string name="ajustes_avisos">Alerts</string>
+    <string name="avisos_permissao">Permission requests</string>
+    <string name="avisos_concluida">Session completed</string>
+    <string name="ajustes_sobre">About</string>
+    <string name="sobre_versao">Version %1$s</string>
+
+    <!--
+        Seção Demonstração: existe apenas em build de depuração, para poder ver no
+        aparelho os estados que o design desenha. Some no build de release.
+    -->
+    <string name="ajustes_demonstracao">Demo</string>
+    <string name="demo_conectado">Connected</string>
+    <string name="demo_vazio">Empty</string>
+    <string name="demo_sem_conexao">Offline</string>
+    <string name="demo_erro">Error</string>
+
+    <!-- Pareamento -->
+    <string name="pareamento_instrucao">Point at the code shown in the desktop app</string>
+    <string name="pareamento_manual">Enter address</string>
+    <!--
+        A tela precisa dizer que ler o QR é obrigatório. Sem esta linha,
+        "Digitar endereço" passa por alternativa de pareamento — e não é uma.
+    -->
+    <string name="pareamento_exige_qr">Pairing requires reading the code. Entering an address only helps once it has been read.</string>
+    <string name="manual_titulo">Enter address</string>
+    <string name="manual_endereco">Address</string>
+    <string name="manual_porta">Port</string>
+    <string name="manual_conectar">Connect</string>
+    <string name="manual_explicacao">The pairing code and the certificate travel only inside the QR code. This screen just says where to connect.</string>
+    <string name="manual_erro_endereco">Enter an address</string>
+    <string name="manual_erro_porta">Port between 1 and 65535</string>
+</resources>

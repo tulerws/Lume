@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Logo do Lume, portado de `static/lume.svg` sem redesenho.
+
+    A grade é a original: 512 de lado, em blocos de 16. Manter o `viewportWidth`
+    em 512 em vez de normalizar para 24 ou 108 preserva os limites dos blocos em
+    números inteiros — que é o que faz a arte parecer pixel-art em vez de pixel
+    art borrada. Toda coordenada abaixo é múltipla de 16 por isso.
+
+    Este é o logo completo, usado dentro do aplicativo. O ícone do lançador é
+    outro arquivo, porque lá o fundo precisa ser camada separada.
+-->
+<!--
+    `width`/`height` são o tamanho **intrínseco**, e ficam em 48dp; `viewport`
+    continua em 512, que é a grade da arte. Os dois são independentes: quem
+    desenha escolhe o tamanho final por modificador, e um intrínseco de 512dp só
+    serviria para o Android alocar um bitmap de cache 100 vezes maior que o
+    necessário na primeira vez que o vetor fosse rasterizado.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <path
+        android:fillColor="#172720"
+        android:pathData="M32,144a112,112 0 0 1 112,-112h224a112,112 0 0 1 112,112v224a112,112 0 0 1 -112,112h-224a112,112 0 0 1 -112,-112z" />
+    <path
+        android:fillColor="#2B4A3D"
+        android:pathData="M96,128h32V96h256v32h32v32h32v160H256v32h128v64h-32v32H192v-32h-64v-32H96z" />
+    <path
+        android:fillColor="#68B887"
+        android:pathData="M128,160h32v-32h192v32h32v32h32v96H224v32h-32v64h-32v-32h-32z" />
+    <path
+        android:fillColor="#83C99E"
+        android:pathData="M160,160h160v32h-160z" />
+    <path
+        android:fillColor="#F2F8F5"
+        android:pathData="M304,176h64v64h-64z" />
+    <path
+        android:fillColor="#1D342B"
+        android:pathData="M336,192h32v32h-32z" />
+    <path
+        android:fillColor="#29493C"
+        android:pathData="M384,256h32v16h-32z" />
+    <path
+        android:fillColor="#172720"
+        android:pathData="M224,288h192v32H256v32h-32z" />
+    <path
+        android:fillColor="#F2F8F5"
+        android:pathData="M320,320h32v24h-32z" />
+</vector>

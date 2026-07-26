@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Contraparte escura de `values/themes.xml`.
+
+    Só o fundo de janela muda. O tema do conteúdo continua vindo do Compose, e
+    ele obedece à preferência do usuário (Claro/Escuro/Sistema), não a este
+    arquivo — que responde apenas ao modo escuro do sistema. A consequência
+    aceita: quem escolher "Claro" com o sistema no escuro vê um instante de fundo
+    escuro na abertura. É um quadro, e a alternativa seria adiar o primeiro
+    desenho até ler a preferência, o que atrasa a abertura de todo mundo para
+    corrigir o lampejo de poucos.
+-->
+<resources>
+    <style name="Theme.Lume" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#1B221F</item>
+    </style>
+</resources>

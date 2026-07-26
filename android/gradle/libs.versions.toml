@@ -1,0 +1,86 @@
+[versions]
+agp = "9.3.1"
+coreKtx = "1.10.1"
+junit = "4.13.2"
+junitVersion = "1.1.5"
+espressoCore = "3.5.1"
+lifecycleRuntimeKtx = "2.6.1"
+activityCompose = "1.8.0"
+kotlin = "2.2.10"
+composeBom = "2026.02.01"
+
+# O KSP acompanha o Kotlin no sufixo: "<versão do Kotlin>-<versão do KSP>". Fica
+# travado no 2.2.10 porque é o Kotlin do scaffold, e subir o Kotlin não é assunto
+# deste trabalho. A partir do Kotlin 2.3 o KSP passou a versionar sozinho (2.3.0,
+# 2.3.1, …); quem subir o Kotlin depois troca o esquema de versão junto.
+ksp = "2.2.10-2.0.2"
+
+hilt = "2.60.1"
+
+# Estas três não estão nas versões mais recentes de propósito. `hilt-navigation-compose
+# 1.4.0` e `lifecycle-viewmodel-compose 2.11.0` exigem `compileSdk 37`, e o
+# scaffold compila contra 36.1 — subir o `compileSdk` por causa de duas
+# dependências trocaria a plataforma de compilação do projeto inteiro, e a 37
+# nem está instalada nesta máquina. As versões abaixo são as últimas estáveis
+# que ainda compilam contra 36.
+hiltNavigationCompose = "1.3.0"
+navigationCompose = "2.9.8"
+lifecycleViewmodelCompose = "2.9.4"
+
+# Rede e protocolo.
+#
+# O `okhttp-tls` entra **só como dependência de teste**. `docs/ANDROID.md` o
+# propõe para produção, via `HandshakeCertificates.addTrustedCertificate`, mas
+# aquela API exige o certificado inteiro e o QR carrega só o SHA-256 dele — ver
+# `PinnedTrust.kt`. Em teste ele serve para o que serve bem: `HeldCertificate`
+# gera os certificados que o caso negativo do pinning precisa.
+okhttp = "5.4.0"
+# O runtime da serialização acompanha o plugin de compilação, e o plugin
+# acompanha a versão do Kotlin.
+kotlinxSerialization = "1.9.0"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+
+# Estado que sobrevive a rotação e à recriação da activity. O seletor
+# Claro/Escuro/Sistema em Ajustes provoca exatamente essa recriação: sem
+# ViewModel, trocar o tema zera a rolagem e a confirmação de risco alto.
+# `ProcessLifecycleOwner`: a conexão vive entre `onStart` e `onStop` do processo,
+# e não da activity. Uma rotação não deve derrubar e reabrir o WebSocket.
+androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycleViewmodelCompose" }
+
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
+
+# Navigation Compose existe pela pilha de retorno: Sessões → Sessão é
+# empilhamento, e o gesto de voltar precisa desempilhar. Um `when` sobre
+# `remember` faz o botão voltar sair do aplicativo em vez de voltar para a lista
+# — defeito que só aparece no aparelho e some no @Preview.
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
+
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+okhttp-tls = { group = "com.squareup.okhttp3", name = "okhttp-tls", version.ref = "okhttp" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+
+hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
+hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.ref = "hilt" }
+androidx-hilt-navigation-compose = { group = "androidx.hilt", name = "hilt-navigation-compose", version.ref = "hiltNavigationCompose" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+hilt = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
