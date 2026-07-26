@@ -2373,7 +2373,9 @@
           </div>
         {:else}
           <div class="settings" in:fade={{ duration: 150 }}>
-            <div class="settings-section-label">{tr("Mobile", "Dispositivo móvel")}</div>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Mobile", "Dispositivo móvel")}</summary>
+              <div class="settings-section-content">
             <div class="integration-row">
               <span class="agent-avatar agent-mobile"><BrandIcon name="mobile" size={19} /></span>
               <div>
@@ -2387,7 +2389,11 @@
                 onclick={() => void openPairing()}
               >{remoteStatus.pairedDevices > 0 ? tr("Manage", "Gerenciar") : tr("Connect", "Conectar")}</button>
             </div>
-            <div class="settings-section-label preferences-label">{tr("Agents", "Agentes")}</div>
+              </div>
+            </details>
+            <details class="settings-section" open>
+              <summary class="settings-section-label">{tr("Agents", "Agentes")}</summary>
+              <div class="settings-section-content">
             {#each integrations as integration}
               {@const diagnostic = integrationDiagnostics[integration.kind]}
               <div class="integration-row">
@@ -2428,7 +2434,11 @@
                 </div>
               {/if}
             {/each}
-            <div class="settings-section-label preferences-label">{tr("External detectors", "Detectores externos")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("External detectors", "Detectores externos")}</summary>
+              <div class="settings-section-content">
             {#each externalPlugins as plugin (plugin.id)}
               <div class="integration-row external-plugin-row">
                 <span class="agent-avatar agent-unknown"><BrandIcon name="unknown" size={17} /></span>
@@ -2448,7 +2458,11 @@
                 {settingsMessage}
               </p>
             {/if}
-            <div class="settings-section-label preferences-label">Interface</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">Interface</summary>
+              <div class="settings-section-content">
             <div class="integration-row">
               <span class="agent-avatar agent-vscode"><BrandIcon name="vscode" size={19} /></span>
               <div>
@@ -2473,7 +2487,11 @@
             {#if browserCompanionPath}
               <p class="browser-path" transition:fade>{browserCompanionPath}</p>
             {/if}
-            <div class="settings-section-label preferences-label">{tr("Preferences", "Preferências")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Preferences", "Preferências")}</summary>
+              <div class="settings-section-content">
             <label class="field-row">
               <span><strong>{tr("Language", "Idioma")}</strong><small>{tr("Lume interface language.", "Idioma da interface do Lume.")}</small></span>
               <select
@@ -2574,7 +2592,11 @@
                 {/each}
               </div>
             </div>
-            <div class="settings-section-label preferences-label">{tr("Keyboard shortcuts", "Atalhos de teclado")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Keyboard shortcuts", "Atalhos de teclado")}</summary>
+              <div class="settings-section-content">
             {#each [
               ["openShortcut", tr("Open Lume", "Abrir o Lume"), tr("Shows and expands the overlay.", "Exibe e expande a sobreposição.")],
               ["globalShortcut", tr("Command palette", "Paleta de comandos"), tr("Search actions and active agents.", "Busca ações e agentes ativos.")],
@@ -2593,7 +2615,11 @@
                 />
               </label>
             {/each}
-            <div class="settings-section-label preferences-label">{tr("Project profiles", "Perfis por projeto")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Project profiles", "Perfis por projeto")}</summary>
+              <div class="settings-section-content">
             {#if detectedProjects.length > 0}
               <label class="field-row">
                 <span><strong>{tr("Project", "Projeto")}</strong><small>{tr("Overrides only for this project.", "Ajustes somente para este projeto.")}</small></span>
@@ -2686,7 +2712,11 @@
             {:else}
               <p class="profile-empty">{tr("Profiles appear after a project is detected.", "Os perfis aparecem depois que um projeto é detectado.")}</p>
             {/if}
-            <div class="settings-section-label preferences-label">{tr("About", "Sobre")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("About", "Sobre")}</summary>
+              <div class="settings-section-content">
             <div class="update-card" aria-live="polite">
               <div class="update-main">
                 <LumeLogo size={30} />
@@ -2723,7 +2753,11 @@
                 </div>
               {/if}
             </div>
-            <div class="settings-section-label preferences-label">{tr("Reset", "Redefinir")}</div>
+              </div>
+            </details>
+            <details class="settings-section">
+              <summary class="settings-section-label">{tr("Reset", "Redefinir")}</summary>
+              <div class="settings-section-content">
             <div class:confirming={resetConfirming} class="reset-settings-control">
               {#if resetConfirming}
                 <span>{tr("Reset all Lume settings to their defaults?", "Redefinir todas as configurações do Lume para o padrão?")}</span>
@@ -2737,6 +2771,8 @@
                 </button>
               {/if}
             </div>
+              </div>
+            </details>
             <span class:visible={savingSettings} class="save-state">{tr("Saving…", "Salvando…")}</span>
           </div>
         {/if}
@@ -3257,6 +3293,31 @@
   .integration-row button.danger:hover:not(:disabled) { background: rgba(165, 76, 76, 0.09); }
   .settings-section-label { padding: 9px 0 5px; color: #929c97; font-size: 9px; font-weight: 750; letter-spacing: 0.07em; text-transform: uppercase; }
   .settings-section-label.preferences-label { padding-top: 17px; }
+  /* Recolhíveis por `<details>` nativo: teclado, leitor de tela e o estado
+     aberto/fechado saem de graça, sem uma linha de JavaScript. */
+  .settings-section { border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
+  .settings-section > .settings-section-label {
+    min-height: 39px;
+    padding: 0 2px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  .settings-section > .settings-section-label::-webkit-details-marker { display: none; }
+  .settings-section > .settings-section-label::after {
+    content: "+";
+    color: #7d8d85;
+    font-size: 15px;
+    font-weight: 450;
+    letter-spacing: 0;
+    transition: color 130ms ease;
+  }
+  .settings-section[open] > .settings-section-label::after { content: "−"; color: #4f7463; }
+  .settings-section > .settings-section-label:hover { color: #66766f; }
+  .settings-section-content { padding: 0 1px 6px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .integration-row .agent-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: 10px; }
   .integration-row > div:not(.integration-actions) { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -3394,6 +3455,10 @@
   .overlay-shell.dark .history-row,
   .overlay-shell.dark .setting-row,
   .overlay-shell.dark .field-row { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .settings-section { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .settings-section > .settings-section-label::after { color: #93a09a; }
+  .overlay-shell.dark .settings-section[open] > .settings-section-label::after { color: #c5d0cb; }
+  .overlay-shell.dark .settings-section > .settings-section-label:hover { color: #c5d0cb; }
   .overlay-shell.dark .session-row:hover,
   .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
   .overlay-shell.dark .project-name,

@@ -829,7 +829,9 @@ A conexão recebe isso como um **fecho**, e não como `AppHandle`. Guardar o `Ap
 
 ### Entrada em Ajustes
 
-A **primeira** opção da aba Ajustes, antes de "Agentes", numa seção própria chamada "Dispositivo móvel". Usa o mesmo `.integration-row` das demais integrações: avatar (`agent-mobile`), título, linha de detalhe e botão à direita.
+A **primeira** seção da aba Ajustes, antes de "Agentes", chamada "Dispositivo móvel".
+
+As seções de Ajustes são recolhíveis por `<details>`/`<summary>` nativos, e **todas nascem fechadas menos "Agentes"** — o elemento nativo entrega teclado, leitor de tela e o estado aberto/fechado sem uma linha de JavaScript. Ser a primeira continua valendo: o cabeçalho fica visível no topo da aba, e só o conteúdo vem recolhido. Usa o mesmo `.integration-row` das demais integrações: avatar (`agent-mobile`), título, linha de detalhe e botão à direita.
 
 O estado da linha vem do comando `remote_status`:
 
