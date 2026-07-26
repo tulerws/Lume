@@ -52,3 +52,155 @@ jobs:
           updaterJsonPreferNsis: true
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: lume-[platform]-[arch]-[bundle]
+
+  # ── APK Android ────────────────────────────────────────────────────────────
+  #
+  # Job separado, e não mais uma linha da matriz acima: aquela roda `tauri-action`
+  # em cada sistema, e o Android não passa por ele. O gatilho é o mesmo — a tag
+  # `v*` — como decidido em docs/ANDROID.md.
+  #
+  # `needs: release` porque o release é criado pelo job acima. Sem essa espera, o
+  # anexo correria contra a criação e falharia de forma intermitente.
+  android:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # O guarda-corpo. Sem keystore, o Gradle **assina com a chave de
+      # depuração** — comportamento deliberado para permitir `assembleRelease`
+      # local, e inaceitável num artefato publicado. Falhar aqui é a única coisa
+      # que impede um release assinado com a chave errada de sair sem ninguém
+      # notar.
+      - name: Exige o keystore de release
+        run: |
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 ausente. O APK sairia assinado com a chave de depuração."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # O segredo é texto e o keystore é binário — daí o base64. O arquivo vive
+      # no diretório temporário da máquina efêmera e morre com ela.
+      - name: Restaura o keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/lume-release.p12"
+
+      - name: Testes
+        working-directory: android
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: APK de release
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/lume-release.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      # Confere que saiu assinado pela chave certa, e **não** pela de depuração.
+      # O `CN=Android Debug` é exatamente o que não pode aparecer aqui.
+      - name: Confere a assinatura
+        working-directory: android
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/certs.txt
+          if grep -q "CN=Android Debug" /tmp/certs.txt; then
+            echo "::error::APK assinado com a chave de depuração."
+            exit 1
+          fi
+
+      # ── Os dois ativos, com os nomes que a base instalada já procura ─────────
+      #
+      # `Lume-Mobile.apk` e `mobile-latest.json` são publicados desde a v0.5.0, e
+      # o atualizador que está nos aparelhos busca exatamente esses nomes em
+      # `releases/latest/download/`. Publicar com outro nome equivale a não
+      # publicar: quem tem o aplicativo instalado nunca descobriria a versão nova.
+      #
+      # O nome do APK não é cosmético — ele entra dentro da URL que o manifesto
+      # anuncia, então renomear o arquivo muda o endereço que o aparelho baixa.
+      - name: Prepara os ativos móveis
+        id: ativos
+        run: |
+          set -euo pipefail
+          versao="$(node -p "require('./package.json').version")"
+
+          # `versionCode` e `versionName` do APK vêm deste mesmo `package.json`.
+          # Se a tag discordar dele, o release sai anunciando uma versão e
+          # instalando outra — e como o `versionCode` é derivado, o número também
+          # estaria errado. Melhor falhar aqui do que descobrir no aparelho.
+          if [ -n "${GITHUB_REF_NAME:-}" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ] \
+             && [ "v$versao" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::A tag $GITHUB_REF_NAME não corresponde à versão $versao do package.json."
+            exit 1
+          fi
+
+          apk="$RUNNER_TEMP/Lume-Mobile.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "$apk"
+
+          # Fora de uma tag, `GITHUB_REF_NAME` é o nome do ramo, e usá-lo geraria
+          # uma URL que não existe. No ensaio a tag derivada da versão é o que o
+          # release real teria — o manifesto sai idêntico ao que seria publicado.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then tag="$GITHUB_REF_NAME"; else tag="v$versao"; fi
+
+          node scripts/mobile-release-manifest.mjs \
+            --version "$versao" \
+            --apk "$apk" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$tag" \
+            --output "$RUNNER_TEMP/mobile-latest.json"
+
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "manifesto=$RUNNER_TEMP/mobile-latest.json" >> "$GITHUB_OUTPUT"
+
+      # Confere que o `versionCode` do APK supera o da última versão publicada.
+      # Um número que não sobe faz o Android recusar a instalação como retrocesso
+      # — falha que só aparece no aparelho de quem já tinha o aplicativo, e nunca
+      # em quem instala do zero. É o defeito mais fácil de publicar sem perceber.
+      - name: Confere que a versão sobe
+        run: |
+          set -euo pipefail
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          novo=$("$AAPT" dump badging "${{ steps.ativos.outputs.apk }}" \
+                 | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)
+          publicado=$(curl -fsSL --max-time 30 \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/mobile-latest.json" \
+            | node -e "
+              let e='';process.stdin.on('data',d=>e+=d).on('end',()=>{
+                const p=JSON.parse(e).version.split('.').map(n=>parseInt(n)||0);
+                while(p.length<4)p.push(0);
+                console.log(p[0]*100000000+p[1]*1000000+p[2]*1000+p[3]);
+              })" 2>/dev/null || echo 0)
+          echo "versionCode novo=$novo publicado=$publicado"
+          if [ "$novo" -le "$publicado" ]; then
+            echo "::error::versionCode $novo não supera o publicado ($publicado). O Android recusaria a atualização."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lume-android-apk
+          path: |
+            ${{ steps.ativos.outputs.apk }}
+            ${{ steps.ativos.outputs.manifesto }}
+
+      # Só numa tag. Num `workflow_dispatch` o job constrói, testa, confere a
+      # assinatura e a subida de versão, mas não publica — serve de ensaio
+      # completo sem criar release.
+      - name: Anexa ao release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "${{ steps.ativos.outputs.apk }}" \
+            "${{ steps.ativos.outputs.manifesto }}" --clobber

@@ -63,12 +63,23 @@
     <string name="sessoes_vazio_titulo">No agents running</string>
     <string name="sessoes_vazio_corpo">As soon as one starts, it appears here.</string>
 
+    <!--
+        Nunca pareado é diferente de desconectado, e a diferença é a ação: um
+        aparelho pareado espera; um que nunca pareou precisa ler um QR. Por isso
+        estas frases existem em vez de reusar "Sem conexão com %1$s", que sem
+        nome vira "Sem conexão com " e não diz o que fazer.
+    -->
+    <string name="sem_aparelho_titulo">No computer paired</string>
+    <string name="sem_aparelho_corpo">Read the code shown in Lume on your computer to start following your agents.</string>
+    <string name="sem_aparelho_acao">Pair a computer</string>
+
     <!-- Erro de conexão -->
     <string name="erro_titulo">No connection to %1$s</string>
     <string name="erro_corpo">Check that the computer is on and on the same network.</string>
     <string name="erro_tentar_novamente">Try again</string>
 
     <!-- Sessão -->
+    <string name="sessao_encerrada">This session has ended</string>
     <string name="sessao_atividade">Activity</string>
     <string name="risco_alto">High risk</string>
     <string name="risco_medio">Medium risk</string>
@@ -92,6 +103,18 @@
     <string name="prompt_aviso_terminal">This opens a terminal on the computer</string>
     <string name="prompt_enviar">Send</string>
 
+    <!--
+        Falha de ação, mostrada no ponto do gesto. Nomeada por código do
+        protocolo. `permission_gone` não está aqui de propósito: o protocolo diz
+        que é situação normal, e ele acende o cartão "respondida em outro
+        dispositivo" em vez de uma mensagem de erro.
+    -->
+    <string name="acao_falhou_desconectado">No connection. The computer did not receive this.</string>
+    <string name="acao_falhou_ocupada">The session is busy. Wait for the agent to finish.</string>
+    <string name="acao_falhou_indisponivel">This action is not available for this session.</string>
+    <string name="acao_falhou_outro">It did not work. Try again.</string>
+    <string name="conexao_sem_estado_conhecido">No connection · nothing received yet</string>
+
     <!-- Afordâncias -->
     <string name="acao_voltar">Back</string>
     <string name="acao_fechar">Close</string>
@@ -112,6 +135,17 @@
     -->
     <string name="evento_concluido">Session completed</string>
     <string name="evento_falhou">Session failed</string>
+
+    <!--
+        Falha ao carregar o histórico. Nomeada por **código** do protocolo, e não
+        pela mensagem que o cliente carrega: aquela é literal em pt-BR.
+        "Nada registrado ainda" seria mentira aqui — não é que não haja nada, é
+        que não deu para perguntar.
+    -->
+    <string name="historico_falhou_titulo">Could not load history</string>
+    <string name="historico_falhou_desconectado">There is no connection to the computer right now.</string>
+    <string name="historico_falhou_indisponivel">This computer does not offer history yet. Update Lume on it.</string>
+    <string name="historico_falhou_outro">Try again in a moment.</string>
 
     <!-- Ajustes -->
     <string name="ajustes_titulo">Settings</string>
@@ -140,10 +174,15 @@
         A tela precisa dizer que ler o QR é obrigatório. Sem esta linha,
         "Digitar endereço" passa por alternativa de pareamento — e não é uma.
     -->
+    <!--
+        A tela precisa dizer que ler o QR é obrigatório. Sem esta linha,
+        "Digitar endereço" passa por alternativa de pareamento — e não é uma.
+    -->
     <string name="pareamento_permissao_corpo">The camera is used only to read the pairing code. Nothing is recorded or sent.</string>
     <string name="pareamento_permissao_botao">Allow</string>
     <string name="pareamento_permissao_negada">Camera access is off. Enable it in Android settings to pair.</string>
     <string name="pareamento_conectando">Connecting to %1$s…</string>
+    <string name="pareamento_conectando_sem_nome">Connecting…</string>
     <string name="pareamento_erro_versao">This code was made by a newer Lume. Update the app on your phone.</string>
     <string name="pareamento_erro_corrompido">Could not read the code. Move closer and try again.</string>
     <string name="pareamento_exige_qr">Pairing requires reading the code. Entering an address only helps once it has been read.</string>
@@ -154,4 +193,25 @@
     <string name="manual_explicacao">The pairing code and the certificate travel only inside the QR code. This screen just says where to connect.</string>
     <string name="manual_erro_endereco">Enter an address</string>
     <string name="manual_erro_porta">Port between 1 and 65535</string>
+
+    <!--
+        Atualização. "Verificar" e "Baixar" nunca aparecem juntos: cada estado
+        oferece um gesto só, porque só há um caminho sensato de cada vez.
+    -->
+    <string name="atualizacao_ociosa">Updates are checked when the app opens</string>
+    <string name="atualizacao_verificando">Checking…</string>
+    <string name="atualizacao_em_dia">You are on the latest version</string>
+    <string name="atualizacao_disponivel">Version %1$s is available</string>
+    <string name="atualizacao_baixando">Downloading…</string>
+    <string name="atualizacao_baixando_pct">Downloading… %1$d%%</string>
+    <string name="atualizacao_pronta">Version %1$s is ready to install</string>
+    <string name="atualizacao_autorizar">Android needs permission to install apps from Lume</string>
+    <string name="atualizacao_erro_rede">Could not reach the update server</string>
+    <string name="atualizacao_erro_sha">The downloaded file does not match the published one</string>
+    <string name="atualizacao_erro_assinatura">The download is not signed by Lume</string>
+    <string name="atualizacao_erro_desconhecido">The update check failed</string>
+    <string name="atualizacao_verificar">Check</string>
+    <string name="atualizacao_baixar">Download</string>
+    <string name="atualizacao_instalar">Install</string>
+    <string name="atualizacao_abrir_ajustes">Open settings</string>
 </resources>

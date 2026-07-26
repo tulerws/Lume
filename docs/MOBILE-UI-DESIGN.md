@@ -86,10 +86,13 @@ Comando, caminho e saída de ferramenta usam **monoespaçada**, nunca Inter — 
 
 O logo é pixel-art com `shape-rendering="crispEdges"`, construído em blocos de 32 numa grade de 512. Ícone de traço arredondado do Material ao lado disso destoa.
 
-- **Destinos da barra inferior e glifos de estado**: grade de pixel, sem antialiasing, sem traço variável. Os glifos de estado **já existem** dentro de `LumeMascot.svelte` como paths — sucesso, falha, atenção e espera — e são portados diretamente para `VectorDrawable`.
+- **Glifos de estado**: grade de pixel, sem antialiasing, sem traço variável. Eles **já existem** dentro de `LumeMascot.svelte` como paths — sucesso, falha, atenção e espera — e são portados diretamente.
+- **Destinos da barra inferior**: **traçados**, grade de 20, medidos do rodapé do desktop (`+page.svelte`, `footer button svg`). `fill: none`, `stroke: currentColor`, espessura 1,65, pontas arredondadas. Dois círculos para Sessões, três linhas para Histórico, engrenagem para Ajustes.
 - **Afordâncias universais** (voltar, fechar, enviar, câmera): Material Symbols, peso 400. Desenhar essas em pixel-art prejudicaria o reconhecimento sem ganho de identidade.
 
-A fronteira é essa e não deve ser borrada: pixel para o que é do Lume, Material para o que é do Android.
+A fronteira é essa: pixel para a **marca** — logo, mascote, glifos de estado —, traço para navegação e afordância.
+
+**Os destinos já foram pixel, e a mudança tem motivo.** A regra original derivava do logo, e o logo é pixel-art. Mas o rodapé do próprio desktop usa traço, e para uma barra de navegação a referência certa é a barra de navegação, não a marca. Quadrados em grade de pixel num aparelho de 384dp leem como blocos, não como ícones.
 
 ## Movimento
 
@@ -129,26 +132,44 @@ Quando `Settings.Global.ANIMATOR_DURATION_SCALE` é `0`, o mascote congela no qu
 
 ### Barra inferior
 
-Altura `64dp` mais o inset de gestos. Superfície `surface`, borda superior de 1dp em `line`, sem sombra além da especificada. Item selecionado em `accent` com o rótulo em `overline`; não selecionado em `inkMuted`. Sem indicador de pílula do Material — o realce é cor e peso, como no desktop.
+**Pílula flutuante**, não barra fixa. Altura `64dp`, margem lateral de 16dp, 12dp acima do inset de gestos — o inset fica **por fora** dela. Superfície `surfaceRaised`, raio de pílula, sombra no valor do desktop.
 
-Destinos:
+O item selecionado ganha um **círculo de 48dp preenchido em `accent`**, com o ícone em `surface` e **sem rótulo**. Os demais mostram ícone em `inkMuted` sobre rótulo em `overline`.
 
 ```
 ┌──────────────────────────────────────────┐
 │                                          │
 │              conteúdo                    │
+│         (rola por baixo da barra)        │
 │                                          │
-├──────────────────────────────────────────┤
-│    ▣            ◫            ⚙           │
-│  Sessões     Histórico     Ajustes       │
+│    ╭────────────────────────────────╮    │
+│    │   ◍         ◫           ⚙      │    │
+│    │         Histórico    Ajustes   │    │
+│    ╰────────────────────────────────╯    │
 └──────────────────────────────────────────┘
 ```
+
+Três coisas que esta forma decide, e que o desenho anterior errou:
+
+- **O inset de gestos fica por fora da altura.** A primeira implementação aplicou `navigationBarsPadding()` **dentro** dos 64dp, então o inset era descontado do conteúdo em vez de somado à barra. Num Galaxy M13 sobravam ~20dp e o rótulo era cortado. Flutuando, o erro deixa de ser possível: a pílula tem altura própria.
+- **A lista rola por baixo.** Toda tela com lista precisa reservar espaço no fim — altura da pílula mais as margens mais o inset. Sem isso a última linha fica escondida, e "a última sessão sumiu" parece defeito de dados.
+- **O círculo é um indicador**, e este documento antes proibia indicadores. A proibição valia contra a pílula do Material, que é decoração genérica; este círculo é a âncora do destino ativo e foi escolhido deliberadamente.
+
+O custo aceito, registrado porque é real: o destino selecionado é o único cujo nome não se lê, e os ícones são abstratos. O `contentDescription` cobre o leitor de tela; quem enxerga depende do ícone.
 
 Três destinos, o mínimo que justifica uma barra inferior. O Histórico é sustentado pela mensagem `history.list` do protocolo — o dado de menor risco do produto, porque o desktop já o persiste sanitizado, sem comando, caminho ou payload.
 
 Notas de resultado (`list_result_notes`) ficam de fora: são recurso de autoria, e autoria no celular não é o problema que este aplicativo resolve.
 
-Pareamento e detalhe de sessão **não são destinos**: pareamento é abertura, detalhe é empilhamento.
+Pareamento e detalhe de sessão **não são destinos**: os dois são empilhamento.
+
+**O pareamento não é a abertura do aplicativo**, e já foi. Sem aparelho pareado, as três abas continuam acessíveis e dizem que não há conexão; a leitura do QR é alcançada por Ajustes → Aparelho, e pelo botão "Parear computador" no estado vazio de Sessões.
+
+Fazê-lo abertura criava um beco: com o pareamento na raiz da navegação, o X daquela tela desempilhava a única entrada e deixava a navegação sem nada para mostrar — o aplicativo congelava até ser reiniciado. E era um beco desnecessário, porque um celular sem pareamento tem o que mostrar: o estado de cada tela sem conexão, que é informação verdadeira.
+
+Nunca pareado e desconectado são **situações diferentes**, e a diferença é a ação. Pareado e sem rede: esperar, tentar de novo, conferir a rede. Nunca pareado: ler um QR — não há a que reconectar. O ponto no cabeçalho diz "Sem conexão" nos dois casos, porque o fato é o mesmo; o corpo da tela é que muda.
+
+Em consequência, a faixa "mostrando o último estado conhecido" **não aparece** para quem nunca pareou: não existe estado conhecido, e prometê-lo seria mentira.
 
 ### Histórico
 

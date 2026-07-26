@@ -58,12 +58,17 @@
     <string name="sessoes_vazio_titulo">Nenhum agente rodando</string>
     <string name="sessoes_vazio_corpo">Assim que um começar, ele aparece aqui.</string>
 
+    <string name="sem_aparelho_titulo">Nenhum computador pareado</string>
+    <string name="sem_aparelho_corpo">Leia o código que aparece no Lume do computador para começar a acompanhar seus agentes.</string>
+    <string name="sem_aparelho_acao">Parear computador</string>
+
     <!-- Erro de conexão -->
     <string name="erro_titulo">Sem conexão com %1$s</string>
     <string name="erro_corpo">Verifique se o computador está ligado e na mesma rede.</string>
     <string name="erro_tentar_novamente">Tentar de novo</string>
 
     <!-- Sessão -->
+    <string name="sessao_encerrada">Esta sessão terminou</string>
     <string name="sessao_atividade">Atividade</string>
     <string name="risco_alto">Risco alto</string>
     <string name="risco_medio">Risco médio</string>
@@ -87,6 +92,12 @@
     <string name="prompt_aviso_terminal">Isto abre um terminal no computador</string>
     <string name="prompt_enviar">Enviar</string>
 
+    <string name="acao_falhou_desconectado">Sem conexão. O computador não recebeu isto.</string>
+    <string name="acao_falhou_ocupada">A sessão está ocupada. Aguarde o agente terminar.</string>
+    <string name="acao_falhou_indisponivel">Esta ação não está disponível para esta sessão.</string>
+    <string name="acao_falhou_outro">Não funcionou. Tente de novo.</string>
+    <string name="conexao_sem_estado_conhecido">Sem conexão · nada recebido ainda</string>
+
     <!-- Afordâncias -->
     <string name="acao_voltar">Voltar</string>
     <string name="acao_fechar">Fechar</string>
@@ -101,6 +112,11 @@
     <string name="historico_carregando">Carregando…</string>
     <string name="evento_concluido">Sessão concluída</string>
     <string name="evento_falhou">Sessão falhou</string>
+
+    <string name="historico_falhou_titulo">Não foi possível carregar o histórico</string>
+    <string name="historico_falhou_desconectado">Não há conexão com o computador agora.</string>
+    <string name="historico_falhou_indisponivel">Este computador ainda não oferece histórico. Atualize o Lume nele.</string>
+    <string name="historico_falhou_outro">Tente de novo daqui a pouco.</string>
 
     <!-- Ajustes -->
     <string name="ajustes_titulo">Ajustes</string>
@@ -129,6 +145,7 @@
     <string name="pareamento_permissao_botao">Permitir</string>
     <string name="pareamento_permissao_negada">O acesso à câmera está desligado. Ligue nos ajustes do Android para parear.</string>
     <string name="pareamento_conectando">Conectando a %1$s…</string>
+    <string name="pareamento_conectando_sem_nome">Conectando…</string>
     <string name="pareamento_erro_versao">Este código foi feito por um Lume mais novo. Atualize o aplicativo no celular.</string>
     <string name="pareamento_erro_corrompido">Não foi possível ler o código. Aproxime e tente de novo.</string>
     <string name="pareamento_exige_qr">O pareamento exige ler o código. Digitar endereço só ajuda depois que ele foi lido.</string>
@@ -139,4 +156,25 @@
     <string name="manual_explicacao">O código de pareamento e o certificado viajam só dentro do QR. Esta tela diz apenas onde conectar.</string>
     <string name="manual_erro_endereco">Informe um endereço</string>
     <string name="manual_erro_porta">Porta entre 1 e 65535</string>
+
+    <!--
+        Atualização. "Verificar" e "Baixar" nunca aparecem juntos: cada estado
+        oferece um gesto só, porque só há um caminho sensato de cada vez.
+    -->
+    <string name="atualizacao_ociosa">As atualizações são verificadas ao abrir o aplicativo</string>
+    <string name="atualizacao_verificando">Verificando…</string>
+    <string name="atualizacao_em_dia">Você está na versão mais recente</string>
+    <string name="atualizacao_disponivel">A versão %1$s está disponível</string>
+    <string name="atualizacao_baixando">Baixando…</string>
+    <string name="atualizacao_baixando_pct">Baixando… %1$d%%</string>
+    <string name="atualizacao_pronta">A versão %1$s está pronta para instalar</string>
+    <string name="atualizacao_autorizar">O Android precisa de permissão para instalar pelo Lume</string>
+    <string name="atualizacao_erro_rede">Não foi possível alcançar o servidor de atualização</string>
+    <string name="atualizacao_erro_sha">O arquivo baixado não confere com o publicado</string>
+    <string name="atualizacao_erro_assinatura">O download não está assinado pelo Lume</string>
+    <string name="atualizacao_erro_desconhecido">A verificação de atualização falhou</string>
+    <string name="atualizacao_verificar">Verificar</string>
+    <string name="atualizacao_baixar">Baixar</string>
+    <string name="atualizacao_instalar">Instalar</string>
+    <string name="atualizacao_abrir_ajustes">Abrir ajustes</string>
 </resources>

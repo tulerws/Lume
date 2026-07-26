@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    O único caminho que o provedor expõe.
+
+    `cache-path` resolve para `Context.getCacheDir()`, que é privado do aplicativo
+    e some quando o sistema precisa de espaço. É o lugar certo para um APK baixado:
+    ele só interessa entre o download e a instalação, e deixá-lo em `files/` faria
+    um arquivo de dezenas de megabytes sobreviver para sempre a uma instalação que
+    a pessoa cancelou.
+
+    O `path` restringe ao subdiretório `updates/`. Sem ele, o provedor emitiria
+    `content://` para qualquer coisa no cache — inclusive o que o OkHttp guarda ali.
+-->
+<paths>
+    <cache-path
+        name="atualizacoes"
+        path="updates/" />
+</paths>

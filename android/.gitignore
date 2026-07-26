@@ -15,5 +15,12 @@
 .cxx
 local.properties
 
+# Keystore de assinatura. Nunca versionado: quem o tiver pode publicar uma
+# atualização que substitui a sua em qualquer aparelho instalado.
+*.p12
+*.jks
+*.keystore
+*.base64
+
 # Saída de compilação do Kotlin fora de `/build`.
 .kotlin/

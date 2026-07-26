@@ -28,9 +28,23 @@
           vez de vazar comando e caminho em texto puro pela rede local.
     -->
 
+    <!--
+        REQUEST_INSTALL_PACKAGES entrou com o atualizador. É a permissão mais
+        sensível que este aplicativo declara, e vale registrar o que ela **não**
+        concede: nada é instalado em silêncio. Ela apenas dá o direito de
+        *apresentar* um APK ao instalador do sistema, que exibe a própria tela e
+        exige confirmação a cada vez. Além disso o sistema recusa qualquer pacote
+        assinado por chave diferente da que instalou este aqui — de modo que nem um
+        manifesto adulterado nem uma rede hostil conseguem trocar o aplicativo.
+
+        A alternativa seria mandar a pessoa para o navegador baixar o APK na mão.
+        Isso não remove risco nenhum: continua terminando no mesmo instalador, com
+        os mesmos avisos, só que sem a conferência de SHA-256 que fazemos antes.
+    -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
@@ -60,6 +74,29 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            O instalador do sistema é outro processo, e desde o Android 7 ele não
+            aceita um `file://` apontando para dentro da nossa área privada — a
+            tentativa levanta `FileUriExposedException`. O provedor emite um
+            `content://` de uso único, concedido àquele processo pela duração da
+            intenção e revogado depois.
+
+            `exported="false"` com `grantUriPermissions="true"` é a combinação certa
+            e parece contraditória: nenhum aplicativo pode consultar este provedor
+            por conta própria, e mesmo assim quem recebe a intenção consegue ler o
+            arquivo exato que nomeamos. A autoridade repete a do aplicativo anterior
+            para não haver duas convenções na mesma base instalada.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>
