@@ -636,6 +636,7 @@ mod linux {
 
 #[derive(Clone, Copy, Debug)]
 pub struct XwaylandDragTarget {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     client: u64,
 }
 
