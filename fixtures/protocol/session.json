@@ -1,0 +1,63 @@
+{
+  "id": "s-1",
+  "agent": "claude",
+  "agentLabel": "Claude",
+  "project": "Lume",
+  "source": "cli",
+  "sourceApp": "Ghostty",
+  "status": "waiting_for_input",
+  "statusLabel": "Aguardando resposta",
+  "startedAt": "2026-07-26T12:00:00Z",
+  "updatedAt": 1785000000,
+  "processId": 4242,
+  "nativeSessionId": "9b7acb3c-f085-4a9f-ab60-5e87c2b257ed",
+  "workingDirectory": "/home/lume/projetos/Lume",
+  "permissionProfile": {
+    "mode": "workspace_write",
+    "label": "Escrita no workspace",
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "lume",
+    "canRespondFromLume": true,
+    "availableActions": [
+      "allow_once",
+      "allow_session",
+      "deny"
+    ]
+  },
+  "pendingPermission": {
+    "id": "p-1",
+    "kind": "command",
+    "summary": "Rodar os testes",
+    "resource": "cargo test",
+    "risk": "low",
+    "requestedAt": "2026-07-26T12:01:00Z"
+  },
+  "lastResponse": "Pronto.",
+  "results": [
+    {
+      "id": "r-1",
+      "response": "Testes passaram.",
+      "createdAt": 1785000001,
+      "files": [
+        "src/lib.rs"
+      ],
+      "tests": [
+        "discovery::tests"
+      ]
+    }
+  ],
+  "activities": [
+    {
+      "id": "a-1",
+      "kind": "tool",
+      "title": "cargo test",
+      "detail": "210 passaram",
+      "status": "completed",
+      "createdAt": 1785000002,
+      "files": [
+        "src/discovery.rs"
+      ]
+    }
+  ],
+  "acceptsPrompt": true
+}

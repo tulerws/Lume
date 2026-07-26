@@ -234,10 +234,15 @@ private fun FaixaDeSessaoEncerrada() {
 /**
  * O texto dentro do campo: a dica quando dá para escrever, o **motivo** quando não
  * dá. Campo desabilitado sem explicação é interface muda.
+ *
+ * A recusa permanente vem **antes** do estado, e a ordem é a informação: uma
+ * sessão sem retomada pode estar executando, e dizer "aguarde o agente terminar"
+ * prometeria que esperar resolve. Não resolve — nunca vai aceitar prompt.
  */
 @Composable
 private fun motivoOuDica(sessao: AgentSession, encerrada: Boolean = false): String = when {
     encerrada -> stringResource(R.string.sessao_encerrada)
+    !sessao.acceptsPrompt -> stringResource(R.string.prompt_desabilitado_sem_retomada)
     else -> when (sessao.status) {
         SessionStatus.Running -> stringResource(R.string.prompt_desabilitado_executando)
         SessionStatus.PermissionRequired -> stringResource(R.string.prompt_desabilitado_permissao)

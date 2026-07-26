@@ -151,6 +151,31 @@ fn is_lume_codex_process(command: &str) -> bool {
     command.contains("127.0.0.1:43130") || command.contains("--remote ws://127.0.0.1:43131")
 }
 
+/// Subcomandos do Claude Code que são **infraestrutura**, não conversa.
+///
+/// O `claude daemon` supervisiona sessões de segundo plano e o `claude
+/// bg-pty-host` hospeda o terminal de uma delas. Nenhum dos dois é uma sessão:
+/// não têm conversa, não têm identificador de retomada, e o `cwd` do daemon é o
+/// diretório de onde o serviço subiu — quase sempre `$HOME`.
+///
+/// Sem esta exclusão eles não apenas apareciam: eles **venciam**. A regra do
+/// ancestral mais próximo da raiz existe para colapsar uma sessão e seus
+/// subcomandos efêmeros num processo só, e supõe que o mais alto da cadeia é a
+/// sessão. O daemon inverteu a suposição — ele é ancestral de várias sessões
+/// independentes, então era ele quem sobrava, levando o `$HOME` junto. Um prompt
+/// enviado do celular abria terminal no diretório errado.
+///
+/// **Escopado ao Claude de propósito.** A comparação exige a forma `claude
+/// <subcomando>`, e não a palavra solta: um processo do Codex que trouxesse
+/// `daemon` nos argumentos não pode ser atingido por isto. Codex e Gemini
+/// atravessam esta função sem serem tocados, e há teste fixando isso.
+fn is_claude_infrastructure(tokens: &[&str]) -> bool {
+    const SUBCOMANDOS: [&str; 2] = ["daemon", "bg-pty-host"];
+    tokens.windows(2).any(|par| {
+        par[0] == "claude" && SUBCOMANDOS.contains(&par[1])
+    })
+}
+
 fn process_descends_from(system: &System, mut child: sysinfo::Pid, ancestor: sysinfo::Pid) -> bool {
     for _ in 0..12 {
         let Some(parent) = system.process(child).and_then(|process| process.parent()) else {
@@ -192,9 +217,27 @@ fn source_for(system: &System, mut pid: sysinfo::Pid) -> SessionSource {
     SessionSource::Cli
 }
 
+/// O executável mora dentro de um diretório chamado exatamente `claude`?
+///
+/// É como o Claude Code aparece quando roda a partir da versão instalada:
+/// `~/.local/share/claude/versions/2.1.220`. O último segmento é o número da
+/// versão, então a comparação por nome de arquivo — que é a que todos os outros
+/// agentes usam — não encontra nada. O processo da sessão de verdade era
+/// invisível para a descoberta, e sobrava apenas a infraestrutura ao redor dele.
+///
+/// A comparação é por **segmento exato**, e isso é o que limita o estrago:
+/// `~/.claude/...` tem o segmento `.claude`, e `~/claude-notes/...` tem
+/// `claude-notes` — nenhum dos dois casa. Só um diretório com o nome cru.
+fn caminho_do_claude(token: &str) -> bool {
+    token
+        .split(['/', '\\'])
+        .any(|segmento| segmento.trim_matches(['"', '\'']) == "claude")
+}
+
 fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
-    let tokens = command
-        .split_whitespace()
+    let brutos = command.split_whitespace().collect::<Vec<_>>();
+    let tokens = brutos
+        .iter()
         .map(|token| {
             token
                 .rsplit(['/', '\\'])
@@ -205,7 +248,17 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
         .collect::<Vec<_>>();
     if name == "codex" || tokens.iter().any(|token| token == &"codex") {
         Some(AgentKind::Codex)
-    } else if name == "claude" || tokens.iter().any(|token| token == &"claude") {
+    } else if is_claude_infrastructure(&tokens) {
+        // Depois do Codex, e não antes: preservar a ordem original é o que
+        // garante que nenhum processo hoje classificado como Codex mude de
+        // resposta por causa desta adição.
+        None
+    } else if name == "claude"
+        || tokens.iter().any(|token| token == &"claude")
+        // Só o executável, nunca os argumentos. `vim ~/claude/notas.md` tem um
+        // segmento `claude` num argumento e não é sessão de agente nenhuma.
+        || brutos.first().is_some_and(|executavel| caminho_do_claude(executavel))
+    {
         Some(AgentKind::Claude)
     } else if name == "gemini" || tokens.iter().any(|token| token == &"gemini") {
         Some(AgentKind::Gemini)
@@ -319,6 +372,69 @@ mod tests {
         assert!(is_lume_codex_process(
             "codex --remote ws://127.0.0.1:43131 resume chat"
         ));
+    }
+
+    /// O caso que produziu o defeito.
+    ///
+    /// O `claude daemon` roda a partir de `$HOME` e é ancestral das sessões de
+    /// segundo plano. Enquanto ele era candidato, a regra do ancestral mais
+    /// próximo da raiz descartava as sessões e mantinha ele — e um prompt vindo
+    /// do celular abria terminal em `$HOME`.
+    #[test]
+    fn claude_infrastructure_is_not_a_session() {
+        assert_eq!(
+            detect_agent("claude", "/home/user/.local/bin/claude daemon"),
+            None
+        );
+        assert_eq!(
+            detect_agent(
+                "2.1.220",
+                "claude bg-pty-host --bg-pty-host /tmp/cc-daemon/x.sock 200 50 -- /home/user/.local/share/claude/versions/2.1.220"
+            ),
+            None
+        );
+    }
+
+    /// O processo da sessão de verdade: o último segmento é a versão, não o nome.
+    #[test]
+    fn versioned_claude_binary_is_a_session() {
+        assert_eq!(
+            detect_agent(
+                "2.1.220",
+                "/home/user/.local/share/claude/versions/2.1.220 --session-id 9b7acb3c --fork-session"
+            ),
+            Some(AgentKind::Claude)
+        );
+    }
+
+    /// O segmento tem de ser o nome cru, e só no executável.
+    #[test]
+    fn claude_lookalikes_are_not_sessions() {
+        // Diretório de configuração, não instalação.
+        assert_eq!(detect_agent("nvim", "/usr/bin/nvim /home/user/.claude/settings.json"), None);
+        // Nome que apenas começa igual.
+        assert_eq!(detect_agent("nvim", "/usr/bin/nvim /home/user/claude-notes/a.md"), None);
+        // Segmento certo, mas num argumento: quem abre o arquivo não é o agente.
+        assert_eq!(detect_agent("nvim", "/usr/bin/nvim /home/user/claude/a.md"), None);
+    }
+
+    /// A promessa desta mudança: **Codex e Gemini não mudam de classificação.**
+    ///
+    /// O ramo do Codex é avaliado antes de tudo que foi acrescentado, e o do
+    /// Gemini não foi tocado. Este teste é o que impede uma refatoração futura de
+    /// reordenar os ramos sem perceber o que quebrou.
+    #[test]
+    fn codex_and_gemini_are_untouched() {
+        assert_eq!(detect_agent("codex", "/usr/bin/codex"), Some(AgentKind::Codex));
+        assert_eq!(detect_agent("bash", "codex resume abc"), Some(AgentKind::Codex));
+        // `daemon` nos argumentos de um processo Codex não pode excluí-lo: a
+        // exclusão exige a forma `claude <subcomando>`.
+        assert_eq!(detect_agent("codex", "/usr/bin/codex daemon"), Some(AgentKind::Codex));
+        assert_eq!(detect_agent("gemini", "/usr/bin/gemini"), Some(AgentKind::Gemini));
+        assert_eq!(detect_agent("bash", "gemini chat"), Some(AgentKind::Gemini));
+        // Claude comum, do jeito que sempre foi detectado.
+        assert_eq!(detect_agent("claude", "/usr/bin/claude"), Some(AgentKind::Claude));
+        assert_eq!(detect_agent("bash", "claude --resume abc"), Some(AgentKind::Claude));
     }
 
     #[test]

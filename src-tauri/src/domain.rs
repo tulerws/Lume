@@ -269,6 +269,61 @@ pub struct AgentSession {
     pub activities: Vec<SessionActivity>,
 }
 
+impl AgentSession {
+    /// A recusa **permanente** desta sessão a prompts, se houver.
+    ///
+    /// "Permanente" é a palavra que importa: aqui não entra
+    /// [`PromptRefusal::SessionBusy`], que depende do que o agente está fazendo
+    /// neste instante e some sozinho. O que esta função responde é se a sessão
+    /// tem, no cadastro, os dados sem os quais a retomada **nunca** vai
+    /// funcionar — e por isso ela é derivável do próprio `AgentSession`, sem
+    /// olhar para estado nenhum.
+    ///
+    /// Existe porque a mesma pergunta era feita em dois lugares. O
+    /// `send_prompt` a respondia espalhada pelos seus ramos, e o aplicativo
+    /// Android a respondia de novo, por conta própria, para decidir se desenhava
+    /// o campo de prompt. As duas respostas divergiram: o celular abria o campo
+    /// numa sessão que o servidor recusava, e quem digitava recebia *"Esta ação
+    /// não está disponível para esta sessão"* depois de ter escrito o texto.
+    ///
+    /// Agora há uma resposta só. `send_prompt` chama esta função, e o resultado
+    /// viaja para o celular como `acceptsPrompt` no `sessions.snapshot`. Não
+    /// existe estado em que a tela e o servidor discordem, porque é o mesmo
+    /// código decidindo os dois.
+    pub fn prompt_refusal(&self) -> Option<PromptRefusal> {
+        // Sessão web vai pelo Companion do Chromium, que não retoma processo
+        // nenhum: não precisa de identificador nem de diretório.
+        if self.source == SessionSource::Web {
+            return None;
+        }
+        if self.agent == AgentKind::Codex {
+            // O Codex é retomado por thread, e a thread é o identificador nativo.
+            // Diretório de trabalho não entra: quem o conhece é o App Server.
+            return self
+                .native_session_id
+                .is_none()
+                .then_some(PromptRefusal::CodexThreadMissing);
+        }
+        if self.agent == AgentKind::Unknown {
+            return Some(PromptRefusal::AgentWithoutResume);
+        }
+        // Claude e Gemini sobem por linha de comando, e ela precisa das duas
+        // coisas: o que retomar, e onde.
+        if self.native_session_id.is_none() {
+            return Some(PromptRefusal::ResumeIdMissing);
+        }
+        if self.working_directory.is_none() {
+            return Some(PromptRefusal::WorkingDirectoryMissing);
+        }
+        None
+    }
+
+    /// Atalho de leitura para [`Self::prompt_refusal`]. É o que vai no protocolo.
+    pub fn accepts_prompt(&self) -> bool {
+        self.prompt_refusal().is_none()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {

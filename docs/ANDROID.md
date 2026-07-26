@@ -199,6 +199,10 @@ Para Codex aberto pelo Lume e para sessões web não há esse efeito, e o aviso 
 
 A recusa por sessão ocupada (`session_busy`) é estado esperado, não erro: o campo de prompt fica desabilitado enquanto a sessão está em execução ou aguardando permissão, com o motivo escrito.
 
+Há uma segunda espécie de recusa, e confundi-las foi defeito real. `session_busy` passa sozinha; `acceptsPrompt` falso **não passa nunca** — a sessão não tem identificador de retomada, não tem diretório de trabalho, ou é de um agente que o Lume não retoma. O campo vem calculado do desktop (ver [REMOTE-CONTROL.md](REMOTE-CONTROL.md#o-campo-derivado-acceptsprompt)) e **não é recalculado aqui**: reimplementá-lo foi o que fez o aplicativo abrir o campo de prompt numa sessão que o servidor sempre recusaria, e quem digitava só descobria depois de enviar.
+
+A ordem em que os dois motivos são anunciados é informação: a permanente vem primeiro. Uma sessão sem retomada pode estar executando, e dizer "aguarde o agente terminar" prometeria que esperar resolve.
+
 ## Build e distribuição
 
 - `applicationId` **`com.tulerws.lume.mobile`**, e ele é imutável. Quatro APKs já foram publicados sob esse identificador (v0.5.0 a v0.5.3); trocá-lo faria o Android instalar esta versão *ao lado* do que a pessoa já tem, em vez de atualizá-lo.
@@ -238,6 +242,7 @@ Testável sem aparelho:
 - **Portão de origem do atualizador**: recusando texto puro, `http` sem cifra, domínio que *contém* `github.com`, subdomínio, outro repositório e caminho que não é o de download. Os negativos são o teste; o positivo passaria com uma função que devolve `true`. URL com credenciais embutidas **não** está entre os recusados, pelo motivo registrado acima.
 - **Conferência de assinatura**: recusando APK de outro `applicationId`, APK assinado com chave diferente, e — o caso que passa despercebido — APK e aplicativo ambos sem assinatura legível, que sem o guarda de conjunto vazio seriam considerados iguais.
 - **Leitura do manifesto**: contra uma cópia byte a byte do `mobile-latest.json` publicado, mais um campo desconhecido — que não pode derrubar a leitura, porque aparelhos antigos não têm como receber um modelo novo antes de atualizar.
+- **Contrato com o desktop**: `session.json`, gerado pelo Rust, lido com `ignoreUnknownKeys = false`. Mais as duas asserções que provam que a trava está armada dos dois lados — campo desconhecido **derruba** o parser estrito, e **não** derruba o de produção. Sem a segunda, alguém "consertaria" o `JsonDoProtocolo` para ser estrito e quebraria a compatibilidade para a frente sem nenhum teste reclamar.
 
 Exige aparelho físico:
 

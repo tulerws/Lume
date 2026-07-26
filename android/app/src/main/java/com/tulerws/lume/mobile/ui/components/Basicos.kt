@@ -22,6 +22,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.tulerws.lume.mobile.R
@@ -55,12 +57,48 @@ fun LumeLogo(modifier: Modifier = Modifier, tamanho: Dp = 26.dp) {
 /**
  * Ponto e rótulo do estado da conexão.
  *
- * Os dois juntos, sempre. Cor nunca é o único portador de estado — quem não
- * distingue o verde do cinza lê "Conectado" ou "Sem conexão" do lado.
+ * ## Sobre [comRotulo]
+ *
+ * O padrão é `true`, e a tela de Sessões o mantém: é onde se passa o tempo, e o
+ * estado da conexão muda o que a lista significa — cache velho ou dado ao vivo.
+ *
+ * Em Ajustes o rótulo sai, por decisão de desenho: ali o estado acompanha o
+ * cartão do aparelho pareado, onde o nome da máquina já é a informação
+ * principal, e um "Conectado" escrito ao lado repete o que o ponto diz.
+ *
+ * Onde o rótulo some, ele **não desaparece**: vira `contentDescription`, e o
+ * TalkBack continua anunciando "Conectado" ou "Sem conexão". Sem isso a cor
+ * ficaria como único portador de estado, que é o que o resto desta base evita —
+ * e neste componente em particular seria grave, porque os quatro estados incluem
+ * verde e vermelho, o par que a forma mais comum de daltonismo confunde.
+ *
+ * ## Sobre as quatro cores
+ *
+ * Não é um binário verde/vermelho. `Conectando` tem tom próprio porque é o
+ * estado de **toda abertura do aplicativo**: pintá-lo de vermelho faria o Lume
+ * piscar um alarme falso toda vez que fosse aberto. E `Desconectado` é separado
+ * de `Erro` porque o domínio os separa — situação contra evento.
  */
 @Composable
-fun PontoDeConexao(estado: ConnectionState, modifier: Modifier = Modifier) {
+fun PontoDeConexao(
+    estado: ConnectionState,
+    modifier: Modifier = Modifier,
+    comRotulo: Boolean = true,
+) {
     val cores = coresDaConexao(estado)
+    val rotulo = stringResource(rotuloDaConexao(estado))
+
+    if (!comRotulo) {
+        Box(
+            modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(cores.fill)
+                .semantics { contentDescription = rotulo },
+        )
+        return
+    }
+
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
@@ -73,7 +111,7 @@ fun PontoDeConexao(estado: ConnectionState, modifier: Modifier = Modifier) {
                 .background(cores.fill),
         )
         Text(
-            text = stringResource(rotuloDaConexao(estado)),
+            text = rotulo,
             style = LumeTheme.typography.label,
             color = cores.on,
         )

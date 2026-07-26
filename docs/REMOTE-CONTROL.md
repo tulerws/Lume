@@ -504,7 +504,7 @@ A serialização segue a do backend: **camelCase**, igual ao que `serde` já emi
 | `type` | Quando | `payload` |
 | --- | --- | --- |
 | `ready` | logo após autenticar | `{ protocolVersion, appVersion, hostname, serverTime }` |
-| `sessions.snapshot` | ao conectar | `{ sessions: AgentSession[] }`, já na ordem de exibição |
+| `sessions.snapshot` | ao conectar | `{ sessions: AgentSession[] }`, já na ordem de exibição — ver *[O campo derivado](#o-campo-derivado-acceptsprompt)* |
 | `sessions.delta` | a cada mudança | `{ updated: AgentSession[], removed: string[], order: string[] }` |
 | `notify` | quando `should_notify` aprova | `{ kind, sessionId, agentLabel, project }` |
 | `result` | resposta a uma requisição | `{ ok: true }` mais dados quando houver |
@@ -752,6 +752,41 @@ O celular **não** ganha poder que o desktop não tem. Especificamente:
 O terceiro caso é o que exige atenção: enviar um prompt do celular para uma sessão Claude faz aparecer um terminal no computador, com o usuário longe dele. Isso não é defeito — é como a retomada funciona hoje — mas **o aplicativo deve avisar antes de enviar**, e não depois.
 
 Vale também no remoto a regra existente: prompt é recusado se a sessão está em `running` ou `permission_required` (`session_busy`).
+
+##### O campo derivado `acceptsPrompt`
+
+`session_busy` é recusa **passageira**: o agente está ocupado e vai desocupar. Existem outras quatro, e nenhuma delas passa — `CodexThreadMissing`, `AgentWithoutResume`, `ResumeIdMissing` e `WorkingDirectoryMissing` dizem que aquela sessão **nunca** vai aceitar prompt, porque falta o dado sem o qual a retomada não existe.
+
+A sessão enviada ao celular carrega, além dos campos de `AgentSession`, um booleano derivado:
+
+| Campo | Origem | Significado |
+| --- | --- | --- |
+| `acceptsPrompt` | `AgentSession::prompt_refusal`, em `domain.rs` | se esta sessão pode **algum dia** receber prompt |
+
+Ele é calculado, nunca armazenado, e a mesma função responde às duas perguntas: `send_prompt` a consulta antes de recusar, e o serializador a consulta para preencher o campo. **Não existe estado em que a tela e o servidor discordem**, porque é o mesmo código decidindo os dois.
+
+Isso não é preciosismo. Antes de o campo existir, o aplicativo Android reimplementava a regra por conta própria para decidir se desenhava o campo de prompt, e as duas versões divergiram: o celular abria o campo numa sessão em `waiting_for_input` sem identificador de retomada, e quem digitava recebia *"Esta ação não está disponível para esta sessão"* **depois** de ter escrito o texto.
+
+O cliente combina o campo com o estado: `acceptsPrompt` falso esconde a possibilidade de vez, com o motivo escrito; `running` ou `permission_required` desabilita temporariamente, com outro motivo. A recusa permanente é anunciada **antes** da passageira — uma sessão sem retomada pode estar executando, e dizer "aguarde o agente terminar" prometeria que esperar resolve.
+
+**Cliente antigo continua funcionando.** O campo é novo e o Kotlin o assume `true` quando ausente, que é o comportamento anterior: tenta, e no pior caso recebe a recusa do servidor.
+
+##### O contrato é fixado por arquivo
+
+O celular lê o protocolo com `ignoreUnknownKeys = true`, o que deixa aparelho antigo conversar com desktop novo — e faz um campo acrescentado aqui **desaparecer em silêncio** do outro lado.
+
+`fixtures/protocol/session.json` fecha esse buraco. Ele é gerado por `contrato_da_sessao_com_o_celular` (`remote_server.rs`) a partir de uma sessão com todos os campos preenchidos, e lido por `ContratoDoProtocoloTest` (Android) com `ignoreUnknownKeys = **false**`. Produção permissiva, teste estrito: mesma mensagem, ajustes opostos.
+
+Mudar o formato quebra o build nas duas pontas, nesta ordem:
+
+```
+Rust muda o payload  →  contrato_da_sessao_com_o_celular falha
+  →  LUME_UPDATE_FIXTURES=1 cargo test --lib contrato_da_sessao_com_o_celular
+  →  ContratoDoProtocoloTest falha com "Encountered an unknown key"
+  →  atualizar o modelo Kotlin
+```
+
+O arquivo mora em `fixtures/protocol/`, fora de `android/` e fora de `src-tauri/`, porque é contrato e nenhum dos dois lados é dono dele.
 
 #### Encerrar de longe
 

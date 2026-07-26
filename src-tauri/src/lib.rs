@@ -260,6 +260,17 @@ fn send_prompt(
     origin: Option<&str>,
 ) -> Result<(), PromptRefusal> {
     let session = accept_prompt(state, session_id, prompt)?;
+    // As recusas permanentes saem aqui, por uma função só — a mesma que produz o
+    // `acceptsPrompt` enviado ao celular. Antes elas viviam espalhadas pelos
+    // ramos abaixo, e o aplicativo Android reimplementava a regra por conta
+    // própria para decidir se desenhava o campo de prompt; as duas divergiram, e
+    // quem digitava numa sessão sem retomada só descobria depois de enviar.
+    //
+    // Os `ok_or` mais abaixo continuam existindo porque extraem os valores, e
+    // não porque decidem: depois desta linha eles não têm mais como falhar.
+    if let Some(refusal) = session.prompt_refusal() {
+        return Err(refusal);
+    }
     let prompt = prompt.trim();
     let result = if session.source == domain::SessionSource::Web {
         browser

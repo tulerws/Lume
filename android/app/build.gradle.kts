@@ -116,6 +116,22 @@ android {
     }
 
     /**
+     * A fixture do protocolo, gerada pelo Rust.
+     *
+     * Mora em `fixtures/protocol/` na raiz do repositório, e não dentro de
+     * `android/`, porque ela é **contrato entre os dois lados** — nenhum deles é
+     * dono. O teste do Rust a escreve, `ContratoDoProtocoloTest` a lê, e é essa
+     * travessia que impede um campo novo do desktop de sumir em silêncio aqui.
+     *
+     * Entra só no conjunto de teste: nada disso vai para dentro do APK.
+     */
+    sourceSets {
+        getByName("test") {
+            resources.srcDir("../../fixtures/protocol")
+        }
+    }
+
+    /**
      * Assinatura de release, lida **do ambiente**.
      *
      * Todo APK precisa ser assinado, e não há autoridade certificadora nisso: a

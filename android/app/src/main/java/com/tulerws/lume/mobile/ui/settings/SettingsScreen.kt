@@ -162,7 +162,7 @@ fun SettingsScreen(
                                     color = LumeTheme.colors.inkMuted,
                                 )
                             }
-                            PontoDeConexao(conexao)
+                            PontoDeConexao(conexao, comRotulo = false)
                         }
                         Divisor()
                         Box(

@@ -230,6 +230,26 @@ data class AgentSession(
     val lastResponse: String? = null,
     val results: List<SessionResult> = emptyList(),
     val activities: List<SessionActivity> = emptyList(),
+    /**
+     * Se esta sessão pode **algum dia** receber prompt. Calculado no desktop.
+     *
+     * Vem de `AgentSession::prompt_refusal`, em `src-tauri/src/domain.rs` — a
+     * mesma função que `send_prompt` consulta antes de recusar. Não é derivado
+     * aqui de propósito: já foi, e a regra reimplementada divergiu da original.
+     * O aplicativo abria o campo de prompt numa sessão que o servidor sempre
+     * recusaria, e quem digitava recebia "Esta ação não está disponível para esta
+     * sessão" **depois** de ter escrito o texto.
+     *
+     * O que ele responde é permanente — falta de identificador de retomada, de
+     * diretório de trabalho, agente sem retomada. O estado passageiro (agente
+     * ocupado) continua sendo lido de [status]; ver [aceitaPrompt].
+     *
+     * Padrão `true` para desktops anteriores a este campo: sem ele, um aparelho
+     * novo contra um desktop antigo esconderia o campo de prompt em toda sessão.
+     * Errar para o lado de tentar devolve, no pior caso, a recusa do servidor —
+     * que é o comportamento que existia antes.
+     */
+    val acceptsPrompt: Boolean = true,
 )
 
 /**
@@ -254,12 +274,25 @@ fun AgentSession.acoesRespondiveis(): List<PermissionAction> =
 /**
  * Se a sessão aceita prompt agora.
  *
- * Mesma regra do desktop: sessão em execução ou esperando resposta de permissão
- * recusa prompt com `session_busy`. Isso é estado esperado, não erro — o campo
- * fica desabilitado **com o motivo escrito**, nunca mudo.
+ * Duas recusas de naturezas diferentes, e a distinção decide o que a tela diz:
+ *
+ * · **Passageira** — sessão em execução ou esperando resposta de permissão. O
+ *   servidor recusa com `session_busy`, é estado esperado, e passa sozinho. O
+ *   campo fica desabilitado **com o motivo escrito**, nunca mudo.
+ * · **Permanente** — [AgentSession.acceptsPrompt], calculado no desktop: a
+ *   sessão não tem identificador de retomada, não tem diretório de trabalho, ou
+ *   é de um agente que o Lume não retoma. Esperar não resolve.
+ *
+ * Só a primeira era conferida aqui, e foi assim que uma sessão em
+ * `WaitingForInput` sem retomada passou no teste, abriu o campo, e recusou o
+ * texto depois de digitado. A segunda **não** é recalculada neste arquivo —
+ * reimplementá-la foi a causa do defeito. Ver o KDoc de
+ * [AgentSession.acceptsPrompt].
  */
 fun AgentSession.aceitaPrompt(): Boolean =
-    status != SessionStatus.Running && status != SessionStatus.PermissionRequired
+    acceptsPrompt &&
+        status != SessionStatus.Running &&
+        status != SessionStatus.PermissionRequired
 
 /**
  * Se enviar prompt daqui abre uma janela de terminal na máquina do usuário.

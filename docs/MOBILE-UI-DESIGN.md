@@ -268,6 +268,12 @@ Ancorado ao rodapé da tela de sessão, acima do teclado, com `imePadding()`.
 
 O ponto no cabeçalho e o mascote carregam a mesma informação em intensidades diferentes: `● Conectado` em `completed`, `● Conectando` em `waiting_for_input`, `● Sem conexão` em `idle`.
 
+**Em Ajustes o ponto vai sem rótulo**, e só ali. No cabeçalho de Sessões o par ponto+texto fica: é a tela onde se passa o tempo, e o estado da conexão muda o que a lista significa — cache velho ou dado ao vivo. No cartão do aparelho pareado o nome da máquina já é a informação principal, e um "Conectado" escrito ao lado repete o que o ponto diz.
+
+Onde o rótulo sai, ele **não é apagado**: vira `contentDescription`, e o TalkBack continua anunciando o estado. Sem isso a cor ficaria como único portador, o que esta interface evita em todo lugar — e aqui seria pior que a média, porque a paleta de conexão inclui verde e vermelho, o par que a forma mais comum de daltonismo confunde.
+
+**São quatro tons, não dois.** `Conectando` tem cor própria porque é o estado de toda abertura do aplicativo: pintá-lo de vermelho faria o Lume piscar um alarme falso toda vez que fosse aberto. E `Sem conexão` é separado de `Erro` porque o domínio os separa — situação contra evento, e só o segundo oferece "Tentar de novo".
+
 Desconectado, o conteúdo em cache aparece esmaecido a 60% de opacidade, com uma faixa fixa no topo. Lista parada por queda de conexão não pode ter a mesma aparência de lista de agentes parados — é a confusão mais provável desta interface.
 
 ## Mascote

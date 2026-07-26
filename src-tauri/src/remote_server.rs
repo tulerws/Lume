@@ -239,8 +239,37 @@ struct Ready {
 /// ele seria cópia literal dos identificadores que já estão na sequência.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionsSnapshot {
-    sessions: Vec<AgentSession>,
+struct SessionsSnapshot<'a> {
+    sessions: Vec<SessionParaCelular<'a>>,
+}
+
+/// A sessão como o celular a recebe: tudo que o desktop tem, mais o veredito.
+///
+/// `flatten` em vez de repetir os dezoito campos. Repeti-los criaria um segundo
+/// lugar para o formato da sessão existir, e a próxima pessoa a acrescentar um
+/// campo o acrescentaria só num deles — que é exatamente a classe de defeito que
+/// `acceptsPrompt` nasceu para fechar.
+///
+/// `acceptsPrompt` é **derivado**, nunca armazenado: sai de
+/// [`AgentSession::accepts_prompt`], a mesma função que `send_prompt` consulta
+/// antes de recusar. Guardá-lo como campo de verdade abriria a possibilidade de
+/// ele discordar da rotina que decide — e essa discordância seria invisível até
+/// alguém digitar um prompt e receber a recusa.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionParaCelular<'a> {
+    #[serde(flatten)]
+    sessao: &'a AgentSession,
+    accepts_prompt: bool,
+}
+
+impl<'a> From<&'a AgentSession> for SessionParaCelular<'a> {
+    fn from(sessao: &'a AgentSession) -> Self {
+        Self {
+            accepts_prompt: sessao.accepts_prompt(),
+            sessao,
+        }
+    }
 }
 
 /// Resposta a uma requisição que não devolve dados. O `id` do envelope é que
@@ -283,8 +312,8 @@ struct SubmitPrompt {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionsDelta {
-    updated: Vec<AgentSession>,
+struct SessionsDelta<'a> {
+    updated: Vec<SessionParaCelular<'a>>,
     removed: Vec<String>,
     order: Vec<String>,
 }
@@ -1115,7 +1144,9 @@ fn send_snapshot(
         &Envelope {
             kind: "sessions.snapshot",
             id: None,
-            payload: SessionsSnapshot { sessions },
+            payload: SessionsSnapshot {
+                sessions: sessions.iter().map(SessionParaCelular::from).collect(),
+            },
         },
     )
 }
@@ -1144,7 +1175,7 @@ fn send_delta(
             kind: "sessions.delta",
             id: None,
             payload: SessionsDelta {
-                updated: delta.updated,
+                updated: delta.updated.iter().map(SessionParaCelular::from).collect(),
                 removed: delta.removed,
                 order: delta.order,
             },
@@ -2942,6 +2973,166 @@ mod tests {
         assert_eq!(read_envelope(&mut socket)["type"], "ready");
         assert_eq!(read_envelope(&mut socket)["type"], "sessions.snapshot");
         socket
+    }
+
+    /// Uma sessão com **todos** os campos preenchidos.
+    ///
+    /// Nada de `None` nem de vetor vazio de propósito: a fixture só protege os
+    /// campos que aparecem nela, e um `Option` vazio poderia sair do JSON sem
+    /// ninguém notar. Preenchida assim, ela lista o formato inteiro.
+    fn sessao_canonica() -> AgentSession {
+        AgentSession {
+            id: "s-1".into(),
+            agent: AgentKind::Claude,
+            agent_label: "Claude".into(),
+            project: "Lume".into(),
+            source: SessionSource::Cli,
+            source_app: Some("Ghostty".into()),
+            status: crate::domain::SessionStatus::WaitingForInput,
+            status_label: "Aguardando resposta".into(),
+            started_at: "2026-07-26T12:00:00Z".into(),
+            updated_at: 1_785_000_000,
+            process_id: Some(4242),
+            native_session_id: Some("9b7acb3c-f085-4a9f-ab60-5e87c2b257ed".into()),
+            working_directory: Some("/home/lume/projetos/Lume".into()),
+            permission_profile: crate::domain::PermissionProfile {
+                mode: crate::domain::AccessMode::WorkspaceWrite,
+                label: "Escrita no workspace".into(),
+                approval_policy: "on-request".into(),
+                approvals_reviewer: Some("lume".into()),
+                can_respond_from_lume: true,
+                available_actions: vec![
+                    PermissionAction::AllowOnce,
+                    PermissionAction::AllowSession,
+                    PermissionAction::Deny,
+                ],
+            },
+            pending_permission: Some(crate::domain::PermissionRequest {
+                id: "p-1".into(),
+                kind: "command".into(),
+                summary: "Rodar os testes".into(),
+                resource: "cargo test".into(),
+                risk: "low".into(),
+                requested_at: "2026-07-26T12:01:00Z".into(),
+            }),
+            last_response: Some("Pronto.".into()),
+            results: vec![crate::domain::SessionResult {
+                id: "r-1".into(),
+                response: "Testes passaram.".into(),
+                created_at: 1_785_000_001,
+                files: vec!["src/lib.rs".into()],
+                tests: vec!["discovery::tests".into()],
+            }],
+            activities: vec![crate::domain::SessionActivity {
+                id: "a-1".into(),
+                kind: "tool".into(),
+                title: "cargo test".into(),
+                detail: Some("210 passaram".into()),
+                status: "completed".into(),
+                created_at: 1_785_000_002,
+                files: vec!["src/discovery.rs".into()],
+                append_detail: false,
+            }],
+        }
+    }
+
+    /// O contrato com o aplicativo Android, fixado num arquivo.
+    ///
+    /// ## Por que existe
+    ///
+    /// O Kotlin lê o protocolo com `ignoreUnknownKeys = true`, e isso é
+    /// deliberado: é o que deixa um aparelho antigo continuar funcionando contra
+    /// um desktop novo. O efeito colateral é que um campo acrescentado aqui
+    /// **desaparece em silêncio** do outro lado — nenhum teste ficava vermelho,
+    /// e a divergência só aparecia no aparelho de alguém.
+    ///
+    /// ## Como ele quebra o build nas duas pontas
+    ///
+    /// Este teste compara o JSON gerado com `fixtures/protocol/session.json`.
+    /// Mexer no formato faz **este** teste falhar. Regenerar a fixture faz o
+    /// teste Kotlin `ContratoDoProtocoloTest` falhar, porque lá ela é lida com
+    /// `ignoreUnknownKeys = false`. Só depois de os dois modelos concordarem o
+    /// build volta a passar.
+    ///
+    /// Produção permissiva, teste estrito: a mesma mensagem, ajustes opostos, e
+    /// é essa assimetria que transforma divergência silenciosa em build vermelho
+    /// sem sacrificar a compatibilidade para a frente.
+    ///
+    /// ## Para regenerar
+    ///
+    /// ```sh
+    /// LUME_UPDATE_FIXTURES=1 cargo test --lib contrato_da_sessao_com_o_celular
+    /// ```
+    ///
+    /// E depois rode os testes do Android, que é o passo que não pode ser pulado.
+    #[test]
+    fn contrato_da_sessao_com_o_celular() {
+        let sessao = sessao_canonica();
+        let atual = serde_json::to_string_pretty(&SessionParaCelular::from(&sessao))
+            .expect("serializa")
+            + "\n";
+
+        let caminho = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/protocol/session.json");
+
+        if std::env::var("LUME_UPDATE_FIXTURES").is_ok() {
+            std::fs::create_dir_all(caminho.parent().expect("pai")).expect("cria diretório");
+            std::fs::write(&caminho, &atual).expect("escreve fixture");
+            return;
+        }
+
+        let esperado = std::fs::read_to_string(&caminho).unwrap_or_else(|_| {
+            panic!(
+                "fixture ausente: {}\nRegenere com LUME_UPDATE_FIXTURES=1",
+                caminho.display()
+            )
+        });
+
+        assert_eq!(
+            esperado, atual,
+            "\n\nO formato da sessão enviada ao celular mudou.\n\
+             Regenere com:\n  \
+             LUME_UPDATE_FIXTURES=1 cargo test --lib contrato_da_sessao_com_o_celular\n\
+             e em seguida atualize o modelo Kotlin em\n  \
+             android/app/src/main/java/com/tulerws/lume/mobile/domain/Session.kt\n\
+             até `ContratoDoProtocoloTest` voltar a passar.\n"
+        );
+    }
+
+    /// O veredito que viaja no `acceptsPrompt`, ramo a ramo.
+    #[test]
+    fn o_veredito_de_prompt_cobre_os_quatro_ramos() {
+        let base = sessao_canonica();
+        assert!(base.accepts_prompt(), "sessão completa aceita prompt");
+
+        // Web não retoma processo: não precisa de identificador nem diretório.
+        let mut web = base.clone();
+        web.source = SessionSource::Web;
+        web.native_session_id = None;
+        web.working_directory = None;
+        assert!(web.accepts_prompt());
+
+        // Codex precisa da thread, e só dela.
+        let mut codex = base.clone();
+        codex.agent = AgentKind::Codex;
+        codex.working_directory = None;
+        assert!(codex.accepts_prompt());
+        codex.native_session_id = None;
+        assert!(!codex.accepts_prompt());
+
+        // Claude e Gemini precisam das duas coisas.
+        let mut sem_id = base.clone();
+        sem_id.native_session_id = None;
+        assert!(!sem_id.accepts_prompt());
+
+        let mut sem_dir = base.clone();
+        sem_dir.working_directory = None;
+        assert!(!sem_dir.accepts_prompt());
+
+        // Agente desconhecido não tem como ser retomado.
+        let mut desconhecido = base.clone();
+        desconhecido.agent = AgentKind::Unknown;
+        assert!(!desconhecido.accepts_prompt());
     }
 
     fn started_event(id: &str) -> HookEvent {

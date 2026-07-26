@@ -100,6 +100,7 @@
     <string name="prompt_dica">Write to %1$s…</string>
     <string name="prompt_desabilitado_executando">Wait for the agent to finish</string>
     <string name="prompt_desabilitado_permissao">Answer the permission first</string>
+    <string name="prompt_desabilitado_sem_retomada">Lume cannot send prompts to this session</string>
     <string name="prompt_aviso_terminal">This opens a terminal on the computer</string>
     <string name="prompt_enviar">Send</string>
 

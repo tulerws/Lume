@@ -89,6 +89,7 @@
     <string name="prompt_dica">Escrever para o %1$s…</string>
     <string name="prompt_desabilitado_executando">Aguarde o agente terminar</string>
     <string name="prompt_desabilitado_permissao">Responda a permissão primeiro</string>
+    <string name="prompt_desabilitado_sem_retomada">O Lume não consegue enviar prompts para esta sessão</string>
     <string name="prompt_aviso_terminal">Isto abre um terminal no computador</string>
     <string name="prompt_enviar">Enviar</string>
 
