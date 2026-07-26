@@ -24,6 +24,12 @@ impl Store {
                  PRAGMA foreign_keys = ON;
                  PRAGMA secure_delete = ON;
                  DROP TABLE IF EXISTS sessions;
+                 -- Sobra do controle remoto por PWA das versões 0.5.0 a 0.5.3,
+                 -- que guardava `token_hash` de cada aparelho pareado. Aquela
+                 -- implementação deixou de existir; a credencial dela não fica
+                 -- para trás. O `secure_delete` acima faz as páginas liberadas
+                 -- serem sobrescritas, e não apenas desligadas.
+                 DROP TABLE IF EXISTS mobile_devices;
                  CREATE TABLE IF NOT EXISTS history (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -318,6 +324,44 @@ mod tests {
         AccessMode, AgentKind, PermissionAction, PermissionProfile, PermissionRequest,
         RemoteDevice, SessionSource, SessionStatus,
     };
+
+    /// Coerência com o resto do produto: `RemoteDevice` não carrega hash de
+    /// token, e a identidade do servidor mora fora do SQLite. Deixar uma tabela
+    /// órfã com credencial de uma funcionalidade removida contradiria os dois.
+    #[test]
+    fn the_pwa_device_table_is_dropped_on_upgrade() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("lume.db");
+
+        // Um banco como o de quem passou pelo 0.5.3.
+        let legacy = rusqlite::Connection::open(&path).expect("banco");
+        legacy
+            .execute_batch(
+                "CREATE TABLE mobile_devices (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    last_seen_at INTEGER,
+                    scopes TEXT NOT NULL
+                 );
+                 INSERT INTO mobile_devices VALUES ('antigo', 'Celular', 'abc', 1, NULL, 'all');",
+            )
+            .expect("tabela antiga");
+        drop(legacy);
+
+        let store = Store::open(&path).expect("abre e migra");
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mobile_devices'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("consulta");
+
+        assert_eq!(remaining, 0, "a tabela do pareamento por PWA precisa sair");
+    }
 
     #[test]
     fn agent_sessions_are_never_persisted() {

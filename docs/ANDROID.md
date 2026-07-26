@@ -2,7 +2,7 @@
 
 Arquitetura do aplicativo Lume para Android, que consome o servidor descrito em [REMOTE-CONTROL.md](REMOTE-CONTROL.md). O protocolo é normativo lá; aqui está como o lado Kotlin o implementa.
 
-O código vive em `android/`, hoje um scaffold vazio do Android Studio (`lume.ai`, Compose, uma `MainActivity` de exemplo).
+O código vive em `android/` (`com.tulerws.lume.mobile`, Compose, Hilt).
 
 ## Escopo
 
@@ -16,7 +16,11 @@ Cinco telas, três delas destinos da barra inferior (ver [MOBILE-UI-DESIGN.md](M
 | **Sessões** | sim | lista ao vivo das sessões, agrupadas por estado, com destaque para quem espera permissão |
 | **Sessão** | não | atividades, resultados, resposta final, pedido de permissão pendente com as ações válidas, e campo de prompt |
 | **Histórico** | sim | registro sanitizado vindo de `history.list`, paginado de 50 em 50, sob demanda |
-| **Ajustes** | sim | desktop pareado, esquecer desktop, retenção do cache, versão e diagnóstico de conexão |
+| **Ajustes** | sim | desktop pareado ou porta para o pareamento, esquecer desktop, retenção do cache, versão e diagnóstico de conexão |
+
+**Sessões é a raiz da navegação, sempre — inclusive sem aparelho pareado.** Parear é empilhamento, alcançado por Ajustes e pelo estado vazio de Sessões. Pôr o pareamento na raiz deixava o botão de fechar daquela tela sem destino: ele desempilhava a única entrada e a navegação ficava sem nada para mostrar.
+
+**"Pareado" é ter credencial guardada, não estar conectado agora.** A distinção decide o que a interface mostra e é fácil de errar: derivá-la do `hostname` que vem no `ready` faz um aparelho pareado se anunciar como não pareado no intervalo entre abrir o aplicativo e a conexão subir. A fonte é o `CredentialStore`.
 
 ## Stack
 
@@ -197,11 +201,26 @@ A recusa por sessão ocupada (`session_busy`) é estado esperado, não erro: o c
 
 ## Build e distribuição
 
-- `applicationId` `lume.ai`; `versionName` acompanha a versão do desktop (`0.5.4`), `versionCode` monotônico.
+- `applicationId` **`com.tulerws.lume.mobile`**, e ele é imutável. Quatro APKs já foram publicados sob esse identificador (v0.5.0 a v0.5.3); trocá-lo faria o Android instalar esta versão *ao lado* do que a pessoa já tem, em vez de atualizá-lo.
+- `versionName` e `versionCode` são **derivados do `package.json`** da raiz, nunca escritos à mão. A fórmula é `major×100000000 + minor×1000000 + patch×1000 + build` — a mesma já usada em campo, para que a sequência publicada siga monotônica através da troca de implementação. O `versionCode` da v0.5.3 vale 5.003.000, e o build falha se `minor > 99` ou `patch > 999`, faixas em que os pesos colidiriam.
 - APK **universal**, assinado com keystore de release. O ML Kit *bundled* traz binário nativo; dividir por ABI complicaria a distribuição por GitHub sem ganho relevante.
-- Keystore, alias e senhas entram como *secrets* do GitHub Actions, o keystore em base64.
-- O workflow `installers.yml` ganha um job Android disparado pela mesma tag `v*`, anexando o APK ao release, ao lado do `.deb`, `.rpm`, AppImage e NSIS.
-- Não há atualização automática: o aplicativo checa a versão publicada e avisa, apontando para o release. Publicar na Play Store fica para depois, se e quando fizer sentido.
+- Keystore, alias e senhas entram como *secrets* do GitHub Actions, o keystore em base64. **A mesma chave das versões já publicadas**: chave diferente com o mesmo `applicationId` faz o sistema recusar a instalação, e obrigaria cada pessoa a desinstalar antes de atualizar.
+- O workflow `installers.yml` ganha um job Android disparado pela mesma tag `v*`, publicando **dois** ativos: `Lume-Mobile.apk` e `mobile-latest.json`. Os nomes são contrato — o atualizador instalado nos aparelhos busca exatamente esses, em `releases/latest/download/`.
+- **Há atualização assistida**, e ela não pode ser silenciosa: no Android nenhum aplicativo instala outro sem passar pelo instalador do sistema, que exige confirmação a cada vez. O aplicativo verifica ao abrir (represado em 6 horas por execução) e sob gesto em *Ajustes → Sobre*; baixa; e entrega ao instalador. Publicar na Play Store fica para depois, se e quando fizer sentido.
+- O manifesto é buscado **direto do GitHub**, com o armazém de certificados do sistema — não com o fingerprint fixado que o resto do aplicativo usa, porque o GitHub tem certificado de autoridade pública e fixá-lo quebraria o atualizador na primeira rotação. A decisão de não perguntar ao desktop é deliberada: quem mais precisa atualizar é quem está com o pareamento quebrado.
+- Três portões independentes cobrem essa abertura, e nenhum basta sozinho: a URL é recusada se não estiver sob `github.com/tulerws/Lume/releases/download/`; o SHA-256 do arquivo baixado tem de bater com o do manifesto; e a assinatura do APK tem de ser idêntica à do aplicativo instalado, conferida antes de mostrar o instalador. Um atacante com controle do DNS consegue **negar** a atualização, nunca forjar uma.
+
+### Três detalhes do atualizador que não se deduzem do código
+
+Cada um destes é uma decisão que alguém tenderia a "corrigir" depois, quebrando algo.
+
+**O portão de origem vale para a URL inicial, não para o destino final.** O GitHub responde o download com redirecionamento para `objects.githubusercontent.com`, que é outro domínio. Endurecer o portão para exigir `github.com` em cada salto quebraria toda atualização, e afrouxá-lo para aceitar qualquer redirecionamento não abre nada: o que chegar ainda precisa bater com o SHA-256 do manifesto, que veio de uma origem já verificada. **O portão de origem fixa de onde a instrução vem; o de conteúdo fixa o que chega.**
+
+**A conferência de assinatura confere o pacote antes da chave.** Um APK de outro `applicationId` nunca seria atualização deste — o sistema o instalaria **ao lado**, e não recusaria. Reprovar por pacote divergente antes de comparar assinatura evita oferecer ao usuário um instalador que produziria um segundo Lume no aparelho.
+
+**O conjunto de assinaturas é conferido como não vazio antes de ser comparado.** Sem isso, um APK sem assinatura legível e um aplicativo sem assinatura legível dariam `emptySet() == emptySet()`, e a comparação aprovaria. É a mesma armadilha de [o modo de falha que importa](#o-modo-de-falha-que-importa), num lugar onde ela é fácil de não enxergar.
+
+**O que o portão de origem não recusa:** URL com credenciais embutidas (`https://usuário:senha@github.com/…`) passa, porque o `host` continua sendo `github.com`. Não é abertura — o destino segue fixado e o conteúdo segue conferido por SHA-256 —, mas está registrado aqui para não ser confundido com descuido.
 
 Antes do primeiro commit da pasta: `android/.gitignore` ignora `/.idea/` apenas em parte, e `git status` já mostra `android/.idea/` como não rastreado. Ignorar o diretório inteiro evita levar arquivo de IDE para o repositório.
 
@@ -215,6 +234,10 @@ Testável sem aparelho:
 - **Trust manager**: aceitando o certificado do desktop e **recusando** (a) um certificado diferente, (b) um certificado válido para uma autoridade pública, (c) cadeia vazia. Os três negativos são o teste; o positivo passaria com `checkServerTrusted` de corpo vazio.
 - **Escopo do fingerprint**: que a comparação é sobre `cert.encoded` e **não** sobre `cert.publicKey.encoded`. Um teste com fixture gerada pelo lado Rust pega isto de uma vez; sem ele, o erro só aparece como "não conecta".
 - **Verificador de hostname**: aceitando quando o fingerprint bate com hostname que não consta do SAN — que é o caso normal, com IP variável — e **recusando** quando o fingerprint não bate, ainda que o hostname confira. Os dois casos juntos provam que a decisão saiu do nome e foi para a chave. Só o primeiro passaria com um verificador que devolve `true`.
+- **Aritmética de versão**: que `codigoDaVersao` reproduz os números **já publicados** (5.000.000 para 0.5.0, 5.003.000 para 0.5.3) e que `0.5.10` supera `0.5.9` — a comparação textual erraria essa e o aplicativo deixaria de oferecer a atualização. Fora de faixa e entrada inválida devolvem `0`, que nunca anuncia nada.
+- **Portão de origem do atualizador**: recusando texto puro, `http` sem cifra, domínio que *contém* `github.com`, subdomínio, outro repositório e caminho que não é o de download. Os negativos são o teste; o positivo passaria com uma função que devolve `true`. URL com credenciais embutidas **não** está entre os recusados, pelo motivo registrado acima.
+- **Conferência de assinatura**: recusando APK de outro `applicationId`, APK assinado com chave diferente, e — o caso que passa despercebido — APK e aplicativo ambos sem assinatura legível, que sem o guarda de conjunto vazio seriam considerados iguais.
+- **Leitura do manifesto**: contra uma cópia byte a byte do `mobile-latest.json` publicado, mais um campo desconhecido — que não pode derrubar a leitura, porque aparelhos antigos não têm como receber um modelo novo antes de atualizar.
 
 Exige aparelho físico:
 
