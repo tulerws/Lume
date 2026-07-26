@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import lume.ai.data.fake.DadosDoDesign
+import lume.ai.data.EstadoDePareamento
 import lume.ai.domain.ConnectionState
 import lume.ai.domain.PermissionAction
 import lume.ai.domain.PermissionProfile
@@ -278,7 +279,17 @@ private fun AjustesEscuro() = Moldura(ThemeMode.Dark) {
 @Preview(name = "Pareamento", widthDp = LARGURA, heightDp = ALTURA)
 @Composable
 private fun Pareamento() = Moldura(ThemeMode.Dark) {
-    PairScreen(aoFechar = {}, aoDigitarEndereco = {})
+    PairScreen(
+        // Sem câmera no preview: `LocalInspectionMode` não impede o CameraX de
+        // tentar, então o que se confere aqui é o gradiente, o enquadramento e a
+        // hierarquia de texto — que é o que o design desenha.
+        estado = EstadoDePareamento.Ocioso,
+        falhaDeLeitura = null,
+        aoLerQr = {},
+        aoFechar = {},
+        aoDigitarEndereco = {},
+        aoConcluir = {},
+    )
 }
 
 @Preview(name = "Pareamento · entrada manual", widthDp = LARGURA, heightDp = ALTURA)

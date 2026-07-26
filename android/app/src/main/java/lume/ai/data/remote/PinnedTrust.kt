@@ -1,5 +1,6 @@
 package lume.ai.data.remote
 
+import android.annotation.SuppressLint
 import okhttp3.OkHttpClient
 import java.security.MessageDigest
 import java.security.cert.CertificateException
@@ -59,6 +60,25 @@ fun fingerprintDe(certificado: X509Certificate): ByteArray =
  * autoassinado não tem cadeia para validar, e uma autoridade pública que
  * assinasse qualquer coisa não teria autoridade nenhuma sobre *este* desktop.
  */
+/*
+ * O lint do Android acusa `CustomX509TrustManager` aqui, e ele está certo em
+ * acusar: implementar um é propenso a erro e costuma desligar a validação de
+ * certificado sem ninguém perceber. A supressão é nominal e fica nesta classe
+ * apenas, nunca no módulo — um `lintOptions` que desligasse a regra esconderia
+ * também o próximo trust manager, escrito por outra pessoa, sem este raciocínio.
+ *
+ * O que justifica o desvio está em `docs/ANDROID.md`, seção *Os três portões*: o
+ * celular tem 32 bytes de hash, não o certificado, e nenhum mecanismo padrão do
+ * Android aceita isso — `NetworkSecurityConfig` e `HandshakeCertificates` exigem
+ * o certificado em tempo de compilação, e o `CertificatePinner` roda depois de um
+ * aperto de mão que um autoassinado nunca completa.
+ *
+ * O que sustenta a afirmação de que este aqui **não** desliga a validação são os
+ * onze testes de `PinnedTrustTest` e os cinco de `FixtureDoRustTest` — incluindo
+ * os três negativos que o documento exige: certificado diferente, certificado
+ * assinado por autoridade pública, e cadeia vazia.
+ */
+@SuppressLint("CustomX509TrustManager")
 internal class TrustManagerFixado(private val fingerprint: ByteArray) : X509TrustManager {
 
     override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {

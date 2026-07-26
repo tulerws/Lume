@@ -121,16 +121,16 @@
     <string name="ajustes_sobre">Sobre</string>
     <string name="sobre_versao">Versão %1$s</string>
 
-    <!-- Seção Demonstração, só em build de depuração -->
-    <string name="ajustes_demonstracao">Demonstração</string>
-    <string name="demo_conectado">Conectado</string>
-    <string name="demo_vazio">Vazio</string>
-    <string name="demo_sem_conexao">Sem conexão</string>
-    <string name="demo_erro">Erro</string>
 
     <!-- Pareamento -->
     <string name="pareamento_instrucao">Aponte para o código que aparece no aplicativo do computador</string>
     <string name="pareamento_manual">Digitar endereço</string>
+    <string name="pareamento_permissao_corpo">A câmera serve apenas para ler o código de pareamento. Nada é gravado nem enviado.</string>
+    <string name="pareamento_permissao_botao">Permitir</string>
+    <string name="pareamento_permissao_negada">O acesso à câmera está desligado. Ligue nos ajustes do Android para parear.</string>
+    <string name="pareamento_conectando">Conectando a %1$s…</string>
+    <string name="pareamento_erro_versao">Este código foi feito por um Lume mais novo. Atualize o aplicativo no celular.</string>
+    <string name="pareamento_erro_corrompido">Não foi possível ler o código. Aproxime e tente de novo.</string>
     <string name="pareamento_exige_qr">O pareamento exige ler o código. Digitar endereço só ajuda depois que ele foi lido.</string>
     <string name="manual_titulo">Digitar endereço</string>
     <string name="manual_endereco">Endereço</string>

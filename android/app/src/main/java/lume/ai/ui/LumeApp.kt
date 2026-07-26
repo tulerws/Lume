@@ -167,9 +167,23 @@ fun LumeApp() {
                     }
 
                     composable(Rotas.PAREAR) {
+                        val vm: PairViewModel = hiltViewModel()
+                        val estadoDoPareamento by vm.estado.collectAsStateWithLifecycle()
+                        val falha by vm.falhaDeLeitura.collectAsStateWithLifecycle()
                         PairScreen(
+                            estado = estadoDoPareamento,
+                            falhaDeLeitura = falha,
+                            aoLerQr = vm::aoLerQr,
                             aoFechar = { navegacao.popBackStack() },
                             aoDigitarEndereco = { navegacao.navigate(Rotas.MANUAL) },
+                            // Pareou: Sessões passa a ser o começo, e a tela de
+                            // pareamento sai da pilha. Voltar dali não deve
+                            // devolver a câmera a quem já pareou.
+                            aoConcluir = {
+                                navegacao.navigate(Rotas.SESSOES) {
+                                    popUpTo(Rotas.PAREAR) { inclusive = true }
+                                }
+                            },
                         )
                     }
 

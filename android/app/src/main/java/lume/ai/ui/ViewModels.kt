@@ -11,7 +11,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import lume.ai.data.ConnectionManager
+import lume.ai.data.EstadoDePareamento
 import lume.ai.data.PreferenciasEmMemoria
+import lume.ai.data.remote.FalhaDeLeitura
+import lume.ai.data.remote.LeituraDeConviteFalhou
+import lume.ai.data.remote.lerConvite
 import lume.ai.data.repo.HistoryRepository
 import lume.ai.data.repo.PairingRepository
 import lume.ai.data.repo.SessionRepository
@@ -182,5 +187,52 @@ class SettingsViewModel @Inject constructor(
 
     fun esquecerDesktop() {
         viewModelScope.launch { pareamento.esquecerDesktop() }
+    }
+}
+
+/**
+ * A tela de pareamento.
+ *
+ * Ela é a única que fala com o [ConnectionManager] sem passar por repositório: o
+ * pareamento não é leitura nem escrita de domínio, é a negociação que cria o
+ * domínio. Inventar um `PairingRepository.parear()` só para respeitar a simetria
+ * poria uma camada entre a tela e a única coisa que ela precisa fazer.
+ *
+ * O nome do aparelho vai como `Build.MODEL` — "Pixel 8". O servidor corta em 64
+ * caracteres e troca vazio por "Celular", então não há o que validar aqui.
+ */
+@HiltViewModel
+class PairViewModel @Inject constructor(
+    private val conexao: ConnectionManager,
+) : ViewModel() {
+
+    val estado: StateFlow<EstadoDePareamento> = conexao.pareamento
+
+    private val _falhaDeLeitura = MutableStateFlow<FalhaDeLeitura?>(null)
+    val falhaDeLeitura: StateFlow<FalhaDeLeitura?> = _falhaDeLeitura.asStateFlow()
+
+    /**
+     * Chamado a cada QR que a câmera lê — inclusive o mesmo, várias vezes.
+     *
+     * A guarda contra repetição está aqui e não no leitor: o detector roda a cada
+     * quadro, e o QR continua na frente da câmera enquanto o pareamento acontece.
+     */
+    fun aoLerQr(texto: String) {
+        if (estado.value != EstadoDePareamento.Ocioso) return
+        lerConvite(texto)
+            .onSuccess { convite ->
+                _falhaDeLeitura.value = null
+                conexao.parear(convite, android.os.Build.MODEL)
+            }
+            .onFailure { erro ->
+                // `NaoEUmConvite` não vira mensagem: a câmera aponta para o mundo,
+                // e avisar a cada QR de embalagem que passa no enquadramento seria
+                // ruído. Os outros são convites de verdade que falharam, e aí o
+                // usuário precisa saber por quê.
+                val motivo = (erro as? LeituraDeConviteFalhou)?.motivo
+                if (motivo != null && motivo !is FalhaDeLeitura.NaoEUmConvite) {
+                    _falhaDeLeitura.value = motivo
+                }
+            }
     }
 }

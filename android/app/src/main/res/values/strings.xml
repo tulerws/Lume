@@ -132,15 +132,6 @@
     <string name="ajustes_sobre">About</string>
     <string name="sobre_versao">Version %1$s</string>
 
-    <!--
-        Seção Demonstração: existe apenas em build de depuração, para poder ver no
-        aparelho os estados que o design desenha. Some no build de release.
-    -->
-    <string name="ajustes_demonstracao">Demo</string>
-    <string name="demo_conectado">Connected</string>
-    <string name="demo_vazio">Empty</string>
-    <string name="demo_sem_conexao">Offline</string>
-    <string name="demo_erro">Error</string>
 
     <!-- Pareamento -->
     <string name="pareamento_instrucao">Point at the code shown in the desktop app</string>
@@ -149,6 +140,12 @@
         A tela precisa dizer que ler o QR é obrigatório. Sem esta linha,
         "Digitar endereço" passa por alternativa de pareamento — e não é uma.
     -->
+    <string name="pareamento_permissao_corpo">The camera is used only to read the pairing code. Nothing is recorded or sent.</string>
+    <string name="pareamento_permissao_botao">Allow</string>
+    <string name="pareamento_permissao_negada">Camera access is off. Enable it in Android settings to pair.</string>
+    <string name="pareamento_conectando">Connecting to %1$s…</string>
+    <string name="pareamento_erro_versao">This code was made by a newer Lume. Update the app on your phone.</string>
+    <string name="pareamento_erro_corrompido">Could not read the code. Move closer and try again.</string>
     <string name="pareamento_exige_qr">Pairing requires reading the code. Entering an address only helps once it has been read.</string>
     <string name="manual_titulo">Enter address</string>
     <string name="manual_endereco">Address</string>

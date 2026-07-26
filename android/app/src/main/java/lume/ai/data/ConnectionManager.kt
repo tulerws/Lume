@@ -14,13 +14,19 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
+import lume.ai.data.crypto.CredencialGuardada
+import lume.ai.data.crypto.CredentialStore
 import lume.ai.data.remote.CanalAberto
+import lume.ai.data.remote.ConviteDePareamento
+import lume.ai.data.remote.Credencial
+import lume.ai.data.remote.Endereco
 import lume.ai.data.remote.EventoDoCanal
 import lume.ai.data.remote.LumeClient
 import lume.ai.data.remote.protocol.EnvelopeDeSaida
 import lume.ai.data.remote.protocol.HistoryList
 import lume.ai.data.remote.protocol.JsonDoProtocolo
 import lume.ai.data.remote.protocol.MensagemDoServidor
+import lume.ai.data.remote.protocol.PairRegister
 import lume.ai.data.remote.protocol.ResolvePermission
 import lume.ai.data.remote.protocol.SubmitPrompt
 import lume.ai.data.remote.protocol.VERSAO_DO_PROTOCOLO
@@ -33,6 +39,14 @@ import lume.ai.domain.PermissionAction
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+
+/** Onde o pareamento está. A tela de Pareamento reage a isto. */
+sealed interface EstadoDePareamento {
+    data object Ocioso : EstadoDePareamento
+    data object EmAndamento : EstadoDePareamento
+    data object Concluido : EstadoDePareamento
+    data class Falhou(val motivo: String) : EstadoDePareamento
+}
 
 /** Falha de uma requisição, já com o código do protocolo. */
 class ErroDoProtocolo(val codigo: String, mensagem: String) : Exception(mensagem)
@@ -65,6 +79,7 @@ class ErroDoProtocolo(val codigo: String, mensagem: String) : Exception(mensagem
 class ConnectionManager @Inject constructor(
     private val cliente: LumeClient,
     private val credenciais: CredenciaisDeDesenvolvimento,
+    private val credencialGuardada: CredentialStore,
 ) {
 
     private val escopo = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -72,6 +87,10 @@ class ConnectionManager @Inject constructor(
 
     @Volatile
     private var canal: CanalAberto? = null
+
+    /** O convite da conexão em curso, quando ela é de pareamento. */
+    @Volatile
+    private var conviteEmCurso: ConviteDePareamento? = null
 
     private val pendentes = mutableMapOf<String, CompletableDeferred<Result<JsonObject?>>>()
     private val cadeado = Mutex()
@@ -86,16 +105,82 @@ class ConnectionManager @Inject constructor(
     private val _hostname = MutableStateFlow<String?>(null)
     val hostname: StateFlow<String?> = _hostname.asStateFlow()
 
+    private val _pareamento = MutableStateFlow<EstadoDePareamento>(EstadoDePareamento.Ocioso)
+    val pareamento: StateFlow<EstadoDePareamento> = _pareamento.asStateFlow()
+
     fun conectar() {
         if (laco?.isActive == true) return
-        val alvo = credenciais.alvo()
-        if (alvo == null) {
-            // Sem alvo configurado o aplicativo não está quebrado — ele está
-            // desemparelhado, que é um estado legítimo e tem tela própria.
-            _connection.value = ConnectionState.Desconectado()
-            return
+        laco = escopo.launch {
+            val alvo = alvoGuardado() ?: credenciais.alvo()
+            if (alvo == null) {
+                // Sem credencial o aplicativo não está quebrado — ele está
+                // desemparelhado, que é estado legítimo e tem tela própria.
+                _connection.value = ConnectionState.Desconectado()
+                return@launch
+            }
+            laçoDeConexao(alvo)
         }
-        laco = escopo.launch { laçoDeConexao(alvo) }
+    }
+
+    /**
+     * A credencial guardada vira alvo.
+     *
+     * Vem antes da de desenvolvimento de propósito: um aparelho pareado de
+     * verdade não deve voltar a usar o token do `local.properties` só porque ele
+     * continua no build.
+     */
+    private suspend fun alvoGuardado(): Alvo? {
+        val guardada = credencialGuardada.ler() ?: return null
+        val fingerprint = deHex(guardada.fingerprintEmHex) ?: return null
+        val host = guardada.candidatos.firstOrNull() ?: return null
+        return Alvo(
+            endereco = Endereco(host, guardada.porta),
+            credencial = Credencial.Token(guardada.token),
+            fingerprint = fingerprint,
+        )
+    }
+
+    /**
+     * Pareia com o desktop cujo QR foi lido.
+     *
+     * O código é consumido **no aperto de mão**, não no `pair.register` — verificar
+     * e consumir são uma operação única sob o mesmo cadeado do lado do servidor.
+     * A consequência prática: uma foto do QR vale para **uma** negociação
+     * bem-sucedida, e cair entre o `101` e o registro obriga a ler o código novo,
+     * que a janela do desktop já regenerou.
+     *
+     * Os candidatos são tentados **na ordem recebida**: o desktop já os ordenou
+     * com interfaces físicas antes das virtuais, e uma máquina com Docker anuncia
+     * `172.17.0.1`, que não leva a lugar nenhum vindo de fora.
+     */
+    fun parear(convite: ConviteDePareamento, nomeDoAparelho: String) {
+        if (laco?.isActive == true) return
+        _pareamento.value = EstadoDePareamento.EmAndamento
+        laco = escopo.launch {
+            for (endereco in convite.enderecos()) {
+                val alvo = Alvo(
+                    endereco = endereco,
+                    credencial = Credencial.CodigoDePareamento(convite.codigo),
+                    fingerprint = convite.fingerprint,
+                )
+                val pareou = umaTentativa(alvo, registrarComo = nomeDoAparelho, convite = convite)
+                if (pareou) {
+                    // A partir daqui a credencial guardada manda, e a reconexão
+                    // usa o token. O código já foi consumido e não serve mais.
+                    val comToken = alvoGuardado() ?: return@launch
+                    laçoDeConexao(comToken)
+                    return@launch
+                }
+            }
+            _pareamento.value = EstadoDePareamento.Falhou(
+                if (convite.candidatos.isEmpty()) {
+                    "O computador não informou um endereço. Digite o endereço."
+                } else {
+                    "Não foi possível alcançar o computador"
+                },
+            )
+            _connection.value = ConnectionState.Desconectado()
+        }
     }
 
     fun desconectar() {
@@ -118,12 +203,32 @@ class ConnectionManager @Inject constructor(
         }
     }
 
-    /** @return se a conexão chegou a receber `ready`. */
-    private suspend fun umaTentativa(alvo: Alvo): Boolean {
+    /**
+     * Uma conexão, do início ao fim dela.
+     *
+     * @param registrarComo quando presente, esta é a conexão de pareamento: o
+     *   `pair.register` sai assim que o canal abre, e o `pair.accepted` grava a
+     *   credencial. O servidor emenda o `ready` **na mesma conexão**, sem exigir
+     *   reconexão — por isso o mesmo `collect` segue valendo depois.
+     * @return `true` se a conexão cumpriu seu propósito: `ready` numa conexão
+     *   comum, credencial gravada numa de pareamento.
+     */
+    private suspend fun umaTentativa(
+        alvo: Alvo,
+        registrarComo: String? = null,
+        convite: ConviteDePareamento? = null,
+    ): Boolean {
         var pronto = false
+        conviteEmCurso = convite
         cliente.conectar(alvo.endereco, alvo.credencial, alvo.fingerprint).collect { evento ->
             when (evento) {
-                is EventoDoCanal.Aberto -> canal = evento.canal
+                is EventoDoCanal.Aberto -> {
+                    canal = evento.canal
+                    // Prazo de 10 segundos do lado do servidor: quem consumiu um
+                    // código e não se registra está segurando conexão sem ser
+                    // ninguém. Mandar já no `onOpen` é o que cabe nele.
+                    if (registrarComo != null) enviarRegistro(evento.canal, registrarComo)
+                }
 
                 is EventoDoCanal.Recebida -> {
                     if (tratar(evento.mensagem)) pronto = true
@@ -139,7 +244,10 @@ class ConnectionManager @Inject constructor(
             }
         }
         canal = null
-        return pronto
+        conviteEmCurso = null
+        // Numa conexão de pareamento o que importa é a credencial ter sido
+        // gravada; numa comum, ter chegado ao `ready`.
+        return if (convite != null) _pareamento.value == EstadoDePareamento.Concluido else pronto
     }
 
     /**
@@ -191,7 +299,25 @@ class ConnectionManager @Inject constructor(
                 }
             }
 
-            is MensagemDoServidor.Pareado -> Unit
+            is MensagemDoServidor.Pareado -> {
+                // Gravado **antes** de qualquer outra coisa: o token trafega uma
+                // única vez, e o desktop guarda só o SHA-256 dele. Perder aqui
+                // significa parear de novo, não recuperar.
+                conviteEmCurso?.let { convite ->
+                    credencialGuardada.gravar(
+                        CredencialGuardada(
+                            deviceId = mensagem.payload.deviceId,
+                            token = mensagem.payload.token,
+                            fingerprintEmHex = convite.fingerprint.joinToString("") { "%02x".format(it) },
+                            candidatos = convite.candidatos,
+                            porta = convite.porta,
+                            nomeDoDesktop = convite.nomeDaMaquina,
+                            pareadoEm = rotuloDeHoje(),
+                        ),
+                    )
+                    _pareamento.value = EstadoDePareamento.Concluido
+                }
+            }
             is MensagemDoServidor.Desconhecida -> Unit
         }
         return false
@@ -274,6 +400,26 @@ class ConnectionManager @Inject constructor(
             pendentes.clear()
         }
     }
+
+    private fun enviarRegistro(aberto: CanalAberto, nome: String) {
+        val texto = JsonDoProtocolo.encodeToString(
+            EnvelopeDeSaida.serializer(PairRegister.serializer()),
+            EnvelopeDeSaida(
+                tipo = "pair.register",
+                id = UUID.randomUUID().toString(),
+                payload = PairRegister(deviceName = nome, platform = "android"),
+            ),
+        )
+        aberto.enviar(texto)
+    }
+
+    /** "12 jul", como a tela de Ajustes mostra. */
+    private fun rotuloDeHoje(): String = java.time.LocalDate.now()
+        .format(java.time.format.DateTimeFormatter.ofPattern("d MMM", java.util.Locale("pt", "BR")))
+
+    private fun deHex(texto: String): ByteArray? = runCatching {
+        ByteArray(texto.length / 2) { texto.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    }.getOrNull()?.takeIf { it.size == 32 }
 
     private companion object {
         const val ESPERA_INICIAL = 1_000L
