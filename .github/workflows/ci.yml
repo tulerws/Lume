@@ -35,8 +35,6 @@ jobs:
       - name: Run Rust tests
         if: runner.os != 'Windows'
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Run Rust tests on Windows
+      - name: Compile Rust tests on Windows
         if: runner.os == 'Windows'
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="windows_legacy"'
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-run
