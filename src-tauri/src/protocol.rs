@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    domain::{
-        AgentKind, AgentSession, PermissionAction, SessionSource,
-    },
+    domain::{AgentKind, AgentSession, PermissionAction, SessionSource},
     state::now_millis,
 };
 
@@ -25,7 +23,9 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "prompts",
     "permissions",
     "termination",
+    "realtime_stream",
 ];
+pub const STREAM_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,10 +65,7 @@ impl SessionCapabilities {
             can_approve: session.pending_permission.is_some()
                 && session.permission_profile.can_respond_from_lume,
             can_terminate: session.source == SessionSource::Cli && session.process_id.is_some(),
-            can_open_source: matches!(
-                session.source,
-                SessionSource::Web | SessionSource::Vscode
-            ),
+            can_open_source: matches!(session.source, SessionSource::Web | SessionSource::Vscode),
             can_read_results: !session.results.is_empty() || session.last_response.is_some(),
         }
     }
@@ -279,6 +276,46 @@ pub struct HubEventEnvelope {
     pub event: HubEvent,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum HubStreamMessage {
+    Hello {
+        protocol_version: u16,
+        features: Vec<String>,
+        heartbeat_interval_ms: u64,
+    },
+    Snapshot {
+        sequence: u64,
+        snapshot: HubSnapshot,
+    },
+    Update {
+        events: Vec<HubEventEnvelope>,
+        snapshot: HubSnapshot,
+    },
+    Error {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl HubStreamMessage {
+    pub fn hello() -> Self {
+        Self::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: PROTOCOL_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+            heartbeat_interval_ms: STREAM_HEARTBEAT_INTERVAL_MS,
+        }
+    }
+}
+
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn event_journal() -> &'static Mutex<VecDeque<HubEventEnvelope>> {
@@ -319,12 +356,14 @@ pub fn events_since(sequence: u64) -> Vec<HubEventEnvelope> {
         .unwrap_or_default()
 }
 
+pub fn latest_event_sequence() -> u64 {
+    EVENT_SEQUENCE.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        AccessMode, PermissionProfile, SessionStatus,
-    };
+    use crate::domain::{AccessMode, PermissionProfile, SessionStatus};
 
     fn session() -> AgentSession {
         AgentSession {
@@ -366,6 +405,26 @@ mod tests {
         let json = serde_json::to_value(snapshot).expect("snapshot");
         assert_eq!(json["sessions"][0]["nativeSessionId"], "thread-1");
         assert_eq!(json["sessions"][0]["capabilities"]["canPrompt"], true);
+    }
+
+    #[test]
+    fn realtime_stream_contract_is_versioned_and_additive() {
+        let hello = serde_json::to_value(HubStreamMessage::hello()).expect("hello");
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(hello["heartbeatIntervalMs"], STREAM_HEARTBEAT_INTERVAL_MS);
+        assert!(hello["features"]
+            .as_array()
+            .is_some_and(|features| features.iter().any(|value| value == "realtime_stream")));
+
+        let snapshot = serde_json::to_value(HubStreamMessage::Snapshot {
+            sequence: 9,
+            snapshot: HubSnapshot::new(vec![session()]),
+        })
+        .expect("snapshot");
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(snapshot["sequence"], 9);
+        assert_eq!(snapshot["snapshot"]["sessions"][0]["id"], "codex:thread-1");
     }
 
     #[test]

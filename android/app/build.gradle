@@ -1,4 +1,6 @@
 apply plugin: 'com.android.application'
+apply plugin: 'com.google.devtools.ksp'
+apply plugin: 'org.jetbrains.kotlin.android'
 
 import groovy.json.JsonSlurper
 
@@ -67,6 +69,12 @@ dependencies {
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation "androidx.work:work-runtime:$androidxWorkVersion"
+    implementation "androidx.datastore:datastore-preferences:1.2.1"
+    implementation "androidx.room:room-ktx:2.7.0"
+    implementation "androidx.room:room-runtime:2.7.0"
+    implementation "com.squareup.okhttp3:okhttp:5.4.0"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"
+    ksp "androidx.room:room-compiler:2.7.0"
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"

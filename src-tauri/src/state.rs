@@ -1200,11 +1200,10 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
         }
     }
     if activity.kind == "message" {
+        let activity_detail = activity.detail.as_deref().map(normalized_chat_text);
         let duplicate = session.activities.iter().rposition(|existing| {
             existing.kind == "message"
-                && existing.detail.as_deref().map(str::trim)
-                    == activity.detail.as_deref().map(str::trim)
-                && (existing.created_at - activity.created_at).abs() < 10_000
+                && existing.detail.as_deref().map(normalized_chat_text) == activity_detail
         });
         if let Some(index) = duplicate.filter(|index| {
             !session.activities[index.saturating_add(1)..]
@@ -1254,6 +1253,36 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
     }
 }
 
+fn normalized_chat_text(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn has_prompt_between(session: &AgentSession, left: i64, right: i64) -> bool {
+    let start = left.min(right);
+    let end = left.max(right);
+    session.activities.iter().any(|activity| {
+        activity.kind == "prompt" && activity.created_at > start && activity.created_at <= end
+    })
+}
+
+fn equivalent_result_in_same_turn(
+    session: &AgentSession,
+    existing: &SessionResult,
+    response: &str,
+    created_at: i64,
+) -> bool {
+    normalized_chat_text(&existing.response) == normalized_chat_text(response)
+        && !has_prompt_between(session, existing.created_at, created_at)
+}
+
 fn remember_result(session: &mut AgentSession, now: i64, observed_files: &[String]) {
     let Some(response) = session
         .last_response
@@ -1265,8 +1294,8 @@ fn remember_result(session: &mut AgentSession, now: i64, observed_files: &[Strin
     };
     if session
         .results
-        .last()
-        .is_some_and(|result| result.response == response)
+        .iter()
+        .any(|result| equivalent_result_in_same_turn(session, result, response, now))
     {
         return;
     }
@@ -1433,11 +1462,22 @@ fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn merge_results(target: &mut AgentSession, source: &AgentSession) {
+    for activity in &source.activities {
+        remember_activity(target, activity.clone());
+    }
     for result in &source.results {
         if !target
             .results
             .iter()
-            .any(|existing| existing.id == result.id)
+            .any(|existing| {
+                existing.id == result.id
+                    || equivalent_result_in_same_turn(
+                        target,
+                        existing,
+                        &result.response,
+                        result.created_at,
+                    )
+            })
         {
             target.results.push(result.clone());
         }
@@ -1445,9 +1485,6 @@ fn merge_results(target: &mut AgentSession, source: &AgentSession) {
     target.results.sort_by_key(|result| result.created_at);
     if target.results.len() > 12 {
         target.results.drain(..target.results.len() - 12);
-    }
-    for activity in &source.activities {
-        remember_activity(target, activity.clone());
     }
 }
 
@@ -1833,7 +1870,7 @@ mod tests {
         state
             .ingest(started_event("codex:messages", 4242))
             .expect("sessão");
-        for (id, created_at) in [("app-server", 10_000), ("rollout", 11_000)] {
+        for (id, created_at) in [("app-server", 10_000), ("rollout", 41_000)] {
             let mut event = started_event("codex:messages", 4242);
             event.event = HookEventKind::Activity;
             event.activity = Some(SessionActivity {
@@ -1858,6 +1895,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn identical_agent_messages_after_a_new_prompt_are_kept() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("codex:repeated-answer", 4242))
+            .expect("sessão");
+        for (id, kind, detail, created_at) in [
+            ("answer-1", "message", "Resposta final", 10_000),
+            ("prompt-2", "prompt", "Faça novamente", 20_000),
+            ("answer-2", "message", "Resposta final", 30_000),
+        ] {
+            let mut event = started_event("codex:repeated-answer", 4242);
+            event.event = HookEventKind::Activity;
+            event.activity = Some(SessionActivity {
+                id: id.into(),
+                kind: kind.into(),
+                title: "Chat".into(),
+                detail: Some(detail.into()),
+                status: "completed".into(),
+                created_at,
+                files: Vec::new(),
+                append_detail: false,
+            });
+            state.ingest(event).expect("atividade");
+        }
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "message")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn merged_sessions_deduplicate_equivalent_recent_results() {
+        let event = started_event("codex:merged-results", 4242);
+        let mut target = session_from_event(&event, 1_000);
+        let mut source = target.clone();
+        target.results.push(SessionResult {
+            id: "app-server-result".into(),
+            response: "Resposta final".into(),
+            created_at: 10_000,
+            files: Vec::new(),
+            tests: Vec::new(),
+        });
+        source.results.push(SessionResult {
+            id: "rollout-result".into(),
+            response: "  Resposta final\n".into(),
+            created_at: 42_000,
+            files: Vec::new(),
+            tests: Vec::new(),
+        });
+
+        merge_results(&mut target, &source);
+
+        assert_eq!(target.results.len(), 1);
+    }
+
+    #[test]
+    fn merged_sessions_keep_identical_results_after_a_new_prompt() {
+        let event = started_event("codex:separate-results", 4242);
+        let mut target = session_from_event(&event, 1_000);
+        let mut source = target.clone();
+        target.results.push(SessionResult {
+            id: "first-result".into(),
+            response: "Resposta final".into(),
+            created_at: 10_000,
+            files: Vec::new(),
+            tests: Vec::new(),
+        });
+        source.activities.push(SessionActivity {
+            id: "second-prompt".into(),
+            kind: "prompt".into(),
+            title: "Prompt".into(),
+            detail: Some("Faça novamente".into()),
+            status: "completed".into(),
+            created_at: 20_000,
+            files: Vec::new(),
+            append_detail: false,
+        });
+        source.results.push(SessionResult {
+            id: "second-result".into(),
+            response: "Resposta final".into(),
+            created_at: 30_000,
+            files: Vec::new(),
+            tests: Vec::new(),
+        });
+
+        merge_results(&mut target, &source);
+
+        assert_eq!(target.results.len(), 2);
     }
 
     #[test]

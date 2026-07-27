@@ -1,4 +1,4 @@
-const cacheName = "lume-mobile-v13";
+const cacheName = "lume-mobile-v17";
 const assets = ["./", "./app.js", "./styles.css", "./manifest.webmanifest", "./lume-mobile-icon.svg"];
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(cacheName).then((cache) => cache.addAll(assets)));

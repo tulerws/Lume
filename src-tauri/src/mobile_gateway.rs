@@ -30,6 +30,7 @@ struct PairingSession {
 pub struct MobileGateway {
     pairing: Arc<Mutex<Option<PairingSession>>>,
     pairing_base_url: Arc<Mutex<Option<String>>>,
+    desktop_id: Arc<Mutex<String>>,
     request_nonces: Arc<Mutex<HashMap<String, i64>>>,
 }
 
@@ -37,6 +38,7 @@ pub struct MobileGateway {
 #[serde(rename_all = "camelCase")]
 pub struct PairingOffer {
     pub protocol_version: u16,
+    pub desktop_id: String,
     pub code: String,
     pub expires_at: i64,
     pub payload: String,
@@ -46,6 +48,7 @@ pub struct PairingOffer {
 #[serde(rename_all = "camelCase")]
 pub struct PairingCredentials {
     pub protocol_version: u16,
+    pub desktop_id: String,
     pub token: String,
     pub device: PairedDevice,
 }
@@ -55,6 +58,19 @@ impl MobileGateway {
         if let Ok(mut url) = self.pairing_base_url.lock() {
             *url = Some(value);
         }
+    }
+
+    pub fn set_desktop_id(&self, value: String) {
+        if let Ok(mut desktop_id) = self.desktop_id.lock() {
+            *desktop_id = value;
+        }
+    }
+
+    pub fn desktop_id(&self) -> String {
+        self.desktop_id
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
     pub fn begin_pairing(&self) -> Result<PairingOffer, String> {
@@ -75,12 +91,14 @@ impl MobileGateway {
             .ok()
             .and_then(|value| value.clone())
             .ok_or_else(|| "O gateway mobile seguro não está disponível".to_string())?;
+        let desktop_id = self.desktop_id();
         Ok(PairingOffer {
             protocol_version: PROTOCOL_VERSION,
             payload: format!(
-                "{MOBILE_WEB_URL}#version={PROTOCOL_VERSION}&gateway={}&code={code}",
+                "{MOBILE_WEB_URL}#version={PROTOCOL_VERSION}&gateway={}&desktopId={desktop_id}&code={code}",
                 encode_query_value(&base_url),
             ),
+            desktop_id,
             code,
             expires_at,
         })
@@ -164,6 +182,7 @@ impl MobileGateway {
         state.save_mobile_device(&device, &hex_digest(&token))?;
         Ok(PairingCredentials {
             protocol_version: PROTOCOL_VERSION,
+            desktop_id: self.desktop_id(),
             token,
             device,
         })
@@ -295,6 +314,7 @@ mod tests {
     fn gateway() -> MobileGateway {
         let gateway = MobileGateway::default();
         gateway.set_pairing_base_url("https://127.0.0.1:43122".into());
+        gateway.set_desktop_id("desktop-test-id".into());
         gateway
     }
 
@@ -308,6 +328,7 @@ mod tests {
             .expect("pareamento");
 
         assert!(!credentials.token.is_empty());
+        assert_eq!(credentials.desktop_id, "desktop-test-id");
         assert_eq!(credentials.device.scopes, vec![MobileScope::Monitor]);
         assert!(gateway
             .authenticate(&state, &credentials.token)
@@ -325,8 +346,13 @@ mod tests {
         let offer = gateway.begin_pairing().expect("oferta");
 
         assert!(offer.expires_at - started_at >= 5 * 60 * 1_000);
-        assert!(offer.payload.starts_with("https://tulerws.github.io/Lume/#"));
-        assert!(offer.payload.contains("gateway=https%3A%2F%2F127.0.0.1%3A43122"));
+        assert!(offer
+            .payload
+            .starts_with("https://tulerws.github.io/Lume/#"));
+        assert!(offer
+            .payload
+            .contains("gateway=https%3A%2F%2F127.0.0.1%3A43122"));
+        assert!(offer.payload.contains("desktopId=desktop-test-id"));
     }
 
     #[test]

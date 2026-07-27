@@ -151,6 +151,14 @@ fn is_lume_codex_process(command: &str) -> bool {
     command.contains("127.0.0.1:43130") || command.contains("--remote ws://127.0.0.1:43131")
 }
 
+/// Subcomandos do Claude Code que são infraestrutura, não conversas.
+fn is_claude_infrastructure(tokens: &[&str]) -> bool {
+    const SUBCOMMANDS: [&str; 2] = ["daemon", "bg-pty-host"];
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "claude" && SUBCOMMANDS.contains(&pair[1]))
+}
+
 fn process_descends_from(system: &System, mut child: sysinfo::Pid, ancestor: sysinfo::Pid) -> bool {
     for _ in 0..12 {
         let Some(parent) = system.process(child).and_then(|process| process.parent()) else {
@@ -192,9 +200,17 @@ fn source_for(system: &System, mut pid: sysinfo::Pid) -> SessionSource {
     SessionSource::Cli
 }
 
+/// Reconhece o executável versionado instalado abaixo de um diretório `claude`.
+fn is_versioned_claude_executable(token: &str) -> bool {
+    token
+        .split(['/', '\\'])
+        .any(|segment| segment.trim_matches(['"', '\'']) == "claude")
+}
+
 fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
-    let tokens = command
-        .split_whitespace()
+    let raw_tokens = command.split_whitespace().collect::<Vec<_>>();
+    let tokens = raw_tokens
+        .iter()
         .map(|token| {
             token
                 .rsplit(['/', '\\'])
@@ -205,7 +221,14 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
         .collect::<Vec<_>>();
     if name == "codex" || tokens.iter().any(|token| token == &"codex") {
         Some(AgentKind::Codex)
-    } else if name == "claude" || tokens.iter().any(|token| token == &"claude") {
+    } else if is_claude_infrastructure(&tokens) {
+        None
+    } else if name == "claude"
+        || tokens.iter().any(|token| token == &"claude")
+        || raw_tokens
+            .first()
+            .is_some_and(|executable| is_versioned_claude_executable(executable))
+    {
         Some(AgentKind::Claude)
     } else if name == "gemini" || tokens.iter().any(|token| token == &"gemini") {
         Some(AgentKind::Gemini)
@@ -319,6 +342,77 @@ mod tests {
         assert!(is_lume_codex_process(
             "codex --remote ws://127.0.0.1:43131 resume chat"
         ));
+    }
+
+    #[test]
+    fn claude_infrastructure_is_not_a_session() {
+        assert_eq!(
+            detect_agent("claude", "/home/user/.local/bin/claude daemon"),
+            None
+        );
+        assert_eq!(
+            detect_agent(
+                "2.1.220",
+                "claude bg-pty-host --bg-pty-host /tmp/cc-daemon/x.sock 200 50 -- /home/user/.local/share/claude/versions/2.1.220"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn versioned_claude_binary_is_a_session() {
+        assert_eq!(
+            detect_agent(
+                "2.1.220",
+                "/home/user/.local/share/claude/versions/2.1.220 --session-id 9b7acb3c --fork-session"
+            ),
+            Some(AgentKind::Claude)
+        );
+    }
+
+    #[test]
+    fn claude_lookalikes_are_not_sessions() {
+        assert_eq!(
+            detect_agent("nvim", "/usr/bin/nvim /home/user/.claude/settings.json"),
+            None
+        );
+        assert_eq!(
+            detect_agent("nvim", "/usr/bin/nvim /home/user/claude-notes/a.md"),
+            None
+        );
+        assert_eq!(
+            detect_agent("nvim", "/usr/bin/nvim /home/user/claude/a.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_detection_does_not_change_codex_or_gemini() {
+        assert_eq!(
+            detect_agent("codex", "/usr/bin/codex"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            detect_agent("bash", "codex resume abc"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            detect_agent("codex", "/usr/bin/codex daemon"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            detect_agent("gemini", "/usr/bin/gemini"),
+            Some(AgentKind::Gemini)
+        );
+        assert_eq!(detect_agent("bash", "gemini chat"), Some(AgentKind::Gemini));
+        assert_eq!(
+            detect_agent("claude", "/usr/bin/claude"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            detect_agent("bash", "claude --resume abc"),
+            Some(AgentKind::Claude)
+        );
     }
 
     #[test]

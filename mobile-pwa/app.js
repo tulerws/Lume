@@ -1,8 +1,10 @@
 const tokenKey = "lume-mobile-token-v1";
 const baseKey = "lume-mobile-gateway-v1";
 const deviceKey = "lume-mobile-device-v1";
+const desktopKey = "lume-mobile-desktop-v1";
 const credentialKey = "lume-mobile-biometric-v1";
 const notificationsKey = "lume-mobile-notifications-v1";
+const backgroundMonitoringKey = "lume-mobile-background-v1";
 const mobileUpdateCheckKey = "lume-mobile-update-check-v1";
 const mobileManifestUrl =
   "https://github.com/tulerws/Lume/releases/latest/download/mobile-latest.json";
@@ -29,6 +31,7 @@ const chatStopButton = document.querySelector("#chat-stop");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
+const headerMascot = document.querySelector("#header-mascot");
 const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
 const closePairInstallPrompt = document.querySelector("#close-pair-install");
@@ -44,9 +47,13 @@ const mobileUpdateProgress = document.querySelector("#mobile-update-progress");
 let token = localStorage.getItem(tokenKey);
 let deviceId = localStorage.getItem(deviceKey);
 let apiBase = localStorage.getItem(baseKey) || "";
+let desktopId = localStorage.getItem(desktopKey);
+let nativeCredentialsAvailable = false;
 let transportKeyPromise;
 let pollTimer;
 let lastSequence = 0;
+let nativeRealtimeConnected = false;
+let nativeRealtimeListenersReady = false;
 let currentDevice;
 let previousStatuses = new Map();
 let hasRenderedSnapshot = false;
@@ -62,7 +69,12 @@ let bannerTimer;
 let openUpdateViewRequested = false;
 let activeChatSessionId;
 let lastChatRenderKey = "";
+let mascotTransitionTimer;
 const expandedResults = new Set();
+const submittingPromptSessions = new Set();
+const promptDrafts = new Map();
+const sendIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg>';
+const sendSpinnerMarkup = '<span class="prompt-send-spinner" aria-hidden="true"></span>';
 
 const escapeHtml = (value = "") =>
   String(value).replace(/[&<>"']/g, (character) => ({
@@ -226,11 +238,20 @@ function localFetch(url, options) {
 }
 
 function clearMobileCredentials() {
+  const realtime = nativeRealtimePlugin();
+  const nativeClear = realtime
+    ? realtime.clearCredentials().catch(() => undefined)
+    : Promise.resolve();
   localStorage.removeItem(tokenKey);
   localStorage.removeItem(deviceKey);
+  localStorage.removeItem(desktopKey);
   token = null;
   deviceId = null;
+  desktopId = null;
+  nativeCredentialsAvailable = false;
+  nativeRealtimeConnected = false;
   transportKeyPromise = undefined;
+  return nativeClear;
 }
 
 async function securePair(options) {
@@ -315,6 +336,22 @@ async function secureApi(path, options = {}) {
 }
 
 async function api(path, options = {}) {
+  const realtime = nativeCredentialsAvailable ? nativeRealtimePlugin() : null;
+  if (realtime && path !== "/api/v1/pair") {
+    let body = {};
+    if (options.body) {
+      try {
+        body = JSON.parse(options.body);
+      } catch {
+        body = {};
+      }
+    }
+    return realtime.request({
+      method: String(options.method || "GET").toUpperCase(),
+      path,
+      body,
+    });
+  }
   if (apiBase.startsWith("http://")) {
     return path === "/api/v1/pair" ? securePair(options) : secureApi(path, options);
   }
@@ -350,6 +387,7 @@ function showEntryView() {
   emptyAuthView.hidden = Boolean(pairingCode);
   connectionDot.className = "";
   connectionLabel.textContent = "Not paired";
+  setHeaderMascotState("sleeping");
   document.querySelector("#refresh-button").hidden = true;
   updateInstallOptions();
   if (pairingCode) {
@@ -362,6 +400,132 @@ function showEntryView() {
 
 function nativePlatform() {
   return window.Capacitor?.getPlatform?.() || "web";
+}
+
+function nativeRealtimePlugin() {
+  return nativePlatform() === "android"
+    ? window.Capacitor?.Plugins?.LumeNative || null
+    : null;
+}
+
+function hasMobileSession() {
+  return Boolean(token || nativeCredentialsAvailable);
+}
+
+async function restoreNativeCredentials() {
+  const realtime = nativeRealtimePlugin();
+  if (!realtime || token) return false;
+  try {
+    const stored = await realtime.getStoredConnection();
+    if (!stored.paired) return false;
+    apiBase = stored.gateway;
+    deviceId = stored.deviceId;
+    desktopId = stored.desktopId || null;
+    nativeCredentialsAvailable = true;
+    localStorage.setItem(baseKey, apiBase);
+    localStorage.setItem(deviceKey, deviceId);
+    if (desktopId) localStorage.setItem(desktopKey, desktopId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function applyRealtimeSnapshot(snapshot, sequence, cached = false) {
+  if (!snapshot?.sessions) return;
+  if (Number.isFinite(Number(sequence))) {
+    lastSequence = Math.max(lastSequence, Number(sequence));
+  }
+  renderSessions(snapshot);
+  if (cached) {
+    connectionDot.className = "offline";
+    connectionLabel.textContent = "Cached";
+    setHeaderMascotState("sleeping");
+    showBanner("Showing the last state saved on this phone.", "info", "connection");
+  } else {
+    connectionDot.className = "online";
+    connectionLabel.textContent = "Connected";
+    hideBanner("connection");
+  }
+}
+
+function applyRealtimeConnectionState(state = {}) {
+  const connected = state.status === "connected";
+  const changed = nativeRealtimeConnected !== connected;
+  nativeRealtimeConnected = connected;
+  if (connected) {
+    connectionDot.className = "online";
+    connectionLabel.textContent = "Connected";
+    hideBanner("connection");
+    setHeaderMascotState(mascotStateForSessions(currentSnapshot?.sessions || []));
+  } else if (state.status === "reconnecting") {
+    connectionDot.className = "offline";
+    connectionLabel.textContent = "Reconnecting";
+    setHeaderMascotState("sleeping");
+  } else {
+    setHeaderMascotState("sleeping");
+  }
+  if (changed && hasMobileSession()) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollEvents, connected ? 10_000 : 250);
+  }
+}
+
+async function initializeNativeRealtime() {
+  const realtime = nativeRealtimePlugin();
+  if (!realtime || !deviceId || !apiBase || (!token && !nativeCredentialsAvailable)) return false;
+  if (!nativeRealtimeListenersReady) {
+    await realtime.addListener("connectionChanged", applyRealtimeConnectionState);
+    await realtime.addListener("sessionSnapshot", ({ snapshot, sequence, cached }) => {
+      applyRealtimeSnapshot(snapshot, sequence, cached);
+    });
+    await realtime.addListener("sessionDelta", ({ snapshot, events = [], cached }) => {
+      for (const event of events || []) {
+        lastSequence = Math.max(lastSequence, Number(event.sequence || 0));
+      }
+      applyRealtimeSnapshot(snapshot, undefined, cached);
+    });
+    await realtime.addListener("streamError", ({ code, message, retryable }) => {
+      if (code === "authentication_failed") {
+        nativeCredentialsAvailable = false;
+        nativeRealtimeConnected = false;
+        localStorage.removeItem(deviceKey);
+        localStorage.removeItem(desktopKey);
+        deviceId = null;
+        desktopId = null;
+        showEntryView();
+      }
+      if (code === "background_service_unavailable") {
+        void realtime.getStatus()
+          .then(applyNativeMonitoringStatus)
+          .catch(() => undefined);
+        showBanner(
+          message || "Android could not start background monitoring.",
+          "error",
+          "connection",
+        );
+      } else if (!retryable) {
+        showBanner(message || "The live connection failed.", "error", "connection");
+      }
+    });
+    nativeRealtimeListenersReady = true;
+  }
+  try {
+    const state = token
+      ? await realtime.connect({ gateway: apiBase, desktopId, deviceId, token })
+      : await realtime.connect();
+    nativeCredentialsAvailable = Boolean(state.credentialsStored || nativeCredentialsAvailable);
+    if (nativeCredentialsAvailable && token) {
+      localStorage.removeItem(tokenKey);
+      token = null;
+      transportKeyPromise = undefined;
+    }
+    applyRealtimeConnectionState(state);
+    return true;
+  } catch {
+    nativeRealtimeConnected = false;
+    return false;
+  }
 }
 
 function parsePairingTarget(rawValue) {
@@ -381,6 +545,8 @@ function parsePairingTarget(rawValue) {
     const code = url.searchParams.get("code") || fragmentParams.get("code");
     const importedToken = url.searchParams.get("token") || fragmentParams.get("token");
     const importedDeviceId = url.searchParams.get("deviceId") || fragmentParams.get("deviceId");
+    const importedDesktopId = url.searchParams.get("desktopId")
+      || fragmentParams.get("desktopId");
     if (
       !/^https?:\/\//.test(gateway || "")
       || (!code && !(importedToken && importedDeviceId))
@@ -390,6 +556,7 @@ function parsePairingTarget(rawValue) {
       code,
       token: importedToken,
       deviceId: importedDeviceId,
+      desktopId: importedDesktopId,
     };
   } catch {
     return null;
@@ -403,6 +570,7 @@ function pairingIntentUrl(target) {
     query.set("token", target.token);
     query.set("deviceId", target.deviceId);
   }
+  if (target.desktopId) query.set("desktopId", target.desktopId);
   const fallback = encodeURIComponent(location.href);
   return `intent://pair?${query.toString()}#Intent;scheme=lume;package=com.tulerws.lume.mobile;S.browser_fallback_url=${fallback};end`;
 }
@@ -425,7 +593,7 @@ function prepareNativePairingLaunch(target) {
 function scheduleAutomaticPairing() {
   clearTimeout(automaticPairingTimer);
   automaticPairingTimer = setTimeout(() => {
-    if (!pairingCode || token || document.hidden || pairForm.querySelector("button").disabled) return;
+    if (!pairingCode || hasMobileSession() || document.hidden || pairForm.querySelector("button").disabled) return;
     pairForm.requestSubmit();
   }, nativePlatform() === "web" ? 900 : 80);
 }
@@ -435,16 +603,19 @@ function applyPairingTarget(target) {
   if (target.token && target.deviceId) {
     token = target.token;
     deviceId = target.deviceId;
+    desktopId = target.desktopId || null;
     pairingCode = null;
     transportKeyPromise = undefined;
     localStorage.setItem(baseKey, apiBase);
     localStorage.setItem(tokenKey, token);
     localStorage.setItem(deviceKey, deviceId);
+    if (desktopId) localStorage.setItem(desktopKey, desktopId);
     history.replaceState({}, "", new URL("./", location.href).pathname);
     void showDashboard();
     return;
   }
   pairingCode = target.code;
+  desktopId = target.desktopId || null;
   pairInstallPromptDismissed = false;
   localStorage.setItem(baseKey, apiBase);
   pairMessage.textContent = "";
@@ -525,6 +696,30 @@ function statusClass(status) {
   }[status] || "waiting";
 }
 
+function mascotStateForSessions(sessions) {
+  const statuses = new Set(sessions.map((session) => session.status));
+  if (statuses.has("permission_required")) return "permission";
+  if (statuses.has("running")) return "running";
+  if (statuses.has("failed")) return "failed";
+  if (statuses.has("completed")) return "completed";
+  if (statuses.has("waiting_for_input")) return "waiting";
+  return sessions.length ? "awake" : "sleeping";
+}
+
+function setHeaderMascotState(state) {
+  if (!headerMascot || headerMascot.dataset.state === state) return;
+  clearTimeout(mascotTransitionTimer);
+  headerMascot.dataset.state = state;
+  headerMascot.className = `lume-mobile-mascot state-${state}`;
+  void headerMascot.offsetWidth;
+  headerMascot.classList.add("is-changing");
+  mascotTransitionTimer = setTimeout(() => headerMascot.classList.remove("is-changing"), 360);
+}
+
+function mascotMarkup(state, extraClass = "") {
+  return `<span class="lume-mobile-mascot state-${state} ${extraClass}" aria-hidden="true">${headerMascot?.innerHTML || ""}</span>`;
+}
+
 function filterSessions(sessions) {
   if (activeFilter === "running") {
     return sessions.filter((session) => session.status === "running");
@@ -565,6 +760,13 @@ function fileChangeRows(files) {
   `).join("");
 }
 
+function chatTextKey(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+}
+
 function buildChatTurns(session) {
   const turns = [];
   const ensureTurn = (id) => {
@@ -580,11 +782,20 @@ function buildChatTurns(session) {
       continue;
     }
     current ||= ensureTurn(`turn:${activity.id}`);
-    current.items.push(activity);
     mergeFileChanges(
       current.files,
       summarizeFileChanges(activity.detail || "", activity.files || [], session.workingDirectory),
     );
+    const messageKey = activity.kind === "message" ? chatTextKey(activity.detail) : "";
+    if (
+      messageKey
+      && current.items.some(
+        (item) => item.kind === "message" && chatTextKey(item.detail) === messageKey,
+      )
+    ) {
+      continue;
+    }
+    current.items.push(activity);
   }
   for (const result of session.results || []) {
     const resultTurn = [...turns]
@@ -599,7 +810,9 @@ function buildChatTurns(session) {
     if (
       result.response
       && !resultTurn.items.some(
-        (item) => item.kind === "message" && item.detail === result.response,
+        (item) =>
+          item.kind === "message"
+          && chatTextKey(item.detail) === chatTextKey(result.response),
       )
     ) {
       resultTurn.items.push({
@@ -617,7 +830,9 @@ function buildChatTurns(session) {
     session.lastResponse
     && !turns.some((turn) =>
       turn.items.some(
-        (item) => item.kind === "message" && item.detail === session.lastResponse,
+        (item) =>
+          item.kind === "message"
+          && chatTextKey(item.detail) === chatTextKey(session.lastResponse),
       ))
   ) {
     current ||= ensureTurn(`response:${session.id}`);
@@ -664,6 +879,7 @@ function renderChat(sessions) {
     session.results,
     session.lastResponse,
     scopes,
+    submittingPromptSessions.has(session.id),
   ]);
   if (renderKey === lastChatRenderKey) return;
   const shouldFollow =
@@ -722,10 +938,13 @@ function renderChat(sessions) {
 
   const canPrompt = scopes.includes("prompt") && session.capabilities?.canPrompt
     && ["completed", "failed", "waiting_for_input"].includes(session.status);
+  const promptSubmitting = submittingPromptSessions.has(session.id);
+  const promptDraft = promptDrafts.get(session.id) || "";
   chatComposer.innerHTML = canPrompt
-    ? `<form class="mobile-chat-form" data-session="${escapeHtml(session.id)}">
-        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" required></textarea>
-        <button type="submit" aria-label="Send prompt"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg></button>
+    ? `<form class="mobile-chat-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
+        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea>
+        <button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
+        <span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span>
       </form>`
     : session.status === "running"
       ? '<div class="mobile-composer-status"><span></span><span></span><span></span><p>Agent is working</p></div>'
@@ -746,6 +965,7 @@ function openChat(sessionId) {
 function renderSessions(snapshot, trackChanges = true) {
   currentSnapshot = snapshot;
   const sessions = snapshot.sessions || [];
+  setHeaderMascotState(mascotStateForSessions(sessions));
   if (trackChanges && hasRenderedSnapshot && localStorage.getItem(notificationsKey) === "on") {
     for (const session of sessions) {
       if (previousStatuses.get(session.id) !== session.status) {
@@ -772,7 +992,7 @@ function renderSessions(snapshot, trackChanges = true) {
   renderChat(sessions);
   const visibleSessions = filterSessions(sessions);
   if (!sessions.length) {
-    sessionList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No agents are open</strong><p>Start an agent on your computer. Lume will bring it here automatically.</p></div>';
+    sessionList.innerHTML = `<div class="empty-list">${mascotMarkup("sleeping")}<strong>No agents are open</strong><p>Start an agent on your computer. Lume will bring it here automatically.</p></div>`;
     return;
   }
   if (!visibleSessions.length) {
@@ -801,8 +1021,10 @@ function renderSessions(snapshot, trackChanges = true) {
       : "";
     const canPrompt = scopes.includes("prompt") && session.capabilities?.canPrompt &&
       ["completed", "failed", "waiting_for_input"].includes(session.status);
+    const promptSubmitting = submittingPromptSessions.has(session.id);
+    const promptDraft = promptDrafts.get(session.id) || "";
     const prompt = canPrompt
-      ? `<form class="prompt-form" data-session="${escapeHtml(session.id)}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(session.agentLabel)}" placeholder="Continue with a new prompt…" required></textarea><button type="submit" aria-label="Send prompt"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg></button></form>`
+      ? `<form class="prompt-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(session.agentLabel)}" placeholder="Continue with a new prompt…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea><button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button><span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span></form>`
       : "";
     const stop = scopes.includes("terminate") && session.capabilities?.canTerminate
       ? `<button class="stop-agent" data-command="terminate" data-session="${escapeHtml(session.id)}">Stop agent</button>`
@@ -828,7 +1050,7 @@ function renderResults(sessions) {
     .flatMap((session) => (session.results || []).map((result) => ({ session, result })))
     .sort((left, right) => right.result.createdAt - left.result.createdAt);
   if (!results.length) {
-    resultsList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No results yet</strong><p>Finished responses and changed files will be collected here.</p></div>';
+    resultsList.innerHTML = `<div class="empty-list">${mascotMarkup("awake")}<strong>No results yet</strong><p>Finished responses and changed files will be collected here.</p></div>`;
     return;
   }
   resultsList.innerHTML = results.map(({ session, result }) => {
@@ -897,6 +1119,13 @@ async function notifySession(session) {
   };
   const body = messages[session.status];
   if (!body) return;
+  if (
+    nativePlatform() === "android"
+    && nativeCredentialsAvailable
+    && nativeRealtimePlugin()
+  ) {
+    return;
+  }
   const localNotifications = window.Capacitor?.Plugins?.LocalNotifications;
   if (nativePlatform() === "android" && localNotifications) {
     let identifier = 17;
@@ -935,13 +1164,18 @@ async function syncNotificationPreference() {
     && localStorage.getItem(notificationsKey) === "on"
   ) {
     const permission = await localNotifications.checkPermissions();
-    if (permission.display !== "granted") localStorage.removeItem(notificationsKey);
+    if (permission.display !== "granted") {
+      localStorage.removeItem(notificationsKey);
+      localStorage.removeItem(backgroundMonitoringKey);
+    }
   }
+  await syncNativeMonitoringPreferences();
 }
 
 function updateSecurityControls() {
   const biometric = document.querySelector("#biometric-button");
   const notifications = document.querySelector("#notification-button");
+  const background = document.querySelector("#background-monitoring-button");
   biometric.querySelector("em").textContent =
     localStorage.getItem(credentialKey) ? "On" : "Off";
   notifications.querySelector("em").textContent =
@@ -951,6 +1185,39 @@ function updateSecurityControls() {
     "active",
     localStorage.getItem(notificationsKey) === "on",
   );
+  const nativeBackgroundAvailable = nativePlatform() === "android" && nativeRealtimePlugin();
+  background.hidden = !nativeBackgroundAvailable;
+  background.querySelector("em").textContent =
+    localStorage.getItem(backgroundMonitoringKey) === "on" ? "On" : "Off";
+  background.classList.toggle(
+    "active",
+    localStorage.getItem(backgroundMonitoringKey) === "on",
+  );
+}
+
+async function syncNativeMonitoringPreferences() {
+  const plugin = nativeRealtimePlugin();
+  if (nativePlatform() !== "android" || !plugin?.setMonitoringPreferences) return;
+  const status = await plugin.setMonitoringPreferences({
+    notificationsEnabled: localStorage.getItem(notificationsKey) === "on",
+    backgroundEnabled: localStorage.getItem(backgroundMonitoringKey) === "on",
+  });
+  return applyNativeMonitoringStatus(status);
+}
+
+function applyNativeMonitoringStatus(status = {}) {
+  if (status.notificationsEnabled) {
+    localStorage.setItem(notificationsKey, "on");
+  } else {
+    localStorage.removeItem(notificationsKey);
+  }
+  if (status.backgroundEnabled) {
+    localStorage.setItem(backgroundMonitoringKey, "on");
+  } else {
+    localStorage.removeItem(backgroundMonitoringKey);
+  }
+  updateSecurityControls();
+  return status;
 }
 
 async function toggleBiometric() {
@@ -1020,7 +1287,16 @@ async function verifySensitiveAction() {
 
 async function toggleNotifications() {
   if (localStorage.getItem(notificationsKey) === "on") {
+    const backgroundWasEnabled = localStorage.getItem(backgroundMonitoringKey) === "on";
     localStorage.removeItem(notificationsKey);
+    localStorage.removeItem(backgroundMonitoringKey);
+    try {
+      await syncNativeMonitoringPreferences();
+    } catch (error) {
+      localStorage.setItem(notificationsKey, "on");
+      if (backgroundWasEnabled) localStorage.setItem(backgroundMonitoringKey, "on");
+      showBanner(error?.message || "Could not turn off notifications.", "error");
+    }
     updateSecurityControls();
     return;
   }
@@ -1048,10 +1324,13 @@ async function toggleNotifications() {
         visibility: 1,
       });
       localStorage.setItem(notificationsKey, "on");
+      await syncNativeMonitoringPreferences();
       showBanner("Notifications enabled for tasks, errors and approvals.", "success");
       updateSecurityControls();
     } catch (error) {
       localStorage.removeItem(notificationsKey);
+      localStorage.removeItem(backgroundMonitoringKey);
+      void syncNativeMonitoringPreferences().catch(() => undefined);
       showBanner(error?.message || "Could not enable Android notifications.", "error");
       updateSecurityControls();
     }
@@ -1067,6 +1346,41 @@ async function toggleNotifications() {
     showBanner("Notifications enabled while Lume Mobile is active.", "success");
   } else {
     showBanner("Notification permission was not granted.", "error");
+  }
+  updateSecurityControls();
+}
+
+async function toggleBackgroundMonitoring() {
+  if (nativePlatform() !== "android" || !nativeRealtimePlugin()) return;
+  if (localStorage.getItem(backgroundMonitoringKey) === "on") {
+    localStorage.removeItem(backgroundMonitoringKey);
+    try {
+      await syncNativeMonitoringPreferences();
+      showBanner("Background monitoring turned off.", "success");
+    } catch (error) {
+      localStorage.setItem(backgroundMonitoringKey, "on");
+      showBanner(error?.message || "Could not turn off background monitoring.", "error");
+    }
+    updateSecurityControls();
+    return;
+  }
+  if (localStorage.getItem(notificationsKey) !== "on") {
+    await toggleNotifications();
+    if (localStorage.getItem(notificationsKey) !== "on") return;
+  }
+  localStorage.setItem(backgroundMonitoringKey, "on");
+  try {
+    const status = await syncNativeMonitoringPreferences();
+    if (!status?.backgroundEnabled) {
+      throw new Error("Android did not enable background monitoring.");
+    }
+    showBanner(
+      "Background monitoring is on. Android will keep a quiet Lume notification visible.",
+      "success",
+    );
+  } catch (error) {
+    localStorage.removeItem(backgroundMonitoringKey);
+    showBanner(error?.message || "Could not enable background monitoring.", "error");
   }
   updateSecurityControls();
 }
@@ -1142,7 +1456,7 @@ async function checkMobileUpdate({ manual = false } = {}) {
     installedMobileInfo = await updater.getInfo();
     if (installedMobileInfo.openedFromUpdateNotification) {
       openUpdateViewRequested = true;
-      if (token && !appContent.hidden) {
+      if (hasMobileSession() && !appContent.hidden) {
         setView("device");
         openUpdateViewRequested = false;
       }
@@ -1208,7 +1522,7 @@ async function initializeMobileUpdates() {
       installedMobileInfo = await nativeUpdater().getInfo();
       if (installedMobileInfo.openedFromUpdateNotification) {
         openUpdateViewRequested = true;
-        if (token && !appContent.hidden) {
+        if (hasMobileSession() && !appContent.hidden) {
           setView("device");
           openUpdateViewRequested = false;
         }
@@ -1242,22 +1556,31 @@ async function refreshSnapshot() {
   } catch (error) {
     connectionDot.className = "offline";
     connectionLabel.textContent = "Offline";
+    setHeaderMascotState("sleeping");
     showBanner(error.message, "error", "connection");
   }
 }
 
 async function executeCommand(command) {
   const requestId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
-  const response = await api("/api/v1/commands", {
-    method: "POST",
-    body: JSON.stringify({ requestId, ...command }),
-  });
+  const request = { requestId, ...command };
+  const realtime = nativeRealtimeConnected ? nativeRealtimePlugin() : null;
+  const response = realtime
+    ? await realtime.sendCommand({ command: request })
+    : await api("/api/v1/commands", {
+        method: "POST",
+        body: JSON.stringify(request),
+      });
   if (!response.ok) throw new Error(response.error?.message || "The command failed");
   await refreshSnapshot();
 }
 
 async function pollEvents() {
-  if (!token) return;
+  if (!hasMobileSession()) return;
+  if (nativeRealtimeConnected) {
+    pollTimer = setTimeout(pollEvents, 10_000);
+    return;
+  }
   try {
     const payload = await api(`/api/v1/events?since=${lastSequence}`);
     const events = payload.events || [];
@@ -1282,6 +1605,7 @@ async function showDashboard() {
   document.querySelector("#refresh-button").hidden = false;
   await syncNotificationPreference();
   updateSecurityControls();
+  await initializeNativeRealtime();
   await refreshSnapshot();
   if (openUpdateViewRequested) {
     setView("device");
@@ -1323,9 +1647,11 @@ pairForm.addEventListener("submit", async (event) => {
     });
     token = credentials.token;
     deviceId = credentials.device.id;
+    desktopId = credentials.desktopId || desktopId;
     pairingCode = null;
     localStorage.setItem(tokenKey, token);
     localStorage.setItem(deviceKey, deviceId);
+    if (desktopId) localStorage.setItem(desktopKey, desktopId);
     history.replaceState({}, "", new URL("./", location.href).pathname);
     await showDashboard();
   } catch (error) {
@@ -1422,10 +1748,12 @@ document.querySelector("#manual-pair-form").addEventListener("submit", async (ev
     });
     token = body.token;
     deviceId = body.device.id;
+    desktopId = body.desktopId || desktopId;
     pairingCode = null;
     localStorage.setItem(baseKey, apiBase);
     localStorage.setItem(tokenKey, token);
     localStorage.setItem(deviceKey, deviceId);
+    if (desktopId) localStorage.setItem(desktopKey, desktopId);
     await showDashboard();
   } catch (error) {
     message.textContent = "";
@@ -1438,19 +1766,49 @@ async function submitPromptForm(form) {
   if (!(await verifySensitiveAction())) return;
   const textarea = form.querySelector("textarea");
   const button = form.querySelector("button");
+  const status = form.querySelector(".prompt-send-state");
+  const sessionId = form.dataset.session;
+  const submittedPrompt = textarea.value.trim();
+  if (!submittedPrompt || submittingPromptSessions.has(sessionId)) return;
+  submittingPromptSessions.add(sessionId);
+  promptDrafts.set(sessionId, textarea.value);
+  form.classList.add("is-sending");
+  form.setAttribute("aria-busy", "true");
+  textarea.disabled = true;
   button.disabled = true;
+  button.setAttribute("aria-label", "Sending prompt");
+  button.innerHTML = sendSpinnerMarkup;
+  if (status) status.textContent = "Sending prompt…";
   try {
     await executeCommand({
       type: "submit_prompt",
-      sessionId: form.dataset.session,
-      prompt: textarea.value,
+      sessionId,
+      prompt: submittedPrompt,
     });
+    promptDrafts.delete(sessionId);
     textarea.value = "";
   } catch (error) {
     showBanner(error.message, "error");
   } finally {
-    button.disabled = false;
+    submittingPromptSessions.delete(sessionId);
+    if (form.isConnected) {
+      form.classList.remove("is-sending");
+      form.setAttribute("aria-busy", "false");
+      textarea.disabled = false;
+      button.disabled = false;
+      button.setAttribute("aria-label", "Send prompt");
+      button.innerHTML = sendIconMarkup;
+      if (status) status.textContent = "";
+    } else if (currentSnapshot) {
+      renderSessions(currentSnapshot, false);
+    }
   }
+}
+
+function rememberPromptDraft(event) {
+  const textarea = event.target.closest?.("textarea");
+  const form = textarea?.closest(".prompt-form, .mobile-chat-form");
+  if (form?.dataset.session) promptDrafts.set(form.dataset.session, textarea.value);
 }
 
 async function runSessionCommand(button) {
@@ -1483,6 +1841,7 @@ sessionList.addEventListener("submit", async (event) => {
   event.preventDefault();
   await submitPromptForm(form);
 });
+sessionList.addEventListener("input", rememberPromptDraft);
 sessionList.addEventListener("click", async (event) => {
   const chatButton = event.target.closest("button[data-chat-session]");
   if (chatButton) {
@@ -1499,6 +1858,7 @@ chatScreen.addEventListener("submit", async (event) => {
   event.preventDefault();
   await submitPromptForm(form);
 });
+chatScreen.addEventListener("input", rememberPromptDraft);
 chatScreen.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-command]");
   if (!button) return;
@@ -1517,6 +1877,8 @@ resultsList.addEventListener("click", (event) => {
 });
 document.querySelector("#biometric-button").addEventListener("click", toggleBiometric);
 document.querySelector("#notification-button").addEventListener("click", toggleNotifications);
+document.querySelector("#background-monitoring-button")
+  .addEventListener("click", toggleBackgroundMonitoring);
 mobileUpdateButton.addEventListener("click", () => {
   if (availableMobileUpdate) void installMobileUpdate();
   else void checkMobileUpdate({ manual: true });
@@ -1537,9 +1899,9 @@ window.addEventListener("appinstalled", () => {
   deferredInstallPrompt = undefined;
   updateInstallOptions();
 });
-document.querySelector("#disconnect-button").addEventListener("click", () => {
+document.querySelector("#disconnect-button").addEventListener("click", async () => {
   if (!confirm("Disconnect this phone from Lume?")) return;
-  clearMobileCredentials();
+  await clearMobileCredentials();
   localStorage.removeItem(baseKey);
   apiBase = "";
   currentDevice = undefined;
@@ -1547,8 +1909,14 @@ document.querySelector("#disconnect-button").addEventListener("click", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
-  if (pairingCode && !token) scheduleAutomaticPairing();
+  if (pairingCode && !hasMobileSession()) scheduleAutomaticPairing();
   if (nativePlatform() === "android") {
+    const realtime = nativeRealtimePlugin();
+    if (realtime?.getStatus) {
+      void realtime.getStatus()
+        .then(applyNativeMonitoringStatus)
+        .catch(() => undefined);
+    }
     const lastCheck = Number(localStorage.getItem(mobileUpdateCheckKey) || 0);
     if (Date.now() - lastCheck >= mobileUpdateInterval) {
       void checkMobileUpdate();
@@ -1558,7 +1926,7 @@ document.addEventListener("visibilitychange", () => {
       void updater.getInfo().then((info) => {
         if (!info.openedFromUpdateNotification) return;
         openUpdateViewRequested = true;
-        if (token && !appContent.hidden) {
+        if (hasMobileSession() && !appContent.hidden) {
           setView("device");
           openUpdateViewRequested = false;
         }
@@ -1579,11 +1947,16 @@ if ("serviceWorker" in navigator) {
     .catch(() => undefined);
 }
 async function startApp() {
-  if (token && !deviceId) clearMobileCredentials();
+  if (token && !deviceId) {
+    localStorage.removeItem(tokenKey);
+    token = null;
+    transportKeyPromise = undefined;
+  }
+  await restoreNativeCredentials();
   const pairingHandled = await initializePairingDeepLinks();
   void initializeMobileUpdates();
   if (pairingHandled) return;
-  if (token) await showDashboard();
+  if (hasMobileSession()) await showDashboard();
   else showEntryView();
 }
 

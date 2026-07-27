@@ -23,11 +23,12 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html { min-height: 100%; background: var(--bg); }
+html { min-height: 100%; overflow-x: hidden; background: var(--bg); }
 body {
   min-width: 280px;
   min-height: 100dvh;
   margin: 0;
+  overflow-x: hidden;
   color: var(--text);
   background:
     radial-gradient(circle at 50% -12%, rgba(60, 102, 81, 0.2), transparent 36rem),
@@ -61,11 +62,89 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
   backdrop-filter: blur(18px) saturate(130%);
 }
 
-.brand-logo {
-  width: 36px;
-  height: 36px;
-  display: block;
-  border-radius: 10px;
+.lume-mobile-mascot {
+  --mascot-body: #68b887;
+  --mascot-highlight: #83c99e;
+  --mascot-shadow: #2b4a3d;
+  --mascot-detail: #29493c;
+  width: 38px;
+  height: 42px;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  contain: layout;
+}
+
+.lume-mobile-mascot svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  fill: none;
+  stroke: none;
+}
+
+.lume-mobile-mascot .mascot-shadow { fill: var(--mascot-shadow); }
+.lume-mobile-mascot .mascot-body { fill: var(--mascot-body); transition: fill 240ms ease; }
+.lume-mobile-mascot .mascot-highlight { fill: var(--mascot-highlight); transition: fill 240ms ease; }
+.lume-mobile-mascot .mascot-eye-light,
+.lume-mobile-mascot .mascot-tooth { fill: #f2f8f5; }
+.lume-mobile-mascot .mascot-eye-pupil,
+.lume-mobile-mascot .mascot-eye-closed { fill: #1d342b; }
+.lume-mobile-mascot .mascot-paw { fill: var(--mascot-detail); }
+.lume-mobile-mascot .mascot-belly { fill: #172720; }
+.lume-mobile-mascot .mascot-eye-closed,
+.lume-mobile-mascot .mascot-sleep-glyphs,
+.lume-mobile-mascot .mascot-status-glyph { display: none; }
+
+.lume-mobile-mascot.state-sleeping {
+  --mascot-body: #8b9490;
+  --mascot-highlight: #a8b0ac;
+  --mascot-shadow: #4b5550;
+  --mascot-detail: #5d6863;
+}
+.lume-mobile-mascot.state-sleeping .mascot-eye-pupil { display: none; }
+.lume-mobile-mascot.state-sleeping .mascot-eye-closed,
+.lume-mobile-mascot.state-sleeping .mascot-sleep-glyphs { display: block; }
+.lume-mobile-mascot.state-sleeping .mascot-sprite { animation: mobile-mascot-sleep 2.6s steps(2, end) infinite; }
+.lume-mobile-mascot.state-sleeping .mascot-sleep-glyphs {
+  fill: #8b9490;
+  animation: mobile-mascot-dream 2.6s steps(4, end) infinite;
+}
+.lume-mobile-mascot.state-awake .mascot-sprite { animation: mobile-mascot-awake 2.4s steps(2, end) infinite; }
+.lume-mobile-mascot.state-running .mascot-sprite { animation: mobile-mascot-run 620ms steps(2, end) infinite; }
+.lume-mobile-mascot.state-running .mascot-glyph-running { display: block; fill: var(--blue); }
+.lume-mobile-mascot.state-permission .mascot-sprite { animation: mobile-mascot-listen 900ms steps(2, end) infinite; }
+.lume-mobile-mascot.state-permission .mascot-glyph-attention { display: block; fill: var(--amber); }
+.lume-mobile-mascot.state-completed .mascot-sprite { animation: mobile-mascot-celebrate 1.25s steps(3, end) infinite; }
+.lume-mobile-mascot.state-completed .mascot-glyph-completed { display: block; fill: var(--green); }
+.lume-mobile-mascot.state-failed .mascot-sprite { animation: mobile-mascot-shake 1.3s steps(3, end) infinite; }
+.lume-mobile-mascot.state-failed .mascot-glyph-attention { display: block; fill: var(--red); }
+.lume-mobile-mascot.state-waiting .mascot-sprite { animation: mobile-mascot-listen 1.7s steps(2, end) infinite; }
+.lume-mobile-mascot.state-waiting .mascot-glyph-waiting { display: block; fill: var(--amber); }
+.lume-mobile-mascot .mascot-status-glyph path { animation: mobile-mascot-glyph 1.3s steps(2, end) infinite; }
+.lume-mobile-mascot.is-changing .mascot-sprite { animation: mobile-mascot-arrive 340ms steps(3, end) both; }
+
+.empty-list .lume-mobile-mascot {
+  width: 70px;
+  height: 78px;
+  margin-bottom: 15px;
+}
+
+@keyframes mobile-mascot-sleep { 50% { transform: translateY(2px); } }
+@keyframes mobile-mascot-dream {
+  0%, 100% { opacity: 0; transform: translate(0, 5px); }
+  35%, 70% { opacity: 0.82; transform: translate(4px, -4px); }
+}
+@keyframes mobile-mascot-awake { 45% { transform: translateX(2px); } 75% { transform: translateX(-2px); } }
+@keyframes mobile-mascot-run { 50% { transform: translateY(-5px); } }
+@keyframes mobile-mascot-listen { 50% { transform: translateY(-2px) rotate(-1deg); } }
+@keyframes mobile-mascot-celebrate { 40% { transform: translateY(-6px); } }
+@keyframes mobile-mascot-shake { 30% { transform: translateX(-3px); } 60% { transform: translateX(3px); } }
+@keyframes mobile-mascot-glyph { 50% { transform: translateY(-2px); } }
+@keyframes mobile-mascot-arrive {
+  0% { transform: translateY(3px) scale(0.94); }
+  65% { transform: translateY(-2px) scale(1.03); }
+  100% { transform: none; }
 }
 
 .brand-copy {
@@ -572,14 +651,18 @@ body.install-modal-open { overflow: hidden; }
 .permission-actions button:last-child { color: #e69a9a; }
 
 .response p {
+  min-width: 0;
+  max-width: 100%;
   max-height: 132px;
   margin: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   color: var(--text-soft);
   font-size: 13px;
   line-height: 1.5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .changes {
@@ -632,6 +715,30 @@ body.install-modal-open { overflow: hidden; }
 .prompt-form textarea::placeholder { color: #687971; }
 .prompt-form button { width: 40px; min-height: 40px; align-self: end; display: grid; place-items: center; border: 0; border-radius: 10px; color: #122018; background: #7bc297; }
 .prompt-form button svg { width: 17px; height: 17px; }
+.prompt-form button:disabled,
+.mobile-chat-form button:disabled { cursor: wait; opacity: 0.82; }
+.prompt-send-state {
+  min-height: 0;
+  grid-column: 1 / -1;
+  padding: 0 8px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 0;
+  opacity: 0;
+  transition: line-height 140ms ease, opacity 140ms ease, padding 140ms ease;
+}
+.is-sending .prompt-send-state { padding-bottom: 5px; line-height: 1.2; opacity: 1; }
+.prompt-send-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(18, 32, 24, 0.28);
+  border-top-color: #122018;
+  border-radius: 50%;
+  animation: prompt-send-spin 650ms linear infinite;
+}
+@keyframes prompt-send-spin { to { transform: rotate(360deg); } }
 
 .stop-agent {
   min-height: 36px;
@@ -689,6 +796,8 @@ body.install-modal-open { overflow: hidden; }
 .result-summary > svg { width: 16px; height: 16px; color: var(--muted); transition: transform 180ms ease; }
 .result-card.expanded .result-summary > svg { transform: rotate(180deg); }
 .result-response {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   padding: 0 13px 14px;
   overflow: hidden;
@@ -698,6 +807,7 @@ body.install-modal-open { overflow: hidden; }
   line-height: 1.55;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  word-break: break-word;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
 }
@@ -731,6 +841,8 @@ body.install-modal-open { overflow: hidden; }
 
 .chat-open .bottom-nav { display: none; }
 .chat-screen {
+  width: 100%;
+  max-width: 100%;
   height: calc(100dvh - 66px - env(safe-area-inset-top));
   min-height: 0;
   padding: 0;
@@ -778,23 +890,28 @@ body.install-modal-open { overflow: hidden; }
   font-weight: 800;
 }
 .mobile-chat-feed {
+  width: 100%;
   min-height: 0;
+  max-width: 100%;
   padding: 16px 13px 22px;
   display: flex;
   flex: 1;
   flex-direction: column;
   gap: 10px;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   scroll-behavior: smooth;
 }
-.mobile-chat-turn { display: grid; gap: 8px; }
+.mobile-chat-turn { min-width: 0; max-width: 100%; display: grid; gap: 8px; overflow-x: hidden; }
 .mobile-chat-message {
   width: fit-content;
+  min-width: 0;
   max-width: 92%;
   padding: 10px 11px;
   border: 1px solid var(--line);
   border-radius: 14px;
+  overflow: hidden;
   background: rgba(255, 255, 255, 0.025);
 }
 .mobile-chat-message.user { margin-left: auto; border-bottom-right-radius: 4px; background: rgba(104, 184, 135, 0.12); }
@@ -802,14 +919,14 @@ body.install-modal-open { overflow: hidden; }
 .mobile-chat-message header { display: flex; align-items: center; gap: 8px; }
 .mobile-chat-message header strong { min-width: 0; flex: 1; color: #9ecbb0; font-size: 10px; }
 .mobile-chat-message header time { color: var(--muted); font-size: 9px; }
-.mobile-chat-message p { margin: 6px 0 0; color: var(--text-soft); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
-.mobile-chat-trace { margin-left: 4px; padding: 7px 8px; border-radius: 9px; background: rgba(255, 255, 255, 0.018); }
+.mobile-chat-message p { min-width: 0; max-width: 100%; margin: 6px 0 0; color: var(--text-soft); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.mobile-chat-trace { min-width: 0; max-width: 100%; margin-left: 4px; padding: 7px 8px; overflow: hidden; border-radius: 9px; background: rgba(255, 255, 255, 0.018); }
 .mobile-chat-trace summary { display: flex; align-items: center; gap: 7px; color: var(--muted); cursor: pointer; list-style: none; }
 .mobile-chat-trace summary::-webkit-details-marker { display: none; }
 .mobile-chat-trace summary i { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
-.mobile-chat-trace summary span { min-width: 0; flex: 1; font-size: 10px; font-weight: 700; }
-.mobile-chat-trace summary time { font-size: 9px; }
-.mobile-chat-trace pre { max-height: 220px; margin: 8px 0 0 13px; overflow: auto; color: #93a39a; font: 10px/1.55 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+.mobile-chat-trace summary span { min-width: 0; flex: 1; overflow-wrap: anywhere; font-size: 10px; font-weight: 700; word-break: break-word; }
+.mobile-chat-trace summary time { flex: 0 0 auto; font-size: 9px; }
+.mobile-chat-trace pre { min-width: 0; max-width: calc(100% - 13px); max-height: 220px; margin: 8px 0 0 13px; overflow-x: hidden; overflow-y: auto; color: #93a39a; font: 10px/1.55 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
 .mobile-turn-files { margin-left: 4px; border-left: 2px solid rgba(104, 184, 135, 0.5); background: rgba(104, 184, 135, 0.035); }
 .mobile-turn-files summary { min-height: 38px; padding: 0 9px; display: flex; align-items: center; gap: 8px; color: #91bda3; cursor: pointer; list-style: none; }
 .mobile-turn-files summary::-webkit-details-marker { display: none; }
@@ -857,7 +974,7 @@ body.install-modal-open { overflow: hidden; }
 }
 .mobile-chat-permission small { color: var(--amber); font-size: 9px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
 .mobile-chat-permission strong { color: #e4ca96; font-size: 12px; line-height: 1.4; }
-.mobile-chat-permission code { color: var(--text-soft); font-size: 10px; overflow-wrap: anywhere; }
+.mobile-chat-permission code { min-width: 0; max-width: 100%; color: var(--text-soft); font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }
 .mobile-chat-permission > div { display: flex; gap: 6px; }
 .mobile-chat-permission button { min-height: 34px; flex: 1; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--text); background: rgba(255, 255, 255, 0.04); font-size: 10px; font-weight: 750; }
 .mobile-chat-permission button[data-command="deny"] { color: #e59a9a; }
@@ -877,6 +994,8 @@ body.install-modal-open { overflow: hidden; }
   background: var(--surface);
 }
 .mobile-chat-form textarea {
+  width: 100%;
+  min-width: 0;
   min-height: 44px;
   max-height: 120px;
   padding: 10px;
@@ -1151,4 +1270,5 @@ body.install-modal-open { overflow: hidden; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .prompt-send-spinner { border-color: rgba(18, 32, 24, 0.62); }
 }

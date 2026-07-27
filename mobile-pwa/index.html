@@ -13,7 +13,37 @@
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <img class="brand-logo" src="./lume-mobile-icon.svg" alt="" />
+        <span id="header-mascot" class="lume-mobile-mascot state-sleeping" aria-hidden="true">
+          <svg viewBox="72 56 392 408" shape-rendering="crispEdges">
+            <g class="mascot-sprite">
+              <path class="mascot-shadow" d="M96 128h32V96h256v32h32v32h32v160H256v32h128v64h-32v32H192v-32h-64v-32H96z" />
+              <path class="mascot-body" d="M128 160h32v-32h192v32h32v32h32v96H224v32h-32v64h-32v-32h-32z" />
+              <path class="mascot-highlight" d="M160 160h160v32H160z" />
+              <path class="mascot-eye-light" d="M304 176h64v64h-64z" />
+              <path class="mascot-eye-pupil" d="M336 192h32v32h-32z" />
+              <path class="mascot-eye-closed" d="M304 200h64v16h-64z" />
+              <path class="mascot-paw" d="M384 256h32v16h-32z" />
+              <path class="mascot-belly" d="M224 288h192v32H256v32h-32z" />
+              <path class="mascot-tooth" d="M320 320h32v24h-32z" />
+            </g>
+            <g class="mascot-sleep-glyphs">
+              <path d="M382 82h25v10h-15v10h15v10h-25v-10h10V92h-10z" />
+              <path d="M414 56h16v8h-4v4h4v8h-16v-8h4v-4h-4z" />
+            </g>
+            <g class="mascot-status-glyph mascot-glyph-attention" transform="translate(398 70) scale(7)">
+              <path d="M2 0h2v3H2zM2 4h2v2H2z" />
+            </g>
+            <g class="mascot-status-glyph mascot-glyph-completed" transform="translate(394 70) scale(7)">
+              <path d="M0 3h2v2H0zM1 4h2v2H1zM2 3h2v2H2zM3 2h2v2H3zM4 1h2v2H4z" />
+            </g>
+            <g class="mascot-status-glyph mascot-glyph-running" transform="translate(394 70) scale(7)">
+              <path d="M1 1h4v1H1zM0 3h5v1H0zM2 5h3v1H2z" />
+            </g>
+            <g class="mascot-status-glyph mascot-glyph-waiting" transform="translate(394 70) scale(7)">
+              <path d="M1 0h3v1H1zM4 1h1v1H4zM3 2h1v1H3zM2 3h1v1H2zM2 5h1v1H2z" />
+            </g>
+          </svg>
+        </span>
         <span class="brand-copy"><strong>Lume</strong><small>Agent hub</small></span>
         <span class="connection-pill"><i id="connection-dot" aria-hidden="true"></i><span id="connection-label">Local</span></span>
         <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh sessions">
@@ -214,6 +244,11 @@
             <button id="notification-button" type="button">
               <span class="setting-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 7h18s-3 0-3-7M10 20h4" /></svg></span>
               <span><strong>Notifications</strong><small>Task completion, errors and approvals</small></span>
+              <em>Off</em>
+            </button>
+            <button id="background-monitoring-button" type="button" hidden>
+              <span class="setting-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1m-8.6 8.6-2.1 2.1"/><circle cx="12" cy="12" r="3"/></svg></span>
+              <span><strong>Background monitoring</strong><small>Keep the secure agent stream active when the app is closed</small></span>
               <em>Off</em>
             </button>
           </div>

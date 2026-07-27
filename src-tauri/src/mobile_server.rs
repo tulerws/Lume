@@ -9,10 +9,11 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -25,6 +26,11 @@ use rustls::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
+use tungstenite::{
+    handshake::derive_accept_key,
+    protocol::{frame::coding::CloseCode, CloseFrame, Message, Role},
+    Error as WebSocketError, WebSocket,
+};
 
 use crate::{
     browser_server::BrowserControl,
@@ -32,7 +38,9 @@ use crate::{
     control,
     domain::{MobileScope, PairedDevice},
     mobile_gateway::MobileGateway,
-    protocol::{self, HubSnapshot, PROTOCOL_VERSION},
+    protocol::{
+        self, HubSnapshot, HubStreamMessage, PROTOCOL_VERSION, STREAM_HEARTBEAT_INTERVAL_MS,
+    },
     state::AppState,
 };
 
@@ -40,6 +48,11 @@ pub const BOOTSTRAP_ADDRESS: &str = "127.0.0.1:43121";
 pub const TLS_ADDRESS: &str = "127.0.0.1:43122";
 const NETWORK_ADDRESS: &str = "0.0.0.0:43124";
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const REALTIME_PATH: &str = "/api/v1/ws";
+const REALTIME_SUBPROTOCOL: &str = "lume.hub.v1";
+const REALTIME_POLL_INTERVAL: Duration = Duration::from_millis(80);
+const REALTIME_READ_TIMEOUT: Duration = Duration::from_millis(5);
+const MDNS_SERVICE_TYPE: &str = "_lume._tcp.local.";
 const MOBILE_INDEX: &str = include_str!("../../mobile-pwa/index.html");
 const MOBILE_APP: &str = include_str!("../../mobile-pwa/app.js");
 const MOBILE_STYLES: &str = include_str!("../../mobile-pwa/styles.css");
@@ -47,9 +60,26 @@ const MOBILE_MANIFEST: &str = include_str!("../../mobile-pwa/manifest.webmanifes
 const MOBILE_SERVICE_WORKER: &str = include_str!("../../mobile-pwa/sw.js");
 const MOBILE_ICON: &str = include_str!("../../mobile-pwa/lume-mobile-icon.svg");
 
+trait MobileStream: Read + Write {
+    fn set_mobile_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl MobileStream for TcpStream {
+    fn set_mobile_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl MobileStream for StreamOwned<ServerConnection, TcpStream> {
+    fn set_mobile_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
 pub struct MobileServer {
     running: Arc<AtomicBool>,
     network_running: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    discovery: Arc<Mutex<Option<MdnsAdvertisement>>>,
     status: Arc<Mutex<MobileServerStatus>>,
     state: Option<AppState>,
     gateway: Option<MobileGateway>,
@@ -61,10 +91,12 @@ impl Default for MobileServer {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             network_running: Arc::new(Mutex::new(None)),
+            discovery: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(MobileServerStatus {
                 running: false,
                 address: String::new(),
                 network_reachable: false,
+                discovery_available: false,
                 transport: "unavailable".into(),
             })),
             state: None,
@@ -80,7 +112,20 @@ pub struct MobileServerStatus {
     pub running: bool,
     pub address: String,
     pub network_reachable: bool,
+    pub discovery_available: bool,
     pub transport: String,
+}
+
+struct MdnsAdvertisement {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+impl Drop for MdnsAdvertisement {
+    fn drop(&mut self) {
+        let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
+    }
 }
 
 impl MobileServer {
@@ -98,6 +143,7 @@ impl MobileServer {
         })?;
         let running = Arc::new(AtomicBool::new(true));
         let address = format!("https://{TLS_ADDRESS}");
+        gateway.set_desktop_id(identity.ca_fingerprint.clone());
         gateway.set_pairing_base_url(address.clone());
         start_listener_pair(
             listener,
@@ -113,11 +159,13 @@ impl MobileServer {
             running: true,
             address,
             network_reachable: false,
+            discovery_available: false,
             transport: "https".into(),
         };
         Ok(Self {
             running,
             network_running: Arc::new(Mutex::new(None)),
+            discovery: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(status)),
             state: Some(state),
             gateway: Some(gateway),
@@ -162,6 +210,11 @@ impl MobileServer {
         start_plain_listener(listener, running.clone(), state, gateway.clone(), app)?;
         let address = format!("http://{ip}:43124");
         gateway.set_pairing_base_url(address.clone());
+        let discovery = start_mdns_advertisement(ip, &gateway.desktop_id()).ok();
+        let discovery_available = discovery.is_some();
+        if let Ok(mut current) = self.discovery.lock() {
+            *current = discovery;
+        }
         *self
             .network_running
             .lock()
@@ -170,6 +223,7 @@ impl MobileServer {
             running: true,
             address,
             network_reachable: true,
+            discovery_available,
             transport: "encrypted-local".into(),
         };
         *self
@@ -192,10 +246,14 @@ impl MobileServer {
         if let Some(gateway) = &self.gateway {
             gateway.set_pairing_base_url(format!("https://{TLS_ADDRESS}"));
         }
+        if let Ok(mut discovery) = self.discovery.lock() {
+            discovery.take();
+        }
         let status = MobileServerStatus {
             running: self.is_running(),
             address: format!("https://{TLS_ADDRESS}"),
             network_reachable: false,
+            discovery_available: false,
             transport: "https".into(),
         };
         *self
@@ -214,6 +272,9 @@ impl Drop for MobileServer {
             if let Some(running) = network.take() {
                 running.store(false, Ordering::Relaxed);
             }
+        }
+        if let Ok(mut discovery) = self.discovery.lock() {
+            discovery.take();
         }
     }
 }
@@ -242,13 +303,25 @@ fn start_listener_pair(
             while thread_running.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
                         let state = state.clone();
                         let gateway = gateway.clone();
                         let app = app.clone();
                         let tls_config = tls_config.clone();
+                        let connection_running = thread_running.clone();
                         let _ = thread::Builder::new()
                             .name("lume-mobile-client".into())
-                            .spawn(move || handle_tls(stream, state, gateway, app, tls_config));
+                            .spawn(move || {
+                                handle_tls(
+                                    stream,
+                                    state,
+                                    gateway,
+                                    app,
+                                    tls_config,
+                                    connection_running,
+                                )
+                            });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(40));
@@ -298,12 +371,17 @@ fn start_plain_listener(
             while running.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
                         let state = state.clone();
                         let gateway = gateway.clone();
                         let app = app.clone();
+                        let connection_running = running.clone();
                         let _ = thread::Builder::new()
                             .name("lume-mobile-network-client".into())
-                            .spawn(move || handle_stream(stream, state, gateway, app));
+                            .spawn(move || {
+                                handle_stream(stream, state, gateway, app, connection_running)
+                            });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(40));
@@ -314,6 +392,42 @@ fn start_plain_listener(
         })
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn start_mdns_advertisement(ip: IpAddr, desktop_id: &str) -> Result<MdnsAdvertisement, String> {
+    let info = mdns_service_info(ip, desktop_id)?;
+    let fullname = info.get_fullname().to_string();
+    let daemon = ServiceDaemon::new().map_err(|error| error.to_string())?;
+    daemon.register(info).map_err(|error| error.to_string())?;
+    Ok(MdnsAdvertisement { daemon, fullname })
+}
+
+fn mdns_service_info(ip: IpAddr, desktop_id: &str) -> Result<ServiceInfo, String> {
+    let stable_suffix = desktop_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>();
+    if stable_suffix.len() < 8 {
+        return Err("Identidade do desktop indisponível para descoberta local".into());
+    }
+    let instance = format!("Lume-{stable_suffix}");
+    let hostname = format!("lume-{}.local.", stable_suffix.to_ascii_lowercase());
+    let properties = HashMap::from([
+        ("id".to_string(), desktop_id.to_string()),
+        ("protocol".to_string(), PROTOCOL_VERSION.to_string()),
+        ("transport".to_string(), "encrypted-local".to_string()),
+        ("realtime".to_string(), "1".to_string()),
+    ]);
+    ServiceInfo::new(
+        MDNS_SERVICE_TYPE,
+        &instance,
+        &hostname,
+        ip,
+        43124,
+        properties,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn local_network_ip() -> Result<IpAddr, String> {
@@ -498,33 +612,364 @@ struct SecureResponsePayload {
     body: serde_json::Value,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureStreamAuthRequest {
+    device_id: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureStreamAuthPayload {
+    timestamp: i64,
+    request_nonce: String,
+    stream_nonce: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureStreamMessage {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    sequence: u64,
+    nonce: String,
+    ciphertext: String,
+}
+
 fn handle_tls(
     stream: TcpStream,
     state: AppState,
     gateway: MobileGateway,
     app: AppHandle,
     config: Arc<ServerConfig>,
+    running: Arc<AtomicBool>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
     let Ok(connection) = ServerConnection::new(config) else {
         return;
     };
-    handle_stream(StreamOwned::new(connection, stream), state, gateway, app);
+    handle_stream(
+        StreamOwned::new(connection, stream),
+        state,
+        gateway,
+        app,
+        running,
+    );
 }
 
-fn handle_stream<S: Read + Write>(
+fn handle_stream<S: MobileStream>(
     mut stream: S,
     state: AppState,
     gateway: MobileGateway,
     app: AppHandle,
+    running: Arc<AtomicBool>,
 ) {
-    let response = match read_request(&mut stream) {
-        Ok(request) => route_with_app(request, &state, &gateway, Some(&app)),
-        Err(message) => json_error(400, "bad_request", &message),
+    match read_request(&mut stream) {
+        Ok(request) if request.path.split('?').next() == Some(REALTIME_PATH) => {
+            handle_realtime_stream(stream, request, state, gateway, running);
+        }
+        Ok(request) => {
+            let response = route_with_app(request, &state, &gateway, Some(&app));
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+        Err(message) => {
+            let response = json_error(400, "bad_request", &message);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    }
+}
+
+fn handle_realtime_stream<S: MobileStream>(
+    mut stream: S,
+    request: HttpRequest,
+    state: AppState,
+    gateway: MobileGateway,
+    running: Arc<AtomicBool>,
+) {
+    let response = match websocket_upgrade_response(&request) {
+        Ok(response) => response,
+        Err(message) => {
+            let response = json_error(400, "websocket_upgrade_failed", &message);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            return;
+        }
     };
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    if stream.write_all(response.as_bytes()).is_err() || stream.flush().is_err() {
+        return;
+    }
+
+    let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+    let (key, stream_nonce) = match authenticate_realtime_stream(&mut socket, &state, &gateway) {
+        Ok(authenticated) => authenticated,
+        Err(_) => {
+            let _ = socket.close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "authentication_failed".into(),
+            }));
+            return;
+        }
+    };
+
+    let mut message_sequence = 0_u64;
+    if send_secure_stream_message(
+        &mut socket,
+        &key,
+        &stream_nonce,
+        &mut message_sequence,
+        &HubStreamMessage::hello(),
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    let mut event_sequence = protocol::latest_event_sequence();
+    let snapshot = match state.sessions() {
+        Ok(sessions) => HubSnapshot::new(sessions),
+        Err(message) => {
+            let _ = send_secure_stream_message(
+                &mut socket,
+                &key,
+                &stream_nonce,
+                &mut message_sequence,
+                &HubStreamMessage::Error {
+                    code: "snapshot_failed".into(),
+                    message,
+                    retryable: true,
+                },
+            );
+            let _ = socket.close(None);
+            return;
+        }
+    };
+    if send_secure_stream_message(
+        &mut socket,
+        &key,
+        &stream_nonce,
+        &mut message_sequence,
+        &HubStreamMessage::Snapshot {
+            sequence: event_sequence,
+            snapshot,
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    let _ = socket
+        .get_mut()
+        .set_mobile_read_timeout(Some(REALTIME_READ_TIMEOUT));
+    let mut last_heartbeat = Instant::now();
+    while running.load(Ordering::Relaxed) {
+        match read_realtime_control(&mut socket) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => break,
+        }
+        let events = protocol::events_since(event_sequence);
+        if !events.is_empty() {
+            let snapshot = match state.sessions() {
+                Ok(sessions) => HubSnapshot::new(sessions),
+                Err(message) => {
+                    if send_secure_stream_message(
+                        &mut socket,
+                        &key,
+                        &stream_nonce,
+                        &mut message_sequence,
+                        &HubStreamMessage::Error {
+                            code: "snapshot_failed".into(),
+                            message,
+                            retryable: true,
+                        },
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                    thread::sleep(REALTIME_POLL_INTERVAL);
+                    continue;
+                }
+            };
+            let latest = events
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(event_sequence);
+            if send_secure_stream_message(
+                &mut socket,
+                &key,
+                &stream_nonce,
+                &mut message_sequence,
+                &HubStreamMessage::Update { events, snapshot },
+            )
+            .is_err()
+            {
+                break;
+            }
+            event_sequence = latest;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_millis(STREAM_HEARTBEAT_INTERVAL_MS) {
+            if socket.send(Message::Ping(Vec::new().into())).is_err() {
+                break;
+            }
+            last_heartbeat = Instant::now();
+        }
+        thread::sleep(REALTIME_POLL_INTERVAL);
+    }
+    let _ = socket.close(None);
+}
+
+fn read_realtime_control<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<bool, String> {
+    match socket.read() {
+        Ok(Message::Ping(value)) => socket
+            .send(Message::Pong(value))
+            .map(|_| true)
+            .map_err(|error| error.to_string()),
+        Ok(Message::Close(_)) => Ok(false),
+        Ok(_) => Ok(true),
+        Err(WebSocketError::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn websocket_upgrade_response(request: &HttpRequest) -> Result<String, String> {
+    if request.method != "GET" {
+        return Err("O canal em tempo real requer GET".into());
+    }
+    if let Some(origin) = request.headers.get("origin") {
+        if !is_mobile_origin(origin) {
+            return Err("Origem não autorizada".into());
+        }
+    }
+    if !header_contains_token(&request.headers, "connection", "upgrade")
+        || !request
+            .headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        return Err("Upgrade WebSocket ausente".into());
+    }
+    if request
+        .headers
+        .get("sec-websocket-version")
+        .is_none_or(|version| version != "13")
+    {
+        return Err("Versão WebSocket não suportada".into());
+    }
+    if !header_contains_token(
+        &request.headers,
+        "sec-websocket-protocol",
+        REALTIME_SUBPROTOCOL,
+    ) {
+        return Err("Subprotocolo do Lume ausente".into());
+    }
+    let key = request
+        .headers
+        .get("sec-websocket-key")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Chave WebSocket ausente".to_string())?;
+    Ok(format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\
+         Sec-WebSocket-Protocol: {REALTIME_SUBPROTOCOL}\r\n\r\n",
+        derive_accept_key(key.as_bytes())
+    ))
+}
+
+fn header_contains_token(headers: &HashMap<String, String>, name: &str, expected: &str) -> bool {
+    headers.get(name).is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|token| token.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn authenticate_realtime_stream<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    state: &AppState,
+    gateway: &MobileGateway,
+) -> Result<([u8; 32], String), String> {
+    let message = loop {
+        match socket.read().map_err(|error| error.to_string())? {
+            Message::Text(value) => break value,
+            Message::Ping(value) => {
+                socket
+                    .send(Message::Pong(value))
+                    .map_err(|error| error.to_string())?;
+            }
+            Message::Close(_) => return Err("Conexão encerrada antes da autenticação".into()),
+            _ => {}
+        }
+    };
+    let request = serde_json::from_str::<SecureStreamAuthRequest>(&message)
+        .map_err(|_| "Autenticação do canal inválida".to_string())?;
+    let (device, key) = gateway
+        .authenticate_encrypted(state, &request.device_id)?
+        .ok_or_else(|| "Dispositivo não pareado".to_string())?;
+    if !device.scopes.contains(&MobileScope::Monitor) {
+        return Err("Monitoramento não autorizado".into());
+    }
+    let payload = decrypt_json::<SecureStreamAuthPayload>(
+        &key,
+        &EncryptedEnvelope {
+            nonce: request.nonce,
+            ciphertext: request.ciphertext,
+        },
+        b"lume-stream-auth-v1",
+    )
+    .map_err(|_| "Autenticação do canal inválida".to_string())?;
+    if !timestamp_is_recent(payload.timestamp)
+        || payload.stream_nonce.len() < 16
+        || payload.stream_nonce.len() > 128
+    {
+        return Err("Autenticação do canal expirada".into());
+    }
+    if !gateway.accept_request_nonce(
+        &request.device_id,
+        &payload.request_nonce,
+        payload.timestamp,
+    )? {
+        return Err("Autenticação do canal expirada ou repetida".into());
+    }
+    Ok((key, payload.stream_nonce))
+}
+
+fn send_secure_stream_message<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    key: &[u8; 32],
+    stream_nonce: &str,
+    sequence: &mut u64,
+    message: &HubStreamMessage,
+) -> Result<(), String> {
+    *sequence = sequence.saturating_add(1);
+    let aad = format!("lume-stream-message-v1:{stream_nonce}:{sequence}");
+    let encrypted = encrypt_json(key, message, aad.as_bytes())?;
+    let body = serde_json::to_string(&SecureStreamMessage {
+        message_type: "secure_message",
+        sequence: *sequence,
+        nonce: encrypted.nonce,
+        ciphertext: encrypted.ciphertext,
+    })
+    .map_err(|error| error.to_string())?;
+    socket
+        .send(Message::Text(body.into()))
+        .map_err(|error| error.to_string())
 }
 
 fn handle_bootstrap(mut stream: TcpStream, ca_pem: &[u8]) {
@@ -541,6 +986,7 @@ fn handle_bootstrap(mut stream: TcpStream, ca_pem: &[u8]) {
                     "ok": true,
                     "protocolVersion": PROTOCOL_VERSION,
                     "purpose": "certificate_bootstrap",
+                    "realtimePath": REALTIME_PATH,
                 }),
             )
         }
@@ -608,6 +1054,8 @@ fn route_core(
                 "ok": true,
                 "protocolVersion": PROTOCOL_VERSION,
                 "transport": "encrypted-local",
+                "realtimePath": REALTIME_PATH,
+                "realtimeEncrypted": true,
             }),
         );
     }
@@ -1076,11 +1524,15 @@ fn with_cors(response: String, origin: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::TcpListener,
         path::Path,
+        sync::Arc,
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+    use tungstenite::{client::IntoClientRequest, connect, http::HeaderValue, Message};
 
     fn request(
         method: &str,
@@ -1098,6 +1550,167 @@ mod tests {
             headers,
             body: serde_json::to_vec(&body).expect("body"),
         }
+    }
+
+    fn websocket_request(origin: Option<&str>) -> HttpRequest {
+        let mut headers = HashMap::from([
+            ("connection".into(), "keep-alive, Upgrade".into()),
+            ("upgrade".into(), "websocket".into()),
+            ("sec-websocket-version".into(), "13".into()),
+            (
+                "sec-websocket-key".into(),
+                "dGhlIHNhbXBsZSBub25jZQ==".into(),
+            ),
+            ("sec-websocket-protocol".into(), REALTIME_SUBPROTOCOL.into()),
+        ]);
+        if let Some(origin) = origin {
+            headers.insert("origin".into(), origin.into());
+        }
+        HttpRequest {
+            method: "GET".into(),
+            path: REALTIME_PATH.into(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn realtime_upgrade_requires_the_lume_subprotocol_and_trusted_origin() {
+        let response =
+            websocket_upgrade_response(&websocket_request(Some("capacitor://localhost")))
+                .expect("upgrade");
+        assert!(response.starts_with("HTTP/1.1 101"));
+        assert!(response.contains("Sec-WebSocket-Protocol: lume.hub.v1"));
+        assert!(response.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        let mut missing_protocol = websocket_request(None);
+        missing_protocol.headers.remove("sec-websocket-protocol");
+        assert!(websocket_upgrade_response(&missing_protocol).is_err());
+        assert!(
+            websocket_upgrade_response(&websocket_request(Some("https://example.com"))).is_err()
+        );
+    }
+
+    #[test]
+    fn mdns_advertisement_is_bound_to_the_persistent_desktop_identity() {
+        let desktop_id = "0123456789abcdef0123456789abcdef";
+        let info =
+            mdns_service_info("192.168.1.50".parse().expect("ip"), desktop_id).expect("serviço");
+
+        assert_eq!(info.get_type(), MDNS_SERVICE_TYPE);
+        assert_eq!(info.get_port(), 43124);
+        assert!(info.get_fullname().starts_with("Lume-0123456789ab."));
+        assert_eq!(
+            info.get_properties().get_property_val_str("id"),
+            Some(desktop_id)
+        );
+    }
+
+    #[test]
+    fn realtime_messages_are_bound_to_the_stream_and_sequence() {
+        let key: [u8; 32] = Sha256::digest(b"stream-test").into();
+        let stream_nonce = "a-unique-stream-nonce";
+        let aad = format!("lume-stream-message-v1:{stream_nonce}:1");
+        let envelope = encrypt_json(&key, &HubStreamMessage::hello(), aad.as_bytes())
+            .expect("mensagem cifrada");
+        let decoded: serde_json::Value =
+            decrypt_json(&key, &envelope, aad.as_bytes()).expect("mensagem decifrada");
+        assert_eq!(decoded["type"], "hello");
+        assert!(decrypt_json::<serde_json::Value>(
+            &key,
+            &envelope,
+            b"lume-stream-message-v1:another-stream:1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn realtime_channel_authenticates_and_delivers_a_snapshot() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let gateway = MobileGateway::default();
+        gateway.set_pairing_base_url("http://127.0.0.1:43124".into());
+        let offer = gateway.begin_pairing().expect("oferta");
+        let credentials = gateway
+            .complete_pairing(&state, &offer.code, "Telefone")
+            .expect("pareamento");
+        let transport_key: [u8; 32] = Sha256::digest(credentials.token.as_bytes()).into();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("endereço");
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = running.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("cliente");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .expect("timeout");
+            let request = read_request(&mut stream).expect("upgrade");
+            handle_realtime_stream(stream, request, state, gateway, server_running);
+        });
+
+        let mut request = format!("ws://{address}{REALTIME_PATH}")
+            .into_client_request()
+            .expect("requisição");
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static(REALTIME_SUBPROTOCOL),
+        );
+        let (mut socket, response) = connect(request).expect("websocket");
+        assert_eq!(response.status(), 101);
+
+        let request_nonce = URL_SAFE_NO_PAD.encode([3_u8; 16]);
+        let stream_nonce = URL_SAFE_NO_PAD.encode([4_u8; 18]);
+        let auth = encrypt_json(
+            &transport_key,
+            &serde_json::json!({
+                "timestamp": crate::state::now_millis(),
+                "requestNonce": request_nonce,
+                "streamNonce": stream_nonce,
+            }),
+            b"lume-stream-auth-v1",
+        )
+        .expect("autenticação cifrada");
+        socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "deviceId": credentials.device.id,
+                    "nonce": auth.nonce,
+                    "ciphertext": auth.ciphertext,
+                })
+                .to_string()
+                .into(),
+            ))
+            .expect("autenticação");
+
+        for (expected_sequence, expected_type) in [(1_u64, "hello"), (2, "snapshot")] {
+            let text = loop {
+                match socket.read().expect("mensagem") {
+                    Message::Text(text) => break text,
+                    Message::Ping(value) => {
+                        socket.send(Message::Pong(value)).expect("pong");
+                    }
+                    _ => {}
+                }
+            };
+            let outer: serde_json::Value = serde_json::from_str(&text).expect("envelope");
+            assert_eq!(outer["type"], "secure_message");
+            assert_eq!(outer["sequence"], expected_sequence);
+            let encrypted = EncryptedEnvelope {
+                nonce: outer["nonce"].as_str().expect("nonce").into(),
+                ciphertext: outer["ciphertext"].as_str().expect("conteúdo").into(),
+            };
+            let decoded: serde_json::Value = decrypt_json(
+                &transport_key,
+                &encrypted,
+                format!("lume-stream-message-v1:{stream_nonce}:{expected_sequence}").as_bytes(),
+            )
+            .expect("mensagem decifrada");
+            assert_eq!(decoded["type"], expected_type);
+        }
+
+        running.store(false, Ordering::Relaxed);
+        socket.close(None).expect("encerramento");
+        server.join().expect("servidor");
     }
 
     #[test]

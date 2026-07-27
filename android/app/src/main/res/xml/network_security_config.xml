@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
+    <!--
+      Lume discovers a dynamic private-LAN address, which Android cannot express
+      as a fixed domain-config. Native gateway validation restricts HTTP to
+      local addresses and every application payload is encrypted with AES-GCM.
+    -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />

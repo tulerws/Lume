@@ -10,6 +10,7 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        registerPlugin(LumeNativePlugin.class);
         registerPlugin(LumeUpdaterPlugin.class);
         super.onCreate(savedInstanceState);
         UpdateCheckScheduler.schedule(this);

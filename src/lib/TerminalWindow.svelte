@@ -150,6 +150,12 @@
     items: SessionActivity[];
     files: FileChangeSummary[];
   };
+  function chatTextKey(value?: string): string {
+    return (value ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]+$/gm, "")
+      .trim();
+  }
   const chatTurns = $derived.by<ChatTurn[]>(() => {
     const turns: ChatTurn[] = [];
     const ensureTurn = (id: string): ChatTurn => {
@@ -165,8 +171,17 @@
         continue;
       }
       current ??= ensureTurn(`turn:${activity.id}`);
-      current.items.push(activity);
       mergeFileChanges(current.files, activityChanges(activity));
+      const messageKey = activity.kind === "message" ? chatTextKey(activity.detail) : "";
+      if (
+        messageKey &&
+        current.items.some(
+          (item) => item.kind === "message" && chatTextKey(item.detail) === messageKey,
+        )
+      ) {
+        continue;
+      }
+      current.items.push(activity);
     }
     for (const result of session?.results ?? []) {
       const resultTurn =
@@ -182,7 +197,9 @@
       if (
         result.response &&
         !resultTurn.items.some(
-          (item) => item.kind === "message" && item.detail === result.response,
+          (item) =>
+            item.kind === "message" &&
+            chatTextKey(item.detail) === chatTextKey(result.response),
         )
       ) {
         resultTurn.items.push({
@@ -200,7 +217,9 @@
       session?.lastResponse &&
       !turns.some((turn) =>
         turn.items.some(
-          (item) => item.kind === "message" && item.detail === session?.lastResponse,
+          (item) =>
+            item.kind === "message" &&
+            chatTextKey(item.detail) === chatTextKey(session?.lastResponse),
         ),
       )
     ) {
@@ -887,7 +906,7 @@
                     <details class="turn-trace">
                       <summary>
                         <span>{activityMark(item)}</span>
-                        {displayText(language, item.title)}
+                        <strong class="trace-title">{displayText(language, item.title)}</strong>
                         <time>{activityTime(item.createdAt)}</time>
                       </summary>
                       {#if item.detail}<pre>{item.detail}</pre>{/if}
@@ -945,6 +964,8 @@
 
       <form
         class="terminal-composer"
+        class:sending
+        aria-busy={sending}
         onsubmit={(event) => {
           event.preventDefault();
           void sendPrompt();
@@ -955,11 +976,16 @@
           disabled={!canSubmit || !readyForPrompt || sending}
           rows="2"
           aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
-          placeholder={!canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
+          placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
         ></textarea>
+        {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
         {#if canSubmit}
-          <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label={tr("Send prompt", "Enviar prompt")}>
-            <svg viewBox="0 0 20 20"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
+          <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
+            {#if sending}
+              <span class="send-spinner" aria-hidden="true"></span>
+            {:else}
+              <svg viewBox="0 0 20 20"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
+            {/if}
           </button>
         {:else}
           <button type="button" onclick={openOrigin} aria-label={tr("Open source", "Abrir origem")}>
@@ -1031,8 +1057,8 @@
   .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 8px Inter, sans-serif; cursor: pointer; }
   .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
   .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: 7px; }
-  .terminal-output { min-height: 0; flex: 1; padding: 10px 12px 7px; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: var(--chat-font-size); }
-  .terminal-output p { margin: 0 0 6px; line-height: 1.45; }
+  .terminal-output { min-width: 0; min-height: 0; max-width: 100%; flex: 1; padding: 10px 12px 7px; overflow-x: hidden; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: var(--chat-font-size); }
+  .terminal-output p { max-width: 100%; margin: 0 0 6px; overflow-wrap: anywhere; line-height: 1.45; word-break: break-word; }
   .terminal-output p > span { color: #36a269; font-weight: 800; }
   .terminal-output i { color: #8a9690; font-style: normal; }
   .status-running, .status-running span { color: #4e7faf; }
@@ -1040,15 +1066,15 @@
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
   .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
-  .chat-feed { margin: 9px 0 7px; display: grid; gap: 10px; }
-  .chat-turn { padding-bottom: 10px; display: grid; gap: 6px; border-bottom: 1px solid rgba(81, 105, 94, 0.09); }
-  .chat-message { max-width: 94%; padding: 7px 8px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
+  .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 10px; overflow-x: hidden; }
+  .chat-turn { min-width: 0; max-width: 100%; padding-bottom: 10px; display: grid; gap: 6px; overflow-x: hidden; border-bottom: 1px solid rgba(81, 105, 94, 0.09); }
+  .chat-message { width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: hidden; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
   .chat-message header { display: flex; align-items: center; gap: 6px; }
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
-  .chat-message pre { margin: 5px 0 0; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .chat-message pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
   .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
   .agent-typing span { width: 4px; height: 4px; border-radius: 50%; background: #4e7faf; animation: agent-typing-dot 850ms ease-in-out infinite; }
   .agent-typing span:nth-child(2) { animation-delay: 130ms; }
@@ -1057,16 +1083,17 @@
     0%, 60%, 100% { opacity: 0.35; transform: translateY(1px); }
     30% { opacity: 1; transform: translateY(-3px); }
   }
-  .turn-trace { padding: 4px 6px; border-radius: 6px; background: rgba(72, 101, 88, 0.03); }
-  .turn-trace summary { display: flex; align-items: center; gap: 5px; color: #71817a; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
+  .turn-trace { min-width: 0; max-width: 100%; padding: 4px 6px; overflow: hidden; border-radius: 6px; background: rgba(72, 101, 88, 0.03); }
+  .turn-trace summary { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 5px; color: #71817a; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
   .turn-trace summary > span { width: 14px; color: #4f806a; text-align: center; }
-  .turn-trace summary time { margin-left: auto; color: #a0aaa5; font-weight: 500; }
-  .turn-trace pre { max-height: 180px; margin: 5px 0 0 19px; overflow: auto; color: #5c6b64; font: var(--chat-small-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .turn-trace .trace-title { min-width: 0; flex: 1; overflow-wrap: anywhere; font: inherit; word-break: break-word; }
+  .turn-trace summary time { margin-left: auto; flex: 0 0 auto; color: #a0aaa5; font-weight: 500; }
+  .turn-trace pre { min-width: 0; max-width: calc(100% - 19px); max-height: 180px; margin: 5px 0 0 19px; overflow-x: hidden; overflow-y: auto; color: #5c6b64; font: var(--chat-small-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
   .turn-files { padding: 7px 8px; border-left: 2px solid #4b9b73; border-radius: 0 7px 7px 0; background: rgba(55, 142, 98, 0.045); }
   .turn-files > strong { display: block; margin-bottom: 5px; color: #4f775f; font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-transform: uppercase; }
   .turn-files > div { display: grid; gap: 3px; }
   .turn-files code { display: flex; gap: 6px; color: #496258; font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
-  .turn-files code .file-path { min-width: 0; flex: 1; color: inherit; }
+  .turn-files code .file-path { min-width: 0; flex: 1; color: inherit; overflow-wrap: anywhere; word-break: break-word; }
   .turn-files code .added,
   .change-list code .added { color: #45906a; }
   .turn-files code .removed,
@@ -1077,7 +1104,7 @@
   .changes-panel > strong { color: #6a7c73; font: 760 var(--chat-small-font-size) Inter, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
   .change-list { display: grid; gap: 4px; }
   .change-list code { padding: 5px 6px; display: flex; align-items: flex-start; gap: 6px; border-radius: 6px; color: #4f6158; background: rgba(70, 101, 86, 0.045); font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
-  .change-list code .file-path { min-width: 0; flex: 1; color: inherit; }
+  .change-list code .file-path { min-width: 0; flex: 1; color: inherit; overflow-wrap: anywhere; word-break: break-word; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
@@ -1095,8 +1122,12 @@
   textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
   textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
   textarea:disabled { opacity: 0.58; }
+  .send-status { padding-bottom: 9px; color: #70827a; font: 700 8px Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
+  .terminal-composer.sending button:disabled { opacity: 0.82; }
+  .send-spinner { width: 12px; height: 12px; border: 2px solid rgba(255, 255, 255, 0.38); border-top-color: white; border-radius: 50%; animation: send-spin 650ms linear infinite; }
+  @keyframes send-spin { to { transform: rotate(360deg); } }
   .message { margin: -4px 11px 6px; color: #ad4f4f; font-size: 8px; }
   .resize-handle { position: absolute; z-index: 20; width: 18px; height: 18px; padding: 0; border: 0; outline: 0; background: transparent; touch-action: none; }
   .resize-handle::after { position: absolute; width: 6px; height: 6px; content: ""; opacity: 0; transition: opacity 120ms ease; }
@@ -1155,5 +1186,6 @@
     .terminal-card { transition-duration: 0.01ms; }
     .dock-silhouette { animation: none; }
     .agent-typing span { animation: none; opacity: 0.7; }
+    .send-spinner { animation: none; border-color: rgba(255, 255, 255, 0.72); }
   }
 </style>
