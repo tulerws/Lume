@@ -95,7 +95,7 @@ impl MobileGateway {
         Ok(PairingOffer {
             protocol_version: PROTOCOL_VERSION,
             payload: format!(
-                "{MOBILE_WEB_URL}#version={PROTOCOL_VERSION}&gateway={}&desktopId={desktop_id}&code={code}",
+                "{MOBILE_WEB_URL}#gateway={}&code={code}",
                 encode_query_value(&base_url),
             ),
             desktop_id,
@@ -352,7 +352,8 @@ mod tests {
         assert!(offer
             .payload
             .contains("gateway=https%3A%2F%2F127.0.0.1%3A43122"));
-        assert!(offer.payload.contains("desktopId=desktop-test-id"));
+        assert!(!offer.payload.contains("desktopId="));
+        assert_eq!(offer.desktop_id, "desktop-test-id");
     }
 
     #[test]

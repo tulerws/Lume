@@ -1208,8 +1208,8 @@
       if (mobileStatus.networkReachable) {
         pairingOffer = await beginMobilePairing();
         pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
-          width: 156,
-          margin: 1,
+          width: 208,
+          margin: 4,
           errorCorrectionLevel: "M",
           color: { dark: "#14241d", light: "#ffffff" },
         });
@@ -1230,8 +1230,8 @@
     try {
       pairingOffer = await beginMobilePairing();
       pairingQr = await QRCode.toDataURL(pairingOffer.payload, {
-        width: 156,
-        margin: 1,
+        width: 208,
+        margin: 4,
         errorCorrectionLevel: "M",
         color: { dark: "#14241d", light: "#ffffff" },
       });
@@ -3410,9 +3410,9 @@
   .paired-devices button { min-height: 25px; padding: 0 7px; border: 1px solid rgba(82, 105, 95, 0.14); border-radius: 7px; color: #577064; background: transparent; font-size: 8px; font-weight: 680; cursor: pointer; }
   .mobile-access-card button:disabled,
   .paired-devices button:disabled { cursor: default; opacity: 0.5; }
-  .mobile-pairing { align-items: flex-start; padding: 8px; border-radius: 9px; background: rgba(255, 255, 255, 0.5); }
-  .mobile-pairing img { width: 92px; height: 92px; border-radius: 5px; image-rendering: pixelated; }
-  .mobile-pairing > span { min-width: 0; display: grid; gap: 5px; }
+  .mobile-pairing { flex-direction: column; align-items: center; padding: 10px; border-radius: 9px; background: rgba(255, 255, 255, 0.5); }
+  .mobile-pairing img { width: 208px; max-width: 100%; height: auto; border-radius: 5px; image-rendering: pixelated; }
+  .mobile-pairing > span { width: 100%; min-width: 0; display: grid; gap: 5px; text-align: center; }
   .mobile-pairing code { color: #31483e; font-size: 9px; overflow-wrap: anywhere; }
   .mobile-message { margin: 0; color: #61756b; font-size: 8px; line-height: 1.4; }
   .mobile-message.error { color: #a34f4f; }
