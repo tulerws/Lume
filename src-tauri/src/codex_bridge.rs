@@ -14,8 +14,8 @@ use tungstenite::{accept, connect, stream::MaybeTlsStream, Message, WebSocket};
 
 use crate::{
     domain::{
-        AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        PermissionRequest, SessionActivity, SessionSource,
+        AccessMode, AgentKind, AgentRateLimit, HookEvent, HookEventKind, PermissionAction,
+        PermissionProfile, PermissionRequest, SessionActivity, SessionSource,
     },
     event_server,
     state::{now_millis, AppState},
@@ -89,12 +89,20 @@ impl CodexBridge {
         &self,
         thread_id: &str,
         prompt: &str,
+        attachment_paths: &[String],
         profile: PermissionProfile,
         state: AppState,
         app: AppHandle,
     ) -> Result<(), String> {
         self.ensure_server()?;
-        let mut server = prompt_connection(thread_id, prompt, profile, &state, &app)?;
+        let mut server = prompt_connection(
+            thread_id,
+            prompt,
+            attachment_paths,
+            profile,
+            &state,
+            &app,
+        )?;
         let thread_id = thread_id.to_string();
         thread::Builder::new()
             .name("lume-codex-prompt".into())
@@ -105,6 +113,34 @@ impl CodexBridge {
             })
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn refresh_rate_limits(&self, state: &AppState, app: &AppHandle) -> Result<(), String> {
+        self.ensure_server()?;
+        let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+        set_server_timeout(&mut server, Duration::from_secs(5))?;
+        let profiles = HashMap::new();
+        send_json(
+            &mut server,
+            json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": { "experimentalApi": true }
+                }
+            }),
+        )?;
+        wait_for_response(&mut server, 1, state, app, &profiles)?;
+        send_json(
+            &mut server,
+            json!({ "method": "initialized", "params": {} }),
+        )?;
+        send_json(
+            &mut server,
+            json!({ "method": "account/rateLimits/read", "id": 2, "params": null }),
+        )?;
+        wait_for_rate_limits_response(&mut server, state, app)
     }
 }
 
@@ -215,6 +251,7 @@ fn transient(error: &std::io::Error) -> bool {
 fn prompt_connection(
     thread_id: &str,
     prompt: &str,
+    attachment_paths: &[String],
     profile: PermissionProfile,
     state: &AppState,
     app: &AppHandle,
@@ -245,7 +282,7 @@ fn prompt_connection(
     )?;
     wait_for_response(&mut server, 2, state, app, &profiles)?;
 
-    let turn = prompt_turn_request(thread_id, prompt);
+    let turn = prompt_turn_request(thread_id, prompt, attachment_paths);
     observe_client_message(&Message::Text(turn.to_string().into()), &mut profiles);
     send_json(&mut server, turn)?;
     wait_for_response(&mut server, 3, state, app, &profiles)?;
@@ -253,13 +290,22 @@ fn prompt_connection(
     Ok(server)
 }
 
-fn prompt_turn_request(thread_id: &str, prompt: &str) -> Value {
+fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String]) -> Value {
+    let mut input = Vec::new();
+    if !prompt.is_empty() {
+        input.push(json!({ "type": "text", "text": prompt }));
+    }
+    input.extend(
+        attachment_paths
+            .iter()
+            .map(|path| json!({ "type": "localImage", "path": path })),
+    );
     json!({
         "method": "turn/start",
         "id": 3,
         "params": {
             "threadId": thread_id,
-            "input": [{ "type": "text", "text": prompt }]
+            "input": input
         }
     })
 }
@@ -314,6 +360,35 @@ fn wait_for_response(
         {
             socket.send(response).map_err(|error| error.to_string())?;
         }
+    }
+}
+
+fn wait_for_rate_limits_response(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    loop {
+        let message = socket.read().map_err(|error| error.to_string())?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value = serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+        if value.get("id").and_then(Value::as_i64) != Some(2) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("O Codex não informou os limites da conta")
+                .to_string());
+        }
+        let limits = rate_limits_from_message(&value);
+        if state.set_agent_rate_limits(AgentKind::Codex, limits)? {
+            crate::protocol::emit_sessions_changed(app);
+        }
+        return Ok(());
     }
 }
 
@@ -372,6 +447,14 @@ fn intercept_server_message(
         return Ok(None);
     };
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "account/rateLimits/updated" {
+        let limits = rate_limits_from_message(&value);
+        if !limits.is_empty()
+            && state.set_agent_rate_limits(AgentKind::Codex, limits)?
+        {
+            crate::protocol::emit_sessions_changed(app);
+        }
+    }
     if is_approval(method) && value.get("id").is_some() {
         return approval_response(&value, method, state, app, profiles).map(Some);
     }
@@ -383,6 +466,69 @@ fn intercept_server_message(
         let _ = event_server::publish_event(state, app, event);
     }
     Ok(None)
+}
+
+fn rate_limits_from_message(value: &Value) -> Vec<AgentRateLimit> {
+    let root = value.get("result").or_else(|| value.get("params")).unwrap_or(value);
+    if let Some(buckets) = root.get("rateLimitsByLimitId").and_then(Value::as_object) {
+        let mut limits = Vec::new();
+        for (id, snapshot) in buckets {
+            append_rate_limit_windows(&mut limits, id, snapshot);
+        }
+        if !limits.is_empty() {
+            return limits;
+        }
+    }
+    let Some(snapshot) = root.get("rateLimits") else {
+        return Vec::new();
+    };
+    let id = snapshot
+        .get("limitId")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let mut limits = Vec::new();
+    append_rate_limit_windows(&mut limits, id, snapshot);
+    limits
+}
+
+fn append_rate_limit_windows(limits: &mut Vec<AgentRateLimit>, id: &str, snapshot: &Value) {
+    for (kind, fallback) in [("primary", "Current"), ("secondary", "Weekly")] {
+        let Some(window) = snapshot.get(kind).filter(|window| !window.is_null()) else {
+            continue;
+        };
+        let used = window
+            .get("usedPercent")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let minutes = window.get("windowDurationMins").and_then(Value::as_i64);
+        let resets_at = window.get("resetsAt").and_then(Value::as_i64).map(|value| {
+            if value < 10_000_000_000 {
+                value.saturating_mul(1_000)
+            } else {
+                value
+            }
+        });
+        limits.push(AgentRateLimit {
+            id: format!("{id}:{kind}"),
+            label: rate_limit_window_label(minutes, fallback),
+            used_percent: used,
+            resets_at,
+            window_minutes: minutes,
+        });
+    }
+}
+
+fn rate_limit_window_label(minutes: Option<i64>, fallback: &str) -> String {
+    match minutes {
+        Some(minutes) if minutes > 0 && minutes % (24 * 60) == 0 => {
+            format!("{}d", minutes / (24 * 60))
+        }
+        Some(minutes) if minutes > 0 && minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) if minutes > 0 => format!("{minutes}m"),
+        _ => fallback.into(),
+    }
 }
 
 fn observe_client_message(message: &Message, profiles: &mut HashMap<String, PermissionProfile>) {
@@ -580,6 +726,7 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
                 status: "running".into(),
                 created_at: now_millis(),
                 files,
+                attachments: Vec::new(),
                 append_detail: false,
             }
         }
@@ -606,6 +753,7 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
                 status: "running".into(),
                 created_at: now_millis(),
                 files: files_from_diff(diff),
+                attachments: Vec::new(),
                 append_detail: false,
             }
         }
@@ -620,6 +768,7 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
             status: "running".into(),
             created_at: now_millis(),
             files: Vec::new(),
+            attachments: Vec::new(),
             append_detail: false,
         },
         _ => return None,
@@ -660,6 +809,7 @@ fn codex_delta_activity(
         status: "running".into(),
         created_at: now_millis(),
         files: Vec::new(),
+        attachments: Vec::new(),
         append_detail: true,
     })
 }
@@ -788,6 +938,7 @@ fn codex_item_activity(thread_id: &str, item: &Value, completed: bool) -> Option
         status: status.into(),
         created_at: now_millis(),
         files,
+        attachments: Vec::new(),
         append_detail: false,
     })
 }
@@ -1212,7 +1363,7 @@ mod tests {
     #[test]
     fn prompt_uses_the_documented_turn_start_shape() {
         assert_eq!(
-            prompt_turn_request("thread-1", "Continue os testes"),
+            prompt_turn_request("thread-1", "Continue os testes", &[]),
             json!({
                 "method": "turn/start",
                 "id": 3,
@@ -1222,6 +1373,45 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn prompt_can_include_local_images() {
+        assert_eq!(
+            prompt_turn_request(
+                "thread-1",
+                "Analise esta tela",
+                &["/tmp/screenshot.png".into()],
+            )["params"]["input"],
+            json!([
+                { "type": "text", "text": "Analise esta tela" },
+                { "type": "localImage", "path": "/tmp/screenshot.png" }
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_rate_limits_expose_remaining_windows() {
+        let limits = rate_limits_from_message(&json!({
+            "result": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 32,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_800_000_000
+                    },
+                    "secondary": {
+                        "usedPercent": 78,
+                        "windowDurationMins": 10_080
+                    }
+                }
+            }
+        }));
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].used_percent, 32);
+        assert_eq!(limits[0].resets_at, Some(1_800_000_000_000));
+        assert_eq!(limits[1].label, "7d");
     }
 
     #[test]

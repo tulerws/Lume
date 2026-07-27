@@ -27,6 +27,7 @@ const chatComposer = document.querySelector("#mobile-chat-composer");
 const chatAgentIcon = document.querySelector("#chat-agent-icon");
 const chatAgentName = document.querySelector("#chat-agent-name");
 const chatAgentStatus = document.querySelector("#chat-agent-status");
+const chatRateLimit = document.querySelector("#chat-rate-limit");
 const chatStopButton = document.querySelector("#chat-stop");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
@@ -74,7 +75,10 @@ let mascotTransitionTimer;
 const expandedResults = new Set();
 const submittingPromptSessions = new Set();
 const promptDrafts = new Map();
+const promptAttachments = new Map();
+const rateLimitRefreshes = new Map();
 const sendIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg>';
+const attachIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 1 1-7-7l8-8" /></svg>';
 const sendSpinnerMarkup = '<span class="prompt-send-spinner" aria-hidden="true"></span>';
 
 const escapeHtml = (value = "") =>
@@ -850,6 +854,65 @@ function buildChatTurns(session) {
   return turns;
 }
 
+function safeImagePreview(value) {
+  const preview = String(value || "");
+  return /^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(preview)
+    ? preview
+    : "";
+}
+
+function messageImagesMarkup(attachments = []) {
+  const images = attachments
+    .map((attachment) => ({
+      name: attachment.name || "Attached image",
+      preview: safeImagePreview(attachment.previewDataUrl),
+    }))
+    .filter((attachment) => attachment.preview);
+  if (!images.length) return "";
+  return `<div class="mobile-message-images">${images.map((attachment) =>
+    `<img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" />`
+  ).join("")}</div>`;
+}
+
+function renderRateLimit(session) {
+  const limits = (session.rateLimits || [])
+    .filter((limit) => Number.isFinite(Number(limit.usedPercent)));
+  if (!limits.length) {
+    chatRateLimit.hidden = true;
+    chatRateLimit.innerHTML = "";
+    return;
+  }
+  const limit = [...limits].sort((left, right) =>
+    Number(right.usedPercent) - Number(left.usedPercent)
+  )[0];
+  const used = Math.max(0, Math.min(100, Math.round(Number(limit.usedPercent))));
+  const remaining = 100 - used;
+  const tone = remaining <= 20 ? "danger" : remaining <= 50 ? "warning" : "healthy";
+  const reset = limit.resetsAt
+    ? ` · resets ${new Date(limit.resetsAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}`
+    : "";
+  chatRateLimit.hidden = false;
+  chatRateLimit.innerHTML = `
+    <span class="rate-donut ${tone}" style="--remaining-angle:${remaining * 3.6}deg" role="img"
+      aria-label="${escapeHtml(`${limit.label}: ${remaining}% remaining${reset}`)}">
+      <b>${remaining}</b>
+    </span>
+    <small>${escapeHtml(limit.label || "Limit")}</small>`;
+  chatRateLimit.title = `${limit.label}: ${remaining}% remaining${reset}`;
+}
+
+async function refreshRateLimitsIfNeeded(session) {
+  if (session.agent !== "codex") return;
+  const lastRefresh = rateLimitRefreshes.get(session.agent) || 0;
+  if (Date.now() - lastRefresh < 60_000) return;
+  rateLimitRefreshes.set(session.agent, Date.now());
+  try {
+    await executeCommand({ type: "refresh_rate_limits", agent: session.agent });
+  } catch {
+    rateLimitRefreshes.delete(session.agent);
+  }
+}
+
 function renderChat(sessions) {
   if (!activeChatSessionId) return;
   const session = sessions.find((item) => item.id === activeChatSessionId);
@@ -857,6 +920,8 @@ function renderChat(sessions) {
     chatAgentName.textContent = "Agent closed";
     chatAgentStatus.textContent = "This session is no longer open";
     chatStopButton.hidden = true;
+    chatRateLimit.hidden = true;
+    chatRateLimit.innerHTML = "";
     chatFeed.innerHTML = '<div class="empty-list compact"><strong>Session closed</strong><p>Return to the agent list to choose another session.</p></div>';
     chatComposer.innerHTML = "";
     return;
@@ -866,6 +931,7 @@ function renderChat(sessions) {
   chatAgentIcon.innerHTML = agentVisual(session);
   chatAgentName.textContent = session.agentLabel;
   chatAgentStatus.textContent = `${session.project} · ${statusLabel(session.status)}`;
+  renderRateLimit(session);
   const scopes = currentDevice?.scopes || [];
   const canTerminate = scopes.includes("terminate") && session.capabilities?.canTerminate;
   chatStopButton.hidden = !canTerminate;
@@ -879,8 +945,10 @@ function renderChat(sessions) {
     session.activities,
     session.results,
     session.lastResponse,
+    session.rateLimits,
     scopes,
     submittingPromptSessions.has(session.id),
+    promptAttachments.get(session.id),
   ]);
   if (renderKey === lastChatRenderKey) return;
   const shouldFollow =
@@ -907,10 +975,11 @@ function renderChat(sessions) {
   const turns = buildChatTurns(session);
   const conversation = turns.map((turn) => `
     <article class="mobile-chat-turn">
-      ${turn.prompt?.detail ? `
+      ${turn.prompt?.detail || turn.prompt?.attachments?.length ? `
         <div class="mobile-chat-message user">
           <header><strong>You</strong><time>${activityTime(turn.prompt.createdAt)}</time></header>
-          <p>${escapeHtml(turn.prompt.detail)}</p>
+          ${turn.prompt.detail ? `<p>${escapeHtml(turn.prompt.detail)}</p>` : ""}
+          ${messageImagesMarkup(turn.prompt.attachments)}
         </div>` : ""}
       ${(turn.items || []).map((item) => {
         if (item.kind === "message" && item.detail) {
@@ -941,10 +1010,17 @@ function renderChat(sessions) {
     && ["completed", "failed", "waiting_for_input"].includes(session.status);
   const promptSubmitting = submittingPromptSessions.has(session.id);
   const promptDraft = promptDrafts.get(session.id) || "";
+  const attachments = promptAttachments.get(session.id) || [];
+  const canAttachImages = Boolean(session.capabilities?.canAttachImages);
   chatComposer.innerHTML = canPrompt
-    ? `<form class="mobile-chat-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
-        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea>
-        <button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
+    ? `<form class="mobile-chat-form${canAttachImages ? " can-attach" : ""}${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
+        ${attachments.length ? `<div class="mobile-pending-images">${attachments.map((attachment, index) => `
+          <span><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="" /><button type="button" data-remove-image="${index}" aria-label="Remove image">×</button></span>
+        `).join("")}</div>` : ""}
+        ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+          <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
+        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
+        <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
         <span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span>
       </form>`
     : session.status === "running"
@@ -960,7 +1036,10 @@ function openChat(sessionId) {
   activeChatSessionId = sessionId;
   lastChatRenderKey = "";
   setView("chat");
-  renderChat(currentSnapshot?.sessions || []);
+  const sessions = currentSnapshot?.sessions || [];
+  renderChat(sessions);
+  const session = sessions.find((item) => item.id === sessionId);
+  if (session) void refreshRateLimitsIfNeeded(session);
 }
 
 function renderSessions(snapshot, trackChanges = true) {
@@ -1774,14 +1853,62 @@ document.querySelector("#manual-pair-form").addEventListener("submit", async (ev
     button.disabled = false;
   }
 });
+
+function loadMobileImage(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const url = URL.createObjectURL(file);
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not read this image."));
+    };
+    image.src = url;
+  });
+}
+
+function imageDataUrl(image, maxDimension, quality) {
+  const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+async function prepareMobileImage(file) {
+  if (!file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
+  if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name} is larger than 20 MB.`);
+  const image = await loadMobileImage(file);
+  let dataUrl = "";
+  for (const [dimension, quality] of [[1600, 0.82], [1400, 0.74], [1200, 0.68], [960, 0.6]]) {
+    dataUrl = imageDataUrl(image, dimension, quality);
+    if (dataUrl.length <= 1_800_000) break;
+  }
+  if (dataUrl.length > 1_800_000) throw new Error(`${file.name} could not be prepared for secure transfer.`);
+  return {
+    name: file.name.replace(/\.[^.]+$/, "") + ".jpg",
+    mimeType: "image/jpeg",
+    dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
+    previewDataUrl: imageDataUrl(image, 360, 0.68),
+  };
+}
+
 async function submitPromptForm(form) {
   if (!(await verifySensitiveAction())) return;
   const textarea = form.querySelector("textarea");
-  const button = form.querySelector("button");
+  const button = form.querySelector(".mobile-send-button, button[type='submit']");
   const status = form.querySelector(".prompt-send-state");
   const sessionId = form.dataset.session;
   const submittedPrompt = textarea.value.trim();
-  if (!submittedPrompt || submittingPromptSessions.has(sessionId)) return;
+  const attachments = promptAttachments.get(sessionId) || [];
+  if ((!submittedPrompt && !attachments.length) || submittingPromptSessions.has(sessionId)) return;
   submittingPromptSessions.add(sessionId);
   promptDrafts.set(sessionId, textarea.value);
   form.classList.add("is-sending");
@@ -1796,8 +1923,10 @@ async function submitPromptForm(form) {
       type: "submit_prompt",
       sessionId,
       prompt: submittedPrompt,
+      attachments,
     });
     promptDrafts.delete(sessionId);
+    promptAttachments.delete(sessionId);
     textarea.value = "";
   } catch (error) {
     showBanner(error.message, "error");
@@ -1820,7 +1949,13 @@ async function submitPromptForm(form) {
 function rememberPromptDraft(event) {
   const textarea = event.target.closest?.("textarea");
   const form = textarea?.closest(".prompt-form, .mobile-chat-form");
-  if (form?.dataset.session) promptDrafts.set(form.dataset.session, textarea.value);
+  if (!form?.dataset.session) return;
+  promptDrafts.set(form.dataset.session, textarea.value);
+  const sendButton = form.querySelector(".mobile-send-button");
+  if (sendButton && !submittingPromptSessions.has(form.dataset.session)) {
+    sendButton.disabled =
+      !textarea.value.trim() && !(promptAttachments.get(form.dataset.session) || []).length;
+  }
 }
 
 async function runSessionCommand(button) {
@@ -1871,7 +2006,44 @@ chatScreen.addEventListener("submit", async (event) => {
   await submitPromptForm(form);
 });
 chatScreen.addEventListener("input", rememberPromptDraft);
+chatScreen.addEventListener("change", async (event) => {
+  const input = event.target.closest(".mobile-image-input");
+  if (!input) return;
+  const form = input.closest(".mobile-chat-form");
+  const sessionId = form?.dataset.session;
+  if (!sessionId) return;
+  const existing = promptAttachments.get(sessionId) || [];
+  try {
+    const selected = [...(input.files || [])].slice(0, 4 - existing.length);
+    const prepared = [];
+    for (const file of selected) prepared.push(await prepareMobileImage(file));
+    promptAttachments.set(sessionId, [...existing, ...prepared]);
+    lastChatRenderKey = "";
+    renderChat(currentSnapshot?.sessions || []);
+  } catch (error) {
+    showBanner(error?.message || "Could not attach this image.", "error");
+  }
+});
 chatScreen.addEventListener("click", async (event) => {
+  const attachButton = event.target.closest("button[data-attach-image]");
+  if (attachButton) {
+    attachButton.closest(".mobile-chat-form")?.querySelector(".mobile-image-input")?.click();
+    return;
+  }
+  const removeButton = event.target.closest("button[data-remove-image]");
+  if (removeButton) {
+    const form = removeButton.closest(".mobile-chat-form");
+    const sessionId = form?.dataset.session;
+    if (!sessionId) return;
+    const index = Number(removeButton.dataset.removeImage);
+    const attachments = [...(promptAttachments.get(sessionId) || [])];
+    attachments.splice(index, 1);
+    if (attachments.length) promptAttachments.set(sessionId, attachments);
+    else promptAttachments.delete(sessionId);
+    lastChatRenderKey = "";
+    renderChat(currentSnapshot?.sessions || []);
+    return;
+  }
   const button = event.target.closest("button[data-command]");
   if (!button) return;
   await runSessionCommand(button);

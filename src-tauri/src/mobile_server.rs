@@ -48,6 +48,7 @@ pub const BOOTSTRAP_ADDRESS: &str = "127.0.0.1:43121";
 pub const TLS_ADDRESS: &str = "127.0.0.1:43122";
 const NETWORK_ADDRESS: &str = "0.0.0.0:43124";
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_SECURE_BODY_BYTES: usize = 12 * 1024 * 1024;
 const REALTIME_PATH: &str = "/api/v1/ws";
 const REALTIME_SUBPROTOCOL: &str = "lume.hub.v1";
 const REALTIME_POLL_INTERVAL: Duration = Duration::from_millis(80);
@@ -1118,6 +1119,7 @@ fn route_core(
                     "Abrir a origem só está disponível no computador",
                 )
             }
+            protocol::HubCommand::RefreshRateLimits { .. } => MobileScope::Monitor,
         };
         if !device.scopes.contains(&required_scope) {
             return json_error(
@@ -1383,8 +1385,13 @@ fn read_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
         }
         headers.insert(name, value);
     }
-    if content_length > MAX_BODY_BYTES {
-        return Err("Requisição excede 64 KB".into());
+    let max_body_bytes = if path == "/api/v1/secure" {
+        MAX_SECURE_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > max_body_bytes {
+        return Err("Requisição excede o limite permitido".into());
     }
     let mut body = vec![0; content_length];
     reader

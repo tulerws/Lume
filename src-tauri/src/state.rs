@@ -10,9 +10,10 @@ use std::{
 use crate::{
     discovery::DiscoveredProcess,
     domain::{
-        AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PairedDevice,
-        PermissionAction, PermissionProfile, PermissionRequest, Preferences, ResultNote,
-        SessionActivity, SessionResult, SessionSource, SessionStatus,
+        AccessMode, AgentKind, AgentRateLimit, AgentSession, HistoryEntry, HookEvent,
+        HookEventKind, PairedDevice, PermissionAction, PermissionProfile, PermissionRequest,
+        Preferences, PromptAttachment, ResultNote, SessionActivity, SessionResult, SessionSource,
+        SessionStatus,
     },
     store::Store,
 };
@@ -35,6 +36,7 @@ pub struct AppState {
     decisions: Arc<(Mutex<HashMap<String, PermissionAction>>, Condvar)>,
     missing_process_scans: Arc<Mutex<HashMap<String, u8>>>,
     workspace_snapshots: Arc<Mutex<HashMap<String, WorkspaceSnapshot>>>,
+    agent_rate_limits: Arc<Mutex<HashMap<AgentKind, Vec<AgentRateLimit>>>>,
 }
 
 impl AppState {
@@ -54,16 +56,28 @@ impl AppState {
             decisions: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
             missing_process_scans: Arc::new(Mutex::new(HashMap::new())),
             workspace_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            agent_rate_limits: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn sessions(&self) -> Result<Vec<AgentSession>, String> {
         let now = now_millis();
-        let sessions = self
+        let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| "Não foi possível acessar as sessões".to_string())?
             .clone();
+        let agent_rate_limits = self
+            .agent_rate_limits
+            .lock()
+            .map_err(|_| "Não foi possível acessar os limites dos agentes".to_string())?
+            .clone();
+        for session in &mut sessions {
+            session.rate_limits = agent_rate_limits
+                .get(&session.agent)
+                .cloned()
+                .unwrap_or_default();
+        }
         let mut deduplicated = Vec::<AgentSession>::new();
         for mut session in sessions {
             let duplicate = deduplicated
@@ -127,20 +141,17 @@ impl AppState {
         Ok(sessions)
     }
 
-    pub fn record_activity(
+    pub fn record_prompt_activity(
         &self,
         session_id: &str,
-        kind: &str,
-        title: &str,
-        detail: Option<String>,
-        status: &str,
-        files: Vec<String>,
+        prompt: &str,
+        attachments: Vec<PromptAttachment>,
     ) -> Result<(), String> {
         let now = now_millis();
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| "Não foi possível atualizar a atividade da sessão".to_string())?;
+            .map_err(|_| "Não foi possível atualizar o prompt da sessão".to_string())?;
         let session = sessions
             .iter_mut()
             .find(|session| session.id == session_id)
@@ -149,17 +160,32 @@ impl AppState {
             session,
             SessionActivity {
                 id: format!("local:{session_id}:{now}"),
-                kind: kind.into(),
-                title: title.into(),
-                detail,
-                status: status.into(),
+                kind: "prompt".into(),
+                title: "Prompt enviado pelo Lume".into(),
+                detail: (!prompt.is_empty()).then(|| prompt.to_string()),
+                status: "completed".into(),
                 created_at: now,
-                files,
+                files: Vec::new(),
+                attachments,
                 append_detail: false,
             },
         );
         session.updated_at = now;
         Ok(())
+    }
+
+    pub fn set_agent_rate_limits(
+        &self,
+        agent: AgentKind,
+        limits: Vec<AgentRateLimit>,
+    ) -> Result<bool, String> {
+        let mut current = self
+            .agent_rate_limits
+            .lock()
+            .map_err(|_| "Não foi possível atualizar os limites dos agentes".to_string())?;
+        let changed = current.get(&agent) != Some(&limits);
+        current.insert(agent, limits);
+        Ok(changed)
     }
 
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
@@ -580,6 +606,7 @@ impl AppState {
                         status: "waiting".into(),
                         created_at: now,
                         files: Vec::new(),
+                        attachments: Vec::new(),
                         append_detail: false,
                     },
                 );
@@ -640,6 +667,7 @@ impl AppState {
                     },
                     created_at: now,
                     files: observed_files.clone(),
+                    attachments: Vec::new(),
                     append_detail: false,
                 },
             );
@@ -1089,6 +1117,7 @@ impl AppState {
                 last_response: None,
                 results: Vec::new(),
                 activities: Vec::new(),
+                rate_limits: Vec::new(),
             };
             snapshots.push(session.clone());
             sessions.push(session);
@@ -1205,6 +1234,7 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
         last_response: event.last_response.clone(),
         results: Vec::new(),
         activities: event.activity.clone().into_iter().collect(),
+        rate_limits: Vec::new(),
     }
 }
 
@@ -1850,6 +1880,7 @@ mod tests {
             status: "running".into(),
             created_at: 10,
             files: Vec::new(),
+            attachments: Vec::new(),
             append_detail: false,
         });
         state.ingest(activity.clone()).expect("atividade iniciada");
@@ -1924,6 +1955,7 @@ mod tests {
                 status: "completed".into(),
                 created_at,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 append_detail: false,
             });
             state.ingest(event).expect("mensagem");
@@ -1961,6 +1993,7 @@ mod tests {
                 status: "completed".into(),
                 created_at,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 append_detail: false,
             });
             state.ingest(event).expect("atividade");
@@ -2022,6 +2055,7 @@ mod tests {
             status: "completed".into(),
             created_at: 20_000,
             files: Vec::new(),
+            attachments: Vec::new(),
             append_detail: false,
         });
         source.results.push(SessionResult {

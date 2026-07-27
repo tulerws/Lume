@@ -158,6 +158,7 @@ fn hook_activity(
             status: "completed".into(),
             created_at: now_millis(),
             files: Vec::new(),
+            attachments: Vec::new(),
             append_detail: false,
         });
     }
@@ -170,6 +171,7 @@ fn hook_activity(
             status: "completed".into(),
             created_at: now_millis(),
             files: Vec::new(),
+            attachments: Vec::new(),
             append_detail: false,
         });
     }
@@ -235,6 +237,7 @@ fn hook_activity(
         status: status.into(),
         created_at: now_millis(),
         files,
+        attachments: Vec::new(),
         append_detail: false,
     })
 }

@@ -420,6 +420,7 @@ mod tests {
                 tests: Vec::new(),
             }],
             activities: Vec::new(),
+            rate_limits: Vec::new(),
         };
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");

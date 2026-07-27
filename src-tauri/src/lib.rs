@@ -21,7 +21,9 @@ mod terminal_windows;
 
 use std::{collections::HashSet, io::Read, sync::Mutex};
 
-use domain::{AgentSession, HistoryEntry, PermissionAction, Preferences, ResultNote};
+use domain::{
+    AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput, ResultNote,
+};
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
 use state::AppState;
@@ -251,6 +253,7 @@ fn submit_prompt(
     browser: State<'_, browser_server::BrowserControl>,
     session_id: String,
     prompt: String,
+    attachments: Vec<PromptAttachmentInput>,
 ) -> Result<(), String> {
     control::submit_prompt(
         &app,
@@ -259,6 +262,8 @@ fn submit_prompt(
         browser.inner(),
         &session_id,
         &prompt,
+        attachments,
+        true,
     )
 }
 

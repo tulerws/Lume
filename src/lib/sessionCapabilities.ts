@@ -12,6 +12,7 @@ export interface SessionCapabilities {
   canTerminate: boolean;
   canOpenSource: boolean;
   canReadResults: boolean;
+  canAttachImages: boolean;
 }
 
 export function sessionCapabilities(session: AgentSession): SessionCapabilities {
@@ -35,5 +36,6 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
     canTerminate: session.source === "cli" && Boolean(session.processId),
     canOpenSource: session.source === "web" || session.source === "vscode",
     canReadResults: session.results.length > 0 || Boolean(session.lastResponse),
+    canAttachImages: session.source !== "web" && session.agent !== "unknown",
   };
 }

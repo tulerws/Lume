@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     Codex,
@@ -119,6 +119,38 @@ pub struct SessionResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PromptAttachment {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub preview_data_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttachmentInput {
+    pub name: String,
+    pub mime_type: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub data_base64: Option<String>,
+    #[serde(default)]
+    pub preview_data_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRateLimit {
+    pub id: String,
+    pub label: String,
+    pub used_percent: u8,
+    pub resets_at: Option<i64>,
+    pub window_minutes: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionActivity {
     pub id: String,
     pub kind: String,
@@ -129,6 +161,8 @@ pub struct SessionActivity {
     pub created_at: i64,
     #[serde(default)]
     pub files: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
     #[serde(default, skip_serializing)]
     pub append_detail: bool,
 }
@@ -171,6 +205,8 @@ pub struct AgentSession {
     pub results: Vec<SessionResult>,
     #[serde(default)]
     pub activities: Vec<SessionActivity>,
+    #[serde(default)]
+    pub rate_limits: Vec<AgentRateLimit>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

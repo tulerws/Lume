@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, SessionActivity, TerminalWindowState } from "$lib/domain";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
@@ -43,6 +45,7 @@
   let initializationError = $state<string | null>(null);
   let initializationRun = 0;
   let prompt = $state("");
+  let promptAttachments = $state<PromptAttachmentInput[]>([]);
   let message = $state<string | null>(null);
   let sending = $state(false);
   let dragging = $state(false);
@@ -155,11 +158,11 @@
     }
     return files;
   });
-  type ChatTurn = {
+  type ChatEntry = {
     id: string;
-    prompt?: SessionActivity;
-    items: SessionActivity[];
+    activity: SessionActivity;
     files: FileChangeSummary[];
+    sequence: number;
   };
   function chatTextKey(value?: string): string {
     return (value ?? "")
@@ -167,85 +170,85 @@
       .replace(/[ \t]+$/gm, "")
       .trim();
   }
-  const chatTurns = $derived.by<ChatTurn[]>(() => {
-    const turns: ChatTurn[] = [];
-    const ensureTurn = (id: string): ChatTurn => {
-      const turn: ChatTurn = { id, items: [], files: [] };
-      turns.push(turn);
-      return turn;
+  const chatEntries = $derived.by<ChatEntry[]>(() => {
+    let sequence = 0;
+    const entries = activities.map((activity) => ({
+      id: `activity:${activity.id}`,
+      activity,
+      files: activityChanges(activity),
+      sequence: sequence++,
+    }));
+    const promptTimes = activities
+      .filter((activity) => activity.kind === "prompt")
+      .map((activity) => activity.createdAt)
+      .sort((left, right) => left - right);
+    const promptSegment = (createdAt: number) => {
+      let segment = Number.NEGATIVE_INFINITY;
+      for (const promptTime of promptTimes) {
+        if (promptTime > createdAt) break;
+        segment = promptTime;
+      }
+      return segment;
     };
-    let current: ChatTurn | undefined;
-    for (const activity of activities) {
-      if (activity.kind === "prompt") {
-        current = ensureTurn(activity.id);
-        current.prompt = activity;
-        continue;
-      }
-      current ??= ensureTurn(`turn:${activity.id}`);
-      mergeFileChanges(current.files, activityChanges(activity));
-      const messageKey = activity.kind === "message" ? chatTextKey(activity.detail) : "";
-      if (
-        messageKey &&
-        current.items.some(
-          (item) => item.kind === "message" && chatTextKey(item.detail) === messageKey,
-        )
-      ) {
-        continue;
-      }
-      current.items.push(activity);
-    }
     for (const result of session?.results ?? []) {
-      const resultTurn =
-        [...turns]
-          .reverse()
-          .find((turn) => !turn.prompt || turn.prompt.createdAt <= result.createdAt) ??
-        ensureTurn(`result:${result.id}`);
-      current = resultTurn;
-      mergeFileChanges(
-        resultTurn.files,
-        summarizeFileChanges("", result.files, session?.workingDirectory),
+      const resultFiles = summarizeFileChanges(
+        result.response,
+        result.files,
+        session?.workingDirectory,
       );
-      if (
-        result.response &&
-        !resultTurn.items.some(
-          (item) =>
-            item.kind === "message" &&
-            chatTextKey(item.detail) === chatTextKey(result.response),
-        )
-      ) {
-        resultTurn.items.push({
-          id: `response:${result.id}`,
-          kind: "message",
-          title: "Resposta do agente",
-          detail: result.response,
-          status: "completed",
-          createdAt: result.createdAt,
-          files: [],
+      const responseKey = chatTextKey(result.response);
+      const matchingMessage = [...entries].reverse().find((entry) =>
+        entry.activity.kind === "message" &&
+        chatTextKey(entry.activity.detail) === responseKey &&
+        promptSegment(entry.activity.createdAt) === promptSegment(result.createdAt)
+      );
+      if (matchingMessage) {
+        mergeFileChanges(matchingMessage.files, resultFiles);
+      } else if (result.response || resultFiles.length) {
+        entries.push({
+          id: `result:${result.id}`,
+          activity: {
+            id: `response:${result.id}`,
+            kind: result.response ? "message" : "file",
+            title: result.response ? "Resposta do agente" : "Arquivos alterados",
+            detail: result.response || undefined,
+            status: "completed",
+            createdAt: result.createdAt,
+            files: result.files,
+          },
+          files: resultFiles,
+          sequence: sequence++,
         });
       }
     }
-    if (
-      session?.lastResponse &&
-      !turns.some((turn) =>
-        turn.items.some(
-          (item) =>
-            item.kind === "message" &&
-            chatTextKey(item.detail) === chatTextKey(session?.lastResponse),
-        ),
-      )
-    ) {
-      current ??= ensureTurn(`response:${session.id}`);
-      current.items.push({
-        id: `response:${session.id}:${session.updatedAt}`,
-        kind: "message",
-        title: "Resposta do agente",
-        detail: session.lastResponse,
-        status: "completed",
-        createdAt: session.updatedAt,
-        files: [],
-      });
+    if (session?.lastResponse) {
+      const responseKey = chatTextKey(session.lastResponse);
+      const segment = promptSegment(session.updatedAt);
+      const alreadyPresent = entries.some((entry) =>
+        entry.activity.kind === "message" &&
+        chatTextKey(entry.activity.detail) === responseKey &&
+        promptSegment(entry.activity.createdAt) === segment
+      );
+      if (!alreadyPresent) {
+        entries.push({
+          id: `last-response:${session.id}:${session.updatedAt}`,
+          activity: {
+            id: `response:${session.id}:${session.updatedAt}`,
+            kind: "message",
+            title: "Resposta do agente",
+            detail: session.lastResponse,
+            status: "completed",
+            createdAt: session.updatedAt,
+            files: [],
+          },
+          files: [],
+          sequence: sequence++,
+        });
+      }
     }
-    return turns;
+    return entries.sort((left, right) =>
+      left.activity.createdAt - right.activity.createdAt || left.sequence - right.sequence
+    );
   });
 
   onMount(() => {
@@ -768,18 +771,73 @@
   }
 
   async function sendPrompt() {
-    if (!session || !prompt.trim() || sending || !canSubmit || !readyForPrompt) return;
+    if (
+      !session
+      || (!prompt.trim() && promptAttachments.length === 0)
+      || sending
+      || !canSubmit
+      || !readyForPrompt
+    ) return;
     sending = true;
     message = null;
     try {
-      await submitPrompt(session.id, prompt.trim());
+      await submitPrompt(session.id, prompt.trim(), promptAttachments);
       prompt = "";
+      promptAttachments = [];
       session = { ...session, status: "running", statusLabel: "Prompt sent by Lume", lastResponse: undefined };
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
       sending = false;
     }
+  }
+
+  async function chooseImages() {
+    if (!canSubmit || !readyForPrompt || sending) return;
+    message = null;
+    try {
+      const selected = await openDialog({
+        multiple: true,
+        directory: false,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
+      });
+      const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+        .filter((path): path is string => typeof path === "string");
+      for (const path of paths.slice(0, 4 - promptAttachments.length)) {
+        const previewDataUrl = await imagePreview(path);
+        promptAttachments = [
+          ...promptAttachments,
+          {
+            name: path.split(/[\\/]/).pop() || "image",
+            mimeType: "",
+            path,
+            previewDataUrl,
+          },
+        ];
+      }
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function removeImage(index: number) {
+    promptAttachments = promptAttachments.filter((_, current) => current !== index);
+  }
+
+  function imagePreview(path: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        const scale = Math.min(1, 480 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        canvas.getContext("2d")?.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.78));
+      };
+      image.onerror = () => reject(new Error(tr("Could not preview this image", "Não foi possível visualizar esta imagem")));
+      image.src = convertFileSrc(path);
+    });
   }
 
   function sendPromptOnEnter(event: KeyboardEvent) {
@@ -873,7 +931,7 @@
 
       <nav class="hub-tabs" aria-label={tr("Session details", "Detalhes da sessão")}>
         <button class:active={activeTab === "chat"} type="button" onclick={() => (activeTab = "chat")}>
-          {tr("Chat", "Chat")} <span>{chatTurns.length}</span>
+          {tr("Chat", "Chat")} <span>{chatEntries.length}</span>
         </button>
         <button class:active={activeTab === "changes"} type="button" onclick={() => (activeTab = "changes")}>
           {tr("Changes", "Alterações")} <span>{changedFiles.length}</span>
@@ -899,48 +957,51 @@
 
         {#if activeTab === "chat"}
           <div class="chat-feed">
-            {#each chatTurns as turn (turn.id)}
-              <article class="chat-turn">
-                {#if turn.prompt?.detail}
-                  <div class="chat-message user-message">
-                    <header>
-                      <strong>{tr("You", "Você")}</strong>
-                      <time>{activityTime(turn.prompt.createdAt)}</time>
-                    </header>
-                    <pre>{turn.prompt.detail}</pre>
-                  </div>
-                {/if}
-                {#each turn.items as item (item.id)}
-                  {#if item.kind === "message" && item.detail}
-                    <div class="chat-message agent-message">
-                      <header>
-                        <strong>{session.agentLabel}</strong>
-                        <time>{activityTime(item.createdAt)}</time>
-                      </header>
-                      <pre>{item.detail}</pre>
-                    </div>
-                  {:else if item.kind !== "file"}
-                    <details class="turn-trace">
-                      <summary>
-                        <span>{activityMark(item)}</span>
-                        <strong class="trace-title">{displayText(language, item.title)}</strong>
-                        <time>{activityTime(item.createdAt)}</time>
-                      </summary>
-                      {#if item.detail}<pre>{item.detail}</pre>{/if}
-                    </details>
-                  {/if}
-                {/each}
-                {#if turn.files.length}
-                  <div class="turn-files">
-                    <strong>{tr("Files changed in this prompt", "Arquivos alterados neste prompt")}</strong>
-                    <div>
-                      {#each turn.files as file}
-                        <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+            {#each chatEntries as entry (entry.id)}
+              {@const item = entry.activity}
+              {#if item.kind === "prompt" && (item.detail || item.attachments?.length)}
+                <div class="chat-message user-message">
+                  <header>
+                    <strong>{tr("You", "Você")}</strong>
+                    <time>{activityTime(item.createdAt)}</time>
+                  </header>
+                  {#if item.detail}<pre>{item.detail}</pre>{/if}
+                  {#if item.attachments?.length}
+                    <div class="message-images">
+                      {#each item.attachments as attachment}
+                        <img src={attachment.previewDataUrl} alt={attachment.name} />
                       {/each}
                     </div>
+                  {/if}
+                </div>
+              {:else if item.kind === "message" && item.detail}
+                <div class="chat-message agent-message">
+                  <header>
+                    <strong>{session.agentLabel}</strong>
+                    <time>{activityTime(item.createdAt)}</time>
+                  </header>
+                  <pre>{item.detail}</pre>
+                </div>
+              {:else if item.kind !== "file"}
+                <details class="turn-trace">
+                  <summary>
+                    <span>{activityMark(item)}</span>
+                    <strong class="trace-title">{displayText(language, item.title)}</strong>
+                    <time>{activityTime(item.createdAt)}</time>
+                  </summary>
+                  {#if item.detail}<pre>{item.detail}</pre>{/if}
+                </details>
+              {/if}
+              {#if entry.files.length}
+                <div class="turn-files">
+                  <strong>{tr("Files changed", "Arquivos alterados")}</strong>
+                  <div>
+                    {#each entry.files as file}
+                      <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                    {/each}
                   </div>
-                {/if}
-              </article>
+                </div>
+              {/if}
             {:else}
               <p class="empty-state">{tr("Messages and agent activity will appear here in real time.", "As mensagens e a atividade do agente aparecerão aqui em tempo real.")}</p>
             {/each}
@@ -988,6 +1049,21 @@
           void sendPrompt();
         }}
       >
+        {#if promptAttachments.length}
+          <div class="pending-images">
+            {#each promptAttachments as attachment, index}
+              <span>
+                <img src={attachment.previewDataUrl} alt="" />
+                <button type="button" onclick={() => removeImage(index)} aria-label={tr("Remove image", "Remover imagem")}>×</button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+        {#if canSubmit && capabilities?.canAttachImages}
+          <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
+            <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
+          </button>
+        {/if}
         <textarea
           bind:value={prompt}
           disabled={!canSubmit || !readyForPrompt || sending}
@@ -998,7 +1074,7 @@
         ></textarea>
         {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
         {#if canSubmit}
-          <button disabled={!prompt.trim() || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
+          <button disabled={(!prompt.trim() && promptAttachments.length === 0) || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
             {#if sending}
               <span class="send-spinner" aria-hidden="true"></span>
             {:else}
@@ -1084,8 +1160,7 @@
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
   .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
-  .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 10px; overflow-x: hidden; }
-  .chat-turn { min-width: 0; max-width: 100%; padding-bottom: 10px; display: grid; gap: 6px; overflow-x: hidden; border-bottom: 1px solid rgba(81, 105, 94, 0.09); }
+  .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 7px; overflow-x: hidden; }
   .chat-message { width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: hidden; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
@@ -1093,6 +1168,8 @@
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
   .chat-message pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+  .message-images { margin-top: 7px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+  .message-images img { width: 100%; max-height: 150px; display: block; border-radius: 7px; object-fit: cover; }
   .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
   .agent-typing span { width: 4px; height: 4px; border-radius: 50%; background: #4e7faf; animation: agent-typing-dot 850ms ease-in-out infinite; }
   .agent-typing span:nth-child(2) { animation-delay: 130ms; }
@@ -1136,12 +1213,17 @@
   .terminate-confirm > div { display: flex; gap: 4px; }
   .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 7px Inter, sans-serif; cursor: pointer; }
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
-  .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
+  .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
+  .pending-images { width: 100%; display: flex; gap: 5px; overflow-x: auto; }
+  .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
+  .pending-images img { width: 100%; height: 100%; display: block; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 8px; object-fit: cover; }
+  .pending-images button { position: absolute; top: -4px; right: -4px; width: 15px; height: 15px; border: 1px solid rgba(82, 106, 95, 0.18); border-radius: 50%; color: #65766e; background: #eef3f0; font-size: 10px; line-height: 1; }
   textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
   textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
   textarea:disabled { opacity: 0.58; }
   .send-status { padding-bottom: 9px; color: #70827a; font: 700 8px Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
+  .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .terminal-composer.sending button:disabled { opacity: 0.82; }
   .send-spinner { width: 12px; height: 12px; border: 2px solid rgba(255, 255, 255, 0.38); border-top-color: white; border-radius: 50%; animation: send-spin 650ms linear infinite; }
@@ -1183,7 +1265,6 @@
   .terminal-window.dark .hub-tabs button.active { color: #83c6a6; border-bottom-color: #59ad84; }
   .terminal-window.dark .hub-tabs span { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
-  .terminal-window.dark .chat-turn { border-color: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .chat-message { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
   .terminal-window.dark .agent-typing { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
   .terminal-window.dark .chat-message.user-message { background: rgba(76, 169, 124, 0.09); }
@@ -1197,6 +1278,8 @@
   .terminal-window.dark .change-list code { color: #bdcbc4; }
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
+  .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .pending-images button { color: #c6d5ce; border-color: rgba(205, 222, 213, 0.14); background: #26332d; }
   .terminal-window.dark .permission strong { color: #dfc6ac; }
   .terminal-window.dark .permission code,
   .terminal-window.dark .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }

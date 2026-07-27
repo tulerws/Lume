@@ -317,6 +317,7 @@ fn activity_event_for(
         status: "completed".into(),
         created_at: now_millis(),
         files: Vec::new(),
+        attachments: Vec::new(),
         append_detail: false,
     });
     Some(event)

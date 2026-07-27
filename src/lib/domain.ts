@@ -57,6 +57,30 @@ export interface AgentSession {
   lastResponse?: string;
   results: SessionResult[];
   activities: SessionActivity[];
+  rateLimits?: AgentRateLimit[];
+}
+
+export interface PromptAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  previewDataUrl: string;
+}
+
+export interface PromptAttachmentInput {
+  name: string;
+  mimeType: string;
+  path?: string;
+  dataBase64?: string;
+  previewDataUrl?: string;
+}
+
+export interface AgentRateLimit {
+  id: string;
+  label: string;
+  usedPercent: number;
+  resetsAt?: number;
+  windowMinutes?: number;
 }
 
 export interface SessionActivity {
@@ -67,6 +91,7 @@ export interface SessionActivity {
   status: "running" | "completed" | "failed" | "waiting";
   createdAt: number;
   files: string[];
+  attachments?: PromptAttachment[];
 }
 
 export interface SessionResult {

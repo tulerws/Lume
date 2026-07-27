@@ -16,6 +16,7 @@ import type {
   PairedDevice,
   PermissionAction,
   Preferences,
+  PromptAttachmentInput,
   ResultNote,
   RestoredTerminalPlacement,
   ExternalAgentPlugin,
@@ -125,8 +126,12 @@ export async function resizeOverlaySurface(width: number, height: number): Promi
   });
 }
 
-export async function submitPrompt(sessionId: string, prompt: string): Promise<void> {
-  await invoke("submit_prompt", { sessionId, prompt });
+export async function submitPrompt(
+  sessionId: string,
+  prompt: string,
+  attachments: PromptAttachmentInput[] = [],
+): Promise<void> {
+  await invoke("submit_prompt", { sessionId, prompt, attachments });
 }
 
 export async function terminateSession(sessionId: string): Promise<void> {

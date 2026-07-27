@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    domain::{AgentKind, AgentSession, PermissionAction, SessionSource},
+    domain::{
+        AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, SessionSource,
+    },
     state::now_millis,
 };
 
@@ -21,6 +23,8 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "results",
     "files",
     "prompts",
+    "image_prompts",
+    "rate_limits",
     "permissions",
     "termination",
     "realtime_stream",
@@ -44,6 +48,7 @@ pub struct SessionCapabilities {
     pub can_terminate: bool,
     pub can_open_source: bool,
     pub can_read_results: bool,
+    pub can_attach_images: bool,
 }
 
 impl SessionCapabilities {
@@ -67,6 +72,8 @@ impl SessionCapabilities {
             can_terminate: session.source == SessionSource::Cli && session.process_id.is_some(),
             can_open_source: matches!(session.source, SessionSource::Web | SessionSource::Vscode),
             can_read_results: !session.results.is_empty() || session.last_response.is_some(),
+            can_attach_images: session.source != SessionSource::Web
+                && session.agent != AgentKind::Unknown,
         }
     }
 }
@@ -122,6 +129,8 @@ pub enum HubCommand {
     SubmitPrompt {
         session_id: String,
         prompt: String,
+        #[serde(default)]
+        attachments: Vec<PromptAttachmentInput>,
     },
     ResolvePermission {
         session_id: String,
@@ -133,6 +142,9 @@ pub enum HubCommand {
     },
     OpenSessionSource {
         session_id: String,
+    },
+    RefreshRateLimits {
+        agent: AgentKind,
     },
 }
 
@@ -148,15 +160,28 @@ impl HubCommandRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_identifier("request_id", &self.request_id, 128)?;
         match &self.command {
-            HubCommand::SubmitPrompt { session_id, prompt } => {
+            HubCommand::SubmitPrompt {
+                session_id,
+                prompt,
+                attachments,
+            } => {
                 validate_identifier("session_id", session_id, 512)?;
-                if prompt.trim().is_empty() {
-                    return Err(ProtocolError::new("prompt_empty", "O prompt está vazio"));
+                if prompt.trim().is_empty() && attachments.is_empty() {
+                    return Err(ProtocolError::new(
+                        "prompt_empty",
+                        "O prompt e os anexos estão vazios",
+                    ));
                 }
                 if prompt.len() > 16 * 1024 {
                     return Err(ProtocolError::new(
                         "prompt_too_large",
                         "O prompt excede 16 KB",
+                    ));
+                }
+                if attachments.len() > 4 {
+                    return Err(ProtocolError::new(
+                        "too_many_attachments",
+                        "O prompt aceita no máximo 4 imagens",
                     ));
                 }
             }
@@ -172,6 +197,7 @@ impl HubCommandRequest {
             | HubCommand::OpenSessionSource { session_id } => {
                 validate_identifier("session_id", session_id, 512)?;
             }
+            HubCommand::RefreshRateLimits { .. } => {}
         }
         Ok(())
     }
@@ -392,6 +418,7 @@ mod tests {
             last_response: None,
             results: Vec::new(),
             activities: Vec::new(),
+            rate_limits: Vec::new(),
         }
     }
 
@@ -454,6 +481,7 @@ mod tests {
             HubCommand::SubmitPrompt {
                 session_id: "codex:thread-1".into(),
                 prompt: "Continue".into(),
+                attachments: Vec::new(),
             }
         );
         let serialized = serde_json::to_value(request).expect("json");
@@ -468,6 +496,7 @@ mod tests {
             command: HubCommand::SubmitPrompt {
                 session_id: "codex:thread-1".into(),
                 prompt: "  ".into(),
+                attachments: Vec::new(),
             },
         };
         assert_eq!(
