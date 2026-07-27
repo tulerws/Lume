@@ -80,6 +80,20 @@ pub struct PermissionProfile {
     pub available_actions: Vec<PermissionAction>,
 }
 
+impl PermissionProfile {
+    pub fn automatically_approves(&self) -> bool {
+        if self.mode == AccessMode::FullAccess {
+            return true;
+        }
+        self.approvals_reviewer.as_deref().is_some_and(|reviewer| {
+            matches!(
+                reviewer.trim().to_ascii_lowercase().as_str(),
+                "auto_review" | "auto-review" | "approve_for_me" | "approve-for-me"
+            )
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRequest {
@@ -343,6 +357,26 @@ mod tests {
             Some(&SessionStatus::PermissionRequired)
         ));
         assert!(!should_notify(&HookEventKind::SessionEnded, None));
+    }
+
+    #[test]
+    fn full_access_and_auto_review_profiles_approve_automatically() {
+        let mut profile = PermissionProfile {
+            mode: AccessMode::FullAccess,
+            label: "Acesso total".into(),
+            approval_policy: "never".into(),
+            approvals_reviewer: None,
+            can_respond_from_lume: true,
+            available_actions: Vec::new(),
+        };
+        assert!(profile.automatically_approves());
+
+        profile.mode = AccessMode::WorkspaceWrite;
+        profile.approvals_reviewer = Some("auto_review".into());
+        assert!(profile.automatically_approves());
+
+        profile.approvals_reviewer = None;
+        assert!(!profile.automatically_approves());
     }
 }
 

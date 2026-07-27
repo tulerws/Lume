@@ -126,10 +126,21 @@
   }
 
   const activities = $derived(session?.activities ?? []);
+  function activityReportedFiles(activity: SessionActivity): string[] {
+    const files = [...activity.files];
+    const title = activity.title.trim();
+    const titleLooksLikePath =
+      activity.kind === "file" &&
+      !/^(?:arquivos alterados|alterações da tarefa|\d+\s+arquivos alterados)$/i.test(title) &&
+      (title.includes("/") || title.includes("\\") || /\.[a-z0-9]{1,8}$/i.test(title));
+    if (titleLooksLikePath && !files.includes(title)) files.push(title);
+    return files;
+  }
+
   function activityChanges(activity: SessionActivity): FileChangeSummary[] {
     return summarizeFileChanges(
       activity.detail ?? "",
-      activity.files,
+      activityReportedFiles(activity),
       session?.workingDirectory,
     );
   }
@@ -139,7 +150,7 @@
     for (const result of session?.results ?? []) {
       mergeFileChanges(
         files,
-        summarizeFileChanges("", result.files, session?.workingDirectory),
+        summarizeFileChanges(result.response, result.files, session?.workingDirectory),
       );
     }
     return files;
@@ -771,6 +782,12 @@
     }
   }
 
+  function sendPromptOnEnter(event: KeyboardEvent) {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    void sendPrompt();
+  }
+
   async function permission(action: PermissionAction) {
     if (!session?.pendingPermission) return;
     if (action === "open_source") {
@@ -974,6 +991,7 @@
         <textarea
           bind:value={prompt}
           disabled={!canSubmit || !readyForPrompt || sending}
+          onkeydown={sendPromptOnEnter}
           rows="2"
           aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
           placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}

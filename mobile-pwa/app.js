@@ -56,6 +56,7 @@ let nativeRealtimeConnected = false;
 let nativeRealtimeListenersReady = false;
 let currentDevice;
 let previousStatuses = new Map();
+let previousPermissionIds = new Map();
 let hasRenderedSnapshot = false;
 let currentSnapshot;
 let activeFilter = "all";
@@ -968,7 +969,15 @@ function renderSessions(snapshot, trackChanges = true) {
   setHeaderMascotState(mascotStateForSessions(sessions));
   if (trackChanges && hasRenderedSnapshot && localStorage.getItem(notificationsKey) === "on") {
     for (const session of sessions) {
-      if (previousStatuses.get(session.id) !== session.status) {
+      const permissionId = session.pendingPermission?.id;
+      const isNewPermission =
+        session.status === "permission_required"
+        && permissionId
+        && previousPermissionIds.get(session.id) !== permissionId;
+      const isStatusTransition =
+        session.status !== "permission_required"
+        && previousStatuses.get(session.id) !== session.status;
+      if (isNewPermission || isStatusTransition) {
         void notifySession(session).catch((error) => {
           showBanner(error?.message || "Could not deliver the notification.", "error");
         });
@@ -977,14 +986,17 @@ function renderSessions(snapshot, trackChanges = true) {
   }
   if (trackChanges) {
     previousStatuses = new Map(sessions.map((session) => [session.id, session.status]));
+    const openSessionIds = new Set(sessions.map((session) => session.id));
+    for (const session of sessions) {
+      if (session.pendingPermission?.id) {
+        previousPermissionIds.set(session.id, session.pendingPermission.id);
+      }
+    }
+    for (const sessionId of previousPermissionIds.keys()) {
+      if (!openSessionIds.has(sessionId)) previousPermissionIds.delete(sessionId);
+    }
     hasRenderedSnapshot = true;
   }
-  const active = sessions.filter((session) =>
-    ["running", "permission_required", "waiting_for_input"].includes(session.status)
-  ).length;
-  const attention = sessions.filter((session) => session.status === "permission_required").length;
-  document.querySelector("#active-count").textContent = String(active);
-  document.querySelector("#attention-count").textContent = String(attention);
   document.querySelector("#updated-at").textContent =
     `Updated ${new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
   renderResults(sessions);

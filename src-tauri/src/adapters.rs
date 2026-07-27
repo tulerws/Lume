@@ -1,6 +1,7 @@
 use std::io::Read;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::{
@@ -326,6 +327,27 @@ fn permission_request(provider: &str, raw: &Value, session_id: &str) -> Permissi
         .map(str::to_string)
         .unwrap_or_else(|| format!("{tool_name} quer executar uma ação"));
     let timestamp = string(raw, "timestamp").unwrap_or_else(|| now_millis().to_string());
+    let request_key = [
+        "permission_request_id",
+        "permissionRequestId",
+        "tool_use_id",
+        "toolUseId",
+        "tool_call_id",
+        "toolCallId",
+        "request_id",
+        "requestId",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|key| string(raw, key))
+    .unwrap_or_else(|| {
+        let bucket = timestamp
+            .parse::<i64>()
+            .unwrap_or_else(|_| now_millis())
+            .div_euclid(30_000);
+        let fingerprint = format!("{provider}\n{session_id}\n{tool_name}\n{resource}\n{bucket}");
+        format!("{:x}", Sha256::digest(fingerprint.as_bytes()))
+    });
     let kind = if tool_name.to_lowercase().contains("bash")
         || tool_name.to_lowercase().contains("shell")
     {
@@ -339,7 +361,7 @@ fn permission_request(provider: &str, raw: &Value, session_id: &str) -> Permissi
     };
 
     PermissionRequest {
-        id: format!("{provider}:{session_id}:{}", now_millis()),
+        id: format!("{provider}:{session_id}:{request_key}"),
         kind: kind.into(),
         summary: truncate(&description, 180),
         resource: truncate(&resource, 320),

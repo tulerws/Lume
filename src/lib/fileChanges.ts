@@ -77,6 +77,12 @@ export function summarizeFileChanges(
   }
   flush();
 
+  const inlinePatch =
+    /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?=\s+(?:\*\*\*|@@)|[\r\n]|$)/g;
+  for (const match of detail.matchAll(inlinePatch)) {
+    record(summaries, cleanPath(match[1], workingDirectory));
+  }
+
   for (const reported of reportedFiles) {
     if (reported.includes("\n") || reported.includes("*** Begin Patch")) {
       for (const summary of summarizeFileChanges(reported, [], workingDirectory)) {

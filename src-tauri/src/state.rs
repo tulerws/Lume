@@ -11,14 +11,15 @@ use crate::{
     discovery::DiscoveredProcess,
     domain::{
         AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PairedDevice,
-        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionActivity,
-        SessionResult, SessionSource, SessionStatus,
+        PermissionAction, PermissionProfile, PermissionRequest, Preferences, ResultNote,
+        SessionActivity, SessionResult, SessionSource, SessionStatus,
     },
     store::Store,
 };
 
 const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
 const WEB_SESSION_STALE_MS: i64 = 12_000;
+const RECENT_NATIVE_SESSION_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 struct WorkspaceSnapshot {
@@ -57,6 +58,7 @@ impl AppState {
     }
 
     pub fn sessions(&self) -> Result<Vec<AgentSession>, String> {
+        let now = now_millis();
         let sessions = self
             .sessions
             .lock()
@@ -86,14 +88,7 @@ impl AppState {
         let native_contexts = deduplicated
             .iter()
             .filter(|session| !is_provisional_process(session))
-            .filter(|session| {
-                matches!(
-                    session.status,
-                    SessionStatus::Running
-                        | SessionStatus::PermissionRequired
-                        | SessionStatus::WaitingForInput
-                )
-            })
+            .filter(|session| session_can_own_process(session, now))
             .filter_map(|session| {
                 session.working_directory.as_ref().map(|directory| {
                     (
@@ -492,14 +487,19 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível atualizar a presença da sessão".to_string())?
             .remove(&target_session_id);
-        let superseded_permission_id = (!matches!(&event.event, HookEventKind::PermissionRequest))
-            .then(|| {
-                session
-                    .pending_permission
-                    .as_ref()
-                    .map(|permission| permission.id.clone())
+        let repeated_permission = matches!(&event.event, HookEventKind::PermissionRequest)
+            && session
+                .pending_permission
+                .as_ref()
+                .zip(event.permission.as_ref())
+                .is_some_and(|(current, incoming)| same_permission_request(current, incoming));
+        let superseded_permission_id = session
+            .pending_permission
+            .as_ref()
+            .filter(|_| {
+                !matches!(&event.event, HookEventKind::PermissionRequest) || !repeated_permission
             })
-            .flatten();
+            .map(|permission| permission.id.clone());
         if let Some(permission_id) = superseded_permission_id.as_ref() {
             if let Some(activity) = session
                 .activities
@@ -548,9 +548,15 @@ impl AppState {
             }
             HookEventKind::Activity => None,
             HookEventKind::PermissionRequest => {
-                let permission = event
+                let mut permission = event
                     .permission
                     .ok_or_else(|| "A solicitação não contém a permissão".to_string())?;
+                if repeated_permission {
+                    if let Some(current) = session.pending_permission.as_ref() {
+                        permission.id.clone_from(&current.id);
+                        permission.requested_at.clone_from(&current.requested_at);
+                    }
+                }
                 let id = permission.id.clone();
                 session.status = SessionStatus::PermissionRequired;
                 session.status_label = event
@@ -912,12 +918,7 @@ impl AppState {
                     !is_provisional_process(session)
                         && session_matches_process(session, &process)
                         && session.source == SessionSource::Vscode
-                        && (matches!(
-                            session.status,
-                            SessionStatus::Running
-                                | SessionStatus::PermissionRequired
-                                | SessionStatus::WaitingForInput
-                        ) || now - session.updated_at < 10 * 60 * 1_000)
+                        && session_can_own_process(session, now)
                 });
             if has_recent_native_vscode_chat {
                 let provisional_ids = sessions
@@ -936,7 +937,7 @@ impl AppState {
                 }
                 continue;
             }
-            let contextual_chat_ids = process
+            let exact_contextual_chat_ids = process
                 .working_directory
                 .as_ref()
                 .map(|directory| {
@@ -947,12 +948,7 @@ impl AppState {
                             session_matches_process(session, &process)
                                 && session.source == process.source
                                 && session.working_directory.as_ref() == Some(directory)
-                                && matches!(
-                                    session.status,
-                                    SessionStatus::Running
-                                        | SessionStatus::PermissionRequired
-                                        | SessionStatus::WaitingForInput
-                                )
+                                && session_can_own_process(session, now)
                                 && session.process_id.is_none_or(|pid| {
                                     pid == process.process_id || !active_pids.contains(&pid)
                                 })
@@ -961,6 +957,30 @@ impl AppState {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let contextual_chat_ids = if exact_contextual_chat_ids.is_empty() {
+                let fallback = sessions
+                    .iter()
+                    .filter(|session| !is_provisional_process(session))
+                    .filter(|session| {
+                        session_matches_process(session, &process)
+                            && session.source == process.source
+                            && session_can_own_process(session, now)
+                            && session.process_id.is_none_or(|pid| {
+                                pid == process.process_id || !active_pids.contains(&pid)
+                            })
+                            && (is_home_directory(process.working_directory.as_deref())
+                                || is_home_directory(session.working_directory.as_deref()))
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>();
+                if fallback.len() == 1 {
+                    fallback
+                } else {
+                    Vec::new()
+                }
+            } else {
+                exact_contextual_chat_ids
+            };
             if !contextual_chat_ids.is_empty() {
                 let provisional_ids = sessions
                     .iter()
@@ -1263,6 +1283,13 @@ fn normalized_chat_text(value: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn same_permission_request(current: &PermissionRequest, incoming: &PermissionRequest) -> bool {
+    current.kind == incoming.kind
+        && current.summary == incoming.summary
+        && current.resource == incoming.resource
+        && current.risk == incoming.risk
 }
 
 fn has_prompt_between(session: &AgentSession, left: i64, right: i64) -> bool {
@@ -1627,6 +1654,22 @@ fn session_matches_process(session: &AgentSession, process: &DiscoveredProcess) 
         &process.agent,
         &process.agent_label,
     )
+}
+
+fn session_can_own_process(session: &AgentSession, now: i64) -> bool {
+    matches!(
+        session.status,
+        SessionStatus::Running
+            | SessionStatus::PermissionRequired
+            | SessionStatus::WaitingForInput
+    ) || now.saturating_sub(session.updated_at) < RECENT_NATIVE_SESSION_MS
+}
+
+fn is_home_directory(directory: Option<&str>) -> bool {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return false;
+    };
+    same_directory(directory, home.to_str())
 }
 
 fn same_directory(left: Option<&str>, right: Option<&str>) -> bool {
@@ -2438,6 +2481,65 @@ mod tests {
     }
 
     #[test]
+    fn completed_native_chat_without_pid_absorbs_the_matching_process() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("claude:completed-without-pid", 4242);
+        event.process_id = None;
+        state.ingest(event.clone()).expect("início");
+        event.event = HookEventKind::Completed;
+        event.status_label = Some("Finalizado".into());
+        state.ingest(event).expect("conclusão");
+
+        state
+            .reconcile_processes(vec![discovered(4242)])
+            .expect("redetecção");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:completed-without-pid");
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].process_id, Some(4242));
+    }
+
+    #[test]
+    fn home_process_does_not_duplicate_a_unique_recent_project_chat() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("diretório do usuário");
+        let project = home.join("Documents").join("Lume");
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex-app-server:chat-home", 4242);
+        event.agent = AgentKind::Codex;
+        event.agent_label = Some("Codex".into());
+        event.project = Some("Lume".into());
+        event.process_id = None;
+        event.native_session_id = Some("chat-home".into());
+        event.working_directory = Some(project.to_string_lossy().into_owned());
+        state.ingest(event.clone()).expect("início");
+        event.event = HookEventKind::Completed;
+        event.status_label = Some("Tarefa finalizada".into());
+        state.ingest(event).expect("conclusão");
+
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
+                process_id: 4242,
+                working_directory: Some(home.to_string_lossy().into_owned()),
+                source: SessionSource::Cli,
+            }])
+            .expect("redetecção");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "codex-app-server:chat-home");
+        assert_eq!(sessions[0].project, "Lume");
+        assert_eq!(sessions[0].status, SessionStatus::Completed);
+        assert_eq!(sessions[0].process_id, Some(4242));
+    }
+
+    #[test]
     fn disappearing_process_removes_a_hook_backed_session() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -2514,6 +2616,52 @@ mod tests {
                 .wait_for_decision("permission-1", Duration::ZERO)
                 .expect("decisão"),
             Some(PermissionAction::Deny)
+        );
+    }
+
+    #[test]
+    fn repeated_permission_keeps_the_original_pending_decision() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut first = started_event("codex:chat-1", 4242);
+        first.event = HookEventKind::PermissionRequest;
+        first.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "npm test".into(),
+            risk: "medium".into(),
+            requested_at: "1".into(),
+        });
+        state.ingest(first).expect("primeira permissão");
+
+        let mut repeated = started_event("codex:chat-1", 4242);
+        repeated.event = HookEventKind::PermissionRequest;
+        repeated.permission = Some(PermissionRequest {
+            id: "permission-2".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "npm test".into(),
+            risk: "medium".into(),
+            requested_at: "2".into(),
+        });
+        let id = state.ingest(repeated).expect("permissão repetida");
+
+        assert_eq!(id.as_deref(), Some("permission-1"));
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(
+            session
+                .pending_permission
+                .as_ref()
+                .map(|value| value.id.as_str()),
+            Some("permission-1")
+        );
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "permission")
+                .count(),
+            1
         );
     }
 

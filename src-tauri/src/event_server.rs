@@ -9,7 +9,7 @@ use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
-    domain::{HookEvent, HookResponse},
+    domain::{HookEvent, HookEventKind, HookResponse, PermissionAction},
     state::AppState,
 };
 
@@ -34,10 +34,28 @@ pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
 }
 
 fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
-    let response = read_event(&stream).and_then(|event| {
+    let response = read_event(&stream).and_then(|mut event| {
+        let automatically_approved = matches!(event.event, HookEventKind::PermissionRequest)
+            && event
+                .permission_profile
+                .as_ref()
+                .is_some_and(|profile| profile.automatically_approves());
         let wait_for_decision = event.wait_for_decision;
+        if automatically_approved {
+            event.event = HookEventKind::Running;
+            event.status_label = Some("Executando".into());
+            event.permission = None;
+            event.wait_for_decision = false;
+        }
         let permission_id = publish_event(&state, &app, event)?;
 
+        if automatically_approved {
+            return Ok(HookResponse {
+                ok: true,
+                action: wait_for_decision.then_some(PermissionAction::AllowOnce),
+                message: None,
+            });
+        }
         if wait_for_decision {
             let permission_id = permission_id.ok_or_else(|| {
                 "O evento aguardava uma decisão, mas não continha permissão".to_string()

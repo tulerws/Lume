@@ -26,29 +26,46 @@ internal class LumeAgentNotifier(context: Context) {
 
     fun clear() {
         synchronized(notificationLock) {
-            state.edit { remove(STATUSES) }
+            state.edit {
+                remove(STATUSES)
+                .remove(PERMISSIONS)
+            }
         }
     }
 
     private fun observeLocked(snapshot: JSONObject) {
         val sessions = snapshot.optJSONArray("sessions") ?: return
         val previous = decodeStatuses(state.getString(STATUSES, null))
+        val previousPermissions = decodeStatuses(state.getString(PERMISSIONS, null))
         val current = linkedMapOf<String, String>()
+        val currentPermissions = linkedMapOf<String, String>()
         for (index in 0 until sessions.length()) {
             val session = sessions.optJSONObject(index) ?: continue
             val id = session.optString("id").takeIf(String::isNotBlank) ?: continue
             val status = session.optString("status")
             current[id] = status
-            if (
-                previous.isNotEmpty() &&
+            val permissionId = session
+                .optJSONObject("pendingPermission")
+                ?.optString("id")
+                ?.takeIf(String::isNotBlank)
+            if (permissionId != null) {
+                currentPermissions[id] = permissionId
+            } else if (previousPermissions[id] != null) {
+                currentPermissions[id] = previousPermissions.getValue(id)
+            }
+            val isNewPermission = status == "permission_required" &&
+                permissionId != null &&
+                previousPermissions[id] != permissionId
+            val isStatusTransition = status != "permission_required" &&
                 previous[id] != null &&
                 previous[id] != status
-            ) {
+            if (previous.isNotEmpty() && (isNewPermission || isStatusTransition)) {
                 notifyTransition(session, status)
             }
         }
         state.edit {
             putString(STATUSES, JSONObject(current as Map<*, *>).toString())
+                .putString(PERMISSIONS, JSONObject(currentPermissions as Map<*, *>).toString())
         }
     }
 
@@ -129,6 +146,7 @@ internal class LumeAgentNotifier(context: Context) {
         const val CHANNEL_ID = "lume-agent-events"
         const val STATE_STORE = "lume-native-agent-notification-state"
         const val STATUSES = "session-statuses"
+        const val PERMISSIONS = "session-permissions"
         val notificationLock = Any()
     }
 }

@@ -2039,18 +2039,28 @@
                 {#if selectedId === session.id}
                   {@const capabilities = sessionCapabilities(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
-                    <div class="capability-bar">
-                      {#if capabilities.canOpenSource}
+                    {#if capabilities.canOpenSource}
+                      <div class="capability-bar">
                         <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
-                      {/if}
-                      {#if capabilities.canReadResults && session.lastResponse}
-                        <button type="button" onclick={() => copyResult(`${session.id}-latest`, session.lastResponse ?? "")}>{copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy result", "Copiar resultado")}</button>
-                      {/if}
-                    </div>
+                      </div>
+                    {/if}
 
                     {#if session.lastResponse}
                       <div class="final-response">
                         <span class="eyebrow">{tr("Final response", "Resposta final")}</span>
+                        <button
+                          class="final-response-copy"
+                          type="button"
+                          onclick={() => copyResult(`${session.id}-latest`, session.lastResponse ?? "")}
+                          aria-label={copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy final response", "Copiar resposta final")}
+                          title={copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
+                        >
+                          {#if copiedResultId === `${session.id}-latest`}
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7" /></svg>
+                          {:else}
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="7" y="6" width="8" height="9" rx="1.5" /><path d="M12 6V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13H7" /></svg>
+                          {/if}
+                        </button>
                         <p>{session.lastResponse}</p>
                       </div>
                     {/if}
@@ -3177,9 +3187,12 @@
   .inline-error { margin: 1px 0 0; color: #a54c4c; font-size: 9px; }
   .integration-note { margin: 0; color: #7c8983; font-size: 10px; line-height: 1.45; }
 
-  .final-response { margin: 0 0 10px; padding: 9px 10px; border: 1px solid rgba(78, 105, 93, 0.1); border-radius: 10px; background: rgba(73, 102, 89, 0.035); }
+  .final-response { position: relative; margin: 0 0 10px; padding: 9px 36px 9px 10px; border: 1px solid rgba(78, 105, 93, 0.1); border-radius: 10px; background: rgba(73, 102, 89, 0.035); }
   .final-response .eyebrow { display: block; margin-bottom: 5px; color: #668075; font-size: 8px; font-weight: 780; letter-spacing: 0.055em; text-transform: uppercase; }
   .final-response p { max-height: 150px; margin: 0; overflow-y: auto; color: #43524c; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; scrollbar-width: thin; }
+  .final-response-copy { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 7px; color: #6a7f75; background: transparent; cursor: pointer; }
+  .final-response-copy:hover { color: #3f6253; background: rgba(72, 99, 87, 0.08); }
+  .final-response-copy svg { width: 13px; height: 13px; }
 
   .continue-trigger { margin-top: 9px; padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #557266; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
   .continue-trigger svg { width: 13px; height: 13px; transition: transform 150ms ease; }
@@ -3557,6 +3570,8 @@
   .overlay-shell.dark .response-preview b { color: #8ca69a; }
   .overlay-shell.dark .final-response p,
   .overlay-shell.dark .response-preview span { color: #c2d0c9; }
+  .overlay-shell.dark .final-response-copy { color: #98aaa1; }
+  .overlay-shell.dark .final-response-copy:hover { color: #d1ded7; background: rgba(222, 233, 228, 0.07); }
   .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
   .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
   .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }

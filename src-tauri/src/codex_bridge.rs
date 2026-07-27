@@ -431,6 +431,15 @@ fn approval_response(
     let permission_id = format!("codex:{thread_id}:{item_id}");
     let cwd = text_at(&params, "cwd").map(str::to_string);
     let (kind, summary, resource, risk) = permission_details(method, &params, cwd.as_deref());
+    let profile = profiles
+        .get(thread_id)
+        .cloned()
+        .unwrap_or_else(direct_profile);
+    if let Some(result) = automatic_approval_result(&profile, method, &params) {
+        let response =
+            json!({ "id": value.get("id").cloned().unwrap_or(Value::Null), "result": result });
+        return Ok(Message::Text(response.to_string().into()));
+    }
     let event = HookEvent {
         event: HookEventKind::PermissionRequest,
         session_id: session_id(thread_id),
@@ -444,12 +453,7 @@ fn approval_response(
         process_id: None,
         native_session_id: Some(thread_id.into()),
         working_directory: cwd,
-        permission_profile: Some(
-            profiles
-                .get(thread_id)
-                .cloned()
-                .unwrap_or_else(direct_profile),
-        ),
+        permission_profile: Some(profile),
         permission: Some(PermissionRequest {
             id: permission_id.clone(),
             kind,
@@ -534,6 +538,16 @@ fn decision_result(method: &str, action: PermissionAction, params: &Value) -> Va
             PermissionAction::Deny | PermissionAction::OpenSource => "decline",
         }
     })
+}
+
+fn automatic_approval_result(
+    profile: &PermissionProfile,
+    method: &str,
+    params: &Value,
+) -> Option<Value> {
+    profile
+        .automatically_approves()
+        .then(|| decision_result(method, PermissionAction::AllowOnce, params))
 }
 
 fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
@@ -798,6 +812,9 @@ fn files_from_diff(diff: &str) -> Vec<String> {
         let Some(path) = line
             .strip_prefix("+++ b/")
             .or_else(|| line.strip_prefix("--- a/"))
+            .or_else(|| line.strip_prefix("*** Update File: "))
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
         else {
             continue;
         };
@@ -1174,6 +1191,25 @@ mod tests {
     }
 
     #[test]
+    fn automatic_profiles_do_not_pause_on_app_server_approval() {
+        let mut profile = direct_profile();
+        profile.approvals_reviewer = Some("auto_review".into());
+        let params = json!({
+            "threadId": "thread",
+            "itemId": "command",
+            "command": "npm test"
+        });
+
+        let response = automatic_approval_result(
+            &profile,
+            "item/commandExecution/requestApproval",
+            &params,
+        )
+        .expect("aprovação automática");
+        assert_eq!(response["decision"], "accept");
+    }
+
+    #[test]
     fn prompt_uses_the_documented_turn_start_shape() {
         assert_eq!(
             prompt_turn_request("thread-1", "Continue os testes"),
@@ -1251,6 +1287,13 @@ mod tests {
         .expect("atividade de arquivo");
         assert_eq!(files.kind, "file");
         assert_eq!(files.files.len(), 2);
+
+        assert_eq!(
+            files_from_diff(
+                "*** Begin Patch\n*** Update File: src/lib/TerminalWindow.svelte\n@@\n-old\n+new\n*** End Patch"
+            ),
+            vec!["src/lib/TerminalWindow.svelte"]
+        );
     }
 
     #[test]
