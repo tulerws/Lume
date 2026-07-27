@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream, UdpSocket},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -12,10 +12,12 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     ServerConfig, ServerConnection, StreamOwned,
@@ -28,7 +30,7 @@ use crate::{
     browser_server::BrowserControl,
     codex_bridge::CodexBridge,
     control,
-    domain::MobileScope,
+    domain::{MobileScope, PairedDevice},
     mobile_gateway::MobileGateway,
     protocol::{self, HubSnapshot, PROTOCOL_VERSION},
     state::AppState,
@@ -36,8 +38,7 @@ use crate::{
 
 pub const BOOTSTRAP_ADDRESS: &str = "127.0.0.1:43121";
 pub const TLS_ADDRESS: &str = "127.0.0.1:43122";
-const NETWORK_BOOTSTRAP_ADDRESS: &str = "0.0.0.0:43123";
-const NETWORK_TLS_ADDRESS: &str = "0.0.0.0:43124";
+const NETWORK_ADDRESS: &str = "0.0.0.0:43124";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MOBILE_INDEX: &str = include_str!("../../mobile-pwa/index.html");
 const MOBILE_APP: &str = include_str!("../../mobile-pwa/app.js");
@@ -53,7 +54,6 @@ pub struct MobileServer {
     state: Option<AppState>,
     gateway: Option<MobileGateway>,
     app: Option<AppHandle>,
-    data_dir: PathBuf,
 }
 
 impl Default for MobileServer {
@@ -66,13 +66,10 @@ impl Default for MobileServer {
                 address: String::new(),
                 network_reachable: false,
                 transport: "unavailable".into(),
-                ca_install_url: String::new(),
-                ca_fingerprint: String::new(),
             })),
             state: None,
             gateway: None,
             app: None,
-            data_dir: PathBuf::new(),
         }
     }
 }
@@ -84,8 +81,6 @@ pub struct MobileServerStatus {
     pub address: String,
     pub network_reachable: bool,
     pub transport: String,
-    pub ca_install_url: String,
-    pub ca_fingerprint: String,
 }
 
 impl MobileServer {
@@ -98,8 +93,9 @@ impl MobileServer {
         let identity = TlsIdentity::load_or_create(data_dir, &[])?;
         let listener = TcpListener::bind(TLS_ADDRESS)
             .map_err(|error| format!("Não foi possível iniciar o gateway mobile: {error}"))?;
-        let bootstrap = TcpListener::bind(BOOTSTRAP_ADDRESS)
-            .map_err(|error| format!("Não foi possível iniciar o instalador do certificado: {error}"))?;
+        let bootstrap = TcpListener::bind(BOOTSTRAP_ADDRESS).map_err(|error| {
+            format!("Não foi possível iniciar o instalador do certificado: {error}")
+        })?;
         let running = Arc::new(AtomicBool::new(true));
         let address = format!("https://{TLS_ADDRESS}");
         gateway.set_pairing_base_url(address.clone());
@@ -118,8 +114,6 @@ impl MobileServer {
             address,
             network_reachable: false,
             transport: "https".into(),
-            ca_install_url: format!("http://{BOOTSTRAP_ADDRESS}/lume-ca.crt"),
-            ca_fingerprint: identity.ca_fingerprint,
         };
         Ok(Self {
             running,
@@ -128,7 +122,6 @@ impl MobileServer {
             state: Some(state),
             gateway: Some(gateway),
             app: Some(app),
-            data_dir: data_dir.to_path_buf(),
         })
     }
 
@@ -163,36 +156,21 @@ impl MobileServer {
             .clone()
             .ok_or_else(|| "O aplicativo não está disponível para comandos remotos".to_string())?;
         let ip = local_network_ip()?;
-        let identity = TlsIdentity::load_or_create(&self.data_dir, &[ip.to_string()])?;
-        let listener = TcpListener::bind(NETWORK_TLS_ADDRESS)
+        let listener = TcpListener::bind(NETWORK_ADDRESS)
             .map_err(|error| format!("Não foi possível abrir o gateway na rede local: {error}"))?;
-        let bootstrap = TcpListener::bind(NETWORK_BOOTSTRAP_ADDRESS)
-            .map_err(|error| format!("Não foi possível abrir o certificado na rede local: {error}"))?;
         let running = Arc::new(AtomicBool::new(true));
-        start_listener_pair(
-            listener,
-            bootstrap,
-            running.clone(),
-            state,
-            gateway.clone(),
-            app,
-            &identity,
-            "network",
-        )?;
-        let address = format!("https://{ip}:43124");
+        start_plain_listener(listener, running.clone(), state, gateway.clone(), app)?;
+        let address = format!("http://{ip}:43124");
         gateway.set_pairing_base_url(address.clone());
         *self
             .network_running
             .lock()
-            .map_err(|_| "Não foi possível ativar o gateway mobile".to_string())? =
-            Some(running);
+            .map_err(|_| "Não foi possível ativar o gateway mobile".to_string())? = Some(running);
         let status = MobileServerStatus {
             running: true,
             address,
             network_reachable: true,
-            transport: "https".into(),
-            ca_install_url: format!("http://{ip}:43123/lume-ca.crt"),
-            ca_fingerprint: identity.ca_fingerprint,
+            transport: "encrypted-local".into(),
         };
         *self
             .status
@@ -214,14 +192,11 @@ impl MobileServer {
         if let Some(gateway) = &self.gateway {
             gateway.set_pairing_base_url(format!("https://{TLS_ADDRESS}"));
         }
-        let fingerprint = self.status().ca_fingerprint;
         let status = MobileServerStatus {
             running: self.is_running(),
             address: format!("https://{TLS_ADDRESS}"),
             network_reachable: false,
             transport: "https".into(),
-            ca_install_url: format!("http://{BOOTSTRAP_ADDRESS}/lume-ca.crt"),
-            ca_fingerprint: fingerprint,
         };
         *self
             .status
@@ -307,16 +282,47 @@ fn start_listener_pair(
     Ok(())
 }
 
+fn start_plain_listener(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    state: AppState,
+    gateway: MobileGateway,
+    app: AppHandle,
+) -> Result<(), String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    thread::Builder::new()
+        .name("lume-mobile-network-gateway".into())
+        .spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let state = state.clone();
+                        let gateway = gateway.clone();
+                        let app = app.clone();
+                        let _ = thread::Builder::new()
+                            .name("lume-mobile-network-client".into())
+                            .spawn(move || handle_stream(stream, state, gateway, app));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(40));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(80)),
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn local_network_ip() -> Result<IpAddr, String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .map_err(|error| format!("Não foi possível consultar a rede local: {error}"))?;
     socket
         .connect("1.1.1.1:80")
         .map_err(|_| "Conecte o computador e o telefone à mesma rede local".to_string())?;
-    let ip = socket
-        .local_addr()
-        .map_err(|error| error.to_string())?
-        .ip();
+    let ip = socket.local_addr().map_err(|error| error.to_string())?.ip();
     if ip.is_loopback() || ip.is_unspecified() {
         return Err("Nenhum endereço de rede local foi encontrado".into());
     }
@@ -374,19 +380,17 @@ impl TlsIdentity {
                 (ca_der, ca_pem, ca_key_der)
             };
 
-        let ca_key =
-            KeyPair::try_from(ca_key_der.as_slice()).map_err(|error| error.to_string())?;
+        let ca_key = KeyPair::try_from(ca_key_der.as_slice()).map_err(|error| error.to_string())?;
         let ca_certificate = CertificateDer::from(ca_der.clone());
-        let ca = Issuer::from_ca_cert_der(&ca_certificate, ca_key)
-            .map_err(|error| error.to_string())?;
+        let ca =
+            Issuer::from_ca_cert_der(&ca_certificate, ca_key).map_err(|error| error.to_string())?;
         let mut hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         for host in additional_hosts {
             if !hosts.contains(host) {
                 hosts.push(host.clone());
             }
         }
-        let mut server_params =
-            CertificateParams::new(hosts).map_err(|error| error.to_string())?;
+        let mut server_params = CertificateParams::new(hosts).map_err(|error| error.to_string())?;
         server_params
             .distinguished_name
             .push(DnType::OrganizationName, "Lume Local");
@@ -455,6 +459,45 @@ struct PairRequest {
     device_name: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptedEnvelope {
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurePairPayload {
+    device_name: String,
+    timestamp: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureTransportRequest {
+    device_id: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureRequestPayload {
+    method: String,
+    path: String,
+    body: serde_json::Value,
+    timestamp: i64,
+    request_nonce: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureResponsePayload {
+    status: u16,
+    body: serde_json::Value,
+}
+
 fn handle_tls(
     stream: TcpStream,
     state: AppState,
@@ -521,9 +564,9 @@ fn route_with_app(
     let allowed_origin = request
         .headers
         .get("origin")
-        .filter(|origin| is_native_mobile_origin(origin))
+        .filter(|origin| is_mobile_origin(origin))
         .cloned();
-    let response = route_core(request, state, gateway, app);
+    let response = route_core(request, state, gateway, app, None);
     if let Some(origin) = allowed_origin {
         with_cors(response, &origin)
     } else {
@@ -536,6 +579,7 @@ fn route_core(
     state: &AppState,
     gateway: &MobileGateway,
     app: Option<&AppHandle>,
+    authenticated_device: Option<PairedDevice>,
 ) -> String {
     if request.method == "OPTIONS" {
         return empty_response(204, "No Content");
@@ -563,7 +607,7 @@ fn route_core(
             &serde_json::json!({
                 "ok": true,
                 "protocolVersion": PROTOCOL_VERSION,
-                "transport": "https",
+                "transport": "encrypted-local",
             }),
         );
     }
@@ -578,17 +622,32 @@ fn route_core(
             Err(message) => json_error(401, "pairing_failed", &message),
         };
     }
+    if request.method == "POST" && request.path == "/api/v1/pair-secure" {
+        return secure_pairing_response(&request.body, state, gateway);
+    }
+    if request.method == "POST" && request.path == "/api/v1/secure" {
+        return secure_transport_response(&request.body, state, gateway, app);
+    }
 
-    let Some(token) = bearer_token(&request.headers) else {
-        return json_error(401, "authentication_required", "Token ausente");
-    };
-    let device = match gateway.authenticate(state, token) {
-        Ok(Some(device)) => device,
-        Ok(None) => return json_error(401, "invalid_token", "Token inválido"),
-        Err(message) => return json_error(500, "authentication_failed", &message),
+    let device = match authenticated_device {
+        Some(device) => device,
+        None => {
+            let Some(token) = bearer_token(&request.headers) else {
+                return json_error(401, "authentication_required", "Token ausente");
+            };
+            match gateway.authenticate(state, token) {
+                Ok(Some(device)) => device,
+                Ok(None) => return json_error(401, "invalid_token", "Token inválido"),
+                Err(message) => return json_error(500, "authentication_failed", &message),
+            }
+        }
     };
     if !device.scopes.contains(&MobileScope::Monitor) {
-        return json_error(403, "scope_required", "Acesso de monitoramento não autorizado");
+        return json_error(
+            403,
+            "scope_required",
+            "Acesso de monitoramento não autorizado",
+        );
     }
 
     if request.method == "GET" && request.path == "/api/v1/me" {
@@ -613,10 +672,18 @@ fn route_core(
             }
         };
         if !device.scopes.contains(&required_scope) {
-            return json_error(403, "scope_required", "Este dispositivo não possui essa permissão");
+            return json_error(
+                403,
+                "scope_required",
+                "Este dispositivo não possui essa permissão",
+            );
         }
         let Some(app) = app else {
-            return json_error(503, "desktop_unavailable", "O aplicativo não está disponível");
+            return json_error(
+                503,
+                "desktop_unavailable",
+                "O aplicativo não está disponível",
+            );
         };
         let response = control::execute_hub_command(
             app,
@@ -647,6 +714,186 @@ fn route_core(
         );
     }
     json_error(404, "not_found", "Rota não encontrada")
+}
+
+fn secure_pairing_response(body: &[u8], state: &AppState, gateway: &MobileGateway) -> String {
+    let envelope = match serde_json::from_slice::<EncryptedEnvelope>(body) {
+        Ok(envelope) => envelope,
+        Err(error) => return json_error(400, "invalid_envelope", &error.to_string()),
+    };
+    let key = match gateway.active_pairing_key() {
+        Ok(key) => key,
+        Err(message) => return json_error(401, "pairing_failed", &message),
+    };
+    let pairing = match decrypt_json::<SecurePairPayload>(&key, &envelope, b"lume-pair-request-v1")
+    {
+        Ok(pairing) if timestamp_is_recent(pairing.timestamp) => pairing,
+        Ok(_) => return json_error(401, "pairing_expired", "Solicitação de pareamento expirada"),
+        Err(_) => {
+            return json_error(
+                401,
+                "pairing_failed",
+                "O QR Code não corresponde ao pareamento ativo",
+            )
+        }
+    };
+    let credentials = match gateway.complete_pairing_with_key(state, &key, &pairing.device_name) {
+        Ok(credentials) => credentials,
+        Err(message) => return json_error(401, "pairing_failed", &message),
+    };
+    match encrypt_json(&key, &credentials, b"lume-pair-response-v1") {
+        Ok(envelope) => json_response(201, &envelope),
+        Err(message) => json_error(500, "encryption_failed", &message),
+    }
+}
+
+fn secure_transport_response(
+    body: &[u8],
+    state: &AppState,
+    gateway: &MobileGateway,
+    app: Option<&AppHandle>,
+) -> String {
+    let request = match serde_json::from_slice::<SecureTransportRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, "invalid_envelope", &error.to_string()),
+    };
+    let (device, key) = match gateway.authenticate_encrypted(state, &request.device_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return json_error(401, "invalid_device", "Dispositivo não pareado"),
+        Err(message) => return json_error(500, "authentication_failed", &message),
+    };
+    let envelope = EncryptedEnvelope {
+        nonce: request.nonce,
+        ciphertext: request.ciphertext,
+    };
+    let payload =
+        match decrypt_json::<SecureRequestPayload>(&key, &envelope, b"lume-secure-request-v1") {
+            Ok(payload) => payload,
+            Err(_) => return json_error(401, "invalid_envelope", "Solicitação inválida"),
+        };
+    if !matches!(payload.method.as_str(), "GET" | "POST")
+        || !payload.path.starts_with("/api/v1/")
+        || matches!(
+            payload.path.split('?').next(),
+            Some("/api/v1/pair" | "/api/v1/pair-secure" | "/api/v1/secure")
+        )
+    {
+        return json_error(400, "invalid_request", "Rota segura inválida");
+    }
+    match gateway.accept_request_nonce(
+        &request.device_id,
+        &payload.request_nonce,
+        payload.timestamp,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return json_error(401, "expired_request", "Solicitação expirada ou repetida"),
+        Err(message) => return json_error(500, "authentication_failed", &message),
+    }
+    let inner_body = if payload.method == "POST" {
+        match serde_json::to_vec(&payload.body) {
+            Ok(body) if body.len() <= MAX_BODY_BYTES => body,
+            Ok(_) => return json_error(413, "request_too_large", "Solicitação muito grande"),
+            Err(error) => return json_error(400, "invalid_request", &error.to_string()),
+        }
+    } else {
+        Vec::new()
+    };
+    let response = route_core(
+        HttpRequest {
+            method: payload.method,
+            path: payload.path,
+            headers: HashMap::new(),
+            body: inner_body,
+        },
+        state,
+        gateway,
+        app,
+        Some(device),
+    );
+    let (status, response_body) = response_json_parts(&response);
+    let response_aad = format!("lume-secure-response-v1:{}", payload.request_nonce);
+    match encrypt_json(
+        &key,
+        &SecureResponsePayload {
+            status,
+            body: response_body,
+        },
+        response_aad.as_bytes(),
+    ) {
+        Ok(envelope) => json_response(200, &envelope),
+        Err(message) => json_error(500, "encryption_failed", &message),
+    }
+}
+
+fn timestamp_is_recent(timestamp: i64) -> bool {
+    crate::state::now_millis()
+        .checked_sub(timestamp)
+        .and_then(i64::checked_abs)
+        .is_some_and(|age| age <= 60 * 1_000)
+}
+
+fn decrypt_json<T: for<'de> Deserialize<'de>>(
+    key: &[u8; 32],
+    envelope: &EncryptedEnvelope,
+    aad: &[u8],
+) -> Result<T, String> {
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(&envelope.nonce)
+        .map_err(|_| "Nonce inválido".to_string())?;
+    let nonce_bytes: [u8; 12] = nonce_bytes
+        .try_into()
+        .map_err(|_| "Nonce inválido".to_string())?;
+    let mut ciphertext = URL_SAFE_NO_PAD
+        .decode(&envelope.ciphertext)
+        .map_err(|_| "Conteúdo cifrado inválido".to_string())?;
+    let key = LessSafeKey::new(
+        UnboundKey::new(&AES_256_GCM, key).map_err(|_| "Chave inválida".to_string())?,
+    );
+    let plaintext = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(aad),
+            &mut ciphertext,
+        )
+        .map_err(|_| "Não foi possível decifrar a solicitação".to_string())?;
+    serde_json::from_slice(plaintext).map_err(|error| error.to_string())
+}
+
+fn encrypt_json(
+    key: &[u8; 32],
+    value: &impl Serialize,
+    aad: &[u8],
+) -> Result<EncryptedEnvelope, String> {
+    let mut nonce_bytes = [0_u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|error| error.to_string())?;
+    let mut ciphertext = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let key = LessSafeKey::new(
+        UnboundKey::new(&AES_256_GCM, key).map_err(|_| "Chave inválida".to_string())?,
+    );
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce_bytes),
+        Aad::from(aad),
+        &mut ciphertext,
+    )
+    .map_err(|_| "Não foi possível cifrar a resposta".to_string())?;
+    Ok(EncryptedEnvelope {
+        nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
+        ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+    })
+}
+
+fn response_json_parts(response: &str) -> (u16, serde_json::Value) {
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    let body = response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str(body).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, body)
 }
 
 struct HttpRequest {
@@ -712,13 +959,10 @@ fn bearer_token(headers: &HashMap<String, String>) -> Option<&str> {
 }
 
 fn query_value<'a>(path: &'a str, name: &str) -> Option<&'a str> {
-    path.split_once('?')?
-        .1
-        .split('&')
-        .find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            (key == name).then_some(value)
-        })
+    path.split_once('?')?.1.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 fn json_response(status: u16, body: &impl serde::Serialize) -> String {
@@ -748,7 +992,11 @@ fn json_response(status: u16, body: &impl serde::Serialize) -> String {
 }
 
 fn raw_response(status: u16, content_type: &str, body: &[u8]) -> String {
-    let label = if status == 200 { "OK" } else { "Internal Server Error" };
+    let label = if status == 200 {
+        "OK"
+    } else {
+        "Internal Server Error"
+    };
     format!(
         "HTTP/1.1 {status} {label}\r\n\
          Content-Type: {content_type}\r\n\
@@ -799,8 +1047,15 @@ fn empty_response(status: u16, label: &str) -> String {
     )
 }
 
-fn is_native_mobile_origin(origin: &str) -> bool {
-    matches!(origin, "capacitor://localhost" | "https://localhost")
+fn is_mobile_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "capacitor://localhost"
+            | "https://localhost"
+            | "https://tulerws.github.io"
+            | "http://localhost:4173"
+            | "http://127.0.0.1:4173"
+    )
 }
 
 fn with_cors(response: String, origin: &str) -> String {
@@ -810,6 +1065,7 @@ fn with_cors(response: String, origin: &str) -> String {
             "Access-Control-Allow-Origin: {origin}\r\n\
              Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
              Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+             Access-Control-Allow-Private-Network: true\r\n\
              Vary: Origin\r\n\
              Content-Length:"
         ),
@@ -826,7 +1082,12 @@ mod tests {
 
     use super::*;
 
-    fn request(method: &str, path: &str, token: Option<&str>, body: serde_json::Value) -> HttpRequest {
+    fn request(
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: serde_json::Value,
+    ) -> HttpRequest {
         let mut headers = HashMap::new();
         if let Some(token) = token {
             headers.insert("authorization".into(), format!("Bearer {token}"));
@@ -867,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn cors_is_limited_to_native_capacitor_origins() {
+    fn cors_is_limited_to_mobile_app_and_published_pwa() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let gateway = MobileGateway::default();
         let mut native = request("OPTIONS", "/api/v1/pair", None, serde_json::Value::Null);
@@ -875,9 +1136,19 @@ mod tests {
             .headers
             .insert("origin".into(), "capacitor://localhost".into());
         let native_response = route(native, &state, &gateway);
-        assert!(native_response.contains(
-            "Access-Control-Allow-Origin: capacitor://localhost"
-        ));
+        assert!(native_response.contains("Access-Control-Allow-Origin: capacitor://localhost"));
+
+        let mut pwa = request(
+            "OPTIONS",
+            "/api/v1/pair-secure",
+            None,
+            serde_json::Value::Null,
+        );
+        pwa.headers
+            .insert("origin".into(), "https://tulerws.github.io".into());
+        let pwa_response = route(pwa, &state, &gateway);
+        assert!(pwa_response.contains("Access-Control-Allow-Origin: https://tulerws.github.io"));
+        assert!(pwa_response.contains("Access-Control-Allow-Private-Network: true"));
 
         let mut external = request("OPTIONS", "/api/v1/pair", None, serde_json::Value::Null);
         external
@@ -909,6 +1180,100 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(!response.contains("token_hash"));
         assert!(!response.contains("tokenHash"));
+    }
+
+    #[test]
+    fn encrypted_pairing_and_requests_never_expose_credentials() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let gateway = MobileGateway::default();
+        gateway.set_pairing_base_url("http://192.168.1.50:43124".into());
+        let offer = gateway.begin_pairing().expect("oferta");
+        let pairing_key: [u8; 32] = Sha256::digest(offer.code.as_bytes()).into();
+        let pairing = encrypt_json(
+            &pairing_key,
+            &serde_json::json!({
+                "deviceName": "Telefone",
+                "timestamp": crate::state::now_millis(),
+            }),
+            b"lume-pair-request-v1",
+        )
+        .expect("pareamento cifrado");
+        let response = route(
+            request(
+                "POST",
+                "/api/v1/pair-secure",
+                None,
+                serde_json::to_value(pairing).expect("envelope"),
+            ),
+            &state,
+            &gateway,
+        );
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(!response.contains("\"token\""));
+        let (_, response_body) = response_json_parts(&response);
+        let response_envelope: EncryptedEnvelope =
+            serde_json::from_value(response_body).expect("resposta cifrada");
+        let credentials: serde_json::Value =
+            decrypt_json(&pairing_key, &response_envelope, b"lume-pair-response-v1")
+                .expect("credenciais");
+        let token = credentials["token"].as_str().expect("token");
+        let device_id = credentials["device"]["id"].as_str().expect("dispositivo");
+        let transport_key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let request_nonce = URL_SAFE_NO_PAD.encode([7_u8; 16]);
+        let secure_request = encrypt_json(
+            &transport_key,
+            &serde_json::json!({
+                "method": "GET",
+                "path": "/api/v1/me",
+                "body": null,
+                "timestamp": crate::state::now_millis(),
+                "requestNonce": request_nonce,
+            }),
+            b"lume-secure-request-v1",
+        )
+        .expect("requisição cifrada");
+        let secure_response = route(
+            request(
+                "POST",
+                "/api/v1/secure",
+                None,
+                serde_json::json!({
+                    "deviceId": device_id,
+                    "nonce": secure_request.nonce,
+                    "ciphertext": secure_request.ciphertext,
+                }),
+            ),
+            &state,
+            &gateway,
+        );
+        assert!(secure_response.starts_with("HTTP/1.1 200"));
+        assert!(!secure_response.contains("Telefone"));
+        let (_, secure_body) = response_json_parts(&secure_response);
+        let secure_envelope: EncryptedEnvelope =
+            serde_json::from_value(secure_body).expect("resposta segura");
+        let decoded: SecureResponsePayload = decrypt_json(
+            &transport_key,
+            &secure_envelope,
+            format!("lume-secure-response-v1:{request_nonce}").as_bytes(),
+        )
+        .expect("resposta decifrada");
+        assert_eq!(decoded.status, 200);
+        assert_eq!(decoded.body["name"], "Telefone");
+    }
+
+    #[test]
+    fn browser_webcrypto_envelope_matches_the_desktop_cipher() {
+        let key: [u8; 32] = Sha256::digest(b"lume-cross-platform-test").into();
+        let envelope = EncryptedEnvelope {
+            nonce: "AAECAwQFBgcICQoL".into(),
+            ciphertext: "JXSIvh5kXBXm-lf4vWqiHmNTDrBOFzG-D8gPiTqOg_iyNwrvgk0EZBJi3hHNUbYTHYFUVT3R"
+                .into(),
+        };
+        let payload: SecurePairPayload =
+            decrypt_json(&key, &envelope, b"lume-pair-request-v1").expect("Web Crypto");
+
+        assert_eq!(payload.device_name, "Phone");
+        assert_eq!(payload.timestamp, 123);
     }
 
     #[test]
@@ -948,14 +1313,12 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("lume-mobile-tls-{}-{suffix}", std::process::id()));
 
-        let first =
-            TlsIdentity::load_or_create(&directory, &["192.168.1.50".into()])
-                .expect("primeira identidade");
+        let first = TlsIdentity::load_or_create(&directory, &["192.168.1.50".into()])
+            .expect("primeira identidade");
         let first_fingerprint = first.ca_fingerprint.clone();
         drop(first);
-        let second =
-            TlsIdentity::load_or_create(&directory, &["192.168.1.51".into()])
-                .expect("identidade persistida");
+        let second = TlsIdentity::load_or_create(&directory, &["192.168.1.51".into()])
+            .expect("identidade persistida");
 
         assert_eq!(second.ca_fingerprint, first_fingerprint);
         assert!(directory.join("mobile/lume-ca.crt").is_file());

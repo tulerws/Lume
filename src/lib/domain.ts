@@ -186,8 +186,6 @@ export interface MobileGatewayStatus {
   address: string;
   networkReachable: boolean;
   transport: string;
-  caInstallUrl: string;
-  caFingerprint: string;
 }
 
 export interface MobilePairingOffer {

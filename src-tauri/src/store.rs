@@ -267,6 +267,46 @@ impl Store {
         }
     }
 
+    pub fn mobile_device_with_token_hash(
+        &self,
+        id: &str,
+        seen_at: i64,
+    ) -> Result<Option<(PairedDevice, String)>, String> {
+        let result = self.connection.query_row(
+            "SELECT id, name, token_hash, created_at, last_seen_at, scopes
+             FROM mobile_devices WHERE id = ?1",
+            [id],
+            |row| {
+                let scopes: String = row.get(5)?;
+                Ok((
+                    PairedDevice {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        created_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        scopes: serde_json::from_str::<Vec<MobileScope>>(&scopes)
+                            .unwrap_or_else(|_| vec![MobileScope::Monitor]),
+                    },
+                    row.get(2)?,
+                ))
+            },
+        );
+        match result {
+            Ok((mut device, token_hash)) => {
+                self.connection
+                    .execute(
+                        "UPDATE mobile_devices SET last_seen_at = ?1 WHERE id = ?2",
+                        params![seen_at, device.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                device.last_seen_at = Some(seen_at);
+                Ok(Some((device, token_hash)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     pub fn revoke_mobile_device(&self, id: &str) -> Result<bool, String> {
         self.connection
             .execute("DELETE FROM mobile_devices WHERE id = ?1", [id])

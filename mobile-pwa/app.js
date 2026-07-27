@@ -1,12 +1,13 @@
 const tokenKey = "lume-mobile-token-v1";
 const baseKey = "lume-mobile-gateway-v1";
+const deviceKey = "lume-mobile-device-v1";
 const credentialKey = "lume-mobile-biometric-v1";
 const notificationsKey = "lume-mobile-notifications-v1";
 const mobileUpdateCheckKey = "lume-mobile-update-check-v1";
 const mobileManifestUrl =
   "https://github.com/tulerws/Lume/releases/latest/download/mobile-latest.json";
 const mobileUpdateInterval = 6 * 60 * 60 * 1000;
-const params = new URLSearchParams(location.search);
+const params = new URLSearchParams(location.hash.slice(1) || location.search);
 let pairingCode = params.get("code");
 const pairView = document.querySelector("#pair-view");
 const pairForm = document.querySelector("#pair-form");
@@ -24,6 +25,7 @@ const connectionLabel = document.querySelector("#connection-label");
 const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
 const openLumeMobile = document.querySelector("#open-lume-mobile");
+const openInstalledMobile = document.querySelector("#open-installed-mobile");
 const mobileApkDeviceDownload = document.querySelector("#mobile-apk-device-download");
 const pwaInstallButton = document.querySelector("#pwa-install-button");
 const mobileUpdateCard = document.querySelector("#mobile-update-card");
@@ -32,7 +34,9 @@ const mobileUpdateDetail = document.querySelector("#mobile-update-detail");
 const mobileVersionLabel = document.querySelector("#mobile-version-label");
 const mobileUpdateProgress = document.querySelector("#mobile-update-progress");
 let token = localStorage.getItem(tokenKey);
+let deviceId = localStorage.getItem(deviceKey);
 let apiBase = localStorage.getItem(baseKey) || "";
+let transportKeyPromise;
 let pollTimer;
 let lastSequence = 0;
 let currentDevice;
@@ -44,6 +48,7 @@ let deferredInstallPrompt;
 let installedMobileInfo;
 let availableMobileUpdate;
 let mobileUpdateBusy = false;
+let automaticPairingTimer;
 const expandedSessions = new Set();
 
 const escapeHtml = (value = "") =>
@@ -65,20 +70,160 @@ const decodeBytes = (value) => {
   return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
 };
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+async function keyFromSecret(secret) {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(secret));
+  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function encryptPayload(key, payload, aad) {
+  const nonce = randomBytes(12);
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: nonce,
+      additionalData: textEncoder.encode(aad),
+    },
+    key,
+    textEncoder.encode(JSON.stringify(payload)),
+  );
+  return { nonce: encodeBytes(nonce), ciphertext: encodeBytes(ciphertext) };
+}
+
+async function decryptPayload(key, envelope, aad) {
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: decodeBytes(envelope.nonce),
+      additionalData: textEncoder.encode(aad),
+    },
+    key,
+    decodeBytes(envelope.ciphertext),
+  );
+  return JSON.parse(textDecoder.decode(plaintext));
+}
+
+function localFetch(url, options) {
+  return fetch(url, { ...options, targetAddressSpace: "local" });
+}
+
+function clearMobileCredentials() {
+  localStorage.removeItem(tokenKey);
+  localStorage.removeItem(deviceKey);
+  token = null;
+  deviceId = null;
+  transportKeyPromise = undefined;
+}
+
+async function securePair(options) {
+  const key = await keyFromSecret(pairingCode);
+  const input = JSON.parse(options.body || "{}");
+  const envelope = await encryptPayload(
+    key,
+    { deviceName: input.deviceName, timestamp: Date.now() },
+    "lume-pair-request-v1",
+  );
+  const response = await localFetch(`${apiBase}/api/v1/pair-secure`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(envelope),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.error?.message || `Lume returned ${response.status}`);
+  }
+  return decryptPayload(key, body, "lume-pair-response-v1");
+}
+
+async function secureApi(path, options = {}) {
+  if (!token || !deviceId) {
+    clearMobileCredentials();
+    showEntryView();
+    throw new Error("Pair this phone with Lume again.");
+  }
+  transportKeyPromise ||= keyFromSecret(token);
+  const key = await transportKeyPromise;
+  const method = String(options.method || "GET").toUpperCase();
+  const requestNonce = encodeBytes(randomBytes(16));
+  let requestBody = null;
+  if (options.body) {
+    try {
+      requestBody = JSON.parse(options.body);
+    } catch {
+      requestBody = options.body;
+    }
+  }
+  const envelope = await encryptPayload(
+    key,
+    {
+      method,
+      path,
+      body: requestBody,
+      timestamp: Date.now(),
+      requestNonce,
+    },
+    "lume-secure-request-v1",
+  );
+  const response = await localFetch(`${apiBase}/api/v1/secure`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId, ...envelope }),
+  });
+  const outerBody = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearMobileCredentials();
+      showEntryView();
+    }
+    throw new Error(outerBody.error?.message || `Lume returned ${response.status}`);
+  }
+  const secureResponse = await decryptPayload(
+    key,
+    outerBody,
+    `lume-secure-response-v1:${requestNonce}`,
+  );
+  if (secureResponse.status < 200 || secureResponse.status >= 300) {
+    if (secureResponse.status === 401) {
+      clearMobileCredentials();
+      showEntryView();
+    }
+    throw new Error(
+      secureResponse.body?.error?.message || `Lume returned ${secureResponse.status}`,
+    );
+  }
+  return secureResponse.body;
+}
+
 async function api(path, options = {}) {
+  if (apiBase.startsWith("http://")) {
+    return path === "/api/v1/pair" ? securePair(options) : secureApi(path, options);
+  }
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   const response = await fetch(`${apiBase}${path}`, { ...options, headers, cache: "no-store" });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401 && path !== "/api/v1/pair") {
-      localStorage.removeItem(tokenKey);
-      token = null;
+      clearMobileCredentials();
       showEntryView();
     }
     throw new Error(body.error?.message || `Lume returned ${response.status}`);
   }
   return body;
+}
+
+function pairingFailureMessage(error) {
+  const detail = String(error?.message || error);
+  if (/failed to fetch|networkerror|load failed/i.test(detail)) {
+    return "Could not reach Lume. Allow local network access and confirm that both devices use the same Wi-Fi.";
+  }
+  return /não está ativo|expirou|not active|expired/i.test(detail)
+    ? "Pairing code expired — generate a new QR code in Lume Desktop."
+    : detail;
 }
 
 function showEntryView() {
@@ -113,23 +258,37 @@ function parsePairingTarget(rawValue) {
 
   try {
     const url = new URL(value);
-    const gateway = url.protocol === "lume:"
-      ? url.searchParams.get("gateway")
-      : url.origin;
-    const code = url.searchParams.get("code");
-    if (!gateway?.startsWith("https://") || !code) return null;
-    return { gateway: gateway.replace(/\/+$/, ""), code };
+    const fragmentParams = new URLSearchParams(url.hash.slice(1));
+    const gateway = url.searchParams.get("gateway")
+      || fragmentParams.get("gateway")
+      || (url.protocol === "lume:" ? null : url.origin);
+    const code = url.searchParams.get("code") || fragmentParams.get("code");
+    const importedToken = url.searchParams.get("token") || fragmentParams.get("token");
+    const importedDeviceId = url.searchParams.get("deviceId") || fragmentParams.get("deviceId");
+    if (
+      !/^https?:\/\//.test(gateway || "")
+      || (!code && !(importedToken && importedDeviceId))
+    ) return null;
+    return {
+      gateway: gateway.replace(/\/+$/, ""),
+      code,
+      token: importedToken,
+      deviceId: importedDeviceId,
+    };
   } catch {
     return null;
   }
 }
 
 function pairingIntentUrl(target) {
-  const query = new URLSearchParams({
-    gateway: target.gateway,
-    code: target.code,
-  });
-  return `intent://pair?${query.toString()}#Intent;scheme=lume;package=com.tulerws.lume.mobile;end`;
+  const query = new URLSearchParams({ gateway: target.gateway });
+  if (target.code) query.set("code", target.code);
+  if (target.token && target.deviceId) {
+    query.set("token", target.token);
+    query.set("deviceId", target.deviceId);
+  }
+  const fallback = encodeURIComponent(location.href);
+  return `intent://pair?${query.toString()}#Intent;scheme=lume;package=com.tulerws.lume.mobile;S.browser_fallback_url=${fallback};end`;
 }
 
 function prepareNativePairingLaunch(target) {
@@ -147,8 +306,28 @@ function prepareNativePairingLaunch(target) {
   }, 120);
 }
 
+function scheduleAutomaticPairing() {
+  clearTimeout(automaticPairingTimer);
+  automaticPairingTimer = setTimeout(() => {
+    if (!pairingCode || token || document.hidden || pairForm.querySelector("button").disabled) return;
+    pairForm.requestSubmit();
+  }, nativePlatform() === "web" ? 900 : 80);
+}
+
 function applyPairingTarget(target) {
   apiBase = target.gateway;
+  if (target.token && target.deviceId) {
+    token = target.token;
+    deviceId = target.deviceId;
+    pairingCode = null;
+    transportKeyPromise = undefined;
+    localStorage.setItem(baseKey, apiBase);
+    localStorage.setItem(tokenKey, token);
+    localStorage.setItem(deviceKey, deviceId);
+    history.replaceState({}, "", new URL("./", location.href).pathname);
+    void showDashboard();
+    return;
+  }
   pairingCode = target.code;
   localStorage.setItem(baseKey, apiBase);
   pairMessage.textContent = "";
@@ -157,6 +336,7 @@ function applyPairingTarget(target) {
   document.querySelector("#manual-code").value = pairingCode;
   showEntryView();
   prepareNativePairingLaunch(target);
+  scheduleAutomaticPairing();
 }
 
 function handlePairingUrl(url) {
@@ -191,8 +371,12 @@ function updateInstallOptions() {
   scanPairingButton.hidden = !(isNative && nativePlatform() === "android");
   pairInstallPrompt.hidden = !pairingCode || !isAndroidBrowser || isNative;
   androidInstallCard.hidden =
-    Boolean(pairingCode) || !isAndroidBrowser || isNative || Boolean(token);
+    Boolean(pairingCode) || !isAndroidBrowser || isNative;
   mobileApkDeviceDownload.hidden = isNative || !isAndroidBrowser;
+  openInstalledMobile.hidden = isNative || !isAndroidBrowser || !token || !deviceId;
+  if (!openInstalledMobile.hidden) {
+    openInstalledMobile.href = pairingIntentUrl({ gateway: apiBase, token, deviceId });
+  }
   pwaInstallButton.hidden = !deferredInstallPrompt;
 }
 
@@ -271,7 +455,7 @@ function renderSessions(snapshot, trackChanges = true) {
   renderDevice();
   const visibleSessions = filterSessions(sessions);
   if (!sessions.length) {
-    sessionList.innerHTML = '<div class="empty-list"><img src="/lume-mobile-icon.svg" alt=""><strong>No agents are open</strong><p>Start an agent on your computer. Lume will bring it here automatically.</p></div>';
+    sessionList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No agents are open</strong><p>Start an agent on your computer. Lume will bring it here automatically.</p></div>';
     return;
   }
   if (!visibleSessions.length) {
@@ -327,7 +511,7 @@ function renderResults(sessions) {
     .flatMap((session) => (session.results || []).map((result) => ({ session, result })))
     .sort((left, right) => right.result.createdAt - left.result.createdAt);
   if (!results.length) {
-    resultsList.innerHTML = '<div class="empty-list"><img src="/lume-mobile-icon.svg" alt=""><strong>No results yet</strong><p>Finished responses and changed files will be collected here.</p></div>';
+    resultsList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No results yet</strong><p>Finished responses and changed files will be collected here.</p></div>';
     return;
   }
   resultsList.innerHTML = results.map(({ session, result }) => `
@@ -698,11 +882,14 @@ pairForm.addEventListener("submit", async (event) => {
       }),
     });
     token = credentials.token;
+    deviceId = credentials.device.id;
+    pairingCode = null;
     localStorage.setItem(tokenKey, token);
-    history.replaceState({}, "", "/");
+    localStorage.setItem(deviceKey, deviceId);
+    history.replaceState({}, "", new URL("./", location.href).pathname);
     await showDashboard();
   } catch (error) {
-    pairMessage.textContent = error.message;
+    pairMessage.textContent = pairingFailureMessage(error);
     pairMessage.className = "message error";
   } finally {
     button.disabled = false;
@@ -759,30 +946,30 @@ document.querySelector("#manual-pair-form").addEventListener("submit", async (ev
   event.preventDefault();
   const gateway = document.querySelector("#manual-gateway").value.trim().replace(/\/+$/, "");
   const code = document.querySelector("#manual-code").value.trim();
-  if (!gateway.startsWith("https://") || !code) return;
+  if (!/^https?:\/\//.test(gateway) || !code) return;
   const button = event.currentTarget.querySelector("button");
   const message = event.currentTarget.querySelector(".message");
   button.disabled = true;
   message.textContent = "Pairing…";
   try {
-    const response = await fetch(`${gateway}/api/v1/pair`, {
+    apiBase = gateway;
+    pairingCode = code;
+    const body = await api("/api/v1/pair", {
       method: "POST",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         code,
         deviceName: document.querySelector("#manual-device-name").value.trim(),
       }),
     });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error?.message || "Pairing failed");
-    apiBase = gateway;
     token = body.token;
+    deviceId = body.device.id;
+    pairingCode = null;
     localStorage.setItem(baseKey, apiBase);
     localStorage.setItem(tokenKey, token);
+    localStorage.setItem(deviceKey, deviceId);
     await showDashboard();
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = pairingFailureMessage(error);
     message.className = "message error";
   } finally {
     button.disabled = false;
@@ -865,12 +1052,14 @@ window.addEventListener("appinstalled", () => {
 });
 document.querySelector("#disconnect-button").addEventListener("click", () => {
   if (!confirm("Disconnect this phone from Lume?")) return;
-  localStorage.removeItem(tokenKey);
+  clearMobileCredentials();
   localStorage.removeItem(baseKey);
-  token = null;
   apiBase = "";
   currentDevice = undefined;
   showEntryView();
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && pairingCode && !token) scheduleAutomaticPairing();
 });
 if ("serviceWorker" in navigator) {
   let refreshing = false;
@@ -879,11 +1068,12 @@ if ("serviceWorker" in navigator) {
     refreshing = true;
     location.reload();
   });
-  navigator.serviceWorker.register("/sw.js")
+  navigator.serviceWorker.register("./sw.js")
     .then((registration) => registration.update())
     .catch(() => undefined);
 }
 async function startApp() {
+  if (token && !deviceId) clearMobileCredentials();
   const pairingHandled = await initializePairingDeepLinks();
   void initializeMobileUpdates();
   if (pairingHandled) return;

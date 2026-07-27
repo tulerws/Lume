@@ -15,6 +15,7 @@ Lume is a subtle, local desktop overlay for monitoring AI coding agents on Windo
 - **Prompt continuation** for compatible Codex sessions and connected web chats without returning to the original application.
 - **Session launcher** for opening or resuming agents in your usual terminal or the VS Code integrated terminal.
 - **Command palette and global shortcuts** for opening Lume, launching sessions, navigating the app, and opening Whiteboard terminals.
+- **Lume Mobile** through an installable PWA or Android app, paired by one QR code with encrypted local-network access and per-device permissions.
 - **Project profiles** for launch destination, monitor, overlay position, permission behavior, Whiteboard layout, and preferred agents.
 - **Local result notes** for explicitly saving useful final responses, reported files, and validation checks.
 - **Extensible detection** through declarative JSON manifests that never load or execute third-party code.
@@ -45,6 +46,8 @@ The [latest GitHub release](https://github.com/tulerws/Lume/releases/latest) pro
 
 Lume checks for updates automatically and lets you install them from **Settings → About**.
 Lume Mobile checks the signed Android release automatically and verifies its SHA-256 hash before opening the system installer. The PWA refreshes its cached application files automatically. iOS updates remain managed by TestFlight or the App Store.
+
+To connect a phone, enable **Settings → Mobile access** and scan the QR code. If the Android app is installed it opens with the pairing details; otherwise the hosted PWA opens and offers the APK download. The browser may ask for local-network access, but no certificate installation is required.
 
 ## Run in development
 
@@ -121,7 +124,7 @@ Manifests only declare process names and matching tokens. They do not load libra
 
 ## Privacy
 
-Everything stays on the machine. Lume services listen only on `127.0.0.1:43119`, `127.0.0.1:43120`, `127.0.0.1:43130`, and `127.0.0.1:43131`.
+Everything stays on the machine. Desktop integrations listen only on localhost. The mobile gateway opens port `43124` on the local network only after the user enables it, accepts only paired devices, and encrypts API payloads with keys established through the one-time QR code. The public PWA contains only static application files; prompts, responses, permissions, and tokens are never sent to it.
 
 Session messages and final responses remain in memory. SQLite stores preferences, sanitized history summaries, and only the responses the user explicitly chooses to save as notes.
 

@@ -10,9 +10,9 @@ use std::{
 use crate::{
     discovery::DiscoveredProcess,
     domain::{
-        AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind,
-        PairedDevice, PermissionAction, PermissionProfile, Preferences, ResultNote,
-        SessionActivity, SessionResult, SessionSource, SessionStatus,
+        AccessMode, AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PairedDevice,
+        PermissionAction, PermissionProfile, Preferences, ResultNote, SessionActivity,
+        SessionResult, SessionSource, SessionStatus,
     },
     store::Store,
 };
@@ -274,6 +274,16 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível autenticar o dispositivo".to_string())?
             .mobile_device_for_token_hash(token_hash, now_millis())
+    }
+
+    pub fn mobile_device_with_token_hash(
+        &self,
+        id: &str,
+    ) -> Result<Option<(PairedDevice, String)>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível autenticar o dispositivo".to_string())?
+            .mobile_device_with_token_hash(id, now_millis())
     }
 
     pub fn revoke_mobile_device(&self, id: &str) -> Result<bool, String> {

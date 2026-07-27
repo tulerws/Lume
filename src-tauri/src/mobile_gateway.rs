@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Serialize;
@@ -11,8 +14,10 @@ use crate::{
     state::{now_millis, AppState},
 };
 
-const PAIRING_TTL_MS: i64 = 2 * 60 * 1_000;
+const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_PAIRING_ATTEMPTS: u8 = 5;
+const REQUEST_TTL_MS: i64 = 60 * 1_000;
+const MOBILE_WEB_URL: &str = "https://tulerws.github.io/Lume/";
 
 #[derive(Clone, Debug)]
 struct PairingSession {
@@ -25,6 +30,7 @@ struct PairingSession {
 pub struct MobileGateway {
     pairing: Arc<Mutex<Option<PairingSession>>>,
     pairing_base_url: Arc<Mutex<Option<String>>>,
+    request_nonces: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,7 +77,10 @@ impl MobileGateway {
             .ok_or_else(|| "O gateway mobile seguro não está disponível".to_string())?;
         Ok(PairingOffer {
             protocol_version: PROTOCOL_VERSION,
-            payload: format!("{base_url}/pair?version={PROTOCOL_VERSION}&code={code}"),
+            payload: format!(
+                "{MOBILE_WEB_URL}#version={PROTOCOL_VERSION}&gateway={}&code={code}",
+                encode_query_value(&base_url),
+            ),
             code,
             expires_at,
         })
@@ -81,6 +90,34 @@ impl MobileGateway {
         &self,
         state: &AppState,
         code: &str,
+        device_name: &str,
+    ) -> Result<PairingCredentials, String> {
+        self.complete_pairing_with_key(state, &digest(code), device_name)
+    }
+
+    pub fn active_pairing_key(&self) -> Result<[u8; 32], String> {
+        let mut pairing = self
+            .pairing
+            .lock()
+            .map_err(|_| "Não foi possível validar o pareamento".to_string())?;
+        let Some(active) = pairing.as_ref() else {
+            return Err(
+                "O pareamento não está ativo. Gere um novo QR Code no Lume Desktop.".into(),
+            );
+        };
+        if active.expires_at < now_millis() {
+            *pairing = None;
+            return Err(
+                "O código de pareamento expirou. Gere um novo QR Code no Lume Desktop.".into(),
+            );
+        }
+        Ok(active.code_hash)
+    }
+
+    pub fn complete_pairing_with_key(
+        &self,
+        state: &AppState,
+        key: &[u8; 32],
         device_name: &str,
     ) -> Result<PairingCredentials, String> {
         let name = device_name.trim();
@@ -95,13 +132,17 @@ impl MobileGateway {
             .lock()
             .map_err(|_| "Não foi possível validar o pareamento".to_string())?;
         let Some(active) = pairing.as_mut() else {
-            return Err("O pareamento não está ativo".into());
+            return Err(
+                "O pareamento não está ativo. Gere um novo QR Code no Lume Desktop.".into(),
+            );
         };
         if active.expires_at < now_millis() {
             *pairing = None;
-            return Err("O código de pareamento expirou".into());
+            return Err(
+                "O código de pareamento expirou. Gere um novo QR Code no Lume Desktop.".into(),
+            );
         }
-        if active.code_hash.ct_eq(&digest(code)).unwrap_u8() != 1 {
+        if active.code_hash.ct_eq(key).unwrap_u8() != 1 {
             active.failed_attempts = active.failed_attempts.saturating_add(1);
             if active.failed_attempts >= MAX_PAIRING_ATTEMPTS {
                 *pairing = None;
@@ -137,6 +178,42 @@ impl MobileGateway {
             return Ok(None);
         }
         state.authenticate_mobile_device(&hex_digest(token))
+    }
+
+    pub fn authenticate_encrypted(
+        &self,
+        state: &AppState,
+        device_id: &str,
+    ) -> Result<Option<(PairedDevice, [u8; 32])>, String> {
+        if device_id.len() > 128 || device_id.trim().is_empty() {
+            return Ok(None);
+        }
+        state
+            .mobile_device_with_token_hash(device_id)?
+            .map(|(device, token_hash)| decode_hex_key(&token_hash).map(|key| (device, key)))
+            .transpose()
+    }
+
+    pub fn accept_request_nonce(
+        &self,
+        device_id: &str,
+        nonce: &str,
+        timestamp: i64,
+    ) -> Result<bool, String> {
+        let now = now_millis();
+        let age = now
+            .checked_sub(timestamp)
+            .and_then(i64::checked_abs)
+            .unwrap_or(i64::MAX);
+        if age > REQUEST_TTL_MS || nonce.len() < 16 || nonce.len() > 128 {
+            return Ok(false);
+        }
+        let mut nonces = self
+            .request_nonces
+            .lock()
+            .map_err(|_| "Não foi possível validar a solicitação mobile".to_string())?;
+        nonces.retain(|_, seen_at| now.saturating_sub(*seen_at) <= REQUEST_TTL_MS);
+        Ok(nonces.insert(format!("{device_id}:{nonce}"), now).is_none())
     }
 
     pub fn devices(&self, state: &AppState) -> Result<Vec<PairedDevice>, String> {
@@ -184,6 +261,31 @@ fn hex_digest(value: &str) -> String {
         .collect()
 }
 
+fn decode_hex_key(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("Credencial mobile inválida".into());
+    }
+    let mut key = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk).map_err(|_| "Credencial mobile inválida")?;
+        key[index] =
+            u8::from_str_radix(text, 16).map_err(|_| "Credencial mobile inválida".to_string())?;
+    }
+    Ok(key)
+}
+
+fn encode_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -214,6 +316,17 @@ mod tests {
         assert!(gateway
             .complete_pairing(&state, &offer.code, "Outro")
             .is_err());
+    }
+
+    #[test]
+    fn pairing_offer_lasts_five_minutes() {
+        let gateway = gateway();
+        let started_at = now_millis();
+        let offer = gateway.begin_pairing().expect("oferta");
+
+        assert!(offer.expires_at - started_at >= 5 * 60 * 1_000);
+        assert!(offer.payload.starts_with("https://tulerws.github.io/Lume/#"));
+        assert!(offer.payload.contains("gateway=https%3A%2F%2F127.0.0.1%3A43122"));
     }
 
     #[test]

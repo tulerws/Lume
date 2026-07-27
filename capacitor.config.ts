@@ -9,10 +9,10 @@ const config: CapacitorConfig = {
     hostname: "localhost",
     androidScheme: "https",
     iosScheme: "capacitor",
-    cleartext: false,
+    cleartext: true,
   },
   android: {
-    allowMixedContent: false,
+    allowMixedContent: true,
     backgroundColor: "#101713",
   },
   ios: {

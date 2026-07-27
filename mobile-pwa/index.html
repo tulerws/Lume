@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#15211c" />
     <meta name="description" content="Monitor your local AI agents through Lume." />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="icon" href="/lume-mobile-icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./lume-mobile-icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
     <title>Lume Mobile</title>
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <img class="brand-logo" src="/lume-mobile-icon.svg" alt="" />
+        <img class="brand-logo" src="./lume-mobile-icon.svg" alt="" />
         <span class="brand-copy"><strong>Lume</strong><small>Agent hub</small></span>
         <span class="connection-pill"><i id="connection-dot" aria-hidden="true"></i><span id="connection-label">Local</span></span>
         <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh sessions">
@@ -23,10 +23,10 @@
 
       <section id="pair-view" class="pair-view" hidden>
         <div class="hero">
-          <img class="hero-logo" src="/lume-mobile-icon.svg" alt="Lume" />
+          <img class="hero-logo" src="./lume-mobile-icon.svg" alt="Lume" />
           <span class="step-pill">Secure pairing</span>
           <h1>Connect to your Lume</h1>
-          <p>This one-time code links only this device. Your sessions stay on your local network.</p>
+          <p>This one-time code links only this device. Allow local network access when your phone asks.</p>
         </div>
         <form id="pair-form" class="surface-form">
           <label>
@@ -37,7 +37,7 @@
           <p id="pair-message" class="message" aria-live="polite"></p>
         </form>
         <aside id="pair-install-prompt" class="pair-install-prompt" hidden>
-          <img src="/lume-mobile-icon.svg" alt="" />
+          <img src="./lume-mobile-icon.svg" alt="" />
           <span>
             <small>Lume for Android</small>
             <strong>Continue in the mobile app</strong>
@@ -50,12 +50,12 @@
             rel="noopener"
           >Download the app</a>
         </aside>
-        <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>End-to-end local. No Lume cloud account required.</p>
+        <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>Encrypted locally. No certificate or Lume cloud account required.</p>
       </section>
 
       <section id="empty-auth-view" class="empty-auth" hidden>
         <div class="hero compact-hero">
-          <img class="hero-logo" src="/lume-mobile-icon.svg" alt="Lume" />
+          <img class="hero-logo" src="./lume-mobile-icon.svg" alt="Lume" />
           <span class="step-pill">Private connection</span>
           <h1>Pair with your computer</h1>
           <p>Open <strong>Lume → Settings → Mobile access</strong>, then scan the QR code or enter the connection details below.</p>
@@ -71,8 +71,8 @@
         </button>
         <form id="manual-pair-form" class="surface-form">
           <label>
-            <span>HTTPS gateway</span>
-            <input id="manual-gateway" inputmode="url" placeholder="https://192.168.1.10:43124" required />
+            <span>Local gateway</span>
+            <input id="manual-gateway" inputmode="url" placeholder="http://192.168.1.10:43124" required />
           </label>
           <label>
             <span>One-time code</span>
@@ -82,20 +82,21 @@
             <span>Device name</span>
             <input id="manual-device-name" maxlength="80" value="Lume Mobile" required />
           </label>
-          <button class="primary-button" type="submit">Connect securely</button>
-          <p class="form-hint"><span>1</span>Install and trust the Lume certificate before pairing.</p>
+          <button class="primary-button" type="submit">Connect locally</button>
+          <p class="form-hint"><span>1</span>Keep the phone and computer on the same Wi-Fi network.</p>
           <p class="message" aria-live="polite"></p>
         </form>
       </section>
 
       <section id="android-install-card" class="android-install-card" hidden>
-        <img src="/lume-mobile-icon.svg" alt="" />
+        <img src="./lume-mobile-icon.svg" alt="" />
         <span>
           <small>Android application</small>
           <strong>Install Lume on this phone</strong>
           <p>Use the native app for a faster launch and automatic update checks.</p>
         </span>
         <button id="pwa-install-button" class="secondary-button" type="button" hidden>Install web app</button>
+        <a id="open-installed-mobile" class="secondary-button" href="#" hidden>Open mobile app</a>
         <a
           id="android-apk-download"
           class="primary-button"
@@ -142,7 +143,7 @@
           </div>
           <article class="device-card">
             <div class="device-identity">
-              <img src="/lume-mobile-icon.svg" alt="" />
+              <img src="./lume-mobile-icon.svg" alt="" />
               <span><strong id="paired-device-name">This phone</strong><small id="device-connection">Secure local connection</small></span>
               <i class="verified-mark" aria-label="Paired">✓</i>
             </div>
@@ -210,12 +211,12 @@
       </div>
 
       <div id="loading-view" class="loading-view" hidden>
-        <img src="/lume-mobile-icon.svg" alt="" />
+        <img src="./lume-mobile-icon.svg" alt="" />
         <span></span>
         <p>Connecting to Lume…</p>
       </div>
       <div id="dashboard-message" class="toast" aria-live="polite"></div>
     </main>
-    <script src="/app.js" defer></script>
+    <script src="./app.js" defer></script>
   </body>
 </html>
