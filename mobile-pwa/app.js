@@ -19,11 +19,19 @@ const appContent = document.querySelector("#app-content");
 const loadingView = document.querySelector("#loading-view");
 const sessionList = document.querySelector("#session-list");
 const resultsList = document.querySelector("#results-list");
+const chatScreen = document.querySelector("#chat-screen");
+const chatFeed = document.querySelector("#mobile-chat-feed");
+const chatComposer = document.querySelector("#mobile-chat-composer");
+const chatAgentIcon = document.querySelector("#chat-agent-icon");
+const chatAgentName = document.querySelector("#chat-agent-name");
+const chatAgentStatus = document.querySelector("#chat-agent-status");
+const chatStopButton = document.querySelector("#chat-stop");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
 const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
+const closePairInstallPrompt = document.querySelector("#close-pair-install");
 const openLumeMobile = document.querySelector("#open-lume-mobile");
 const openInstalledMobile = document.querySelector("#open-installed-mobile");
 const mobileApkDeviceDownload = document.querySelector("#mobile-apk-device-download");
@@ -49,7 +57,12 @@ let installedMobileInfo;
 let availableMobileUpdate;
 let mobileUpdateBusy = false;
 let automaticPairingTimer;
-const expandedSessions = new Set();
+let pairInstallPromptDismissed = false;
+let bannerTimer;
+let openUpdateViewRequested = false;
+let activeChatSessionId;
+let lastChatRenderKey = "";
+const expandedResults = new Set();
 
 const escapeHtml = (value = "") =>
   String(value).replace(/[&<>"']/g, (character) => ({
@@ -60,6 +73,91 @@ const escapeHtml = (value = "") =>
     "'": "&#039;",
   })[character]);
 
+function cleanFilePath(value, workingDirectory) {
+  let path = String(value || "").trim().replace(/^["']|["']$/g, "");
+  if (!path || path === "/dev/null") return null;
+  if (path.startsWith("a/") || path.startsWith("b/")) path = path.slice(2);
+  const root = String(workingDirectory || "").replace(/[\\/]+$/, "");
+  if (root && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))) {
+    path = path.slice(root.length).replace(/^[\\/]+/, "");
+  }
+  return path || null;
+}
+
+function mergeFileChange(summaries, path, added = 0, removed = 0) {
+  if (!path) return;
+  const current = summaries.get(path);
+  if (current) {
+    current.added = Math.max(current.added, added);
+    current.removed = Math.max(current.removed, removed);
+  } else {
+    summaries.set(path, { path, added, removed });
+  }
+}
+
+function summarizeFileChanges(detail = "", reportedFiles = [], workingDirectory) {
+  const summaries = new Map();
+  let currentPath = null;
+  let added = 0;
+  let removed = 0;
+  let counting = false;
+  const flush = () => {
+    mergeFileChange(summaries, currentPath, added, removed);
+    added = 0;
+    removed = 0;
+  };
+  for (const line of String(detail || "").split(/\r?\n/)) {
+    const patchHeader = line.match(/^\*\*\* (?:Update|Add|Delete) File:\s+(.+)$/);
+    const gitHeader = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    const nextFile = line.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
+    if (patchHeader || gitHeader || nextFile) {
+      flush();
+      currentPath = cleanFilePath(
+        patchHeader?.[1] ?? gitHeader?.[2] ?? nextFile?.[1] ?? "",
+        workingDirectory,
+      );
+      counting = Boolean(patchHeader);
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      counting = true;
+      continue;
+    }
+    if (line === "*** End Patch") {
+      flush();
+      currentPath = null;
+      counting = false;
+      continue;
+    }
+    if (!currentPath || !counting) continue;
+    if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) removed += 1;
+  }
+  flush();
+  for (const reported of reportedFiles || []) {
+    if (String(reported).includes("\n") || String(reported).includes("*** Begin Patch")) {
+      for (const change of summarizeFileChanges(reported, [], workingDirectory)) {
+        mergeFileChange(summaries, change.path, change.added, change.removed);
+      }
+    } else {
+      mergeFileChange(summaries, cleanFilePath(reported, workingDirectory));
+    }
+  }
+  return [...summaries.values()];
+}
+
+function mergeFileChanges(target, incoming) {
+  for (const change of incoming) {
+    const current = target.find((item) => item.path === change.path);
+    if (current) {
+      current.added = Math.max(current.added, change.added);
+      current.removed = Math.max(current.removed, change.removed);
+    } else {
+      target.push({ ...change });
+    }
+  }
+}
+
 const randomBytes = (length) => crypto.getRandomValues(new Uint8Array(length));
 const encodeBytes = (value) =>
   btoa(String.fromCharCode(...new Uint8Array(value)))
@@ -69,6 +167,24 @@ const decodeBytes = (value) => {
   const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
   return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
 };
+
+function showBanner(message, kind = "info", source = "general") {
+  clearTimeout(bannerTimer);
+  dashboardMessage.textContent = String(message || "Something went wrong.");
+  dashboardMessage.dataset.kind = kind;
+  dashboardMessage.dataset.source = source;
+  dashboardMessage.setAttribute("role", kind === "error" ? "alert" : "status");
+  dashboardMessage.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
+  bannerTimer = setTimeout(() => {
+    if (dashboardMessage.dataset.source === source) dashboardMessage.textContent = "";
+  }, kind === "error" ? 7000 : 4500);
+}
+
+function hideBanner(source) {
+  if (source && dashboardMessage.dataset.source !== source) return;
+  clearTimeout(bannerTimer);
+  dashboardMessage.textContent = "";
+}
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -329,6 +445,7 @@ function applyPairingTarget(target) {
     return;
   }
   pairingCode = target.code;
+  pairInstallPromptDismissed = false;
   localStorage.setItem(baseKey, apiBase);
   pairMessage.textContent = "";
   pairMessage.className = "message";
@@ -368,8 +485,11 @@ async function initializePairingDeepLinks() {
 function updateInstallOptions() {
   const isAndroidBrowser = /Android/i.test(navigator.userAgent);
   const isNative = window.Capacitor?.isNativePlatform?.() || nativePlatform() !== "web";
+  const showPairInstallPrompt =
+    Boolean(pairingCode) && isAndroidBrowser && !isNative && !pairInstallPromptDismissed;
   scanPairingButton.hidden = !(isNative && nativePlatform() === "android");
-  pairInstallPrompt.hidden = !pairingCode || !isAndroidBrowser || isNative;
+  pairInstallPrompt.hidden = !showPairInstallPrompt;
+  document.body.classList.toggle("install-modal-open", showPairInstallPrompt);
   androidInstallCard.hidden =
     Boolean(pairingCode) || !isAndroidBrowser || isNative;
   mobileApkDeviceDownload.hidden = isNative || !isAndroidBrowser;
@@ -431,12 +551,208 @@ function agentVisual(session) {
   return `<span>${escapeHtml((session.agentLabel || "AI").slice(0, 2).toUpperCase())}</span>`;
 }
 
+function activityTime(createdAt) {
+  return new Date(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function fileChangeRows(files) {
+  return files.map((file) => `
+    <code>
+      <span class="file-path">${escapeHtml(file.path)}</span>
+      <span class="added">+${file.added}</span>
+      <span class="removed">-${file.removed}</span>
+    </code>
+  `).join("");
+}
+
+function buildChatTurns(session) {
+  const turns = [];
+  const ensureTurn = (id) => {
+    const turn = { id, items: [], files: [] };
+    turns.push(turn);
+    return turn;
+  };
+  let current;
+  for (const activity of session.activities || []) {
+    if (activity.kind === "prompt") {
+      current = ensureTurn(activity.id);
+      current.prompt = activity;
+      continue;
+    }
+    current ||= ensureTurn(`turn:${activity.id}`);
+    current.items.push(activity);
+    mergeFileChanges(
+      current.files,
+      summarizeFileChanges(activity.detail || "", activity.files || [], session.workingDirectory),
+    );
+  }
+  for (const result of session.results || []) {
+    const resultTurn = [...turns]
+      .reverse()
+      .find((turn) => !turn.prompt || turn.prompt.createdAt <= result.createdAt)
+      || ensureTurn(`result:${result.id}`);
+    current = resultTurn;
+    mergeFileChanges(
+      resultTurn.files,
+      summarizeFileChanges("", result.files || [], session.workingDirectory),
+    );
+    if (
+      result.response
+      && !resultTurn.items.some(
+        (item) => item.kind === "message" && item.detail === result.response,
+      )
+    ) {
+      resultTurn.items.push({
+        id: `response:${result.id}`,
+        kind: "message",
+        title: "Agent response",
+        detail: result.response,
+        status: "completed",
+        createdAt: result.createdAt,
+        files: [],
+      });
+    }
+  }
+  if (
+    session.lastResponse
+    && !turns.some((turn) =>
+      turn.items.some(
+        (item) => item.kind === "message" && item.detail === session.lastResponse,
+      ))
+  ) {
+    current ||= ensureTurn(`response:${session.id}`);
+    current.items.push({
+      id: `response:${session.id}:${session.updatedAt}`,
+      kind: "message",
+      title: "Agent response",
+      detail: session.lastResponse,
+      status: "completed",
+      createdAt: session.updatedAt,
+      files: [],
+    });
+  }
+  return turns;
+}
+
+function renderChat(sessions) {
+  if (!activeChatSessionId) return;
+  const session = sessions.find((item) => item.id === activeChatSessionId);
+  if (!session) {
+    chatAgentName.textContent = "Agent closed";
+    chatAgentStatus.textContent = "This session is no longer open";
+    chatStopButton.hidden = true;
+    chatFeed.innerHTML = '<div class="empty-list compact"><strong>Session closed</strong><p>Return to the agent list to choose another session.</p></div>';
+    chatComposer.innerHTML = "";
+    return;
+  }
+
+  chatAgentIcon.className = `agent-icon agent-${session.agent}`;
+  chatAgentIcon.innerHTML = agentVisual(session);
+  chatAgentName.textContent = session.agentLabel;
+  chatAgentStatus.textContent = `${session.project} · ${statusLabel(session.status)}`;
+  const scopes = currentDevice?.scopes || [];
+  const canTerminate = scopes.includes("terminate") && session.capabilities?.canTerminate;
+  chatStopButton.hidden = !canTerminate;
+  chatStopButton.dataset.session = session.id;
+  chatStopButton.dataset.command = "terminate";
+
+  const renderKey = JSON.stringify([
+    session.status,
+    session.updatedAt,
+    session.pendingPermission,
+    session.activities,
+    session.results,
+    session.lastResponse,
+    scopes,
+  ]);
+  if (renderKey === lastChatRenderKey) return;
+  const shouldFollow =
+    !lastChatRenderKey
+    || chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 90;
+  lastChatRenderKey = renderKey;
+
+  const permission = session.pendingPermission
+    ? `<article class="mobile-chat-permission">
+        <small>Approval required</small>
+        <strong>${escapeHtml(session.pendingPermission.summary)}</strong>
+        <code>${escapeHtml(session.pendingPermission.resource)}</code>
+        ${scopes.includes("approve") && session.capabilities?.canApprove
+          ? `<div>${(session.permissionProfile?.availableActions || ["deny"]).map((action) => `
+              <button
+                data-command="${escapeHtml(action)}"
+                data-session="${escapeHtml(session.id)}"
+                data-permission="${escapeHtml(session.pendingPermission.id)}"
+              >${action === "allow_once" ? "Allow once" : action === "allow_session" ? "Allow session" : "Deny"}</button>
+            `).join("")}</div>`
+          : ""}
+      </article>`
+    : "";
+  const turns = buildChatTurns(session);
+  const conversation = turns.map((turn) => `
+    <article class="mobile-chat-turn">
+      ${turn.prompt?.detail ? `
+        <div class="mobile-chat-message user">
+          <header><strong>You</strong><time>${activityTime(turn.prompt.createdAt)}</time></header>
+          <p>${escapeHtml(turn.prompt.detail)}</p>
+        </div>` : ""}
+      ${(turn.items || []).map((item) => {
+        if (item.kind === "message" && item.detail) {
+          return `<div class="mobile-chat-message agent">
+            <header><strong>${escapeHtml(session.agentLabel)}</strong><time>${activityTime(item.createdAt)}</time></header>
+            <p>${escapeHtml(item.detail)}</p>
+          </div>`;
+        }
+        if (item.kind === "file") return "";
+        return `<details class="mobile-chat-trace">
+          <summary><i></i><span>${escapeHtml(item.title || "Agent activity")}</span><time>${activityTime(item.createdAt)}</time></summary>
+          ${item.detail ? `<pre>${escapeHtml(item.detail)}</pre>` : ""}
+        </details>`;
+      }).join("")}
+      ${turn.files.length ? `
+        <details class="mobile-turn-files">
+          <summary><span>Files changed in this prompt</span><em>${turn.files.length}</em></summary>
+          <div>${fileChangeRows(turn.files)}</div>
+        </details>` : ""}
+    </article>
+  `).join("");
+  const typing = session.status === "running"
+    ? `<div class="mobile-agent-typing" aria-label="${escapeHtml(session.agentLabel)} is working"><span></span><span></span><span></span></div>`
+    : "";
+  chatFeed.innerHTML = permission + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
+
+  const canPrompt = scopes.includes("prompt") && session.capabilities?.canPrompt
+    && ["completed", "failed", "waiting_for_input"].includes(session.status);
+  chatComposer.innerHTML = canPrompt
+    ? `<form class="mobile-chat-form" data-session="${escapeHtml(session.id)}">
+        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" required></textarea>
+        <button type="submit" aria-label="Send prompt"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg></button>
+      </form>`
+    : session.status === "running"
+      ? '<div class="mobile-composer-status"><span></span><span></span><span></span><p>Agent is working</p></div>'
+      : '<p class="mobile-composer-unavailable">Sending is unavailable for this session.</p>';
+
+  if (shouldFollow) {
+    requestAnimationFrame(() => chatFeed.scrollTo({ top: chatFeed.scrollHeight, behavior: "smooth" }));
+  }
+}
+
+function openChat(sessionId) {
+  activeChatSessionId = sessionId;
+  lastChatRenderKey = "";
+  setView("chat");
+  renderChat(currentSnapshot?.sessions || []);
+}
+
 function renderSessions(snapshot, trackChanges = true) {
   currentSnapshot = snapshot;
   const sessions = snapshot.sessions || [];
   if (trackChanges && hasRenderedSnapshot && localStorage.getItem(notificationsKey) === "on") {
     for (const session of sessions) {
-      if (previousStatuses.get(session.id) !== session.status) notifySession(session);
+      if (previousStatuses.get(session.id) !== session.status) {
+        void notifySession(session).catch((error) => {
+          showBanner(error?.message || "Could not deliver the notification.", "error");
+        });
+      }
     }
   }
   if (trackChanges) {
@@ -453,6 +769,7 @@ function renderSessions(snapshot, trackChanges = true) {
     `Updated ${new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
   renderResults(sessions);
   renderDevice();
+  renderChat(sessions);
   const visibleSessions = filterSessions(sessions);
   if (!sessions.length) {
     sessionList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No agents are open</strong><p>Start an agent on your computer. Lume will bring it here automatically.</p></div>';
@@ -464,7 +781,7 @@ function renderSessions(snapshot, trackChanges = true) {
   }
   sessionList.innerHTML = visibleSessions.map((session) => {
     const scopes = currentDevice?.scopes || [];
-    const expanded = expandedSessions.has(session.id) || session.status === "permission_required";
+    const expanded = session.status === "permission_required";
     const response = session.lastResponse
       ? `<div class="response"><span class="content-label">Final response</span><p>${escapeHtml(session.lastResponse)}</p></div>`
       : "";
@@ -492,7 +809,7 @@ function renderSessions(snapshot, trackChanges = true) {
       : "";
     return `
       <article class="session tone-${statusClass(session.status)} ${expanded ? "expanded" : ""}">
-        <button class="session-summary" data-expand="${escapeHtml(session.id)}" type="button" aria-expanded="${expanded}">
+        <button class="session-summary" data-chat-session="${escapeHtml(session.id)}" type="button" aria-label="Open chat with ${escapeHtml(session.agentLabel)}">
           <span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span>
           <span class="session-heading"><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span>
           <span class="source-badge">${escapeHtml(sourceLabel(session))}</span>
@@ -514,13 +831,52 @@ function renderResults(sessions) {
     resultsList.innerHTML = '<div class="empty-list"><img src="./lume-mobile-icon.svg" alt=""><strong>No results yet</strong><p>Finished responses and changed files will be collected here.</p></div>';
     return;
   }
-  resultsList.innerHTML = results.map(({ session, result }) => `
-    <article class="result-card">
-      <header><span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span><span><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span><time>${new Date(result.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></header>
-      <p>${escapeHtml(result.response || "Task completed.")}</p>
-      ${(result.files || []).length ? `<div class="result-meta"><span>${result.files.length} changed file${result.files.length === 1 ? "" : "s"}</span></div>` : ""}
-    </article>
-  `).join("");
+  resultsList.innerHTML = results.map(({ session, result }) => {
+    const resultKey = `${session.id}:${result.id}`;
+    const expanded = expandedResults.has(resultKey);
+    const files = summarizeFileChanges("", result.files || [], session.workingDirectory);
+    const previousPrompt = [...(session.activities || [])]
+      .reverse()
+      .find((activity) => activity.kind === "prompt" && activity.createdAt <= result.createdAt);
+    for (const activity of session.activities || []) {
+      if (
+        activity.createdAt > result.createdAt
+        || (previousPrompt && activity.createdAt < previousPrompt.createdAt)
+      ) {
+        continue;
+      }
+      mergeFileChanges(
+        files,
+        summarizeFileChanges(
+          activity.detail || "",
+          activity.files || [],
+          session.workingDirectory,
+        ),
+      );
+    }
+    const added = files.reduce((total, file) => total + file.added, 0);
+    const removed = files.reduce((total, file) => total + file.removed, 0);
+    return `
+      <article class="result-card ${expanded ? "expanded" : ""}">
+        <button class="result-summary" data-result="${escapeHtml(resultKey)}" type="button" aria-expanded="${expanded}">
+          <span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span>
+          <span><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span>
+          <time>${activityTime(result.createdAt)}</time>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
+        </button>
+        <p class="result-response">${escapeHtml(result.response || "Task completed.")}</p>
+        ${files.length ? `
+          <details class="result-changes">
+            <summary>
+              <span>${files.length} changed file${files.length === 1 ? "" : "s"}</span>
+              <i class="added">+${added}</i>
+              <i class="removed">-${removed}</i>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
+            </summary>
+            <div>${fileChangeRows(files)}</div>
+          </details>` : ""}
+      </article>`;
+  }).join("");
 }
 
 function renderDevice() {
@@ -540,16 +896,46 @@ async function notifySession(session) {
     failed: `${session.agentLabel} reported an error.`,
   };
   const body = messages[session.status];
-  if (!body || Notification.permission !== "granted") return;
+  if (!body) return;
+  const localNotifications = window.Capacitor?.Plugins?.LocalNotifications;
+  if (nativePlatform() === "android" && localNotifications) {
+    let identifier = 17;
+    for (const character of `${session.id}-${session.status}`) {
+      identifier = ((identifier * 31) + character.charCodeAt(0)) & 0x7fffffff;
+    }
+    await localNotifications.schedule({
+      notifications: [{
+        id: identifier || 1,
+        title: "Lume",
+        body,
+        channelId: "lume-agent-events",
+        extra: { sessionId: session.id, status: session.status },
+      }],
+    });
+    return;
+  }
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
   const registration = await navigator.serviceWorker?.ready.catch(() => null);
   if (registration) {
     registration.showNotification("Lume", {
       body,
       tag: `lume-${session.id}-${session.status}`,
-      icon: "/lume-mobile-icon.svg",
+      icon: "./lume-mobile-icon.svg",
     });
   } else {
     new Notification("Lume", { body, tag: `lume-${session.id}-${session.status}` });
+  }
+}
+
+async function syncNotificationPreference() {
+  const localNotifications = window.Capacitor?.Plugins?.LocalNotifications;
+  if (
+    nativePlatform() === "android"
+    && localNotifications
+    && localStorage.getItem(notificationsKey) === "on"
+  ) {
+    const permission = await localNotifications.checkPermissions();
+    if (permission.display !== "granted") localStorage.removeItem(notificationsKey);
   }
 }
 
@@ -576,7 +962,7 @@ async function toggleBiometric() {
     return;
   }
   if (!window.PublicKeyCredential) {
-    dashboardMessage.textContent = "Device verification is not supported in this browser.";
+    showBanner("Device verification is not supported in this browser.", "error");
     return;
   }
   try {
@@ -600,12 +986,12 @@ async function toggleBiometric() {
       },
     });
     localStorage.setItem(credentialKey, encodeBytes(credential.rawId));
-    dashboardMessage.textContent = "Device verification enabled for remote actions.";
+    showBanner("Device verification enabled for remote actions.", "success");
     updateSecurityControls();
   } catch (error) {
-    dashboardMessage.textContent = error.name === "NotAllowedError"
+    showBanner(error.name === "NotAllowedError"
       ? "Device verification was cancelled."
-      : "Could not enable device verification.";
+      : "Could not enable device verification.", "error");
   }
 }
 
@@ -627,7 +1013,7 @@ async function verifySensitiveAction() {
     });
     return true;
   } catch {
-    dashboardMessage.textContent = "Device verification was not completed.";
+    showBanner("Device verification was not completed.", "error");
     return false;
   }
 }
@@ -638,16 +1024,49 @@ async function toggleNotifications() {
     updateSecurityControls();
     return;
   }
+  const localNotifications = window.Capacitor?.Plugins?.LocalNotifications;
+  if (nativePlatform() === "android" && localNotifications) {
+    try {
+      let permission = await localNotifications.checkPermissions();
+      if (permission.display !== "granted") {
+        permission = await localNotifications.requestPermissions();
+      }
+      if (permission.display !== "granted") {
+        localStorage.removeItem(notificationsKey);
+        showBanner(
+          "Notification access is blocked. Enable it in Android Settings → Apps → Lume → Notifications.",
+          "error",
+        );
+        updateSecurityControls();
+        return;
+      }
+      await localNotifications.createChannel({
+        id: "lume-agent-events",
+        name: "Agent activity",
+        description: "Task completion, errors and permission requests",
+        importance: 4,
+        visibility: 1,
+      });
+      localStorage.setItem(notificationsKey, "on");
+      showBanner("Notifications enabled for tasks, errors and approvals.", "success");
+      updateSecurityControls();
+    } catch (error) {
+      localStorage.removeItem(notificationsKey);
+      showBanner(error?.message || "Could not enable Android notifications.", "error");
+      updateSecurityControls();
+    }
+    return;
+  }
   if (!("Notification" in window)) {
-    dashboardMessage.textContent = "Notifications are not supported in this browser.";
+    showBanner("Notifications are not supported in this browser.", "error");
     return;
   }
   const permission = await Notification.requestPermission();
   if (permission === "granted") {
     localStorage.setItem(notificationsKey, "on");
-    dashboardMessage.textContent = "Notifications enabled while Lume Mobile is active.";
+    showBanner("Notifications enabled while Lume Mobile is active.", "success");
   } else {
-    dashboardMessage.textContent = "Notification permission was not granted.";
+    showBanner("Notification permission was not granted.", "error");
   }
   updateSecurityControls();
 }
@@ -721,6 +1140,13 @@ async function checkMobileUpdate({ manual = false } = {}) {
   mobileUpdateDetail.textContent = "Checking for a new version…";
   try {
     installedMobileInfo = await updater.getInfo();
+    if (installedMobileInfo.openedFromUpdateNotification) {
+      openUpdateViewRequested = true;
+      if (token && !appContent.hidden) {
+        setView("device");
+        openUpdateViewRequested = false;
+      }
+    }
     showCurrentMobileVersion();
     const response = await fetch(mobileManifestUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`Update manifest returned ${response.status}`);
@@ -780,6 +1206,13 @@ async function initializeMobileUpdates() {
   if (platform === "android" && nativeUpdater()) {
     try {
       installedMobileInfo = await nativeUpdater().getInfo();
+      if (installedMobileInfo.openedFromUpdateNotification) {
+        openUpdateViewRequested = true;
+        if (token && !appContent.hidden) {
+          setView("device");
+          openUpdateViewRequested = false;
+        }
+      }
       showCurrentMobileVersion();
     } catch {
       mobileVersionLabel.textContent = "Android application";
@@ -805,11 +1238,11 @@ async function refreshSnapshot() {
     renderSessions(snapshot);
     connectionDot.className = "online";
     connectionLabel.textContent = "Connected";
-    dashboardMessage.textContent = "";
+    hideBanner("connection");
   } catch (error) {
     connectionDot.className = "offline";
     connectionLabel.textContent = "Offline";
-    dashboardMessage.textContent = error.message;
+    showBanner(error.message, "error", "connection");
   }
 }
 
@@ -834,7 +1267,7 @@ async function pollEvents() {
     }
   } catch (error) {
     connectionDot.className = "offline";
-    dashboardMessage.textContent = error.message;
+    showBanner(error.message, "error", "connection");
   } finally {
     pollTimer = setTimeout(pollEvents, 1400);
   }
@@ -847,8 +1280,13 @@ async function showDashboard() {
   loadingView.hidden = false;
   updateInstallOptions();
   document.querySelector("#refresh-button").hidden = false;
+  await syncNotificationPreference();
   updateSecurityControls();
   await refreshSnapshot();
+  if (openUpdateViewRequested) {
+    setView("device");
+    openUpdateViewRequested = false;
+  }
   loadingView.hidden = true;
   pollEvents();
 }
@@ -858,6 +1296,7 @@ function setView(view) {
     sessions: dashboard,
     results: document.querySelector("#results-screen"),
     device: document.querySelector("#device-screen"),
+    chat: chatScreen,
   };
   for (const [name, screen] of Object.entries(screens)) {
     screen.hidden = name !== view;
@@ -865,6 +1304,7 @@ function setView(view) {
   document.querySelectorAll(".bottom-nav button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
   });
+  appContent.classList.toggle("chat-open", view === "chat");
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -889,8 +1329,8 @@ pairForm.addEventListener("submit", async (event) => {
     history.replaceState({}, "", new URL("./", location.href).pathname);
     await showDashboard();
   } catch (error) {
-    pairMessage.textContent = pairingFailureMessage(error);
-    pairMessage.className = "message error";
+    pairMessage.textContent = "";
+    showBanner(pairingFailureMessage(error), "error");
   } finally {
     button.disabled = false;
   }
@@ -899,6 +1339,20 @@ pairForm.addEventListener("submit", async (event) => {
 document.querySelector("#refresh-button").addEventListener("click", refreshSnapshot);
 document.querySelectorAll(".bottom-nav button").forEach((button) => {
   button.addEventListener("click", () => setView(button.dataset.view));
+});
+closePairInstallPrompt.addEventListener("click", () => {
+  pairInstallPromptDismissed = true;
+  updateInstallOptions();
+});
+pairInstallPrompt.addEventListener("click", (event) => {
+  if (event.target !== pairInstallPrompt) return;
+  pairInstallPromptDismissed = true;
+  updateInstallOptions();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || pairInstallPrompt.hidden) return;
+  pairInstallPromptDismissed = true;
+  updateInstallOptions();
 });
 document.querySelectorAll(".filter-bar button").forEach((button) => {
   button.addEventListener("click", () => {
@@ -913,8 +1367,8 @@ scanPairingButton.addEventListener("click", async () => {
   const scanner = window.Capacitor?.Plugins?.CapacitorBarcodeScanner;
   const message = document.querySelector("#manual-pair-form .message");
   if (!scanner) {
-    message.textContent = "QR scanner is unavailable. Restart the app and try again.";
-    message.className = "message error";
+    message.textContent = "";
+    showBanner("QR scanner is unavailable. Restart the app and try again.", "error");
     return;
   }
 
@@ -936,8 +1390,13 @@ scanPairingButton.addEventListener("click", async () => {
     }
   } catch (error) {
     const detail = String(error?.message || error);
-    message.textContent = /cancel/i.test(detail) ? "Scan cancelled." : detail;
-    message.className = /cancel/i.test(detail) ? "message" : "message error";
+    if (/cancel/i.test(detail)) {
+      message.textContent = "Scan cancelled.";
+      message.className = "message";
+    } else {
+      message.textContent = "";
+      showBanner(detail, "error");
+    }
   } finally {
     scanPairingButton.disabled = false;
   }
@@ -969,16 +1428,13 @@ document.querySelector("#manual-pair-form").addEventListener("submit", async (ev
     localStorage.setItem(deviceKey, deviceId);
     await showDashboard();
   } catch (error) {
-    message.textContent = pairingFailureMessage(error);
-    message.className = "message error";
+    message.textContent = "";
+    showBanner(pairingFailureMessage(error), "error");
   } finally {
     button.disabled = false;
   }
 });
-sessionList.addEventListener("submit", async (event) => {
-  const form = event.target.closest(".prompt-form");
-  if (!form) return;
-  event.preventDefault();
+async function submitPromptForm(form) {
   if (!(await verifySensitiveAction())) return;
   const textarea = form.querySelector("textarea");
   const button = form.querySelector("button");
@@ -991,22 +1447,13 @@ sessionList.addEventListener("submit", async (event) => {
     });
     textarea.value = "";
   } catch (error) {
-    dashboardMessage.textContent = error.message;
+    showBanner(error.message, "error");
   } finally {
     button.disabled = false;
   }
-});
-sessionList.addEventListener("click", async (event) => {
-  const summary = event.target.closest("button[data-expand]");
-  if (summary) {
-    const sessionId = summary.dataset.expand;
-    if (expandedSessions.has(sessionId)) expandedSessions.delete(sessionId);
-    else expandedSessions.add(sessionId);
-    if (currentSnapshot) renderSessions(currentSnapshot, false);
-    return;
-  }
-  const button = event.target.closest("button[data-command]");
-  if (!button) return;
+}
+
+async function runSessionCommand(button) {
   const command = button.dataset.command;
   if (command === "terminate" && !confirm("Stop this agent and its commands?")) return;
   if (!(await verifySensitiveAction())) return;
@@ -1014,6 +1461,7 @@ sessionList.addEventListener("click", async (event) => {
   try {
     if (command === "terminate") {
       await executeCommand({ type: "terminate_session", sessionId: button.dataset.session });
+      showBanner("Agent stopped.", "success");
     } else {
       await executeCommand({
         type: "resolve_permission",
@@ -1023,10 +1471,49 @@ sessionList.addEventListener("click", async (event) => {
       });
     }
   } catch (error) {
-    dashboardMessage.textContent = error.message;
+    showBanner(error.message, "error");
   } finally {
     button.disabled = false;
   }
+}
+
+sessionList.addEventListener("submit", async (event) => {
+  const form = event.target.closest(".prompt-form");
+  if (!form) return;
+  event.preventDefault();
+  await submitPromptForm(form);
+});
+sessionList.addEventListener("click", async (event) => {
+  const chatButton = event.target.closest("button[data-chat-session]");
+  if (chatButton) {
+    openChat(chatButton.dataset.chatSession);
+    return;
+  }
+  const button = event.target.closest("button[data-command]");
+  if (!button) return;
+  await runSessionCommand(button);
+});
+chatScreen.addEventListener("submit", async (event) => {
+  const form = event.target.closest(".mobile-chat-form");
+  if (!form) return;
+  event.preventDefault();
+  await submitPromptForm(form);
+});
+chatScreen.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-command]");
+  if (!button) return;
+  await runSessionCommand(button);
+});
+document.querySelector("#chat-back").addEventListener("click", () => {
+  setView("sessions");
+});
+resultsList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-result]");
+  if (!button) return;
+  const resultId = button.dataset.result;
+  if (expandedResults.has(resultId)) expandedResults.delete(resultId);
+  else expandedResults.add(resultId);
+  if (currentSnapshot) renderResults(currentSnapshot.sessions || []);
 });
 document.querySelector("#biometric-button").addEventListener("click", toggleBiometric);
 document.querySelector("#notification-button").addEventListener("click", toggleNotifications);
@@ -1059,7 +1546,26 @@ document.querySelector("#disconnect-button").addEventListener("click", () => {
   showEntryView();
 });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && pairingCode && !token) scheduleAutomaticPairing();
+  if (document.hidden) return;
+  if (pairingCode && !token) scheduleAutomaticPairing();
+  if (nativePlatform() === "android") {
+    const lastCheck = Number(localStorage.getItem(mobileUpdateCheckKey) || 0);
+    if (Date.now() - lastCheck >= mobileUpdateInterval) {
+      void checkMobileUpdate();
+    } else {
+      const updater = nativeUpdater();
+      if (!updater) return;
+      void updater.getInfo().then((info) => {
+        if (!info.openedFromUpdateNotification) return;
+        openUpdateViewRequested = true;
+        if (token && !appContent.hidden) {
+          setView("device");
+          openUpdateViewRequested = false;
+        }
+        void checkMobileUpdate({ manual: true });
+      }).catch(() => undefined);
+    }
+  }
 });
 if ("serviceWorker" in navigator) {
   let refreshing = false;

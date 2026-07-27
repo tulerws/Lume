@@ -42,6 +42,11 @@ public class LumeUpdaterPlugin extends Plugin {
             result.put("version", info.versionName);
             result.put("versionCode", versionCode(info));
             result.put("canInstallUpdates", canInstallUpdates());
+            Intent launchIntent = getActivity().getIntent();
+            boolean openedFromUpdateNotification =
+                MainActivity.ACTION_OPEN_UPDATE.equals(launchIntent.getAction());
+            result.put("openedFromUpdateNotification", openedFromUpdateNotification);
+            if (openedFromUpdateNotification) launchIntent.setAction(null);
             call.resolve(result);
         } catch (Exception error) {
             call.reject("Could not read the installed Lume version.", "VERSION_READ_FAILED", error);

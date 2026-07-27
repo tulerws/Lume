@@ -908,6 +908,11 @@
             {:else}
               <p class="empty-state">{tr("Messages and agent activity will appear here in real time.", "As mensagens e a atividade do agente aparecerão aqui em tempo real.")}</p>
             {/each}
+            {#if session.status === "running"}
+              <div class="agent-typing" aria-label={tr(`${session.agentLabel} is working`, `${session.agentLabel} está trabalhando`)}>
+                <span></span><span></span><span></span>
+              </div>
+            {/if}
           </div>
         {:else}
           <section class="changes-panel">
@@ -1044,6 +1049,14 @@
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
   .chat-message pre { margin: 5px 0 0; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
+  .agent-typing span { width: 4px; height: 4px; border-radius: 50%; background: #4e7faf; animation: agent-typing-dot 850ms ease-in-out infinite; }
+  .agent-typing span:nth-child(2) { animation-delay: 130ms; }
+  .agent-typing span:nth-child(3) { animation-delay: 260ms; }
+  @keyframes agent-typing-dot {
+    0%, 60%, 100% { opacity: 0.35; transform: translateY(1px); }
+    30% { opacity: 1; transform: translateY(-3px); }
+  }
   .turn-trace { padding: 4px 6px; border-radius: 6px; background: rgba(72, 101, 88, 0.03); }
   .turn-trace summary { display: flex; align-items: center; gap: 5px; color: #71817a; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
   .turn-trace summary > span { width: 14px; color: #4f806a; text-align: center; }
@@ -1123,6 +1136,7 @@
   .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
   .terminal-window.dark .chat-turn { border-color: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .chat-message { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
+  .terminal-window.dark .agent-typing { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
   .terminal-window.dark .chat-message.user-message { background: rgba(76, 169, 124, 0.09); }
   .terminal-window.dark .chat-message header strong,
   .terminal-window.dark .chat-message pre,
@@ -1140,5 +1154,6 @@
   @media (prefers-reduced-motion: reduce) {
     .terminal-card { transition-duration: 0.01ms; }
     .dock-silhouette { animation: none; }
+    .agent-typing span { animation: none; opacity: 0.7; }
   }
 </style>

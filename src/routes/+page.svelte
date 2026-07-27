@@ -1215,12 +1215,6 @@
         });
       }
       mobileMessageIsError = false;
-      mobileMessage = mobileStatus.networkReachable
-        ? tr(
-            "Local access is ready. Scan the QR code — no certificate installation is required.",
-            "O acesso local está pronto. Leia o QR Code — não é necessário instalar certificado.",
-          )
-        : tr("Mobile access is off.", "O acesso mobile está desativado.");
     } catch (error) {
       mobileMessageIsError = true;
       mobileMessage = String(error).replace(/^Error:\s*/, "");
@@ -2617,7 +2611,7 @@
               <div class="mobile-access-header">
                 <div>
                   <strong>{tr("Local network gateway", "Gateway da rede local")}</strong>
-                  <span>{tr("Off by default. Only paired devices can read your sessions.", "Desativado por padrão. Apenas dispositivos pareados podem ler suas sessões.")}</span>
+                  <span>{tr("Only paired devices can read your sessions.", "Apenas dispositivos pareados podem ler suas sessões.")}</span>
                 </div>
                 <label class="switch">
                   <input
@@ -2674,8 +2668,7 @@
                   <div class="paired-devices">
                     <div class="paired-devices-intro">
                       <strong>{tr("Phone permissions", "Permissões do telefone")}</strong>
-                      <p>{tr("Choose what each paired phone is allowed to do in Lume. Changes apply immediately.", "Escolha o que cada telefone pareado pode fazer no Lume. As alterações são aplicadas imediatamente.")}</p>
-                    </div>
+                      </div>
                     {#each pairedDevices as device (device.id)}
                       <article class="paired-device-card">
                         <div class="paired-device-header">

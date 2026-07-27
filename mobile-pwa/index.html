@@ -37,18 +37,28 @@
           <p id="pair-message" class="message" aria-live="polite"></p>
         </form>
         <aside id="pair-install-prompt" class="pair-install-prompt" hidden>
-          <img src="./lume-mobile-icon.svg" alt="" />
-          <span>
-            <small>Lume for Android</small>
-            <strong>Continue in the mobile app</strong>
-            <p>Open the installed app, or download it before pairing.</p>
-          </span>
-          <a id="open-lume-mobile" class="primary-button" href="#">Open Lume Mobile</a>
-          <a
-            class="pair-download-link"
-            href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
-            rel="noopener"
-          >Download the app</a>
+          <div
+            class="pair-install-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pair-install-title"
+          >
+            <button id="close-pair-install" class="pair-install-close" type="button" aria-label="Close">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
+            </button>
+            <img src="./lume-mobile-icon.svg" alt="" />
+            <span>
+              <small>Lume for Android</small>
+              <strong id="pair-install-title">Continue in the mobile app</strong>
+              <p>Open the installed app, or download it before pairing.</p>
+            </span>
+            <a id="open-lume-mobile" class="primary-button" href="#">Open Lume Mobile</a>
+            <a
+              class="pair-download-link"
+              href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
+              rel="noopener"
+            >Download the app</a>
+          </div>
         </aside>
         <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>Encrypted locally. No certificate or Lume cloud account required.</p>
       </section>
@@ -137,6 +147,22 @@
           <div id="results-list" class="results-list"></div>
         </section>
 
+        <section id="chat-screen" class="screen chat-screen" hidden>
+          <header class="mobile-chat-header">
+            <button id="chat-back" class="chat-back" type="button" aria-label="Back to agents">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+            </button>
+            <span id="chat-agent-icon" class="agent-icon"></span>
+            <span class="mobile-chat-identity">
+              <strong id="chat-agent-name">Agent</strong>
+              <small id="chat-agent-status">Connecting…</small>
+            </span>
+            <button id="chat-stop" class="chat-stop" type="button" hidden>Stop</button>
+          </header>
+          <div id="mobile-chat-feed" class="mobile-chat-feed"></div>
+          <div id="mobile-chat-composer" class="mobile-chat-composer"></div>
+        </section>
+
         <section id="device-screen" class="screen" hidden>
           <div class="page-heading">
             <span><small>Local controls</small><h1>Device</h1></span>
@@ -215,7 +241,7 @@
         <span></span>
         <p>Connecting to Lume…</p>
       </div>
-      <div id="dashboard-message" class="toast" aria-live="polite"></div>
+      <div id="dashboard-message" class="toast" role="status" aria-live="polite"></div>
     </main>
     <script src="./app.js" defer></script>
   </body>
