@@ -27,9 +27,9 @@ export function terminalMatchesSession(
   return false;
 }
 
-export function resolveTerminalSession(
+export function resolveTerminalSession<T extends AgentSession>(
   terminal: TerminalWindowState,
-  sessions: AgentSession[],
+  sessions: T[],
 ) {
   const direct = sessions.find((session) => terminalMatchesSession(terminal, session));
   if (direct) return direct;

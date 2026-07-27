@@ -134,6 +134,10 @@ export async function submitPrompt(
   await invoke("submit_prompt", { sessionId, prompt, attachments });
 }
 
+export async function refreshAgentRateLimits(agent: AgentSession["agent"]): Promise<void> {
+  await invoke("refresh_agent_rate_limits", { agent });
+}
+
 export async function terminateSession(sessionId: string): Promise<void> {
   await invoke("terminate_session", { sessionId });
 }

@@ -22,7 +22,8 @@ mod terminal_windows;
 use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
-    AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput, ResultNote,
+    AgentKind, AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput,
+    ResultNote,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -265,6 +266,20 @@ fn submit_prompt(
         attachments,
         true,
     )
+}
+
+#[tauri::command]
+fn refresh_agent_rate_limits(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    agent: AgentKind,
+) -> Result<(), String> {
+    if agent == AgentKind::Codex {
+        bridge.refresh_rate_limits(state.inner(), &app)
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -873,6 +888,7 @@ pub fn run() {
             resolve_permission,
             open_session_source,
             submit_prompt,
+            refresh_agent_rate_limits,
             terminate_session,
             list_history,
             list_result_notes,

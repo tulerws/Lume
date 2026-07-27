@@ -870,6 +870,104 @@ body.install-modal-open { overflow: hidden; }
   font-size: 10px;
   font-weight: 800;
 }
+.chat-work-tray[hidden] { display: none; }
+.chat-work-tray {
+  max-height: 180px;
+  padding: 8px 13px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  flex: 0 0 auto;
+  gap: 7px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line);
+  background: rgba(17, 25, 21, 0.985);
+}
+.chat-work-card {
+  min-width: 0;
+  margin: 0;
+  padding: 8px 9px;
+  overflow: hidden;
+  border: 1px solid rgba(135, 164, 149, 0.1);
+  border-radius: 11px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.025);
+}
+.chat-work-card strong {
+  color: #8fb9a4;
+  font-size: 8px;
+  font-weight: 850;
+  letter-spacing: 0.12em;
+}
+.chat-work-card.todo summary {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+}
+.chat-work-card.todo summary::-webkit-details-marker { display: none; }
+.chat-work-card.todo summary > span { min-width: 0; display: grid; flex: 1; gap: 2px; }
+.chat-work-card.todo summary small,
+.chat-work-card.goal p {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 9px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-work-card.todo summary b,
+.chat-work-card.goal b {
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: #7fd0a5;
+  background: rgba(72, 179, 122, 0.09);
+  font-size: 8px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.chat-todo-progress {
+  height: 3px;
+  margin-top: 7px;
+  display: none;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(135, 164, 149, 0.1);
+}
+.chat-todo-progress em { height: 100%; display: block; border-radius: inherit; background: #58b17f; }
+.chat-work-card.todo[open] .chat-todo-progress { display: block; }
+.chat-work-card.todo ul {
+  margin: 7px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+  list-style: none;
+}
+.chat-work-card.todo:not([open]) ul { display: none; }
+.chat-work-card.todo li { min-width: 0; display: flex; align-items: flex-start; gap: 6px; color: var(--muted); }
+.chat-work-card.todo li > i {
+  width: 7px;
+  height: 7px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  border: 1px solid #64746c;
+  border-radius: 50%;
+}
+.chat-work-card.todo li span { min-width: 0; overflow-wrap: anywhere; font-size: 9px; line-height: 1.35; }
+.chat-work-card.todo li.in_progress { color: #c3d5cc; }
+.chat-work-card.todo li.in_progress > i { border-color: #5da5d3; background: #5da5d3; box-shadow: 0 0 0 3px rgba(93, 165, 211, 0.1); }
+.chat-work-card.todo li.completed { color: #798b82; }
+.chat-work-card.todo li.completed > i { border-color: #58b17f; background: #58b17f; }
+.chat-work-card.goal { display: grid; align-content: start; gap: 5px; }
+.chat-work-card.goal > div { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.chat-work-card.goal b.blocked { color: #ee9999; background: rgba(214, 100, 100, 0.1); }
+.chat-work-card.goal b.complete { color: #7fd0a5; }
+.chat-work-card.goal > small { color: var(--muted); font-size: 8px; font-weight: 700; }
+.chat-work-card.goal > small::before { margin-right: 3px; content: "◷"; }
 .mobile-chat-feed {
   width: 100%;
   min-height: 0;
@@ -977,7 +1075,8 @@ body.install-modal-open { overflow: hidden; }
   background: var(--surface);
 }
 .mobile-chat-form.can-attach { grid-template-columns: 38px minmax(0, 1fr) 42px; }
-.mobile-pending-images { grid-column: 1 / -1; padding: 3px; display: flex; gap: 7px; overflow-x: auto; }
+.mobile-pending-images { grid-column: 1 / -1; min-height: 68px; padding: 7px 8px; display: flex; align-items: center; gap: 8px; overflow-x: auto; border-bottom: 1px solid var(--line); border-radius: 11px 11px 5px 5px; background: rgba(123, 194, 151, 0.045); }
+.mobile-pending-images > small { max-width: 62px; flex: 0 0 auto; color: var(--muted); font-size: 8px; font-weight: 750; line-height: 1.25; text-transform: uppercase; }
 .mobile-pending-images > span { position: relative; width: 54px; height: 54px; flex: 0 0 auto; }
 .mobile-pending-images img { width: 100%; height: 100%; display: block; border: 1px solid var(--line-strong); border-radius: 10px; object-fit: cover; }
 .mobile-pending-images button {

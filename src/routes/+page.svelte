@@ -89,6 +89,7 @@
   type View = "sessions" | "board" | "history" | "settings";
   type ShellStatus = SessionStatus | "idle";
   type ShortcutAction = "open" | "palette" | "new-session" | "whiteboard";
+  type CompanionUpdateEvent = { mobileVersion: string };
   type ShortcutPreferenceKey =
     | "openShortcut"
     | "globalShortcut"
@@ -344,6 +345,7 @@
     let stopListening: (() => void) | undefined;
     let stopTerminalListening: (() => void) | undefined;
     let stopShortcutListening: (() => void) | undefined;
+    let stopCompanionUpdateListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -398,6 +400,12 @@
         stopShortcutListening = await listen<ShortcutAction>("lume://shortcut", ({ payload }) => {
           void runShortcutAction(payload);
         });
+        stopCompanionUpdateListening = await listen<CompanionUpdateEvent>(
+          "lume://companion-update-check",
+          ({ payload }) => {
+            void handleCompanionUpdateRequest(payload);
+          },
+        );
         const pendingShortcut = await takePendingShortcutAction();
         if (pendingShortcut) void runShortcutAction(pendingShortcut);
         pollTimer = setInterval(() => void refreshSessions(false), 15_000);
@@ -409,6 +417,7 @@
       stopListening?.();
       stopTerminalListening?.();
       stopShortcutListening?.();
+      stopCompanionUpdateListening?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       window.removeEventListener("keydown", handleAppShortcut);
       window.removeEventListener("pointerup", finishOverlayDragFromWindow, true);
@@ -468,6 +477,27 @@
         "Não foi possível verificar agora. Tente novamente em instantes.",
       );
     }
+  }
+
+  async function handleCompanionUpdateRequest(payload: CompanionUpdateEvent) {
+    for (let attempt = 0; updateState === "checking" && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!["available", "downloading", "ready"].includes(updateState)) {
+      await checkForUpdates();
+    }
+    if (!["available", "downloading", "ready"].includes(updateState)) return;
+    if (!expanded) await toggleExpanded();
+    await openView("settings");
+    await tick();
+    document.querySelector<HTMLElement>("[data-update-card]")?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
+    updateDetail = tr(
+      `Lume Mobile ${payload.mobileVersion} found this desktop update.`,
+      `O Lume Mobile ${payload.mobileVersion} encontrou esta atualização do desktop.`,
+    );
   }
 
   async function installAvailableUpdate() {
@@ -2741,7 +2771,7 @@
             <section class="settings-section settings-section-static">
               <div class="settings-section-label">{tr("About", "Sobre")}</div>
               <div class="settings-section-content">
-                <div class="update-card" aria-live="polite">
+                <div class="update-card" data-update-card aria-live="polite">
               <div class="update-main">
                 <LumeLogo size={30} />
                 <div class="update-copy">

@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     browser_server::BrowserControl,
@@ -367,6 +367,18 @@ pub fn execute_hub_command(
         protocol::HubCommand::RefreshRateLimits { agent } => {
             if agent == AgentKind::Codex {
                 bridge.refresh_rate_limits(state, app)
+            } else {
+                Ok(())
+            }
+        }
+        protocol::HubCommand::ReportMobileVersion { version } => {
+            if protocol::is_version_newer(&version, env!("CARGO_PKG_VERSION")) {
+                crate::reveal_main_window(app);
+                app.emit(
+                    "lume://companion-update-check",
+                    serde_json::json!({ "mobileVersion": version }),
+                )
+                .map_err(|error| error.to_string())
             } else {
                 Ok(())
             }

@@ -54,6 +54,28 @@ public class LumeUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void getUpdateManifest(PluginCall call) {
+        executor.submit(() -> {
+            try {
+                UpdateCheckWorker.UpdateManifest manifest = UpdateCheckWorker.fetchManifest();
+                JSObject android = new JSObject();
+                android.put("url", manifest.apkUrl);
+                android.put("sha256", manifest.sha256);
+                JSObject result = new JSObject();
+                result.put("version", manifest.version);
+                result.put("android", android);
+                call.resolve(result);
+            } catch (Exception error) {
+                call.reject(
+                    "Could not securely check for Lume updates.",
+                    "UPDATE_CHECK_FAILED",
+                    error
+                );
+            }
+        });
+    }
+
+    @PluginMethod
     public void installUpdate(PluginCall call) {
         String url = call.getString("url", "");
         String expectedSha256 = call.getString("sha256", "");

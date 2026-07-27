@@ -1120,6 +1120,7 @@ fn route_core(
                 )
             }
             protocol::HubCommand::RefreshRateLimits { .. } => MobileScope::Monitor,
+            protocol::HubCommand::ReportMobileVersion { .. } => MobileScope::Monitor,
         };
         if !device.scopes.contains(&required_scope) {
             return json_error(

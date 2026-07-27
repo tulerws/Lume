@@ -12,6 +12,7 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(LumeNativePlugin.class);
         registerPlugin(LumeUpdaterPlugin.class);
+        registerPlugin(LumeImagePlugin.class);
         super.onCreate(savedInstanceState);
         UpdateCheckScheduler.schedule(this);
     }

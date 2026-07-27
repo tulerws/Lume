@@ -6,8 +6,6 @@ const credentialKey = "lume-mobile-biometric-v1";
 const notificationsKey = "lume-mobile-notifications-v1";
 const backgroundMonitoringKey = "lume-mobile-background-v1";
 const mobileUpdateCheckKey = "lume-mobile-update-check-v1";
-const mobileManifestUrl =
-  "https://github.com/tulerws/Lume/releases/latest/download/mobile-latest.json";
 const mobileUpdateInterval = 6 * 60 * 60 * 1000;
 const params = new URLSearchParams(location.hash.slice(1) || location.search);
 let pairingCode = params.get("code");
@@ -28,6 +26,7 @@ const chatAgentIcon = document.querySelector("#chat-agent-icon");
 const chatAgentName = document.querySelector("#chat-agent-name");
 const chatAgentStatus = document.querySelector("#chat-agent-status");
 const chatRateLimit = document.querySelector("#chat-rate-limit");
+const chatWorkTray = document.querySelector("#chat-work-tray");
 const chatStopButton = document.querySelector("#chat-stop");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
@@ -65,6 +64,10 @@ let deferredInstallPrompt;
 let installedMobileInfo;
 let availableMobileUpdate;
 let mobileUpdateBusy = false;
+let mobileUpdatesReady = false;
+let companionUpdateBusy = false;
+const companionUpdateAttempts = new Map();
+let lastMobileVersionReport = { key: "", at: 0 };
 let automaticPairingTimer;
 let pairInstallPromptDismissed = false;
 let bannerTimer;
@@ -913,6 +916,74 @@ async function refreshRateLimitsIfNeeded(session) {
   }
 }
 
+function elapsedWorkTime(startedAt, updatedAt, active = true) {
+  const end = active ? Date.now() : Number(updatedAt || Date.now());
+  const seconds = Math.max(0, Math.floor((end - Number(startedAt || end)) / 1_000));
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
+function goalStatusLabel(status) {
+  return { active: "Active", complete: "Complete", blocked: "Blocked" }[status] || "Active";
+}
+
+function renderWorkTray(session) {
+  const todo = session.workSummary?.todo;
+  const goal = session.workSummary?.goal;
+  if (!todo && !goal) {
+    chatWorkTray.hidden = true;
+    chatWorkTray.innerHTML = "";
+    return;
+  }
+
+  const completed = todo?.items.filter((item) => item.status === "completed").length || 0;
+  const current = todo?.items.find((item) => item.status === "in_progress")
+    || todo?.items.find((item) => item.status === "pending")
+    || todo?.items.at(-1);
+  const todoMarkup = todo ? `
+    <details class="chat-work-card todo">
+      <summary>
+        <span><strong>TO DO</strong><small>${escapeHtml(current?.label || "Plan complete")}</small></span>
+        <b>${completed}/${todo.items.length}</b>
+      </summary>
+      <i class="chat-todo-progress"><em style="width:${(completed / todo.items.length) * 100}%"></em></i>
+      <ul>${todo.items.map((item) => `
+        <li class="${escapeHtml(item.status)}"><i></i><span>${escapeHtml(item.label)}</span></li>
+      `).join("")}</ul>
+    </details>` : "";
+  const goalMarkup = goal ? `
+    <article class="chat-work-card goal">
+      <div>
+        <strong>GOAL</strong>
+        <b class="${escapeHtml(goal.status)}">${goalStatusLabel(goal.status)}</b>
+      </div>
+      <p>${escapeHtml(goal.objective)}</p>
+      <small
+        data-goal-started="${Number(goal.startedAt)}"
+        data-goal-updated="${Number(goal.updatedAt)}"
+        data-goal-active="${goal.status === "active"}"
+      >${elapsedWorkTime(goal.startedAt, goal.updatedAt, goal.status === "active")}</small>
+    </article>` : "";
+
+  chatWorkTray.innerHTML = todoMarkup + goalMarkup;
+  chatWorkTray.hidden = false;
+}
+
+function updateGoalElapsedTimes() {
+  document.querySelectorAll("[data-goal-started]").forEach((element) => {
+    element.textContent = elapsedWorkTime(
+      Number(element.dataset.goalStarted),
+      Number(element.dataset.goalUpdated),
+      element.dataset.goalActive === "true",
+    );
+  });
+}
+
 function renderChat(sessions) {
   if (!activeChatSessionId) return;
   const session = sessions.find((item) => item.id === activeChatSessionId);
@@ -922,6 +993,8 @@ function renderChat(sessions) {
     chatStopButton.hidden = true;
     chatRateLimit.hidden = true;
     chatRateLimit.innerHTML = "";
+    chatWorkTray.hidden = true;
+    chatWorkTray.innerHTML = "";
     chatFeed.innerHTML = '<div class="empty-list compact"><strong>Session closed</strong><p>Return to the agent list to choose another session.</p></div>';
     chatComposer.innerHTML = "";
     return;
@@ -946,6 +1019,7 @@ function renderChat(sessions) {
     session.results,
     session.lastResponse,
     session.rateLimits,
+    session.workSummary,
     scopes,
     submittingPromptSessions.has(session.id),
     promptAttachments.get(session.id),
@@ -955,6 +1029,7 @@ function renderChat(sessions) {
     !lastChatRenderKey
     || chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 90;
   lastChatRenderKey = renderKey;
+  renderWorkTray(session);
 
   const permission = session.pendingPermission
     ? `<article class="mobile-chat-permission">
@@ -1014,10 +1089,12 @@ function renderChat(sessions) {
   const canAttachImages = Boolean(session.capabilities?.canAttachImages);
   chatComposer.innerHTML = canPrompt
     ? `<form class="mobile-chat-form${canAttachImages ? " can-attach" : ""}${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
-        ${attachments.length ? `<div class="mobile-pending-images">${attachments.map((attachment, index) => `
-          <span><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="" /><button type="button" data-remove-image="${index}" aria-label="Remove image">×</button></span>
+        ${attachments.length ? `<div class="mobile-pending-images">
+          <small>${attachments.length === 1 ? "Photo attached" : `${attachments.length} photos attached`}</small>
+          ${attachments.map((attachment, index) => `
+          <span title="${escapeHtml(attachment.name || "Attached image")}"><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="${escapeHtml(attachment.name || "Attached image")}" /><button type="button" data-remove-image="${index}" aria-label="Remove image">×</button></span>
         `).join("")}</div>` : ""}
-        ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+        ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/*" multiple hidden />
           <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
         <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
         <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
@@ -1044,6 +1121,7 @@ function openChat(sessionId) {
 
 function renderSessions(snapshot, trackChanges = true) {
   currentSnapshot = snapshot;
+  void coordinateCompanionUpdates(snapshot);
   const sessions = snapshot.sessions || [];
   setHeaderMascotState(mascotStateForSessions(sessions));
   if (trackChanges && hasRenderedSnapshot && localStorage.getItem(notificationsKey) === "on") {
@@ -1510,7 +1588,7 @@ function showCurrentMobileVersion() {
 }
 
 async function checkMobileUpdate({ manual = false } = {}) {
-  if (mobileUpdateBusy) return;
+  if (mobileUpdateBusy) return "busy";
   const platform = nativePlatform();
   if (platform === "web") {
     setMobileUpdateBusy(true);
@@ -1520,25 +1598,26 @@ async function checkMobileUpdate({ manual = false } = {}) {
       await registration?.update();
       mobileUpdateDetail.textContent = "The web app updates automatically.";
       mobileVersionLabel.textContent = "Web app";
+      return "up_to_date";
     } catch {
       mobileUpdateDetail.textContent = "Could not check the web app right now.";
+      return "error";
     } finally {
       setMobileUpdateBusy(false);
     }
-    return;
   }
   if (platform === "ios") {
     mobileUpdateDetail.textContent = "Updates are managed securely by TestFlight or the App Store.";
     mobileVersionLabel.textContent = "iOS application";
     mobileUpdateButton.hidden = true;
-    return;
+    return "managed";
   }
 
   const updater = nativeUpdater();
   if (!updater) {
     mobileUpdateDetail.textContent = "The native updater is unavailable in this build.";
     mobileUpdateButton.hidden = true;
-    return;
+    return "unavailable";
   }
 
   setMobileUpdateBusy(true);
@@ -1553,9 +1632,7 @@ async function checkMobileUpdate({ manual = false } = {}) {
       }
     }
     showCurrentMobileVersion();
-    const response = await fetch(mobileManifestUrl, { cache: "no-store" });
-    if (!response.ok) throw new Error(`Update manifest returned ${response.status}`);
-    const manifest = await response.json();
+    const manifest = await updater.getUpdateManifest();
     if (
       !manifest.version ||
       !manifest.android?.url ||
@@ -1569,16 +1646,19 @@ async function checkMobileUpdate({ manual = false } = {}) {
       mobileUpdateCard.classList.add("available");
       mobileUpdateDetail.textContent = `Version ${manifest.version} is ready to install.`;
       mobileUpdateButton.textContent = "Install";
+      return "available";
     } else {
       availableMobileUpdate = undefined;
       mobileUpdateCard.classList.remove("available");
       mobileUpdateDetail.textContent = "You are using the latest version.";
       mobileUpdateButton.textContent = "Check now";
+      return "up_to_date";
     }
-  } catch {
+  } catch (error) {
     mobileUpdateDetail.textContent = manual
-      ? "Could not check for updates right now."
+      ? (error?.message || "Could not check for updates right now.")
       : "Automatic update checks will retry later.";
+    return "error";
   } finally {
     setMobileUpdateBusy(false);
   }
@@ -1631,6 +1711,61 @@ async function initializeMobileUpdates() {
     mobileUpdateDetail.textContent = "The web app updates automatically.";
   }
   setInterval(() => void checkMobileUpdate(), mobileUpdateInterval);
+  mobileUpdatesReady = true;
+  if (currentSnapshot) void coordinateCompanionUpdates(currentSnapshot);
+}
+
+async function coordinateCompanionUpdates(snapshot) {
+  if (
+    nativePlatform() !== "android"
+    || !mobileUpdatesReady
+    || companionUpdateBusy
+    || !snapshot?.desktopVersion
+  ) return;
+  const updater = nativeUpdater();
+  if (!updater) return;
+  try {
+    installedMobileInfo ||= await updater.getInfo();
+  } catch {
+    return;
+  }
+  const mobileVersion = installedMobileInfo?.version;
+  const desktopVersion = snapshot.desktopVersion;
+  if (!mobileVersion) return;
+
+  if (compareVersions(desktopVersion, mobileVersion) > 0) {
+    const key = `mobile:${mobileVersion}->${desktopVersion}`;
+    const attemptedAt = companionUpdateAttempts.get(key) || 0;
+    if (Date.now() - attemptedAt < 5 * 60_000) return;
+    companionUpdateAttempts.set(key, Date.now());
+    companionUpdateBusy = true;
+    try {
+      const result = await checkMobileUpdate({ manual: true });
+      if (result === "available") {
+        setView("device");
+        await installMobileUpdate();
+      }
+    } finally {
+      companionUpdateBusy = false;
+    }
+    return;
+  }
+
+  if (compareVersions(mobileVersion, desktopVersion) > 0) {
+    const key = `${mobileVersion}->${desktopVersion}`;
+    if (lastMobileVersionReport.key === key && Date.now() - lastMobileVersionReport.at < 60_000) {
+      return;
+    }
+    lastMobileVersionReport = { key, at: Date.now() };
+    try {
+      await executeCommand({
+        type: "report_mobile_version",
+        version: mobileVersion,
+      });
+    } catch {
+      // The next snapshot retries after the short throttle.
+    }
+  }
 }
 
 async function refreshSnapshot() {
@@ -1854,19 +1989,23 @@ document.querySelector("#manual-pair-form").addEventListener("submit", async (ev
   }
 });
 
-function loadMobileImage(file) {
+function readMobileFileDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string"
+      ? resolve(reader.result)
+      : reject(new Error("Could not read this image."));
+    reader.onerror = () => reject(new Error("Could not read this image."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadMobileImage(source) {
   return new Promise((resolve, reject) => {
     const image = new Image();
-    const url = URL.createObjectURL(file);
-    image.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(image);
-    };
-    image.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Could not read this image."));
-    };
-    image.src = url;
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not decode this image."));
+    image.src = source;
   });
 }
 
@@ -1883,9 +2022,24 @@ function imageDataUrl(image, maxDimension, quality) {
 }
 
 async function prepareMobileImage(file) {
-  if (!file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
+  if (file.type && !file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
   if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name} is larger than 20 MB.`);
-  const image = await loadMobileImage(file);
+  const source = await readMobileFileDataUrl(file);
+  const nativeImages = nativePlatform() === "android"
+    ? window.Capacitor?.Plugins?.LumeImages
+    : null;
+  if (nativeImages?.prepareImage) {
+    const prepared = await nativeImages.prepareImage({
+      dataBase64: source.slice(source.indexOf(",") + 1),
+    });
+    return {
+      name: file.name.replace(/\.[^.]+$/, "") + ".jpg",
+      mimeType: prepared.mimeType,
+      dataBase64: prepared.dataBase64,
+      previewDataUrl: prepared.previewDataUrl,
+    };
+  }
+  const image = await loadMobileImage(source);
   let dataUrl = "";
   for (const [dimension, quality] of [[1600, 0.82], [1400, 0.74], [1200, 0.68], [960, 0.6]]) {
     dataUrl = imageDataUrl(image, dimension, quality);
@@ -2145,3 +2299,4 @@ async function startApp() {
 }
 
 void startApp();
+setInterval(updateGoalElapsedTimes, 30_000);

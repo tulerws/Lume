@@ -8,12 +8,34 @@ import type { SessionCapabilities } from "$lib/sessionCapabilities";
 
 export const HUB_PROTOCOL_VERSION = 1;
 
+export type WorkItemStatus = "pending" | "in_progress" | "completed";
+
+export interface WorkItem {
+  label: string;
+  status: WorkItemStatus;
+}
+
+export interface AgentWorkSummary {
+  todo?: {
+    items: WorkItem[];
+    updatedAt: number;
+  };
+  goal?: {
+    objective: string;
+    status: "active" | "complete" | "blocked";
+    startedAt: number;
+    updatedAt: number;
+  };
+}
+
 export type HubSession = AgentSession & {
   capabilities: SessionCapabilities;
+  workSummary: AgentWorkSummary;
 };
 
 export interface HubSnapshot {
   protocolVersion: number;
+  desktopVersion: string;
   generatedAt: number;
   features: string[];
   sessions: HubSession[];
@@ -43,6 +65,10 @@ export type HubCommand =
   | {
       type: "refresh_rate_limits";
       agent: AgentKind;
+    }
+  | {
+      type: "report_mobile_version";
+      version: string;
     };
 
 export type HubCommandRequest = HubCommand & {

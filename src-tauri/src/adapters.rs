@@ -190,11 +190,14 @@ fn hook_activity(
         .and_then(resource_from_input)
         .unwrap_or_else(|| tool_name.clone());
     let lower_tool = tool_name.to_lowercase();
+    let is_todo_tool = lower_tool.contains("todo");
     let lower_resource = resource.to_lowercase();
     let is_command = lower_tool.contains("bash")
         || lower_tool.contains("shell")
         || lower_tool.contains("command");
-    let kind = if is_command && is_test_command(&lower_resource) {
+    let kind = if is_todo_tool {
+        "tool"
+    } else if is_command && is_test_command(&lower_resource) {
         "test"
     } else if is_command {
         "command"
@@ -216,8 +219,12 @@ fn hook_activity(
         .or_else(|| raw.get("tool_result"))
         .or_else(|| raw.get("result"))
         .and_then(|value| serde_json::to_string_pretty(value).ok());
-    let detail =
-        result.or_else(|| input.and_then(|value| serde_json::to_string_pretty(value).ok()));
+    let input_detail = input.and_then(|value| serde_json::to_string_pretty(value).ok());
+    let detail = if is_todo_tool {
+        input_detail
+    } else {
+        result.or(input_detail)
+    };
     let tool_id = string(raw, "tool_use_id")
         .or_else(|| string(raw, "tool_call_id"))
         .unwrap_or_else(|| now_millis().to_string());
@@ -232,7 +239,7 @@ fn hook_activity(
     Some(SessionActivity {
         id: format!("{provider}:{session_id}:tool:{tool_id}"),
         kind: kind.into(),
-        title: truncate(&resource, 240),
+        title: truncate(if is_todo_tool { &tool_name } else { &resource }, 240),
         detail: detail.map(|detail| truncate(&detail, 16 * 1024)),
         status: status.into(),
         created_at: now_millis(),
@@ -702,5 +709,36 @@ mod tests {
         .expect("atividade de arquivo");
         assert_eq!(file.kind, "file");
         assert_eq!(file.files, vec!["/work/project/src/app.ts"]);
+    }
+
+    #[test]
+    fn todo_tool_keeps_its_items_after_completion() {
+        let todo = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "cwd": "/work/project",
+                "hook_event_name": "PostToolUse",
+                "tool_use_id": "todo-1",
+                "tool_name": "TodoWrite",
+                "tool_input": {
+                    "todos": [
+                        { "content": "Inspect hooks", "status": "completed" },
+                        { "content": "Validate tray", "status": "in_progress" }
+                    ]
+                },
+                "tool_response": { "ok": true }
+            }),
+        )
+        .expect("evento de todo")
+        .activity
+        .expect("atividade de todo");
+
+        assert_eq!(todo.kind, "tool");
+        assert_eq!(todo.title, "TodoWrite");
+        assert!(todo
+            .detail
+            .as_deref()
+            .is_some_and(|value| value.contains("Validate tray")));
     }
 }

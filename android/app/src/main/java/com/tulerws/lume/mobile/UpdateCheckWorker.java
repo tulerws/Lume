@@ -90,7 +90,7 @@ public final class UpdateCheckWorker extends Worker {
         return parsed;
     }
 
-    private UpdateManifest fetchManifest() throws Exception {
+    static UpdateManifest fetchManifest() throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(MANIFEST_URL).openConnection();
         connection.setConnectTimeout(15_000);
         connection.setReadTimeout(20_000);
@@ -115,26 +115,34 @@ public final class UpdateCheckWorker extends Worker {
                     }
                     output.write(buffer, 0, count);
                 }
-                JSONObject root = new JSONObject(output.toString(StandardCharsets.UTF_8.name()));
-                JSONObject android = root.getJSONObject("android");
-                String version = root.getString("version");
-                String apkUrl = android.getString("url");
-                String sha256 = android.getString("sha256");
-                if (
-                    version.trim().isEmpty()
-                    || !isTrustedReleaseUrl(apkUrl)
-                    || !sha256.matches("(?i)^[a-f0-9]{64}$")
-                ) {
-                    throw new SecurityException("Update manifest is invalid.");
-                }
-                return new UpdateManifest(version);
+                return parseManifest(output.toString(StandardCharsets.UTF_8.name()));
             }
         } finally {
             connection.disconnect();
         }
     }
 
-    private boolean isTrustedReleaseUrl(String value) {
+    static UpdateManifest parseManifest(String payload) throws Exception {
+        JSONObject root = new JSONObject(payload);
+        JSONObject android = root.getJSONObject("android");
+        String version = root.getString("version");
+        String apkUrl = android.getString("url");
+        String sha256 = android.getString("sha256");
+        return validateManifest(version, apkUrl, sha256);
+    }
+
+    static UpdateManifest validateManifest(String version, String apkUrl, String sha256) {
+        if (
+            version.trim().isEmpty()
+            || !isTrustedReleaseUrl(apkUrl)
+            || !sha256.matches("(?i)^[a-f0-9]{64}$")
+        ) {
+            throw new SecurityException("Update manifest is invalid.");
+        }
+        return new UpdateManifest(version, apkUrl, sha256);
+    }
+
+    private static boolean isTrustedReleaseUrl(String value) {
         try {
             URI uri = URI.create(value);
             return "https".equalsIgnoreCase(uri.getScheme())
@@ -196,11 +204,15 @@ public final class UpdateCheckWorker extends Worker {
         return true;
     }
 
-    private static final class UpdateManifest {
+    static final class UpdateManifest {
         final String version;
+        final String apkUrl;
+        final String sha256;
 
-        UpdateManifest(String version) {
+        UpdateManifest(String version, String apkUrl, String sha256) {
             this.version = version;
+            this.apkUrl = apkUrl;
+            this.sha256 = sha256;
         }
     }
 }

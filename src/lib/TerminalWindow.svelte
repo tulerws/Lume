@@ -5,6 +5,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
@@ -25,10 +26,11 @@
     finishLayeredTerminalResize,
     loadDisplayBackend,
     loadPreferences,
-    loadSessions,
+    loadHubSnapshot,
     loadTerminalWindowState,
     moveTerminalWindow,
     openSessionSource,
+    refreshAgentRateLimits,
     resizeTerminalWindow,
     submitPrompt,
     syncTerminalWindowPosition,
@@ -41,7 +43,7 @@
   const label = currentWindow.label;
   type ResizeDirection = "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest";
   let windowState = $state<TerminalWindowState | null>(null);
-  let session = $state<AgentSession | null>(null);
+  let session = $state<HubSession | null>(null);
   let initializationError = $state<string | null>(null);
   let initializationRun = 0;
   let prompt = $state("");
@@ -90,10 +92,12 @@
   let terminateConfirm = $state(false);
   let terminating = $state(false);
   let activeTab = $state<"chat" | "changes">("chat");
+  let rateLimitRefreshRequested = false;
   let outputElement = $state<HTMLDivElement | null>(null);
   let language = $state<Language>("en");
   let darkMode = $state<boolean | undefined>(undefined);
   let systemDark = $state(false);
+  let workClock = $state(Date.now());
   const effectiveDark = $derived(darkMode ?? systemDark);
   $effect(() => {
     document.documentElement.dataset.theme = effectiveDark ? "dark" : "light";
@@ -108,6 +112,73 @@
   const readyForPrompt = $derived(
     Boolean(session && ["completed", "failed", "waiting_for_input"].includes(session.status)),
   );
+  const activeRateLimit = $derived.by(() => {
+    const limits = (session?.rateLimits ?? [])
+      .filter((limit) => Number.isFinite(Number(limit.usedPercent)));
+    return [...limits].sort(
+      (left, right) => Number(right.usedPercent) - Number(left.usedPercent),
+    )[0] ?? null;
+  });
+  const rateLimitRemaining = $derived(
+    activeRateLimit
+      ? Math.max(0, Math.min(100, Math.round(100 - Number(activeRateLimit.usedPercent))))
+      : 0,
+  );
+  const todo = $derived(session?.workSummary.todo ?? null);
+  const goal = $derived(session?.workSummary.goal ?? null);
+  const completedTodoItems = $derived(
+    todo?.items.filter((item) => item.status === "completed").length ?? 0,
+  );
+
+  function rateLimitWindow(minutes?: number) {
+    if (!minutes) return tr("Rate limit", "Limite");
+    if (minutes % 1_440 === 0) return `${minutes / 1_440}d`;
+    if (minutes % 60 === 0) return `${minutes / 60}h`;
+    return `${minutes}m`;
+  }
+
+  function rateLimitTitle() {
+    if (!activeRateLimit) return "";
+    const reset = activeRateLimit.resetsAt
+      ? new Intl.DateTimeFormat(language, {
+          dateStyle: "short",
+          timeStyle: "short",
+        }).format(new Date(activeRateLimit.resetsAt))
+      : null;
+    return [
+      `${activeRateLimit.label}: ${rateLimitRemaining}% ${tr("remaining", "restante")}`,
+      `${rateLimitWindow(activeRateLimit.windowMinutes)} ${tr("window", "janela")}`,
+      reset ? `${tr("resets", "reinicia")} ${reset}` : null,
+    ].filter(Boolean).join(" · ");
+  }
+
+  function workItemLabel(status: WorkItemStatus) {
+    return {
+      pending: tr("Pending", "Pendente"),
+      in_progress: tr("In progress", "Em andamento"),
+      completed: tr("Done", "Concluído"),
+    }[status];
+  }
+
+  function goalStatusLabel(status: "active" | "complete" | "blocked") {
+    return {
+      active: tr("Active", "Ativa"),
+      complete: tr("Complete", "Concluída"),
+      blocked: tr("Blocked", "Bloqueada"),
+    }[status];
+  }
+
+  function elapsedGoalTime() {
+    if (!goal) return "";
+    const end = goal.status === "active" ? workClock : goal.updatedAt;
+    const elapsedSeconds = Math.max(0, Math.floor((end - goal.startedAt) / 1_000));
+    const days = Math.floor(elapsedSeconds / 86_400);
+    const hours = Math.floor((elapsedSeconds % 86_400) / 3_600);
+    const minutes = Math.floor((elapsedSeconds % 3_600) / 60);
+    if (days) return `${days}d ${hours}h`;
+    if (hours) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
 
   function promptUnavailableText() {
     if (capabilities?.promptUnavailableReason === "session_not_connected") {
@@ -260,6 +331,9 @@
     let stopPreferences: (() => void) | undefined;
     let stopDockPreview: (() => void) | undefined;
     let stopNativeDragEnded: (() => void) | undefined;
+    const workClockInterval = setInterval(() => {
+      workClock = Date.now();
+    }, 30_000);
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -357,6 +431,7 @@
       colorScheme.removeEventListener("change", syncSystemTheme);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
+      clearInterval(workClockInterval);
     };
   });
 
@@ -372,6 +447,12 @@
         windowState = await loadTerminalWindowState(label);
         await refresh();
         if (session) {
+          if (session.agent === "codex" && !rateLimitRefreshRequested) {
+            rateLimitRefreshRequested = true;
+            void refreshAgentRateLimits(session.agent)
+              .then(() => refresh())
+              .catch(() => undefined);
+          }
           return;
         }
       } catch (error) {
@@ -387,8 +468,8 @@
   async function refresh() {
     const shouldFollow = !outputElement ||
       outputElement.scrollHeight - outputElement.scrollTop - outputElement.clientHeight < 32;
-    const sessions = await loadSessions();
-    session = windowState ? resolveTerminalSession(windowState, sessions) ?? null : null;
+    const snapshot = await loadHubSnapshot();
+    session = windowState ? resolveTerminalSession(windowState, snapshot.sessions) ?? null : null;
     if (shouldFollow) {
       await tick();
       outputElement?.scrollTo({ top: outputElement.scrollHeight });
@@ -914,6 +995,19 @@
           <BrandIcon name={sourceIcon(session)} size={10} />
           {sourceLabel(session)}
         </span>
+        {#if activeRateLimit}
+          <div
+            class:warning={rateLimitRemaining <= 50 && rateLimitRemaining > 20}
+            class:danger={rateLimitRemaining <= 20}
+            class="rate-limit-meter"
+            role="img"
+            aria-label={rateLimitTitle()}
+            title={rateLimitTitle()}
+          >
+            <span><b>{rateLimitRemaining}%</b><small>{rateLimitWindow(activeRateLimit.windowMinutes)}</small></span>
+            <i><em style={`width: ${rateLimitRemaining}%`}></em></i>
+          </div>
+        {/if}
         {#if windowState?.docked}
           <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
             <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
@@ -928,6 +1022,48 @@
           <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
         </button>
       </header>
+
+      {#if todo || goal}
+        <aside class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")}>
+          {#if todo}
+            <section class="work-card todo-card">
+              <div class="work-card-heading">
+                <strong>TO DO</strong>
+                <span>{completedTodoItems}/{todo.items.length}</span>
+              </div>
+              <i class="todo-progress" style={`--todo-progress: ${(completedTodoItems / todo.items.length) * 100}%`}>
+                <em></em>
+              </i>
+              <ul>
+                {#each todo.items.slice(0, 4) as item}
+                  <li class:active={item.status === "in_progress"} class:done={item.status === "completed"} title={workItemLabel(item.status)}>
+                    <span aria-hidden="true"></span>
+                    <small>{item.label}</small>
+                  </li>
+                {/each}
+              </ul>
+              {#if todo.items.length > 4}
+                <small class="work-more">+{todo.items.length - 4} {tr("more", "a mais")}</small>
+              {/if}
+            </section>
+          {/if}
+          {#if goal}
+            <section class="work-card goal-card">
+              <div class="work-card-heading">
+                <strong>GOAL</strong>
+                <span class:complete={goal.status === "complete"} class:blocked={goal.status === "blocked"}>
+                  {goalStatusLabel(goal.status)}
+                </span>
+              </div>
+              <p title={goal.objective}>{goal.objective}</p>
+              <small class="goal-time">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"></circle><path d="M10 6v4l3 2"></path></svg>
+                {elapsedGoalTime()}
+              </small>
+            </section>
+          {/if}
+        </aside>
+      {/if}
 
       <nav class="hub-tabs" aria-label={tr("Session details", "Detalhes da sessão")}>
         <button class:active={activeTab === "chat"} type="button" onclick={() => (activeTab = "chat")}>
@@ -1051,9 +1187,14 @@
       >
         {#if promptAttachments.length}
           <div class="pending-images">
+            <small class="pending-images-label">
+              {promptAttachments.length === 1
+                ? tr("Photo attached", "Foto anexada")
+                : tr(`${promptAttachments.length} photos attached`, `${promptAttachments.length} fotos anexadas`)}
+            </small>
             {#each promptAttachments as attachment, index}
-              <span>
-                <img src={attachment.previewDataUrl} alt="" />
+              <span title={attachment.name}>
+                <img src={attachment.previewDataUrl} alt={attachment.name} />
                 <button type="button" onclick={() => removeImage(index)} aria-label={tr("Remove image", "Remover imagem")}>×</button>
               </span>
             {/each}
@@ -1142,11 +1283,40 @@
   .identity strong { color: #26342e; font-size: 11px; }
   .identity small { overflow: hidden; color: #829089; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
   .source-badge { padding: 3px 5px; display: inline-flex; align-items: center; gap: 3px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 7px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
+  .rate-limit-meter { width: clamp(58px, 21cqw, 96px); min-width: 58px; display: grid; flex: 0 1 auto; gap: 3px; color: #438161; pointer-events: none; }
+  .rate-limit-meter > span { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; font: 750 7px Inter, sans-serif; white-space: nowrap; }
+  .rate-limit-meter b { color: currentColor; font-size: 8px; }
+  .rate-limit-meter small { color: #87938d; font-size: 6px; font-weight: 700; text-transform: uppercase; }
+  .rate-limit-meter > i { height: 3px; overflow: hidden; border-radius: 999px; background: rgba(65, 130, 95, 0.12); }
+  .rate-limit-meter > i > em { height: 100%; display: block; border-radius: inherit; background: currentColor; transition: width 280ms ease, background-color 180ms ease; }
+  .rate-limit-meter.warning { color: #b4812f; }
+  .rate-limit-meter.danger { color: #b65656; }
   header button { position: relative; z-index: 25; width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   .dock-button { color: #4a7564; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+  .work-tray { padding: 6px 8px; display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 5px; overflow-x: hidden; overflow-y: auto; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
+  .work-card { min-width: 0; padding: 6px 7px; display: grid; align-content: start; gap: 4px; overflow: hidden; border: 1px solid rgba(78, 106, 93, 0.09); border-radius: 8px; background: rgba(255, 255, 255, 0.34); }
+  .work-card-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+  .work-card-heading strong { color: #587064; font: 800 6px Inter, sans-serif; letter-spacing: 0.12em; }
+  .work-card-heading span { padding: 2px 4px; border-radius: 999px; color: #4e8068; background: rgba(57, 145, 99, 0.08); font: 750 6px Inter, sans-serif; white-space: nowrap; }
+  .work-card-heading span.complete { color: #3c8460; background: rgba(50, 153, 99, 0.1); }
+  .work-card-heading span.blocked { color: #a15e58; background: rgba(170, 78, 78, 0.08); }
+  .todo-progress { height: 2px; overflow: hidden; border-radius: 999px; background: rgba(69, 112, 91, 0.1); }
+  .todo-progress em { width: var(--todo-progress); height: 100%; display: block; border-radius: inherit; background: #4d9e76; transition: width 240ms ease; }
+  .todo-card ul { min-width: 0; margin: 0; padding: 0; display: grid; gap: 2px; list-style: none; }
+  .todo-card li { min-width: 0; display: flex; align-items: center; gap: 5px; color: #88948e; }
+  .todo-card li > span { width: 5px; height: 5px; flex: 0 0 auto; border: 1px solid #98a49e; border-radius: 50%; }
+  .todo-card li.active { color: #4b755f; }
+  .todo-card li.active > span { border-color: #4d98c3; background: #4d98c3; box-shadow: 0 0 0 2px rgba(77, 152, 195, 0.1); }
+  .todo-card li.done { color: #91a099; }
+  .todo-card li.done > span { border-color: #55a77b; background: #55a77b; }
+  .todo-card li small { min-width: 0; overflow: hidden; font: 650 7px/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .work-more { color: #96a19c; font: 650 6px Inter, sans-serif; }
+  .goal-card p { min-width: 0; margin: 0; overflow: hidden; color: #4b5f55; font: 680 7px/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .goal-time { display: flex; align-items: center; gap: 3px; color: #86948d; font: 650 6px Inter, sans-serif; }
+  .goal-time svg { width: 9px; height: 9px; }
   .hub-tabs { min-height: 29px; padding: 4px 9px 0; display: flex; gap: 3px; border-bottom: 1px solid rgba(97, 119, 109, 0.09); }
   .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 8px Inter, sans-serif; cursor: pointer; }
   .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
@@ -1214,7 +1384,8 @@
   .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 7px Inter, sans-serif; cursor: pointer; }
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
-  .pending-images { width: 100%; display: flex; gap: 5px; overflow-x: auto; }
+  .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
+  .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 6px/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
   .pending-images img { width: 100%; height: 100%; display: block; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 8px; object-fit: cover; }
   .pending-images button { position: absolute; top: -4px; right: -4px; width: 15px; height: 15px; border: 1px solid rgba(82, 106, 95, 0.18); border-radius: 50%; color: #65766e; background: #eef3f0; font-size: 10px; line-height: 1; }
@@ -1260,6 +1431,17 @@
   .terminal-window.dark .agent-icon,
   .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .source-badge { color: #a7b5ae; }
+  .terminal-window.dark .rate-limit-meter small,
+  .terminal-window.dark .pending-images-label { color: #8f9f97; }
+  .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
+  .terminal-window.dark .pending-images { background: rgba(83, 174, 129, 0.055); }
+  .terminal-window.dark .work-tray { border-color: rgba(190, 209, 200, 0.07); background: rgba(202, 222, 212, 0.018); }
+  .terminal-window.dark .work-card { border-color: rgba(205, 222, 213, 0.07); background: rgba(218, 234, 226, 0.025); }
+  .terminal-window.dark .work-card-heading strong { color: #93aa9f; }
+  .terminal-window.dark .todo-card li { color: #77867f; }
+  .terminal-window.dark .todo-card li.active,
+  .terminal-window.dark .goal-card p { color: #b4c7bd; }
+  .terminal-window.dark .todo-card li.done { color: #84958c; }
   .terminal-window.dark .hub-tabs { border-color: rgba(190, 209, 200, 0.07); }
   .terminal-window.dark .hub-tabs button { color: #84938c; }
   .terminal-window.dark .hub-tabs button.active { color: #83c6a6; border-bottom-color: #59ad84; }
