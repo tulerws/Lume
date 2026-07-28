@@ -488,7 +488,8 @@ fn resize_overlay_surface(app: AppHandle, width: i32, height: i32) -> Result<(),
 }
 
 #[tauri::command]
-async fn open_terminal_window(
+// Keep this command synchronous: terminal creation configures GTK and must run on its main thread.
+fn open_terminal_window(
     app: AppHandle,
     state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
