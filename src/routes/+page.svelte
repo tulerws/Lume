@@ -22,6 +22,12 @@
   import LumeMascot from "$lib/LumeMascot.svelte";
   import TerminalWindow from "$lib/TerminalWindow.svelte";
   import { displayText, localize } from "$lib/i18n";
+  import {
+    clipboardHasImage,
+    collectClipboardImages,
+    createImagePreview,
+    prepareClipboardImage,
+  } from "$lib/imageAttachments";
   import { sessionCapabilities } from "$lib/sessionCapabilities";
   import { resolveTerminalSession, terminalMatchesSession } from "$lib/sessionIdentity";
   import type {
@@ -38,6 +44,7 @@
     PairedDevice,
     PermissionAction,
     Preferences,
+    PromptAttachmentInput,
     ResultNote,
     SessionStatus,
     TerminalWindowState,
@@ -71,6 +78,7 @@
     resizeOverlaySurface,
     installExternalPlugin,
     removeExternalPlugin,
+    readLocalImageDataUrl,
     revealBrowserCompanion,
     revokePairedDevice,
     launchAgentSession,
@@ -163,6 +171,7 @@
   let resettingSettings = $state(false);
   let composerSessionId = $state<string | null>(null);
   let composerPrompt = $state("");
+  let composerAttachments = $state<PromptAttachmentInput[]>([]);
   let composerMessage = $state<string | null>(null);
   let composerSending = $state(false);
   let terminateConfirmId = $state<string | null>(null);
@@ -985,27 +994,81 @@
   function toggleSessionComposer(session: AgentSession) {
     composerSessionId = composerSessionId === session.id ? null : session.id;
     composerPrompt = "";
+    composerAttachments = [];
     composerMessage = null;
   }
 
   async function sendSessionPrompt(session: AgentSession) {
     const prompt = composerPrompt.trim();
-    if (!prompt || composerSending) return;
+    if ((!prompt && composerAttachments.length === 0) || composerSending) return;
     composerSending = true;
     composerMessage = null;
     try {
-      if (isTauri) await submitPrompt(session.id, prompt);
+      if (isTauri) await submitPrompt(session.id, prompt, composerAttachments);
       sessions = sessions.map((item) =>
         item.id === session.id
           ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined }
           : item,
       );
       composerPrompt = "";
+      composerAttachments = [];
       composerSessionId = null;
     } catch (error) {
       composerMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       composerSending = false;
+    }
+  }
+
+  async function inlineImagePreview(path: string) {
+    return createImagePreview(
+      await readLocalImageDataUrl(path),
+      preferences.language,
+    );
+  }
+
+  function removeComposerImage(index: number) {
+    composerAttachments = composerAttachments.filter((_, current) => current !== index);
+  }
+
+  async function pasteSessionImages(
+    event: ClipboardEvent,
+    session: AgentSession,
+  ) {
+    if (!clipboardHasImage(event)) return;
+    event.preventDefault();
+    composerMessage = null;
+    const capabilities = sessionCapabilities(session);
+    if (
+      composerSending ||
+      !canContinueSession(session) ||
+      !capabilities.canPrompt ||
+      !capabilities.canAttachImages
+    ) {
+      composerMessage = tr(
+        "Images can only be attached when this session is ready for a prompt.",
+        "Imagens só podem ser anexadas quando esta sessão estiver pronta para um prompt.",
+      );
+      return;
+    }
+    try {
+      const { files, paths } = await collectClipboardImages(event, preferences.language);
+      const available = 4 - composerAttachments.length;
+      const prepared: PromptAttachmentInput[] = [];
+      for (const [index, file] of files.slice(0, available).entries()) {
+        prepared.push(await prepareClipboardImage(file, index, preferences.language));
+      }
+      for (const path of paths.slice(0, available - prepared.length)) {
+        prepared.push({
+          name: path.split(/[\\/]/).pop() || "image",
+          mimeType: "",
+          path,
+          previewDataUrl: await inlineImagePreview(path),
+        });
+      }
+      composerAttachments = [...composerAttachments, ...prepared];
+    } catch (error) {
+      composerMessage = String(error).replace(/^Error:\s*/, "");
     }
   }
 
@@ -2199,21 +2262,42 @@
                       {#if composerSessionId === session.id}
                         <form
                           class="inline-composer"
+                          onpaste={(event) => void pasteSessionImages(event, session)}
                           onsubmit={(event) => {
                             event.preventDefault();
                             void sendSessionPrompt(session);
                           }}
                           transition:slide={{ duration: 160, easing: cubicOut }}
                         >
-                          <textarea
-                            bind:value={composerPrompt}
-                            aria-label={tr(`New prompt for ${session.agentLabel}`, `Novo prompt para ${session.agentLabel}`)}
-                            placeholder={tr("Enter the next prompt…", "Digite o próximo prompt…")}
-                            rows="2"
-                          ></textarea>
-                          <button disabled={!composerPrompt.trim() || composerSending} type="submit" aria-label={tr("Send prompt", "Enviar prompt")}>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
-                          </button>
+                          {#if composerAttachments.length}
+                            <div class="inline-attachments">
+                              {#each composerAttachments as attachment, index}
+                                <span title={attachment.name}>
+                                  <img src={attachment.previewDataUrl} alt={attachment.name} />
+                                  <button
+                                    type="button"
+                                    onclick={() => removeComposerImage(index)}
+                                    aria-label={tr("Remove image", "Remover imagem")}
+                                  >×</button>
+                                </span>
+                              {/each}
+                            </div>
+                          {/if}
+                          <div class="inline-composer-controls">
+                            <textarea
+                              bind:value={composerPrompt}
+                              aria-label={tr(`New prompt for ${session.agentLabel}`, `Novo prompt para ${session.agentLabel}`)}
+                              placeholder={tr("Paste an image or enter the next prompt…", "Cole uma imagem ou digite o próximo prompt…")}
+                              rows="2"
+                            ></textarea>
+                            <button
+                              disabled={(!composerPrompt.trim() && composerAttachments.length === 0) || composerSending}
+                              type="submit"
+                              aria-label={tr("Send prompt", "Enviar prompt")}
+                            >
+                              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
+                            </button>
+                          </div>
                         </form>
                         {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
                       {/if}
@@ -2253,7 +2337,6 @@
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="board-intro">
               <strong>{tr("A separate space for each chat", "Um espaço separado para cada chat")}</strong>
-              <p>{tr("Open independent mini terminals and move them close to dock them.", "Abra mini terminais independentes e aproxime um do outro para acoplá-los.")}</p>
             </div>
 
             <div class="layout-toolbar">
@@ -3336,13 +3419,18 @@
   .continue-trigger svg { width: 13px; height: 13px; transition: transform 150ms ease; }
   .continue-trigger:hover svg,
   .continue-trigger.active svg { transform: translateX(2px); }
-  .inline-composer { margin-top: 8px; display: flex; align-items: flex-end; gap: 6px; }
+  .inline-composer { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .inline-composer-controls { display: flex; align-items: flex-end; gap: 6px; }
   .inline-composer textarea { resize: none; outline: none; font: inherit; }
   .inline-composer textarea { min-width: 0; min-height: 52px; flex: 1; padding: 8px 9px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 10px; color: #34423c; background: rgba(255, 255, 255, 0.48); font-size: 10px; line-height: 1.4; }
   .inline-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
-  .inline-composer button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
-  .inline-composer button:hover:not(:disabled) { transform: translateY(-1px); }
-  .inline-composer button:disabled { opacity: 0.35; cursor: default; }
+  .inline-composer-controls > button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
+  .inline-composer-controls > button:hover:not(:disabled) { transform: translateY(-1px); }
+  .inline-composer-controls > button:disabled { opacity: 0.35; cursor: default; }
+  .inline-attachments { min-width: 0; display: flex; gap: 6px; overflow-x: auto; }
+  .inline-attachments > span { position: relative; width: 44px; height: 44px; flex: 0 0 auto; overflow: hidden; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 9px; background: rgba(71, 98, 86, 0.05); }
+  .inline-attachments img { width: 100%; height: 100%; display: block; object-fit: cover; }
+  .inline-attachments button { position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(255, 255, 255, 0.5); border-radius: 50%; color: white; background: rgba(27, 39, 34, 0.78); font-size: 11px; line-height: 1; cursor: pointer; }
   .terminate-agent-control { margin-top: 11px; display: flex; align-items: center; gap: 6px; }
   .terminate-agent-control > button { padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #9a5c59; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
   .terminate-agent-control > button svg { width: 13px; height: 13px; }
@@ -3709,6 +3797,7 @@
   .overlay-shell.dark .field-row select,
   .overlay-shell.dark .shortcut-input,
   .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .inline-attachments > span { border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .final-response,
   .overlay-shell.dark .response-preview { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
   .overlay-shell.dark .final-response .eyebrow,

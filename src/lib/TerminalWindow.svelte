@@ -10,6 +10,12 @@
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
+  import {
+    clipboardHasImage,
+    collectClipboardImages,
+    createImagePreview,
+    prepareClipboardImage,
+  } from "$lib/imageAttachments";
   import { renderSafeMarkdown } from "$lib/markdown.js";
   import {
     mergeFileChanges,
@@ -1095,90 +1101,36 @@
     promptAttachments = promptAttachments.filter((_, current) => current !== index);
   }
 
-  function loadImage(source: string): Promise<HTMLImageElement> {
-    return new Promise((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = () => reject(new Error(tr("Could not preview this image", "Não foi possível visualizar esta imagem")));
-      image.src = source;
-    });
-  }
-
-  function imageDataUrl(image: HTMLImageElement, maxDimension: number, quality: number) {
-    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error(tr("Could not prepare this image", "Não foi possível preparar esta imagem"));
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", quality);
-  }
-
   async function imagePreview(path: string): Promise<string> {
     const source = await readLocalImageDataUrl(path);
-    return imageDataUrl(await loadImage(source), 480, 0.78);
-  }
-
-  function readFileDataUrl(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        typeof reader.result === "string"
-          ? resolve(reader.result)
-          : reject(new Error(tr("Could not read this image", "Não foi possível ler esta imagem")));
-      reader.onerror = () =>
-        reject(new Error(tr("Could not read this image", "Não foi possível ler esta imagem")));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  async function prepareClipboardImage(
-    file: File,
-    index: number,
-  ): Promise<PromptAttachmentInput> {
-    if (file.size > 20 * 1024 * 1024) {
-      throw new Error(tr("The pasted image is too large", "A imagem colada é muito grande"));
-    }
-    const image = await loadImage(await readFileDataUrl(file));
-    let dataUrl = "";
-    for (const [dimension, quality] of [[1600, 0.82], [1400, 0.74], [1200, 0.68], [960, 0.6]]) {
-      dataUrl = imageDataUrl(image, dimension, quality);
-      if (dataUrl.length <= 6_900_000) break;
-    }
-    if (dataUrl.length > 6_900_000) {
-      throw new Error(tr("The pasted image is too large", "A imagem colada é muito grande"));
-    }
-    const baseName = (file.name || `clipboard-image-${index + 1}`)
-      .replace(/\.[^.]+$/, "");
-    return {
-      name: `${baseName}.jpg`,
-      mimeType: "image/jpeg",
-      dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
-      previewDataUrl: imageDataUrl(image, 480, 0.78),
-    };
+    return createImagePreview(source, language);
   }
 
   async function pasteImages(event: ClipboardEvent) {
-    const itemFiles = [...(event.clipboardData?.items ?? [])]
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null);
-    const files = itemFiles.length
-      ? itemFiles
-      : [...(event.clipboardData?.files ?? [])]
-          .filter((file) => !file.type || file.type.startsWith("image/"));
-    if (!files.length) return;
-    if (!canSubmit || !readyForPrompt || sending || !capabilities?.canAttachImages) return;
+    if (!clipboardHasImage(event)) return;
     event.preventDefault();
     message = null;
+    if (!canSubmit || !readyForPrompt || sending || !capabilities?.canAttachImages) {
+      message = tr(
+        "Images can only be attached when this session is ready for a prompt.",
+        "Imagens só podem ser anexadas quando esta sessão estiver pronta para um prompt.",
+      );
+      return;
+    }
     try {
+      const { files, paths } = await collectClipboardImages(event, language);
       const available = 4 - promptAttachments.length;
-      const prepared = [];
+      const prepared: PromptAttachmentInput[] = [];
       for (const [index, file] of files.slice(0, available).entries()) {
-        prepared.push(await prepareClipboardImage(file, index));
+        prepared.push(await prepareClipboardImage(file, index, language));
+      }
+      for (const path of paths.slice(0, available - prepared.length)) {
+        prepared.push({
+          name: path.split(/[\\/]/).pop() || "image",
+          mimeType: "",
+          path,
+          previewDataUrl: await imagePreview(path),
+        });
       }
       promptAttachments = [...promptAttachments, ...prepared];
     } catch (error) {
@@ -1483,9 +1435,6 @@
           </section>
         {/if}
 
-        {#if !canSubmit}
-          <p class="hint">{tr("This source is monitored here, but prompts are sent from the source.", "Esta origem é acompanhada aqui, mas o envio continua nela.")}</p>
-        {/if}
         {#if terminateConfirm}
           <div class="terminate-confirm">
             <span>{tr("Stop this agent and its commands?", "Encerrar este agente e os comandos dele?")}</span>

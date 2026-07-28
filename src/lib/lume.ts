@@ -314,9 +314,9 @@ export async function takePendingShortcutAction(): Promise<
 export async function loadIntegrationStatuses(): Promise<IntegrationStatus[]> {
   if (!("__TAURI_INTERNALS__" in window)) {
     return [
-      { kind: "codex", label: "Codex", installed: true, configured: false, directPermissions: false, detail: "Pronto para conectar" },
-      { kind: "claude", label: "Claude", installed: true, configured: true, directPermissions: true, detail: "Monitoramento e decisões conectados" },
-      { kind: "gemini", label: "Gemini", installed: true, configured: false, directPermissions: false, detail: "Pronto para conectar" },
+      { kind: "codex", label: "Codex", installed: true, configured: false, directPermissions: false, detail: "Ready to connect" },
+      { kind: "claude", label: "Claude", installed: true, configured: true, directPermissions: true, detail: "Monitoring and decisions connected" },
+      { kind: "gemini", label: "Gemini", installed: true, configured: false, directPermissions: false, detail: "Ready to connect" },
     ];
   }
   return invoke<IntegrationStatus[]>("integration_statuses");

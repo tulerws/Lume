@@ -13,14 +13,14 @@
   · Windows · Linux · Android
 </p>
 
-## Meet Lume
+## What it does
 
-Lume stays as a small capsule at the top of the screen and watches Codex, Claude, and Gemini sessions opened from a CLI, VS Code, or a supported browser. It shows which agent is working, waiting, finished, failed, or requesting permission without forcing you to keep every terminal visible.
+Lume stays as a small capsule at the top of the screen and watches all your agent sessions opened from a CLI, VS Code, or a supported browser. It shows which agent is working, waiting, finished, failed, or requesting permission without forcing you to keep every terminal visible.
 
 Expand the capsule to review all sessions, approve supported actions, continue a chat, inspect final responses, and open independent Whiteboard windows for focused work.
 
 <p align="center">
-  <img src="docs/screenshots/lume-desktop-sessions.png" width="420" alt="Lume session hub showing Codex, Claude, and Gemini" />
+  <img src="docs/media/lume-orb-panel.gif" width="840" alt="The Lume orb expanding into the live session panel" />
 </p>
 
 <table>
