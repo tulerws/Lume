@@ -92,10 +92,15 @@ impl MobileGateway {
             .and_then(|value| value.clone())
             .ok_or_else(|| "O gateway mobile seguro não está disponível".to_string())?;
         let desktop_id = self.desktop_id();
+        let mobile_web_url = if base_url.starts_with("http://") {
+            format!("{}/", base_url.trim_end_matches('/'))
+        } else {
+            MOBILE_WEB_URL.to_string()
+        };
         Ok(PairingOffer {
             protocol_version: PROTOCOL_VERSION,
             payload: format!(
-                "{MOBILE_WEB_URL}#gateway={}&code={code}",
+                "{mobile_web_url}#gateway={}&code={code}",
                 encode_query_value(&base_url),
             ),
             desktop_id,
@@ -354,6 +359,20 @@ mod tests {
             .contains("gateway=https%3A%2F%2F127.0.0.1%3A43122"));
         assert!(!offer.payload.contains("desktopId="));
         assert_eq!(offer.desktop_id, "desktop-test-id");
+    }
+
+    #[test]
+    fn local_pairing_offer_opens_the_local_mobile_shell() {
+        let gateway = MobileGateway::default();
+        gateway.set_pairing_base_url("http://192.168.1.50:43124".into());
+        gateway.set_desktop_id("desktop-test-id".into());
+
+        let offer = gateway.begin_pairing().expect("oferta");
+
+        assert!(offer.payload.starts_with("http://192.168.1.50:43124/#"));
+        assert!(offer
+            .payload
+            .contains("gateway=http%3A%2F%2F192.168.1.50%3A43124"));
     }
 
     #[test]

@@ -3,12 +3,14 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, SessionActivity, TerminalWindowState } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
+  import { renderSafeMarkdown } from "$lib/markdown.js";
   import {
     mergeFileChanges,
     summarizeFileChanges,
@@ -100,13 +102,106 @@
   let darkMode = $state<boolean | undefined>(undefined);
   let systemDark = $state(false);
   let workClock = $state(Date.now());
+  const composerMinHeight = 63;
+  const composerAttachmentMinHeight = 120;
+  const textZoomMin = 0.8;
+  const textZoomMax = 1.8;
+  let composerHeight = $state(composerMinHeight);
+  let composerResizeState: {
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+    target: HTMLElement;
+  } | null = null;
+  let textZoom = $state(1);
+  let textZoomOpen = $state(false);
   const effectiveDark = $derived(darkMode ?? systemDark);
+  const displayedComposerHeight = $derived.by(() => {
+    const desired = Math.max(
+      composerHeight,
+      promptAttachments.length ? composerAttachmentMinHeight : composerMinHeight,
+    );
+    return Math.min(desired, composerHeightLimit());
+  });
   $effect(() => {
     document.documentElement.dataset.theme = effectiveDark ? "dark" : "light";
   });
 
   function tr(english: string, portuguese: string) {
     return localize(language, english, portuguese);
+  }
+
+  function terminalStorageKey(setting: string) {
+    return `lume-terminal-${setting}-v1:${label}`;
+  }
+
+  function composerHeightLimit() {
+    const stateHeight = windowState?.height ?? 0;
+    const viewportHeight = typeof window === "undefined" ? stateHeight : window.innerHeight;
+    const height = viewportHeight || stateHeight || 400;
+    return Math.max(
+      composerMinHeight,
+      Math.min(height - 120, Math.floor(height * 0.68)),
+    );
+  }
+
+  function clampComposerHeight(value: number) {
+    return Math.max(composerMinHeight, Math.min(composerHeightLimit(), Math.round(value)));
+  }
+
+  function persistTerminalSetting(setting: string, value: number) {
+    try {
+      localStorage.setItem(terminalStorageKey(setting), String(value));
+    } catch {
+      // The terminal remains usable when web storage is unavailable.
+    }
+  }
+
+  function setTextZoom(value: number) {
+    textZoom = Math.round(Math.max(textZoomMin, Math.min(textZoomMax, value)) * 10) / 10;
+    persistTerminalSetting("text-zoom", textZoom);
+  }
+
+  function beginComposerResize(event: PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture(event.pointerId);
+    composerResizeState = {
+      pointerId: event.pointerId,
+      startY: event.screenY,
+      startHeight: displayedComposerHeight,
+      target,
+    };
+  }
+
+  function moveComposerResize(event: PointerEvent) {
+    if (!composerResizeState || composerResizeState.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerHeight = clampComposerHeight(
+      composerResizeState.startHeight + composerResizeState.startY - event.screenY,
+    );
+  }
+
+  function endComposerResize(event: PointerEvent) {
+    if (!composerResizeState || composerResizeState.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (composerResizeState.target.hasPointerCapture(event.pointerId)) {
+      composerResizeState.target.releasePointerCapture(event.pointerId);
+    }
+    composerResizeState = null;
+    persistTerminalSetting("composer-height", composerHeight);
+  }
+
+  function resizeComposerWithKeyboard(event: KeyboardEvent) {
+    const direction = event.key === "ArrowUp" ? 1 : event.key === "ArrowDown" ? -1 : 0;
+    if (!direction) return;
+    event.preventDefault();
+    composerHeight = clampComposerHeight(displayedComposerHeight + direction * 20);
+    persistTerminalSetting("composer-height", composerHeight);
   }
 
   const capabilities = $derived(session ? sessionCapabilities(session) : null);
@@ -383,8 +478,39 @@
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
     };
+    const openMarkdownLink = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      const anchor = event.target.closest<HTMLAnchorElement>(".markdown-content a");
+      if (!anchor) return;
+      event.preventDefault();
+      void openUrl(anchor.href).catch((error) => {
+        message = String(error).replace(/^Error:\s*/, "");
+      });
+    };
+    const closeTextZoom = (event: PointerEvent) => {
+      if (!(event.target instanceof Element)) return;
+      if (!event.target.closest(".text-zoom-control")) textZoomOpen = false;
+    };
+    try {
+      const savedComposerHeight = Number(
+        localStorage.getItem(terminalStorageKey("composer-height")),
+      );
+      const savedTextZoom = Number(localStorage.getItem(terminalStorageKey("text-zoom")));
+      if (Number.isFinite(savedComposerHeight) && savedComposerHeight > 0) {
+        composerHeight = clampComposerHeight(savedComposerHeight);
+      }
+      if (Number.isFinite(savedTextZoom) && savedTextZoom > 0) {
+        textZoom = Math.round(
+          Math.max(textZoomMin, Math.min(textZoomMax, savedTextZoom)) * 10,
+        ) / 10;
+      }
+    } catch {
+      // Use the defaults when web storage is unavailable.
+    }
     syncSystemTheme(colorScheme);
     colorScheme.addEventListener("change", syncSystemTheme);
+    document.addEventListener("click", openMarkdownLink);
+    document.addEventListener("pointerdown", closeTextZoom);
     void (async () => {
       const [nextPreferences, nextDisplayBackend] = await Promise.all([
         loadPreferences(),
@@ -452,6 +578,7 @@
       stopResized = await currentWindow.onResized(() => {
         if (settling) return;
         if (resizeDragState) return;
+        composerHeight = clampComposerHeight(composerHeight);
         resizing = true;
         if (resizeEndTimer) clearTimeout(resizeEndTimer);
         resizeEndTimer = setTimeout(async () => {
@@ -474,6 +601,8 @@
       stopDockPreview?.();
       stopNativeDragEnded?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
+      document.removeEventListener("click", openMarkdownLink);
+      document.removeEventListener("pointerdown", closeTextZoom);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
       clearInterval(workClockInterval);
@@ -616,7 +745,6 @@
       dockMovingLabel = null;
       dockPreview = null;
       void beginTerminalNativeDrag(label)
-        .then(() => currentWindow.startDragging())
         .catch((error) => {
           nativeDragActive = false;
           dragging = false;
@@ -757,7 +885,8 @@
   }
 
   async function beginResize(event: PointerEvent, direction: ResizeDirection) {
-    if (event.button !== 0) return;
+    const state = windowState;
+    if (event.button !== 0 || !state) return;
     event.preventDefault();
     event.stopPropagation();
     dragging = false;
@@ -766,7 +895,7 @@
     dockPreview = null;
     dockMovingLabel = null;
     resizing = true;
-    if (windowState?.layered) {
+    if (state.layered || displayBackend === "xwayland-fallback") {
       const target = event.currentTarget as HTMLElement;
       target.setPointerCapture(event.pointerId);
       resizeDragState = {
@@ -774,11 +903,11 @@
         direction,
         startX: event.screenX,
         startY: event.screenY,
-        originX: windowState.x,
-        originY: windowState.y,
-        originWidth: windowState.width,
-        originHeight: windowState.height,
-        scale: windowState.scale,
+        originX: state.x,
+        originY: state.y,
+        originWidth: state.width,
+        originHeight: state.height,
+        scale: state.scale,
       };
       pendingResize = null;
       resizePreparing = beginLayeredTerminalResize(label)
@@ -865,6 +994,7 @@
     }
     try {
       windowState = await finishLayeredTerminalResize(label);
+      composerHeight = clampComposerHeight(composerHeight);
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
@@ -1109,6 +1239,9 @@
       class:joined-top={windowState?.connectedSides.includes("top")}
       class:joined-bottom={windowState?.connectedSides.includes("bottom")}
       class="terminal-card"
+      style:--chat-font-adjust={`${(textZoom - 1) * 9}px`}
+      style:--chat-small-font-adjust={`${(textZoom - 1) * 8}px`}
+      style:--chat-tiny-font-adjust={`${(textZoom - 1) * 7}px`}
     >
       {#if dockPreview?.targetLabel === label}
         <div class="dock-silhouette" aria-hidden="true"><span>{tr("Dock", "Acoplar")}</span></div>
@@ -1143,6 +1276,41 @@
             <i><em style={`width: ${rateLimitRemaining}%`}></em></i>
           </div>
         {/if}
+        <span class="text-zoom-control">
+          <button
+            class:active={textZoomOpen}
+            class="text-zoom-button"
+            type="button"
+            aria-expanded={textZoomOpen}
+            aria-label={tr("Adjust terminal text size", "Ajustar tamanho dos textos do terminal")}
+            title={tr("Text size", "Tamanho do texto")}
+            onclick={() => (textZoomOpen = !textZoomOpen)}
+          >
+            <svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="4.5"></circle><path d="m12 12 4 4M8.5 6.5v4M6.5 8.5h4"></path></svg>
+          </button>
+          {#if textZoomOpen}
+            <span
+              class="text-zoom-popover"
+              role="group"
+              aria-label={tr("Terminal text size", "Tamanho dos textos do terminal")}
+              onpointerdown={(event) => event.stopPropagation()}
+            >
+              <button
+                disabled={textZoom <= textZoomMin}
+                type="button"
+                aria-label={tr("Decrease text size", "Diminuir textos")}
+                onclick={() => setTextZoom(textZoom - 0.1)}
+              >−</button>
+              <output>{Math.round(textZoom * 100)}%</output>
+              <button
+                disabled={textZoom >= textZoomMax}
+                type="button"
+                aria-label={tr("Increase text size", "Aumentar textos")}
+                onclick={() => setTextZoom(textZoom + 0.1)}
+              >+</button>
+            </span>
+          {/if}
+        </span>
         {#if windowState?.docked}
           <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
             <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
@@ -1269,7 +1437,7 @@
                     <strong>{session.agentLabel}</strong>
                     <time>{activityTime(item.createdAt)}</time>
                   </header>
-                  <pre>{item.detail}</pre>
+                  <div class="markdown-content">{@html renderSafeMarkdown(item.detail)}</div>
                 </div>
               {:else if item.kind !== "file"}
                 <details class="turn-trace">
@@ -1332,13 +1500,26 @@
       <form
         class="terminal-composer"
         class:sending
+        class:has-attachments={promptAttachments.length > 0}
         aria-busy={sending}
+        style:height={`${displayedComposerHeight}px`}
         onpaste={(event) => void pasteImages(event)}
         onsubmit={(event) => {
           event.preventDefault();
           void sendPrompt();
         }}
       >
+        <button
+          class="composer-resize-handle"
+          type="button"
+          aria-label={tr("Drag up to enlarge the prompt field", "Arraste para cima para aumentar o campo de prompt")}
+          title={tr("Drag up to enlarge the prompt field", "Arraste para cima para aumentar o campo de prompt")}
+          onkeydown={resizeComposerWithKeyboard}
+          onpointerdown={beginComposerResize}
+          onpointermove={moveComposerResize}
+          onpointerup={endComposerResize}
+          onpointercancel={endComposerResize}
+        ><span></span></button>
         {#if promptAttachments.length}
           <div class="pending-images">
             <small class="pending-images-label">
@@ -1354,33 +1535,35 @@
             {/each}
           </div>
         {/if}
-        {#if canSubmit && capabilities?.canAttachImages}
-          <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
-            <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
-          </button>
-        {/if}
-        <textarea
-          bind:value={prompt}
-          disabled={!canSubmit || !readyForPrompt || sending}
-          onkeydown={sendPromptOnEnter}
-          rows="2"
-          aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
-          placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
-        ></textarea>
-        {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
-        {#if canSubmit}
-          <button disabled={(!prompt.trim() && promptAttachments.length === 0) || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
-            {#if sending}
-              <span class="send-spinner" aria-hidden="true"></span>
-            {:else}
-              <svg viewBox="0 0 20 20"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
-            {/if}
-          </button>
-        {:else}
-          <button type="button" onclick={openOrigin} aria-label={tr("Open source", "Abrir origem")}>
-            <svg viewBox="0 0 20 20"><path d="M7 5h8v8M14.5 5.5 6 14" /></svg>
-          </button>
-        {/if}
+        <div class="composer-controls">
+          {#if canSubmit && capabilities?.canAttachImages}
+            <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
+              <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
+            </button>
+          {/if}
+          <textarea
+            bind:value={prompt}
+            disabled={!canSubmit || !readyForPrompt || sending}
+            onkeydown={sendPromptOnEnter}
+            rows="2"
+            aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
+            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
+          ></textarea>
+          {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
+          {#if canSubmit}
+            <button disabled={(!prompt.trim() && promptAttachments.length === 0) || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
+              {#if sending}
+                <span class="send-spinner" aria-hidden="true"></span>
+              {:else}
+                <svg viewBox="0 0 20 20"><path d="m4 10 12-6-4 12-2-4zM10 12l2-2" /></svg>
+              {/if}
+            </button>
+          {:else}
+            <button type="button" onclick={openOrigin} aria-label={tr("Open source", "Abrir origem")}>
+              <svg viewBox="0 0 20 20"><path d="M7 5h8v8M14.5 5.5 6 14" /></svg>
+            </button>
+          {/if}
+        </div>
       </form>
       {#if message}<p class="message">{message}</p>{/if}
       <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
@@ -1404,9 +1587,9 @@
 
 <style>
   .terminal-window { width: 100%; height: 100%; }
-  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; --chat-font-size: 9px; --chat-small-font-size: 8px; --chat-tiny-font-size: 7px; border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: #f8fbf9; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+  .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; --chat-font-adjust: 0px; --chat-small-font-adjust: 0px; --chat-tiny-font-adjust: 0px; --chat-font-size: calc(9px + var(--chat-font-adjust)); --chat-small-font-size: calc(8px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(7px + var(--chat-tiny-font-adjust)); border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: #f8fbf9; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
   @supports (width: 1cqw) {
-    .terminal-card { --chat-font-size: clamp(9px, calc(7px + 0.55cqw), 12px); --chat-small-font-size: clamp(8px, calc(6.2px + 0.5cqw), 10.5px); --chat-tiny-font-size: clamp(7px, calc(5.8px + 0.4cqw), 9px); }
+    .terminal-card { --chat-font-size: clamp(calc(9px + var(--chat-font-adjust)), calc(7px + 0.55cqw + var(--chat-font-adjust)), calc(12px + var(--chat-font-adjust))); --chat-small-font-size: clamp(calc(8px + var(--chat-small-font-adjust)), calc(6.2px + 0.5cqw + var(--chat-small-font-adjust)), calc(10.5px + var(--chat-small-font-adjust))); --chat-tiny-font-size: clamp(calc(7px + var(--chat-tiny-font-adjust)), calc(5.8px + 0.4cqw + var(--chat-tiny-font-adjust)), calc(9px + var(--chat-tiny-font-adjust))); }
   }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
@@ -1447,15 +1630,22 @@
   .rate-limit-meter.danger { color: #b65656; }
   header button { position: relative; z-index: 25; width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
+  header button.active { color: #347b5b; background: rgba(52, 139, 94, 0.09); }
+  .text-zoom-control { position: relative; z-index: 45; display: flex; flex: 0 0 auto; }
+  .text-zoom-popover { position: absolute; z-index: 50; top: 30px; right: 0; min-width: 91px; height: 31px; padding: 3px; display: flex; align-items: center; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 9px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 8px 22px rgba(30, 55, 43, 0.15); cursor: default; }
+  .text-zoom-popover button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 13px/1 Inter, sans-serif; }
+  .text-zoom-popover button:hover { color: #287452; background: rgba(57, 145, 99, 0.1); }
+  .text-zoom-popover button:disabled { opacity: 0.32; cursor: default; }
+  .text-zoom-popover output { min-width: 35px; color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
   .dock-button { color: #4a7564; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
   .work-tray-toggle { width: 100%; min-height: 27px; padding: 4px 9px; display: flex; align-items: center; gap: 7px; border: 0; color: #62756c; background: transparent; cursor: pointer; }
   .work-tray-toggle:hover { background: rgba(65, 100, 83, 0.035); }
-  .work-tray-toggle > strong { flex: 0 0 auto; font: 800 6px Inter, sans-serif; letter-spacing: 0.1em; text-transform: uppercase; }
+  .work-tray-toggle > strong { flex: 0 0 auto; font: 800 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.1em; text-transform: uppercase; }
   .work-tray-toggle > span { min-width: 0; display: flex; flex: 1; justify-content: flex-end; gap: 5px; overflow: hidden; }
-  .work-tray-toggle small { min-width: 0; overflow: hidden; color: #83928b; font: 680 6px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .work-tray-toggle small { min-width: 0; overflow: hidden; color: #83928b; font: 680 var(--chat-tiny-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .work-tray-toggle svg { width: 11px; height: 11px; flex: 0 0 auto; transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
   .work-tray.collapsed .work-tray-toggle svg { transform: rotate(-90deg); }
   .work-tray-body { max-height: 150px; overflow: hidden; opacity: 1; transition: max-height 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 140ms ease; }
@@ -1463,8 +1653,8 @@
   .work-tray-grid { max-height: 145px; padding: 0 8px 6px; display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 5px; overflow-x: hidden; overflow-y: auto; }
   .work-card { min-width: 0; padding: 6px 7px; display: grid; align-content: start; gap: 4px; overflow: hidden; border: 1px solid rgba(78, 106, 93, 0.09); border-radius: 8px; background: rgba(255, 255, 255, 0.34); }
   .work-card-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
-  .work-card-heading strong { color: #587064; font: 800 6px Inter, sans-serif; letter-spacing: 0.12em; }
-  .work-card-heading span { padding: 2px 4px; border-radius: 999px; color: #4e8068; background: rgba(57, 145, 99, 0.08); font: 750 6px Inter, sans-serif; white-space: nowrap; }
+  .work-card-heading strong { color: #587064; font: 800 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.12em; }
+  .work-card-heading span { padding: 2px 4px; border-radius: 999px; color: #4e8068; background: rgba(57, 145, 99, 0.08); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; }
   .work-card-heading span.complete { color: #3c8460; background: rgba(50, 153, 99, 0.1); }
   .work-card-heading span.blocked { color: #a15e58; background: rgba(170, 78, 78, 0.08); }
   .todo-progress { height: 2px; overflow: hidden; border-radius: 999px; background: rgba(69, 112, 91, 0.1); }
@@ -1476,15 +1666,15 @@
   .todo-card li.active > span { border-color: #4d98c3; background: #4d98c3; box-shadow: 0 0 0 2px rgba(77, 152, 195, 0.1); }
   .todo-card li.done { color: #91a099; }
   .todo-card li.done > span { border-color: #55a77b; background: #55a77b; }
-  .todo-card li small { min-width: 0; overflow: hidden; font: 650 7px/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
-  .work-more { color: #96a19c; font: 650 6px Inter, sans-serif; }
-  .goal-card p { min-width: 0; margin: 0; overflow: hidden; color: #4b5f55; font: 680 7px/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
-  .goal-time { display: flex; align-items: center; gap: 3px; color: #86948d; font: 650 6px Inter, sans-serif; }
+  .todo-card li small { min-width: 0; overflow: hidden; font: 650 var(--chat-small-font-size)/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .work-more { color: #96a19c; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .goal-card p { min-width: 0; margin: 0; overflow: hidden; color: #4b5f55; font: 680 var(--chat-small-font-size)/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .goal-time { display: flex; align-items: center; gap: 3px; color: #86948d; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; }
   .goal-time svg { width: 9px; height: 9px; }
   .hub-tabs { min-height: 29px; padding: 4px 9px 0; display: flex; gap: 3px; border-bottom: 1px solid rgba(97, 119, 109, 0.09); }
-  .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 8px Inter, sans-serif; cursor: pointer; }
+  .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
-  .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: 7px; }
+  .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: var(--chat-tiny-font-size); }
   .terminal-output { min-width: 0; min-height: 0; max-width: 100%; flex: 1; padding: 10px 12px 7px; overflow-x: hidden; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: var(--chat-font-size); }
   .terminal-output p { max-width: 100%; margin: 0 0 6px; overflow-wrap: anywhere; line-height: 1.45; word-break: break-word; }
   .terminal-output p > span { color: #36a269; font-weight: 800; }
@@ -1501,7 +1691,32 @@
   .chat-message header { display: flex; align-items: center; gap: 6px; }
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
-  .chat-message pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+  .chat-message.user-message > pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+  .markdown-content { min-width: 0; max-width: 100%; margin-top: 5px; overflow: hidden; color: #4b5c54; font: var(--chat-font-size)/1.55 Inter, sans-serif; overflow-wrap: anywhere; word-break: break-word; }
+  .markdown-content :global(> :first-child) { margin-top: 0; }
+  .markdown-content :global(> :last-child) { margin-bottom: 0; }
+  .markdown-content :global(p) { max-width: 100%; margin: 0 0 6px; }
+  .markdown-content :global(strong) { color: #40564b; font-weight: 800; }
+  .markdown-content :global(em) { font-style: italic; }
+  .markdown-content :global(del) { color: #87948e; }
+  .markdown-content :global(a) { color: #2f8560; font-weight: 650; text-decoration: underline; text-decoration-color: rgba(47, 133, 96, 0.38); text-underline-offset: 2px; }
+  .markdown-content :global(a:hover) { color: #216b4b; text-decoration-color: currentColor; }
+  .markdown-content :global(ul),
+  .markdown-content :global(ol) { margin: 5px 0 7px; padding-left: 18px; }
+  .markdown-content :global(li) { margin: 2px 0; padding-left: 1px; }
+  .markdown-content :global(h1),
+  .markdown-content :global(h2),
+  .markdown-content :global(h3),
+  .markdown-content :global(h4) { margin: 8px 0 4px; color: #40564b; font-family: Inter, sans-serif; line-height: 1.3; }
+  .markdown-content :global(h1) { font-size: calc(var(--chat-font-size) + 3px); }
+  .markdown-content :global(h2) { font-size: calc(var(--chat-font-size) + 2px); }
+  .markdown-content :global(h3),
+  .markdown-content :global(h4) { font-size: calc(var(--chat-font-size) + 1px); }
+  .markdown-content :global(blockquote) { margin: 6px 0; padding: 4px 8px; border-left: 2px solid #58a37d; color: #687970; background: rgba(62, 143, 101, 0.05); }
+  .markdown-content :global(code) { max-width: 100%; padding: 1px 4px; border-radius: 4px; color: #3f6553; background: rgba(53, 116, 84, 0.08); font: 0.92em/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: break-spaces; }
+  .markdown-content :global(pre) { max-width: 100%; max-height: 220px; margin: 6px 0; padding: 7px 8px; overflow: auto; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 6px; background: rgba(42, 63, 53, 0.055); }
+  .markdown-content :global(pre code) { padding: 0; color: #465a50; background: transparent; font-size: var(--chat-small-font-size); white-space: pre-wrap; word-break: break-word; }
+  .markdown-content :global(hr) { height: 1px; margin: 8px 0; border: 0; background: rgba(77, 104, 91, 0.12); }
   .message-images { margin-top: 7px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
   .message-images img { width: 100%; max-height: 150px; display: block; border-radius: 7px; object-fit: cover; }
   .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
@@ -1538,32 +1753,39 @@
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
   .permission > div { display: flex; gap: 4px; }
-  .permission button { min-height: 23px; padding: 0 7px; border: 1px solid rgba(82, 101, 93, 0.15); border-radius: 6px; color: #4b5d55; background: rgba(255, 255, 255, 0.58); font: 700 8px Inter, sans-serif; cursor: pointer; }
+  .permission button { min-height: 23px; padding: 0 7px; border: 1px solid rgba(82, 101, 93, 0.15); border-radius: 6px; color: #4b5d55; background: rgba(255, 255, 255, 0.58); font: 700 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .permission button.danger { color: #a64d4d; }
   .hint { color: #89948f; font-size: var(--chat-small-font-size); }
   .hint.docked { color: #4f7566; }
-  .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 8px/1.35 Inter, sans-serif; }
+  .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 var(--chat-small-font-size)/1.35 Inter, sans-serif; }
   .terminate-confirm > span { min-width: 0; flex: 1; color: #7d5d58; }
   .terminate-confirm > div { display: flex; gap: 4px; }
-  .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 7px Inter, sans-serif; cursor: pointer; }
+  .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
-  .terminal-composer { min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
+  .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
+  .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
-  .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 6px/1.25 Inter, sans-serif; text-transform: uppercase; }
+  .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
   .pending-images img { width: 100%; height: 100%; display: block; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 8px; object-fit: cover; }
   .pending-images button { position: absolute; top: -4px; right: -4px; width: 15px; height: 15px; border: 1px solid rgba(82, 106, 95, 0.18); border-radius: 50%; color: #65766e; background: #eef3f0; font-size: 10px; line-height: 1; }
-  textarea { min-width: 0; height: 46px; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
-  textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
-  textarea:disabled { opacity: 0.58; }
-  .send-status { padding-bottom: 9px; color: #70827a; font: 700 8px Inter, sans-serif; white-space: nowrap; }
+  .composer-controls textarea { min-width: 0; min-height: 46px; height: 100%; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
+  .composer-controls textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
+  .composer-controls textarea:disabled { opacity: 0.58; }
+  .send-status { padding-bottom: 9px; color: #70827a; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
   .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .terminal-composer.sending button:disabled { opacity: 0.82; }
+  .terminal-composer .composer-resize-handle { position: absolute; z-index: 18; top: -6px; left: 50%; width: 54px; height: 12px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 999px; color: #7c8d85; background: transparent; cursor: ns-resize; touch-action: none; transform: translateX(-50%); }
+  .terminal-composer .composer-resize-handle:hover,
+  .terminal-composer .composer-resize-handle:focus-visible { opacity: 1; background: rgba(69, 111, 91, 0.07); outline: none; }
+  .composer-resize-handle span { width: 25px; height: 2px; display: block; border-radius: 999px; background: currentColor; opacity: 0.55; transition: width 120ms ease, opacity 120ms ease; }
+  .composer-resize-handle:hover span,
+  .composer-resize-handle:focus-visible span { width: 31px; opacity: 0.9; }
   .send-spinner { width: 12px; height: 12px; border: 2px solid rgba(255, 255, 255, 0.38); border-top-color: white; border-radius: 50%; animation: send-spin 650ms linear infinite; }
   @keyframes send-spin { to { transform: rotate(360deg); } }
-  .message { margin: -4px 11px 6px; color: #ad4f4f; font-size: 8px; }
+  .message { margin: -4px 11px 6px; color: #ad4f4f; font-size: var(--chat-small-font-size); }
   .resize-handle { position: absolute; z-index: 20; width: 18px; height: 18px; padding: 0; border: 0; outline: 0; background: transparent; touch-action: none; }
   .resize-handle::after { position: absolute; width: 6px; height: 6px; content: ""; opacity: 0; transition: opacity 120ms ease; }
   .resize-handle:hover::after { opacity: 0.7; }
@@ -1595,6 +1817,11 @@
   .terminal-window.dark .agent-icon,
   .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .source-badge { color: #a7b5ae; }
+  .terminal-window.dark .text-zoom-button.active { color: #86cbaa; background: rgba(102, 190, 149, 0.09); }
+  .terminal-window.dark .text-zoom-popover { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
+  .terminal-window.dark .text-zoom-popover button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
+  .terminal-window.dark .text-zoom-popover button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
+  .terminal-window.dark .text-zoom-popover output { color: #a5b6ad; }
   .terminal-window.dark .rate-limit-meter small,
   .terminal-window.dark .pending-images-label { color: #8f9f97; }
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
@@ -1618,9 +1845,20 @@
   .terminal-window.dark .agent-typing { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
   .terminal-window.dark .chat-message.user-message { background: rgba(76, 169, 124, 0.09); }
   .terminal-window.dark .chat-message header strong,
-  .terminal-window.dark .chat-message pre,
+  .terminal-window.dark .chat-message.user-message > pre,
+  .terminal-window.dark .markdown-content,
   .terminal-window.dark .turn-trace pre,
   .terminal-window.dark .turn-files code { color: #bdcbc4; }
+  .terminal-window.dark .markdown-content :global(strong),
+  .terminal-window.dark .markdown-content :global(h1),
+  .terminal-window.dark .markdown-content :global(h2),
+  .terminal-window.dark .markdown-content :global(h3),
+  .terminal-window.dark .markdown-content :global(h4) { color: #d1ddd7; }
+  .terminal-window.dark .markdown-content :global(a) { color: #76c49d; text-decoration-color: rgba(118, 196, 157, 0.42); }
+  .terminal-window.dark .markdown-content :global(blockquote) { color: #a5b6ad; background: rgba(91, 177, 137, 0.055); }
+  .terminal-window.dark .markdown-content :global(code) { color: #b9d9c9; background: rgba(157, 205, 181, 0.075); }
+  .terminal-window.dark .markdown-content :global(pre) { border-color: rgba(205, 222, 213, 0.08); background: rgba(7, 16, 12, 0.2); }
+  .terminal-window.dark .markdown-content :global(pre code) { color: #bdcbc4; background: transparent; }
   .terminal-window.dark .turn-trace { background: rgba(218, 234, 226, 0.025); }
   .terminal-window.dark .turn-files { border-color: #5bad83; background: rgba(91, 177, 137, 0.055); }
   .terminal-window.dark .turn-files > strong { color: #8bc6a8; }
@@ -1628,6 +1866,9 @@
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
   .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
+  .terminal-window.dark .terminal-composer .composer-resize-handle:hover,
+  .terminal-window.dark .terminal-composer .composer-resize-handle:focus-visible { background: rgba(205, 225, 215, 0.045); }
   .terminal-window.dark .pending-images button { color: #c6d5ce; border-color: rgba(205, 222, 213, 0.14); background: #26332d; }
   .terminal-window.dark .permission strong { color: #dfc6ac; }
   .terminal-window.dark .permission code,

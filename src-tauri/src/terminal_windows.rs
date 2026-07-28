@@ -592,6 +592,12 @@ impl TerminalWindows {
                 }
                 error.to_string()
             })?;
+        window.start_dragging().map_err(|error| {
+            if let Ok(mut active) = self.native_drags.lock() {
+                active.remove(&label);
+            }
+            error.to_string()
+        })?;
         Ok(())
     }
 

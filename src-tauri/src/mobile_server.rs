@@ -56,6 +56,7 @@ const REALTIME_READ_TIMEOUT: Duration = Duration::from_millis(5);
 const MDNS_SERVICE_TYPE: &str = "_lume._tcp.local.";
 const MOBILE_INDEX: &str = include_str!("../../mobile-pwa/index.html");
 const MOBILE_APP: &str = include_str!("../../mobile-pwa/app.js");
+const MOBILE_MARKDOWN: &str = include_str!("../../src/lib/markdown.js");
 const MOBILE_STYLES: &str = include_str!("../../mobile-pwa/styles.css");
 const MOBILE_MANIFEST: &str = include_str!("../../mobile-pwa/manifest.webmanifest");
 const MOBILE_SERVICE_WORKER: &str = include_str!("../../mobile-pwa/sw.js");
@@ -1036,6 +1037,7 @@ fn route_core(
         let asset = match path {
             "/" | "/pair" => Some(("text/html; charset=utf-8", MOBILE_INDEX)),
             "/app.js" => Some(("text/javascript; charset=utf-8", MOBILE_APP)),
+            "/markdown.js" => Some(("text/javascript; charset=utf-8", MOBILE_MARKDOWN)),
             "/styles.css" => Some(("text/css; charset=utf-8", MOBILE_STYLES)),
             "/manifest.webmanifest" => {
                 Some(("application/manifest+json; charset=utf-8", MOBILE_MANIFEST))
@@ -1761,6 +1763,14 @@ mod tests {
         assert!(response.contains("Content-Security-Policy:"));
         assert!(response.contains("<title>Lume Mobile</title>"));
         assert!(!response.contains("temporary"));
+
+        let markdown = route(
+            request("GET", "/markdown.js", None, serde_json::Value::Null),
+            &state,
+            &gateway,
+        );
+        assert!(markdown.starts_with("HTTP/1.1 200"));
+        assert!(markdown.contains("renderSafeMarkdown"));
     }
 
     #[test]

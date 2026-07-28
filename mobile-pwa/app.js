@@ -1,3 +1,5 @@
+import { renderSafeMarkdown } from "./markdown.js";
+
 const tokenKey = "lume-mobile-token-v1";
 const baseKey = "lume-mobile-gateway-v1";
 const deviceKey = "lume-mobile-device-v1";
@@ -387,6 +389,9 @@ async function api(path, options = {}) {
 function pairingFailureMessage(error) {
   const detail = String(error?.message || error);
   if (/failed to fetch|networkerror|load failed/i.test(detail)) {
+    if (nativePlatform() === "ios") {
+      return "Could not reach Lume. In iPhone Settings, allow Lume to access the local network and confirm that both devices use the same Wi-Fi.";
+    }
     return "Could not reach Lume. Allow local network access and confirm that both devices use the same Wi-Fi.";
   }
   return /não está ativo|expirou|not active|expired/i.test(detail)
@@ -1104,7 +1109,7 @@ function renderChat(sessions) {
         if (item.kind === "message" && item.detail) {
           return `<div class="mobile-chat-message agent">
             <header><strong>${escapeHtml(session.agentLabel)}</strong><time>${activityTime(item.createdAt)}</time></header>
-            <p>${escapeHtml(item.detail)}</p>
+            <div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>
           </div>`;
         }
         if (item.kind === "file") return "";

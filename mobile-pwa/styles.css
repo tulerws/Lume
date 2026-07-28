@@ -998,7 +998,31 @@ body.install-modal-open { overflow: hidden; }
 .mobile-chat-message header { display: flex; align-items: center; gap: 8px; }
 .mobile-chat-message header strong { min-width: 0; flex: 1; color: #9ecbb0; font-size: 10px; }
 .mobile-chat-message header time { color: var(--muted); font-size: 9px; }
-.mobile-chat-message p { width: 100%; min-width: 0; max-width: 100%; height: auto; max-height: none; margin: 6px 0 0; display: block; overflow: visible; color: var(--text-soft); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.mobile-chat-message.user > p { width: 100%; min-width: 0; max-width: 100%; height: auto; max-height: none; margin: 6px 0 0; display: block; overflow: visible; color: var(--text-soft); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.mobile-markdown { width: 100%; min-width: 0; max-width: 100%; margin-top: 7px; overflow: hidden; color: var(--text-soft); font-size: 13px; line-height: 1.58; overflow-wrap: anywhere; word-break: break-word; }
+.mobile-markdown > :first-child { margin-top: 0; }
+.mobile-markdown > :last-child { margin-bottom: 0; }
+.mobile-markdown p { max-width: 100%; margin: 0 0 9px; }
+.mobile-markdown strong { color: #d4e5dc; font-weight: 800; }
+.mobile-markdown em { font-style: italic; }
+.mobile-markdown del { color: #718078; }
+.mobile-markdown a { color: #75c89b; font-weight: 700; text-decoration: underline; text-decoration-color: rgba(117, 200, 155, 0.42); text-underline-offset: 2px; }
+.mobile-markdown ul,
+.mobile-markdown ol { margin: 7px 0 10px; padding-left: 21px; }
+.mobile-markdown li { margin: 3px 0; padding-left: 1px; }
+.mobile-markdown h1,
+.mobile-markdown h2,
+.mobile-markdown h3,
+.mobile-markdown h4 { margin: 11px 0 5px; color: #d5e4dc; line-height: 1.3; }
+.mobile-markdown h1 { font-size: 17px; }
+.mobile-markdown h2 { font-size: 16px; }
+.mobile-markdown h3,
+.mobile-markdown h4 { font-size: 14px; }
+.mobile-markdown blockquote { margin: 8px 0; padding: 6px 9px; border-left: 3px solid #58ad80; color: #9eb0a6; background: rgba(88, 173, 128, 0.06); }
+.mobile-markdown code { max-width: 100%; padding: 2px 5px; border-radius: 5px; color: #b9dcca; background: rgba(135, 197, 164, 0.09); font: 0.9em/1.45 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; white-space: break-spaces; }
+.mobile-markdown pre { max-width: 100%; max-height: 280px; margin: 8px 0; padding: 9px 10px; overflow: auto; border: 1px solid rgba(149, 180, 164, 0.1); border-radius: 9px; background: rgba(5, 12, 8, 0.25); }
+.mobile-markdown pre code { padding: 0; color: #b8c8c0; background: transparent; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.mobile-markdown hr { height: 1px; margin: 10px 0; border: 0; background: rgba(149, 180, 164, 0.12); }
 .mobile-message-images { margin-top: 8px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .mobile-message-images img { width: 100%; max-height: 220px; display: block; border-radius: 10px; object-fit: cover; }
 .mobile-chat-trace { min-width: 0; max-width: 100%; margin-left: 4px; padding: 7px 8px; overflow: visible; border-radius: 9px; background: rgba(255, 255, 255, 0.018); }
