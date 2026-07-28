@@ -14,6 +14,7 @@
     "core:window:allow-available-monitors",
     "core:webview:allow-set-webview-size",
     "dialog:allow-open",
+    "clipboard-manager:allow-read-image",
     "opener:default",
     "process:allow-restart",
     "updater:default"

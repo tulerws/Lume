@@ -168,8 +168,8 @@ function fileUriPath(uri: string) {
 }
 
 function clipboardImagePaths(event: ClipboardEvent) {
-  const uriList = event.clipboardData?.getData("text/uri-list") ??
-    event.clipboardData?.getData("text/plain") ??
+  const uriList = event.clipboardData?.getData("text/uri-list") ||
+    event.clipboardData?.getData("text/plain") ||
     "";
   return uriList
     .split(/\r?\n/)
@@ -197,11 +197,56 @@ async function asynchronousClipboardImages() {
   return files;
 }
 
+async function nativeClipboardImage() {
+  try {
+    const { readImage } = await import("@tauri-apps/plugin-clipboard-manager");
+    const image = await readImage();
+    try {
+      const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
+      if (!size.width || !size.height || rgba.length !== size.width * size.height * 4) {
+        return [];
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = size.width;
+      canvas.height = size.height;
+      const context = canvas.getContext("2d");
+      if (!context) return [];
+      context.putImageData(
+        new ImageData(new Uint8ClampedArray(rgba), size.width, size.height),
+        0,
+        0,
+      );
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/png")
+      );
+      return blob
+        ? [new File([blob], "clipboard-image.png", { type: "image/png" })]
+        : [];
+    } finally {
+      await image.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
 export function clipboardHasImage(event: ClipboardEvent) {
   if (directImageFiles(event).length || clipboardImagePaths(event).length) return true;
   const types = [...(event.clipboardData?.types ?? [])];
   if (types.some((type) => type === "Files" || type.startsWith("image/"))) return true;
   return /<img[^>]+src=/i.test(event.clipboardData?.getData("text/html") ?? "");
+}
+
+export function clipboardMayContainImage(event: ClipboardEvent) {
+  const clipboard = event.clipboardData;
+  if (!clipboard) return true;
+  const types = [...clipboard.types];
+  if (!types.length) return true;
+  const plainText = clipboard.getData("text/plain");
+  const html = clipboard.getData("text/html");
+  return !plainText && !html && types.every((type) =>
+    type === "text/plain" || type === "text/html"
+  );
 }
 
 export async function collectClipboardImages(
@@ -218,6 +263,7 @@ export async function collectClipboardImages(
       // Some WebViews expose the image only through ClipboardEvent.
     }
   }
+  if (!files.length && !paths.length) files = await nativeClipboardImage();
   if (!files.length && !paths.length) {
     throw new Error(message(
       language,

@@ -24,6 +24,7 @@
   import { displayText, localize } from "$lib/i18n";
   import {
     clipboardHasImage,
+    clipboardMayContainImage,
     collectClipboardImages,
     createImagePreview,
     prepareClipboardImage,
@@ -1038,7 +1039,7 @@
     event: ClipboardEvent,
     session: AgentSession,
   ) {
-    if (!clipboardHasImage(event)) return;
+    if (!clipboardHasImage(event) && !clipboardMayContainImage(event)) return;
     event.preventDefault();
     composerMessage = null;
     const capabilities = sessionCapabilities(session);

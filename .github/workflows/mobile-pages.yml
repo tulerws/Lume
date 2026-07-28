@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - "mobile-pwa/**"
+      - "src/lib/markdown.js"
+      - "src/lib/responseDedup.js"
+      - "scripts/validate-mobile-assets.mjs"
+      - "scripts/test-response-dedup.mjs"
+      - "package.json"
       - ".github/workflows/mobile-pages.yml"
   workflow_dispatch:
 
@@ -26,6 +31,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate mobile assets
+        run: npm run check:mobile
       - uses: actions/configure-pages@v5
         with:
           enablement: true

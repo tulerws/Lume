@@ -1,4 +1,5 @@
 import { renderSafeMarkdown } from "./markdown.js";
+import { latestResponseText, sameResponseText } from "./responseDedup.js";
 
 const tokenKey = "lume-mobile-token-v1";
 const baseKey = "lume-mobile-gateway-v1";
@@ -801,26 +802,6 @@ function chatTextKey(value) {
     .trim();
 }
 
-function comparableResponseText(value) {
-  return chatTextKey(value).replace(/(?:…|\.\.\.)$/, "").trimEnd();
-}
-
-function sameResponseText(left, right) {
-  const leftKey = comparableResponseText(left);
-  const rightKey = comparableResponseText(right);
-  if (!leftKey || !rightKey) return false;
-  if (leftKey === rightKey) return true;
-  const shorter = leftKey.length <= rightKey.length ? leftKey : rightKey;
-  const longer = leftKey.length <= rightKey.length ? rightKey : leftKey;
-  return shorter.length >= 256 && longer.startsWith(shorter);
-}
-
-function keepFullerResponse(item, response) {
-  if (chatTextKey(response).length > chatTextKey(item.detail).length) {
-    item.detail = response;
-  }
-}
-
 function buildChatTurns(session) {
   const turns = [];
   const ensureTurn = (id) => {
@@ -847,7 +828,16 @@ function buildChatTurns(session) {
         )
       : undefined;
     if (matchingMessage) {
-      keepFullerResponse(matchingMessage, activity.detail);
+      const previousCreatedAt = matchingMessage.createdAt;
+      matchingMessage.detail = latestResponseText(
+        matchingMessage.detail,
+        activity.detail,
+        previousCreatedAt,
+        activity.createdAt,
+      );
+      if (activity.createdAt >= previousCreatedAt) {
+        Object.assign(matchingMessage, activity, { detail: matchingMessage.detail });
+      }
       continue;
     }
     current.items.push({ ...activity });
@@ -870,7 +860,16 @@ function buildChatTurns(session) {
         )
       : undefined;
     if (matchingMessage) {
-      keepFullerResponse(matchingMessage, result.response);
+      matchingMessage.detail = latestResponseText(
+        matchingMessage.detail,
+        result.response,
+        matchingMessage.createdAt,
+        result.createdAt,
+      );
+      if (result.createdAt >= matchingMessage.createdAt) {
+        matchingMessage.createdAt = result.createdAt;
+        matchingMessage.status = "completed";
+      }
     } else if (result.response) {
       resultTurn.items.push({
         id: `response:${result.id}`,
@@ -893,7 +892,16 @@ function buildChatTurns(session) {
         )
     : undefined;
   if (matchingLastResponse) {
-    keepFullerResponse(matchingLastResponse, session.lastResponse);
+    matchingLastResponse.detail = latestResponseText(
+      matchingLastResponse.detail,
+      session.lastResponse,
+      matchingLastResponse.createdAt,
+      session.updatedAt,
+    );
+    if (session.updatedAt >= matchingLastResponse.createdAt) {
+      matchingLastResponse.createdAt = session.updatedAt;
+      matchingLastResponse.status = "completed";
+    }
   } else if (session.lastResponse) {
     current ||= ensureTurn(`response:${session.id}`);
     current.items.push({

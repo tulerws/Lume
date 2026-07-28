@@ -12,11 +12,13 @@
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
     clipboardHasImage,
+    clipboardMayContainImage,
     collectClipboardImages,
     createImagePreview,
     prepareClipboardImage,
   } from "$lib/imageAttachments";
   import { renderSafeMarkdown } from "$lib/markdown.js";
+  import { latestResponseText, sameResponseText } from "$lib/responseDedup.js";
   import {
     mergeFileChanges,
     summarizeFileChanges,
@@ -346,21 +348,6 @@
       .replace(/[ \t]+$/gm, "")
       .trim();
   }
-  function comparableResponseText(value?: string): string {
-    return chatTextKey(value).replace(/(?:…|\.\.\.)$/, "").trimEnd();
-  }
-  function sameResponseText(left?: string, right?: string): boolean {
-    const leftKey = comparableResponseText(left);
-    const rightKey = comparableResponseText(right);
-    if (!leftKey || !rightKey) return false;
-    if (leftKey === rightKey) return true;
-    const [shorter, longer] =
-      leftKey.length <= rightKey.length ? [leftKey, rightKey] : [rightKey, leftKey];
-    return shorter.length >= 256 && longer.startsWith(shorter);
-  }
-  function fullerResponseText(left?: string, right?: string): string | undefined {
-    return chatTextKey(right).length > chatTextKey(left).length ? right : left;
-  }
   const chatEntries = $derived.by<ChatEntry[]>(() => {
     let sequence = 0;
     const promptTimes = activities
@@ -386,10 +373,20 @@
           )
         : undefined;
       if (matchingMessage) {
-        matchingMessage.activity.detail = fullerResponseText(
+        const previousCreatedAt = matchingMessage.activity.createdAt;
+        matchingMessage.activity.detail = latestResponseText(
           matchingMessage.activity.detail,
           activity.detail,
+          previousCreatedAt,
+          activity.createdAt,
         );
+        if (activity.createdAt >= previousCreatedAt) {
+          matchingMessage.activity = {
+            ...matchingMessage.activity,
+            ...activity,
+            detail: matchingMessage.activity.detail,
+          };
+        }
         mergeFileChanges(matchingMessage.files, files);
         continue;
       }
@@ -413,10 +410,16 @@
         promptSegment(entry.activity.createdAt) === promptSegment(result.createdAt)
       );
       if (matchingMessage) {
-        matchingMessage.activity.detail = fullerResponseText(
+        matchingMessage.activity.detail = latestResponseText(
           matchingMessage.activity.detail,
           result.response,
+          matchingMessage.activity.createdAt,
+          result.createdAt,
         );
+        if (result.createdAt >= matchingMessage.activity.createdAt) {
+          matchingMessage.activity.createdAt = result.createdAt;
+          matchingMessage.activity.status = "completed";
+        }
         mergeFileChanges(matchingMessage.files, resultFiles);
       } else if (result.response || resultFiles.length) {
         entries.push({
@@ -444,10 +447,16 @@
         promptSegment(entry.activity.createdAt) === segment
       );
       if (matchingMessage) {
-        matchingMessage.activity.detail = fullerResponseText(
+        matchingMessage.activity.detail = latestResponseText(
           matchingMessage.activity.detail,
           session.lastResponse,
+          matchingMessage.activity.createdAt,
+          session.updatedAt,
         );
+        if (session.updatedAt >= matchingMessage.activity.createdAt) {
+          matchingMessage.activity.createdAt = session.updatedAt;
+          matchingMessage.activity.status = "completed";
+        }
       } else {
         entries.push({
           id: `last-response:${session.id}:${session.updatedAt}`,
@@ -1110,7 +1119,7 @@
   }
 
   async function pasteImages(event: ClipboardEvent) {
-    if (!clipboardHasImage(event)) return;
+    if (!clipboardHasImage(event) && !clipboardMayContainImage(event)) return;
     event.preventDefault();
     message = null;
     if (!canSubmit || !readyForPrompt || sending || !capabilities?.canAttachImages) {
