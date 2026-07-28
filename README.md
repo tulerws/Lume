@@ -1,28 +1,62 @@
-# Lume
+<p align="center">
+  <img src="static/branding/light/lume-128.png" width="76" alt="Lume dinosaur mascot" />
+</p>
 
-Lume is a subtle, local desktop overlay for monitoring AI coding agents on Windows and Linux. Its compact capsule shows when agents are running, waiting for input, requesting permission, completing work, or failing. Expand it whenever you need the full session hub.
+<h1 align="center">Lume</h1>
 
-[Download the latest release](https://github.com/tulerws/Lume/releases/latest)
+<p align="center">
+  A quiet, local hub for every AI coding agent running on your computer.
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/tulerws/Lume/releases/latest"><strong>Download the latest release</strong></a>
+  · Windows · Linux · Android
+</p>
 
-- **Unified agent monitoring** for Codex, Claude, and Gemini across CLIs, VS Code, and supported Chromium browsers.
-- **Real-time session status** with a quiet animated mascot, active-agent counter, optional sounds, and system tray access.
-- **Permission handling** with a clear description of the requested action and direct approval or denial whenever the source supports it.
-- **Continuous per-session chat** showing prompts, agent responses, observable commands, tools, final results, and changed files in chronological order.
-- **Image attachments** from the file picker or clipboard in desktop terminals and Lume Mobile, with previews before sending.
-- **Changed-file tracking** grouped by prompt, plus a consolidated Changes tab with concise file names and line counts.
-- **Live work tray** for agent TO DO progress, active GOAL status, and elapsed goal time.
-- **Floating Whiteboard terminals** that can be moved, resized, docked horizontally or vertically, and restored through saved layouts.
-- **Prompt continuation** for compatible Codex sessions and connected web chats without returning to the original application.
-- **Session launcher** for opening or resuming agents in your usual terminal or the VS Code integrated terminal.
-- **Command palette and global shortcuts** for opening Lume, launching sessions, navigating the app, and opening Whiteboard terminals.
-- **Lume Mobile** through an installable PWA or Android app, paired by one QR code with encrypted local-network access, per-device permissions, and a desktop review banner for newly connected phones.
-- **Project profiles** for launch destination, monitor, overlay position, permission behavior, Whiteboard layout, and preferred agents.
-- **Local result notes** for explicitly saving useful final responses, reported files, and validation checks.
-- **Extensible detection** through declarative JSON manifests that never load or execute third-party code.
-- **Local-first privacy** with sanitized history, in-memory session content, and services bound exclusively to localhost.
-- **Automatic updates**, autostart, configurable monitor placement, light/dark themes, and fullscreen-aware overlay behavior.
+<p align="center">
+  <img src="docs/screenshots/lume-desktop-sessions.png" width="420" alt="Lume session hub showing Codex, Claude, and Gemini" />
+</p>
+
+## What Lume does
+
+Lume stays as a small capsule at the top of the screen and watches Codex, Claude, and Gemini sessions opened from a CLI, VS Code, or a supported browser. It shows which agent is working, waiting, finished, failed, or requesting permission without forcing you to keep every terminal visible.
+
+Expand the capsule to review all sessions, approve supported actions, continue a chat, inspect final responses, and open independent Whiteboard windows for focused work.
+
+## How it works
+
+1. **Install Lume** and connect the agent integrations you use.
+2. **Keep working normally.** Lume discovers supported sessions already running on the machine.
+3. **Follow the capsule.** Its mascot, color, counter, sound, and notifications reflect what needs attention.
+4. **Open the hub when needed.** Send a prompt to one specific agent, review its response and changed files, or manage the same sessions from Lume Mobile.
+
+Desktop data stays on the computer. Mobile access is disabled by default and, when enabled, uses a paired and encrypted connection over the local network.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/screenshots/lume-whiteboard.png" width="420" alt="Lume Whiteboard session launcher" /><br />
+      <sub><strong>Whiteboard</strong> — open, arrange, resize, and dock independent agent windows.</sub>
+    </td>
+    <td align="center">
+      <img src="docs/screenshots/lume-settings.png" width="420" alt="Lume settings and agent integrations" /><br />
+      <sub><strong>Settings</strong> — connect agents and keep advanced options organized.</sub>
+    </td>
+  </tr>
+</table>
+
+## Highlights
+
+- Real-time monitoring for Codex, Claude, and Gemini across CLI, VS Code, and supported Chromium browsers.
+- Clear permission requests with approve or deny actions when the source integration supports them.
+- Continuous per-session chat with Markdown, images, observable commands, final responses, and changed files.
+- Floating Whiteboard windows with resize, horizontal or vertical docking, grouped movement, and saved layouts.
+- TO DO, GOAL, elapsed-time, and rate-limit indicators for supported agents.
+- One-QR mobile pairing through the Android app or browser interface, with per-device permissions.
+- Session launcher, command palette, global shortcuts, tray access, optional sounds, and automatic updates.
+- Local-first storage with sanitized history and explicitly saved result notes.
 
 ## Supported sources
 
