@@ -19,6 +19,8 @@ Lume stays as a small capsule at the top of the screen and watches all your agen
 
 Expand the capsule to review all sessions, approve supported actions, continue a chat, inspect final responses, and open independent Whiteboard windows for focused work.
 
+It does not use your data, does not require an account, and does not send prompts or responses to the cloud. All data stays on the computer.
+
 <p align="center">
   <img src="docs/media/lume-orb-panel.gif" width="840" alt="The Lume orb expanding into the live session panel" />
 </p>
