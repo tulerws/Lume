@@ -13,15 +13,28 @@
   · Windows · Linux · Android
 </p>
 
-<p align="center">
-  <img src="docs/screenshots/lume-desktop-sessions.png" width="420" alt="Lume session hub showing Codex, Claude, and Gemini" />
-</p>
-
-## What Lume does
+## Meet Lume
 
 Lume stays as a small capsule at the top of the screen and watches Codex, Claude, and Gemini sessions opened from a CLI, VS Code, or a supported browser. It shows which agent is working, waiting, finished, failed, or requesting permission without forcing you to keep every terminal visible.
 
 Expand the capsule to review all sessions, approve supported actions, continue a chat, inspect final responses, and open independent Whiteboard windows for focused work.
+
+<p align="center">
+  <img src="docs/screenshots/lume-desktop-sessions.png" width="420" alt="Lume session hub showing Codex, Claude, and Gemini" />
+</p>
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/screenshots/lume-whiteboard.png" width="420" alt="Lume Whiteboard session launcher" /><br />
+      <sub><strong>Organize your workspace</strong> — open a terminal for one agent or restore a saved layout.</sub>
+    </td>
+    <td align="center">
+      <img src="docs/screenshots/lume-settings.png" width="420" alt="Lume settings and agent integrations" /><br />
+      <sub><strong>Connect once</strong> — integrations and advanced preferences stay organized and out of the way.</sub>
+    </td>
+  </tr>
+</table>
 
 ## How it works
 
@@ -32,24 +45,15 @@ Expand the capsule to review all sessions, approve supported actions, continue a
 
 Desktop data stays on the computer. Mobile access is disabled by default and, when enabled, uses a paired and encrypted connection over the local network.
 
-## Screenshots
+## Whiteboard terminals
+
+Turn any monitored session into a focused floating chat. Each terminal keeps the agent conversation, live activity, changed files, TO DO and GOAL progress, rate limits, image attachments, and prompt input together in one window.
 
 <p align="center">
   <img src="docs/media/lume-terminal-docking.gif" width="840" alt="Two Lume Whiteboard terminals docking side by side" />
 </p>
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="docs/screenshots/lume-whiteboard.png" width="420" alt="Lume Whiteboard session launcher" /><br />
-      <sub><strong>Whiteboard</strong> — open, arrange, resize, and dock independent agent windows.</sub>
-    </td>
-    <td align="center">
-      <img src="docs/screenshots/lume-settings.png" width="420" alt="Lume settings and agent integrations" /><br />
-      <sub><strong>Settings</strong> — connect agents and keep advanced options organized.</sub>
-    </td>
-  </tr>
-</table>
+Move terminals freely, resize them from the corners, or dock them horizontally or vertically. Docked terminals form a group and move together while remaining independent chats.
 
 ## Highlights
 
