@@ -38,10 +38,6 @@ Desktop data stays on the computer. Mobile access is disabled by default and, wh
   <img src="docs/media/lume-terminal-docking.gif" width="840" alt="Two Lume Whiteboard terminals docking side by side" />
 </p>
 
-<p align="center">
-  <sub>Move a terminal close to another one, follow the docking highlight, and release to join both windows.</sub>
-</p>
-
 <table>
   <tr>
     <td align="center">

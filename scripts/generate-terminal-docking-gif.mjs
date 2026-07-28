@@ -1,389 +1,540 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { inflateSync } from "node:zlib";
 
-const WIDTH = 840;
-const HEIGHT = 400;
-const FRAME_COUNT = 36;
-const FRAME_DELAY = 12;
-const outputPath = resolve("docs/media/lume-terminal-docking.gif");
+const CARD_WIDTH = 420;
+const CARD_HEIGHT = 340;
+const MARGIN = 18;
+const START_OFFSET = 100;
+const WIDTH = MARGIN * 2 + CARD_WIDTH * 2 + START_OFFSET;
+const HEIGHT = MARGIN * 2 + CARD_HEIGHT;
+const FRAME_COUNT = 42;
+const FRAME_DELAY = 7;
 
-const palette = [
-  [10, 16, 13],
-  [20, 32, 27],
-  [47, 70, 59],
-  [220, 232, 225],
-  [130, 153, 142],
-  [82, 198, 137],
-  [84, 167, 247],
-  [226, 176, 87],
-];
+const codexPath = resolve("docs/media/lume-terminal-codex.png");
+const claudePath = resolve("docs/media/lume-terminal-claude.png");
+const outputPath = resolve(
+  process.env.LUME_GIF_OUTPUT ?? "docs/media/lume-terminal-docking.gif",
+);
 
-const C = {
-  background: 0,
-  surface: 1,
-  border: 2,
-  text: 3,
-  muted: 4,
-  green: 5,
-  blue: 6,
-  amber: 7,
-};
-
-const FONT = {
-  " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
-  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-  B: ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
-  C: ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
-  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
-  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-  F: ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
-  G: ["01111", "10000", "10000", "10111", "10001", "10001", "01111"],
-  H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
-  I: ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-  J: ["00111", "00010", "00010", "00010", "10010", "10010", "01100"],
-  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
-  L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
-  M: ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-  N: ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
-  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-  Q: ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
-  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-  V: ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
-  W: ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
-  X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
-  Y: ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
-  Z: ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
-  "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
-  "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
-  "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
-  "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
-  "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
-  "5": ["11111", "10000", "10000", "11110", "00001", "00001", "11110"],
-  "6": ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
-  "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
-  "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
-  "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
-  ".": ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
-  ":": ["00000", "00110", "00110", "00000", "00110", "00110", "00000"],
-  "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
-  "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
-  ">": ["10000", "01000", "00100", "00010", "00100", "01000", "10000"],
-  "$": ["00100", "01111", "10100", "01110", "00101", "11110", "00100"],
-  "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
-};
-
-function frameBuffer() {
-  return new Uint8Array(WIDTH * HEIGHT).fill(C.background);
-}
-
-function setPixel(buffer, x, y, color) {
-  if (x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT) {
-    buffer[y * WIDTH + x] = color;
-  }
-}
-
-function fillRect(buffer, x, y, width, height, color) {
-  const startX = Math.max(0, Math.round(x));
-  const startY = Math.max(0, Math.round(y));
-  const endX = Math.min(WIDTH, Math.round(x + width));
-  const endY = Math.min(HEIGHT, Math.round(y + height));
-  for (let row = startY; row < endY; row += 1) {
-    buffer.fill(color, row * WIDTH + startX, row * WIDTH + endX);
-  }
-}
-
-function roundedRect(buffer, x, y, width, height, radius, color) {
-  fillRect(buffer, x + radius, y, width - radius * 2, height, color);
-  fillRect(buffer, x, y + radius, width, height - radius * 2, color);
-  for (let dy = 0; dy < radius; dy += 1) {
-    for (let dx = 0; dx < radius; dx += 1) {
-      const distance = (radius - dx - 0.5) ** 2 + (radius - dy - 0.5) ** 2;
-      if (distance <= radius ** 2) {
-        setPixel(buffer, x + dx, y + dy, color);
-        setPixel(buffer, x + width - dx - 1, y + dy, color);
-        setPixel(buffer, x + dx, y + height - dy - 1, color);
-        setPixel(buffer, x + width - dx - 1, y + height - dy - 1, color);
-      }
-    }
-  }
-}
-
-function outlineRoundedRect(buffer, x, y, width, height, radius, color, thickness = 2) {
-  roundedRect(buffer, x, y, width, height, radius, color);
-  roundedRect(
-    buffer,
-    x + thickness,
-    y + thickness,
-    width - thickness * 2,
-    height - thickness * 2,
-    Math.max(1, radius - thickness),
-    C.surface,
+function readUInt32(buffer, offset) {
+  return (
+    buffer[offset] * 0x1000000 +
+    buffer[offset + 1] * 0x10000 +
+    buffer[offset + 2] * 0x100 +
+    buffer[offset + 3]
   );
 }
 
-function drawLine(buffer, x1, y1, x2, y2, color) {
-  let x = Math.round(x1);
-  let y = Math.round(y1);
-  const targetX = Math.round(x2);
-  const targetY = Math.round(y2);
-  const dx = Math.abs(targetX - x);
-  const sx = x < targetX ? 1 : -1;
-  const dy = -Math.abs(targetY - y);
-  const sy = y < targetY ? 1 : -1;
-  let error = dx + dy;
-  while (true) {
-    setPixel(buffer, x, y, color);
-    if (x === targetX && y === targetY) break;
-    const doubled = error * 2;
-    if (doubled >= dy) {
-      error += dy;
-      x += sx;
+function paeth(left, above, upperLeft) {
+  const prediction = left + above - upperLeft;
+  const leftDistance = Math.abs(prediction - left);
+  const aboveDistance = Math.abs(prediction - above);
+  const upperLeftDistance = Math.abs(prediction - upperLeft);
+  if (leftDistance <= aboveDistance && leftDistance <= upperLeftDistance) return left;
+  if (aboveDistance <= upperLeftDistance) return above;
+  return upperLeft;
+}
+
+function decodePng(path) {
+  const file = readFileSync(path);
+  const signature = file.subarray(0, 8).toString("hex");
+  if (signature !== "89504e470d0a1a0a") {
+    throw new Error(`${path} is not a PNG file`);
+  }
+
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  const compressed = [];
+
+  for (let offset = 8; offset < file.length;) {
+    const length = readUInt32(file, offset);
+    const type = file.subarray(offset + 4, offset + 8).toString("ascii");
+    const data = file.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") {
+      width = readUInt32(data, 0);
+      height = readUInt32(data, 4);
+      bitDepth = data[8];
+      colorType = data[9];
+    } else if (type === "IDAT") {
+      compressed.push(data);
+    } else if (type === "IEND") {
+      break;
     }
-    if (doubled <= dx) {
-      error += dx;
-      y += sy;
+    offset += length + 12;
+  }
+
+  if (bitDepth !== 8 || ![2, 6].includes(colorType)) {
+    throw new Error(`${path} must be an 8-bit RGB or RGBA PNG`);
+  }
+
+  const channels = colorType === 6 ? 4 : 3;
+  const scanlineLength = width * channels;
+  const inflated = inflateSync(Buffer.concat(compressed));
+  const pixels = new Uint8Array(width * height * 4);
+  let sourceOffset = 0;
+  let previous = new Uint8Array(scanlineLength);
+
+  for (let y = 0; y < height; y += 1) {
+    const filter = inflated[sourceOffset];
+    sourceOffset += 1;
+    const raw = inflated.subarray(sourceOffset, sourceOffset + scanlineLength);
+    sourceOffset += scanlineLength;
+    const row = new Uint8Array(scanlineLength);
+
+    for (let x = 0; x < scanlineLength; x += 1) {
+      const left = x >= channels ? row[x - channels] : 0;
+      const above = previous[x] ?? 0;
+      const upperLeft = x >= channels ? previous[x - channels] : 0;
+      const value = raw[x];
+      row[x] = {
+        0: value,
+        1: value + left,
+        2: value + above,
+        3: value + Math.floor((left + above) / 2),
+        4: value + paeth(left, above, upperLeft),
+      }[filter] & 0xff;
+    }
+
+    for (let x = 0; x < width; x += 1) {
+      const source = x * channels;
+      const target = (y * width + x) * 4;
+      pixels[target] = row[source];
+      pixels[target + 1] = row[source + 1];
+      pixels[target + 2] = row[source + 2];
+      pixels[target + 3] = channels === 4 ? row[source + 3] : 255;
+    }
+    previous = row;
+  }
+
+  return { width, height, pixels };
+}
+
+function clearCapturedHint(image, startY, endY) {
+  for (let y = startY; y < endY; y += 1) {
+    for (let x = 2; x < image.width - 2; x += 1) {
+      const offset = (y * image.width + x) * 4;
+      image.pixels[offset] = 20;
+      image.pixels[offset + 1] = 29;
+      image.pixels[offset + 2] = 25;
+      image.pixels[offset + 3] = 255;
     }
   }
 }
 
-function drawText(buffer, text, x, y, color, scale = 1) {
-  let cursor = Math.round(x);
-  for (const rawCharacter of String(text).toUpperCase()) {
-    const glyph = FONT[rawCharacter] ?? FONT[" "];
-    for (let row = 0; row < 7; row += 1) {
-      for (let column = 0; column < 5; column += 1) {
-        if (glyph[row][column] === "1") {
-          fillRect(
-            buffer,
-            cursor + column * scale,
-            y + row * scale,
-            scale,
-            scale,
-            color,
-          );
-        }
+function clearCapturedArea(image, startX, startY, endX, endY) {
+  for (let y = startY; y < endY; y += 1) {
+    for (let x = startX; x < endX; x += 1) {
+      const offset = (y * image.width + x) * 4;
+      image.pixels[offset] = 20;
+      image.pixels[offset + 1] = 29;
+      image.pixels[offset + 2] = 25;
+      image.pixels[offset + 3] = 255;
+    }
+  }
+}
+
+function createFrame() {
+  const pixels = new Uint8Array(WIDTH * HEIGHT * 4);
+  for (let offset = 0; offset < pixels.length; offset += 4) {
+    pixels[offset] = 8;
+    pixels[offset + 1] = 14;
+    pixels[offset + 2] = 11;
+    pixels[offset + 3] = 255;
+  }
+  return pixels;
+}
+
+function blendPixel(frame, x, y, red, green, blue, alpha = 255) {
+  if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT || alpha === 0) return;
+  const offset = (y * WIDTH + x) * 4;
+  const amount = alpha / 255;
+  frame[offset] = Math.round(red * amount + frame[offset] * (1 - amount));
+  frame[offset + 1] = Math.round(green * amount + frame[offset + 1] * (1 - amount));
+  frame[offset + 2] = Math.round(blue * amount + frame[offset + 2] * (1 - amount));
+}
+
+function composite(frame, image, destinationX, destinationY) {
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const source = (y * image.width + x) * 4;
+      let red = image.pixels[source];
+      let green = image.pixels[source + 1];
+      let blue = image.pixels[source + 2];
+      const alpha = image.pixels[source + 3];
+
+      // Firefox headless may paint its native scrollbar white. WebView uses the
+      // app theme here, so normalize only that narrow capture artifact.
+      if (
+        x >= image.width - 13 &&
+        y >= 58 &&
+        red > 220 &&
+        green > 220 &&
+        blue > 220
+      ) {
+        red = 20;
+        green = 29;
+        blue = 25;
+      }
+      blendPixel(frame, destinationX + x, destinationY + y, red, green, blue, alpha);
+    }
+  }
+}
+
+function fillRect(frame, x, y, width, height, color, alpha = 255) {
+  for (let row = Math.max(0, y); row < Math.min(HEIGHT, y + height); row += 1) {
+    for (let column = Math.max(0, x); column < Math.min(WIDTH, x + width); column += 1) {
+      blendPixel(frame, column, row, color[0], color[1], color[2], alpha);
+    }
+  }
+}
+
+function roundedRect(frame, x, y, width, height, radius, color, alpha = 255) {
+  fillRect(frame, x + radius, y, width - radius * 2, height, color, alpha);
+  fillRect(frame, x, y + radius, width, height - radius * 2, color, alpha);
+  for (let row = 0; row < radius; row += 1) {
+    for (let column = 0; column < radius; column += 1) {
+      const dx = radius - column - 0.5;
+      const dy = radius - row - 0.5;
+      if (dx * dx + dy * dy <= radius * radius) {
+        blendPixel(frame, x + column, y + row, ...color, alpha);
+        blendPixel(frame, x + width - column - 1, y + row, ...color, alpha);
+        blendPixel(frame, x + column, y + height - row - 1, ...color, alpha);
+        blendPixel(frame, x + width - column - 1, y + height - row - 1, ...color, alpha);
       }
     }
-    cursor += 6 * scale;
   }
 }
 
-function textWidth(text, scale = 1) {
-  return Math.max(0, String(text).length * 6 * scale - scale);
+function outlineRoundedRect(frame, x, y, width, height, radius, color, alpha = 255) {
+  const inside = (column, row, inset) => {
+    const left = x + inset;
+    const top = y + inset;
+    const right = x + width - inset - 1;
+    const bottom = y + height - inset - 1;
+    const innerRadius = Math.max(0, radius - inset);
+    if (column < left || column > right || row < top || row > bottom) return false;
+    if (
+      (column >= left + innerRadius && column <= right - innerRadius) ||
+      (row >= top + innerRadius && row <= bottom - innerRadius)
+    ) {
+      return true;
+    }
+    const centerX = column < left + innerRadius
+      ? left + innerRadius
+      : right - innerRadius;
+    const centerY = row < top + innerRadius
+      ? top + innerRadius
+      : bottom - innerRadius;
+    const dx = column - centerX;
+    const dy = row - centerY;
+    return dx * dx + dy * dy <= innerRadius * innerRadius;
+  };
+
+  for (let row = y; row < y + height; row += 1) {
+    for (let column = x; column < x + width; column += 1) {
+      if (inside(column, row, 0) && !inside(column, row, 2)) {
+        blendPixel(frame, column, row, ...color, alpha);
+      }
+    }
+  }
 }
 
-function drawBadge(buffer, text, right, y, color) {
-  const width = textWidth(text) + 13;
-  roundedRect(buffer, right - width, y, width, 17, 7, C.border);
-  roundedRect(buffer, right - width + 1, y + 1, width - 2, 15, 6, C.surface);
-  drawText(buffer, text, right - width + 7, y + 5, color);
+function drawDockHighlight(frame, targetX, targetY, pulse) {
+  const green = pulse ? [94, 197, 148] : [76, 171, 126];
+  outlineRoundedRect(frame, targetX, targetY, CARD_WIDTH, CARD_HEIGHT, 17, green, 190);
+  const previewWidth = 126;
+  const previewX = targetX + CARD_WIDTH - previewWidth - 12;
+  const previewY = targetY + 42;
+  const previewHeight = CARD_HEIGHT - 84;
+  roundedRect(frame, previewX, previewY, previewWidth, previewHeight, 10, green, 54);
+  outlineRoundedRect(
+    frame,
+    previewX,
+    previewY,
+    previewWidth,
+    previewHeight,
+    10,
+    green,
+    145,
+  );
 }
 
-function drawMascot(buffer, x, y, awake) {
-  const color = awake ? C.green : C.muted;
-  const pixels = [
-    "00111100",
-    "01111110",
-    "11100110",
-    "11111110",
-    "11111000",
-    "01111100",
-    "00110110",
-    "00110010",
+function drawMovingBorder(frame, x, y) {
+  outlineRoundedRect(frame, x, y, CARD_WIDTH, CARD_HEIGHT, 17, [91, 186, 143], 150);
+}
+
+function fillPolygon(frame, points, color, alpha = 255) {
+  const minimumX = Math.floor(Math.min(...points.map(([x]) => x)));
+  const maximumX = Math.ceil(Math.max(...points.map(([x]) => x)));
+  const minimumY = Math.floor(Math.min(...points.map(([, y]) => y)));
+  const maximumY = Math.ceil(Math.max(...points.map(([, y]) => y)));
+  for (let y = minimumY; y <= maximumY; y += 1) {
+    for (let x = minimumX; x <= maximumX; x += 1) {
+      let inside = false;
+      for (
+        let current = 0, previous = points.length - 1;
+        current < points.length;
+        previous = current++
+      ) {
+        const [currentX, currentY] = points[current];
+        const [previousX, previousY] = points[previous];
+        const crosses = currentY > y !== previousY > y &&
+          x < ((previousX - currentX) * (y - currentY)) /
+            (previousY - currentY) + currentX;
+        if (crosses) inside = !inside;
+      }
+      if (inside) blendPixel(frame, x, y, ...color, alpha);
+    }
+  }
+}
+
+function drawCursor(frame, x, y, animationFrame) {
+  const ringRadius = 6 + (animationFrame % 4);
+  for (let angle = 0; angle < 360; angle += 5) {
+    const radians = (angle * Math.PI) / 180;
+    blendPixel(
+      frame,
+      Math.round(x + Math.cos(radians) * ringRadius),
+      Math.round(y + Math.sin(radians) * ringRadius),
+      91,
+      173,
+      220,
+      180,
+    );
+  }
+
+  const outline = [
+    [x, y],
+    [x, y + 25],
+    [x + 6, y + 19],
+    [x + 11, y + 29],
+    [x + 16, y + 26],
+    [x + 11, y + 17],
+    [x + 21, y + 17],
   ];
-  for (let row = 0; row < pixels.length; row += 1) {
-    for (let column = 0; column < pixels[row].length; column += 1) {
-      if (pixels[row][column] === "1") {
-        fillRect(buffer, x + column * 2, y + row * 2, 2, 2, color);
-      }
-    }
-  }
-  fillRect(buffer, x + 11, y + 4, 2, 2, C.background);
+  fillPolygon(
+    frame,
+    outline.map(([column, row]) => [column + 2, row + 2]),
+    [0, 0, 0],
+    110,
+  );
+  fillPolygon(frame, outline, [7, 12, 10], 255);
+  fillPolygon(frame, [
+    [x + 2, y + 4],
+    [x + 2, y + 20],
+    [x + 7, y + 15],
+    [x + 12, y + 24],
+    [x + 13, y + 23],
+    [x + 8, y + 14],
+    [x + 16, y + 14],
+  ], [235, 242, 238], 255);
 }
 
-function drawTerminal(buffer, {
-  x,
-  y,
-  width,
-  height,
-  agent,
-  project,
-  source,
-  running,
-  moving,
-  docked,
-  frame,
-}) {
-  const borderColor = moving ? C.amber : docked ? C.green : C.border;
-  roundedRect(buffer, x + 5, y + 7, width, height, 15, C.background);
-  outlineRoundedRect(buffer, x, y, width, height, 15, borderColor, 2);
-  fillRect(buffer, x + 2, y + 49, width - 4, 1, C.border);
-
-  roundedRect(buffer, x + 14, y + 12, 28, 28, 8, C.border);
-  roundedRect(buffer, x + 16, y + 14, 24, 24, 7, C.surface);
-  drawMascot(buffer, x + 20, y + 18, running);
-  drawText(buffer, agent, x + 51, y + 14, C.text, 2);
-  drawText(buffer, project, x + 52, y + 32, C.muted);
-  drawBadge(buffer, source, x + width - 14, y + 16, source === "CLI" ? C.muted : C.blue);
-
-  drawText(buffer, "$", x + 18, y + 67, C.green);
-  drawText(buffer, project, x + 31, y + 67, C.muted);
-  drawText(buffer, ">", x + 18, y + 88, running ? C.blue : C.amber);
-  drawText(buffer, running ? "RUNNING" : "WAITING FOR INPUT", x + 31, y + 88, running ? C.blue : C.amber);
-  if (running) {
-    const activeDot = frame % 3;
-    for (let dot = 0; dot < 3; dot += 1) {
-      fillRect(buffer, x + 81 + dot * 6, y + 88, 3, 3, dot === activeDot ? C.blue : C.border);
-    }
+function drawRunningPulse(frame, x, y, animationFrame) {
+  roundedRect(frame, x, y, 43, 27, 10, [30, 43, 37], 255);
+  outlineRoundedRect(frame, x, y, 43, 27, 10, [62, 84, 74], 155);
+  const active = animationFrame % 3;
+  for (let index = 0; index < 3; index += 1) {
+    const color = index === active ? [91, 168, 222] : [57, 101, 128];
+    const offsetY = index === active ? -1 : 0;
+    roundedRect(frame, x + 11 + index * 9, y + 12 + offsetY, 5, 5, 2, color, 255);
   }
-
-  roundedRect(buffer, x + 15, y + 112, width - 30, 72, 9, C.border);
-  roundedRect(buffer, x + 17, y + 114, width - 34, 68, 8, C.surface);
-  drawText(buffer, running ? "CURRENT STEP" : "LAST RESPONSE", x + 27, y + 124, C.muted);
-  drawText(buffer, running ? "UPDATING SESSION MONITOR" : "READY FOR THE NEXT PROMPT", x + 27, y + 143, C.text);
-  drawText(buffer, running ? "+ TERMINAL WINDOWS" : "NO PENDING ACTIONS", x + 27, y + 160, running ? C.green : C.muted);
-
-  roundedRect(buffer, x + 15, y + height - 54, width - 65, 37, 9, C.border);
-  roundedRect(buffer, x + 17, y + height - 52, width - 69, 33, 8, C.surface);
-  drawText(buffer, running ? "AGENT IS WORKING" : "PROMPT FOR AGENT", x + 29, y + height - 40, C.muted);
-  roundedRect(buffer, x + width - 44, y + height - 54, 29, 37, 9, running ? C.border : C.green);
-  drawText(buffer, running ? "..." : ">", x + width - 37, y + height - 41, running ? C.muted : C.text);
 }
 
-function drawDashedPreview(buffer, x, y, width, height, pulse) {
-  const color = pulse ? C.amber : C.green;
-  for (let offset = 0; offset < width; offset += 12) {
-    fillRect(buffer, x + offset, y, 7, 2, color);
-    fillRect(buffer, x + offset, y + height - 2, 7, 2, color);
-  }
-  for (let offset = 0; offset < height; offset += 12) {
-    fillRect(buffer, x, y + offset, 2, 7, color);
-    fillRect(buffer, x + width - 2, y + offset, 2, 7, color);
-  }
-  const label = "RELEASE TO DOCK";
-  const labelWidth = textWidth(label) + 18;
-  roundedRect(buffer, x + (width - labelWidth) / 2, y - 28, labelWidth, 20, 9, C.border);
-  drawText(buffer, label, x + (width - labelWidth) / 2 + 9, y - 21, color);
+function easeInOut(value) {
+  return 0.5 - Math.cos(value * Math.PI) / 2;
 }
 
-function drawCursor(buffer, x, y) {
-  for (let row = 0; row < 18; row += 1) {
-    for (let column = 0; column <= Math.floor(row * 0.55); column += 1) {
-      setPixel(buffer, x + column, y + row, C.text);
-    }
-  }
-  drawLine(buffer, x + 7, y + 12, x + 15, y + 20, C.text);
-  drawLine(buffer, x + 8, y + 12, x + 16, y + 19, C.text);
-}
-
-function renderFrame(frame) {
-  const buffer = frameBuffer();
-  for (let x = 0; x < WIDTH; x += 40) {
-    fillRect(buffer, x, 0, 1, HEIGHT, C.surface);
-  }
-  for (let y = 0; y < HEIGHT; y += 40) {
-    fillRect(buffer, 0, y, WIDTH, 1, C.surface);
-  }
-
-  drawText(buffer, "LUME WHITEBOARD", 40, 24, C.text, 2);
-  drawText(buffer, "MOVE CLOSE / HIGHLIGHT / RELEASE / DOCK", 41, 48, C.muted);
-
-  const firstX = 40;
-  const targetX = 370;
-  const initialX = 480;
-  const terminalY = 88;
-  const terminalWidth = 330;
-  const terminalHeight = 260;
+function renderFrame(index, codex, claude) {
+  const frame = createFrame();
+  const firstX = MARGIN;
+  const targetX = MARGIN + CARD_WIDTH;
+  const initialX = targetX + START_OFFSET;
+  const y = MARGIN;
   let secondX = initialX;
   let moving = false;
   let docked = false;
 
-  if (frame >= 7 && frame <= 24) {
+  if (index >= 8 && index <= 29) {
     moving = true;
-    const progress = (frame - 7) / 17;
-    const eased = 0.5 - Math.cos(progress * Math.PI) / 2;
-    secondX = Math.round(initialX + (targetX - initialX) * eased);
-  } else if (frame === 25) {
+    const progress = easeInOut((index - 8) / 21);
+    secondX = Math.round(initialX + (targetX - initialX) * progress);
+  } else if (index === 30) {
     moving = true;
-    secondX = targetX - 7;
-  } else if (frame === 26) {
+    secondX = targetX - 6;
+  } else if (index === 31) {
     moving = true;
     secondX = targetX + 3;
-  } else if (frame >= 27) {
-    secondX = targetX;
+  } else if (index >= 32) {
     docked = true;
+    secondX = targetX;
   }
 
-  const showPreview = moving && secondX - targetX < 58;
-  if (showPreview) {
-    drawDashedPreview(
-      buffer,
-      targetX,
-      terminalY,
-      terminalWidth,
-      terminalHeight,
-      frame % 4 < 2,
+  composite(frame, codex, firstX, y);
+  composite(frame, claude, secondX, y);
+  drawRunningPulse(frame, firstX + 12, y + 235, index);
+
+  const previewActive = moving && secondX - targetX <= 62;
+  if (previewActive) {
+    drawDockHighlight(frame, firstX, y, index % 4 < 2);
+    drawMovingBorder(frame, secondX, y);
+  }
+
+  if (moving) {
+    drawCursor(frame, secondX + 292, y + 17, index);
+  }
+
+  if (docked && index < 38) {
+    const fade = Math.max(0, 170 - (index - 32) * 28);
+    outlineRoundedRect(frame, firstX, y, CARD_WIDTH * 2, CARD_HEIGHT, 17, [91, 186, 143], fade);
+  }
+
+  return frame;
+}
+
+function buildPalette(frames) {
+  const histogram = new Map();
+  for (const frame of frames) {
+    for (let offset = 0; offset < frame.length; offset += 4) {
+      const red = frame[offset];
+      const green = frame[offset + 1];
+      const blue = frame[offset + 2];
+      const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
+      const entry = histogram.get(key);
+      if (entry) {
+        entry.count += 1;
+        entry.red += red;
+        entry.green += green;
+        entry.blue += blue;
+      } else {
+        histogram.set(key, { count: 1, red, green, blue });
+      }
+    }
+  }
+
+  const colors = Array.from(histogram.values(), (entry) => ({
+    count: entry.count,
+    red: entry.red / entry.count,
+    green: entry.green / entry.count,
+    blue: entry.blue / entry.count,
+  }));
+
+  const describe = (boxColors) => {
+    const ranges = ["red", "green", "blue"].map((channel) => {
+      let minimum = 255;
+      let maximum = 0;
+      for (const color of boxColors) {
+        minimum = Math.min(minimum, color[channel]);
+        maximum = Math.max(maximum, color[channel]);
+      }
+      return { channel, range: maximum - minimum };
+    });
+    const widest = ranges.sort((left, right) => right.range - left.range)[0];
+    const total = boxColors.reduce((sum, color) => sum + color.count, 0);
+    return {
+      colors: boxColors,
+      channel: widest.channel,
+      score: widest.range * Math.log2(total + 1),
+      total,
+    };
+  };
+
+  const boxes = [describe(colors)];
+  while (boxes.length < 256) {
+    boxes.sort((left, right) => right.score - left.score);
+    const box = boxes.shift();
+    if (!box || box.colors.length < 2) {
+      if (box) boxes.push(box);
+      break;
+    }
+    box.colors.sort((left, right) => left[box.channel] - right[box.channel]);
+    const halfway = box.total / 2;
+    let accumulated = 0;
+    let split = 1;
+    for (; split < box.colors.length; split += 1) {
+      accumulated += box.colors[split - 1].count;
+      if (accumulated >= halfway) break;
+    }
+    split = Math.max(1, Math.min(box.colors.length - 1, split));
+    boxes.push(
+      describe(box.colors.slice(0, split)),
+      describe(box.colors.slice(split)),
     );
   }
 
-  drawTerminal(buffer, {
-    x: firstX,
-    y: terminalY,
-    width: terminalWidth,
-    height: terminalHeight,
-    agent: "CODEX",
-    project: "LUME",
-    source: "VS CODE",
-    running: true,
-    moving: false,
-    docked,
-    frame,
+  const paletteColors = boxes.map((box) => {
+    const totals = box.colors.reduce(
+      (result, color) => {
+        result.red += color.red * color.count;
+        result.green += color.green * color.count;
+        result.blue += color.blue * color.count;
+        result.count += color.count;
+        return result;
+      },
+      { red: 0, green: 0, blue: 0, count: 0 },
+    );
+    return [
+      Math.round(totals.red / totals.count),
+      Math.round(totals.green / totals.count),
+      Math.round(totals.blue / totals.count),
+    ];
   });
-  drawTerminal(buffer, {
-    x: secondX,
-    y: terminalY,
-    width: terminalWidth,
-    height: terminalHeight,
-    agent: "CLAUDE",
-    project: "ORBIT API",
-    source: "CLI",
-    running: false,
-    moving,
-    docked,
-    frame,
-  });
+  while (paletteColors.length < 256) paletteColors.push([0, 0, 0]);
+  return paletteColors.slice(0, 256);
+}
 
-  if (moving) {
-    drawCursor(buffer, secondX + 236, terminalY + 24);
+function quantize(frame, palette) {
+  const indexed = new Uint8Array(WIDTH * HEIGHT);
+  const cache = new Uint16Array(32 * 32 * 32).fill(0xffff);
+  for (let source = 0, target = 0; source < frame.length; source += 4, target += 1) {
+    const red = frame[source];
+    const green = frame[source + 1];
+    const blue = frame[source + 2];
+    const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
+    if (cache[key] === 0xffff) {
+      let bestIndex = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      for (let index = 0; index < palette.length; index += 1) {
+        const color = palette[index];
+        const redDistance = red - color[0];
+        const greenDistance = green - color[1];
+        const blueDistance = blue - color[2];
+        const distance =
+          redDistance * redDistance +
+          greenDistance * greenDistance +
+          blueDistance * blueDistance;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = index;
+        }
+      }
+      cache[key] = bestIndex;
+    }
+    indexed[target] = cache[key];
   }
-  if (docked) {
-    const label = "DOCKED / THE WINDOWS NOW MOVE AS A GROUP";
-    const width = textWidth(label) + 24;
-    roundedRect(buffer, (WIDTH - width) / 2, 365, width, 22, 10, C.border);
-    drawText(buffer, label, (WIDTH - width) / 2 + 12, 373, C.green);
-  } else {
-    drawText(buffer, "DRAG THE CLAUDE WINDOW TOWARD CODEX", 40, 373, C.muted);
-  }
-  return buffer;
+  return indexed;
 }
 
 function pushWord(bytes, value) {
   bytes.push(value & 0xff, (value >> 8) & 0xff);
 }
 
-function literalLzw(indices) {
-  const clearCode = 8;
-  const endCode = 9;
+function compressLzw(indices) {
+  const clearCode = 256;
+  const endCode = 257;
   const bytes = [];
   let current = 0;
   let bitCount = 0;
-  const writeCode = (code) => {
+  let codeSize = 9;
+  let nextCode = 258;
+  let dictionary = new Map();
+
+  const writeCode = (code, size = codeSize) => {
     current |= code << bitCount;
-    bitCount += 4;
+    bitCount += size;
     while (bitCount >= 8) {
       bytes.push(current & 0xff);
       current >>= 8;
@@ -391,25 +542,46 @@ function literalLzw(indices) {
     }
   };
 
-  for (let index = 0; index < indices.length; index += 6) {
-    writeCode(clearCode);
-    const end = Math.min(indices.length, index + 6);
-    for (let cursor = index; cursor < end; cursor += 1) {
-      writeCode(indices[cursor]);
+  const resetDictionary = () => {
+    dictionary = new Map();
+    codeSize = 9;
+    nextCode = 258;
+  };
+
+  writeCode(clearCode);
+  let prefix = indices[0];
+  for (let index = 1; index < indices.length; index += 1) {
+    const symbol = indices[index];
+    const key = (prefix << 8) | symbol;
+    const existing = dictionary.get(key);
+    if (existing !== undefined) {
+      prefix = existing;
+      continue;
     }
+
+    writeCode(prefix);
+    if (nextCode < 4096) {
+      dictionary.set(key, nextCode);
+      nextCode += 1;
+      if (nextCode > 1 << codeSize && codeSize < 12) codeSize += 1;
+    } else {
+      writeCode(clearCode);
+      resetDictionary();
+    }
+    prefix = symbol;
   }
+  writeCode(prefix);
   writeCode(endCode);
   if (bitCount > 0) bytes.push(current & 0xff);
   return bytes;
 }
 
 function encodeGif(frames) {
+  const palette = buildPalette(frames);
   const bytes = [...Buffer.from("GIF89a", "ascii")];
   pushWord(bytes, WIDTH);
   pushWord(bytes, HEIGHT);
-  bytes.push(0xf2, C.background, 0);
-  for (const [red, green, blue] of palette) bytes.push(red, green, blue);
-
+  bytes.push(0xf7, 0, 0, ...palette.flat());
   bytes.push(
     0x21, 0xff, 0x0b,
     ...Buffer.from("NETSCAPE2.0", "ascii"),
@@ -419,15 +591,14 @@ function encodeGif(frames) {
   for (const frame of frames) {
     bytes.push(0x21, 0xf9, 0x04, 0x04);
     pushWord(bytes, FRAME_DELAY);
-    bytes.push(0x00, 0x00);
-    bytes.push(0x2c);
+    bytes.push(0x00, 0x00, 0x2c);
     pushWord(bytes, 0);
     pushWord(bytes, 0);
     pushWord(bytes, WIDTH);
     pushWord(bytes, HEIGHT);
-    bytes.push(0x00, 0x03);
+    bytes.push(0x00, 0x08);
 
-    const compressed = literalLzw(frame);
+    const compressed = compressLzw(quantize(frame, palette));
     for (let offset = 0; offset < compressed.length; offset += 255) {
       const block = compressed.slice(offset, offset + 255);
       bytes.push(block.length, ...block);
@@ -438,7 +609,28 @@ function encodeGif(frames) {
   return Buffer.from(bytes);
 }
 
-const frames = Array.from({ length: FRAME_COUNT }, (_, frame) => renderFrame(frame));
-mkdirSync(dirname(outputPath), { recursive: true });
+const codex = decodePng(codexPath);
+const claude = decodePng(claudePath);
+clearCapturedHint(codex, 263, 281);
+clearCapturedHint(claude, 234, 258);
+clearCapturedArea(codex, 9, 230, 58, 265);
+if (
+  codex.width !== CARD_WIDTH ||
+  codex.height !== CARD_HEIGHT ||
+  claude.width !== CARD_WIDTH ||
+  claude.height !== CARD_HEIGHT
+) {
+  throw new Error(`Terminal captures must be ${CARD_WIDTH}x${CARD_HEIGHT}`);
+}
+
+const requestedFrame = Number(process.env.LUME_GIF_PREVIEW_FRAME);
+const frameIndexes = Number.isInteger(requestedFrame) &&
+    requestedFrame >= 0 &&
+    requestedFrame < FRAME_COUNT
+  ? [requestedFrame]
+  : Array.from({ length: FRAME_COUNT }, (_, index) => index);
+const frames = frameIndexes.map((index) => renderFrame(index, codex, claude));
 writeFileSync(outputPath, encodeGif(frames));
-console.log(`Generated ${outputPath} (${FRAME_COUNT} frames, ${(FRAME_COUNT * FRAME_DELAY) / 100}s)`);
+console.log(
+  `Generated ${outputPath} (${WIDTH}x${HEIGHT}, ${frames.length} frames, ${(frames.length * FRAME_DELAY) / 100}s)`,
+);
