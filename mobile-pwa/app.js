@@ -98,8 +98,15 @@ function cleanFilePath(value, workingDirectory) {
   if (!path || path === "/dev/null") return null;
   if (path.startsWith("a/") || path.startsWith("b/")) path = path.slice(2);
   const root = String(workingDirectory || "").replace(/[\\/]+$/, "");
-  if (root && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))) {
-    path = path.slice(root.length).replace(/^[\\/]+/, "");
+  if (root) {
+    const normalizedPath = path.replace(/\\/g, "/");
+    const normalizedRoot = root.replace(/\\/g, "/");
+    const windowsPath = /^[a-z]:\//i.test(normalizedRoot);
+    const comparedPath = windowsPath ? normalizedPath.toLowerCase() : normalizedPath;
+    const comparedRoot = windowsPath ? normalizedRoot.toLowerCase() : normalizedRoot;
+    if (comparedPath === comparedRoot || comparedPath.startsWith(`${comparedRoot}/`)) {
+      path = normalizedPath.slice(normalizedRoot.length).replace(/^\/+/, "");
+    }
   }
   return path || null;
 }
@@ -758,10 +765,21 @@ function activityTime(createdAt) {
   return new Date(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function displayFilePath(path) {
+  const value = String(path || "").trim();
+  if (
+    /^(?:[a-z]:[\\/]|[\\/]{2}|\/)/i.test(value)
+    || /^(?:\.\.[\\/])/.test(value)
+  ) {
+    return value;
+  }
+  return value.split(/[\\/]/).filter(Boolean).pop() || value;
+}
+
 function fileChangeRows(files) {
   return files.map((file) => `
     <code>
-      <span class="file-path">${escapeHtml(file.path)}</span>
+      <span class="file-path" title="${escapeHtml(file.path)}">${escapeHtml(displayFilePath(file.path))}</span>
       <span class="added">+${file.added}</span>
       <span class="removed">-${file.removed}</span>
     </code>
@@ -773,6 +791,26 @@ function chatTextKey(value) {
     .replace(/\r\n?/g, "\n")
     .replace(/[ \t]+$/gm, "")
     .trim();
+}
+
+function comparableResponseText(value) {
+  return chatTextKey(value).replace(/(?:…|\.\.\.)$/, "").trimEnd();
+}
+
+function sameResponseText(left, right) {
+  const leftKey = comparableResponseText(left);
+  const rightKey = comparableResponseText(right);
+  if (!leftKey || !rightKey) return false;
+  if (leftKey === rightKey) return true;
+  const shorter = leftKey.length <= rightKey.length ? leftKey : rightKey;
+  const longer = leftKey.length <= rightKey.length ? rightKey : leftKey;
+  return shorter.length >= 256 && longer.startsWith(shorter);
+}
+
+function keepFullerResponse(item, response) {
+  if (chatTextKey(response).length > chatTextKey(item.detail).length) {
+    item.detail = response;
+  }
 }
 
 function buildChatTurns(session) {
@@ -795,15 +833,16 @@ function buildChatTurns(session) {
       summarizeFileChanges(activity.detail || "", activity.files || [], session.workingDirectory),
     );
     const messageKey = activity.kind === "message" ? chatTextKey(activity.detail) : "";
-    if (
-      messageKey
-      && current.items.some(
-        (item) => item.kind === "message" && chatTextKey(item.detail) === messageKey,
-      )
-    ) {
+    const matchingMessage = messageKey
+      ? current.items.find(
+          (item) => item.kind === "message" && sameResponseText(item.detail, activity.detail),
+        )
+      : undefined;
+    if (matchingMessage) {
+      keepFullerResponse(matchingMessage, activity.detail);
       continue;
     }
-    current.items.push(activity);
+    current.items.push({ ...activity });
   }
   for (const result of session.results || []) {
     const resultTurn = [...turns]
@@ -815,14 +854,16 @@ function buildChatTurns(session) {
       resultTurn.files,
       summarizeFileChanges("", result.files || [], session.workingDirectory),
     );
-    if (
-      result.response
-      && !resultTurn.items.some(
-        (item) =>
-          item.kind === "message"
-          && chatTextKey(item.detail) === chatTextKey(result.response),
-      )
-    ) {
+    const matchingMessage = result.response
+      ? resultTurn.items.find(
+          (item) =>
+            item.kind === "message"
+            && sameResponseText(item.detail, result.response),
+        )
+      : undefined;
+    if (matchingMessage) {
+      keepFullerResponse(matchingMessage, result.response);
+    } else if (result.response) {
       resultTurn.items.push({
         id: `response:${result.id}`,
         kind: "message",
@@ -834,15 +875,18 @@ function buildChatTurns(session) {
       });
     }
   }
-  if (
-    session.lastResponse
-    && !turns.some((turn) =>
-      turn.items.some(
-        (item) =>
-          item.kind === "message"
-          && chatTextKey(item.detail) === chatTextKey(session.lastResponse),
-      ))
-  ) {
+  const matchingLastResponse = session.lastResponse
+    ? turns
+        .flatMap((turn) => turn.items)
+        .find(
+          (item) =>
+            item.kind === "message"
+            && sameResponseText(item.detail, session.lastResponse),
+        )
+    : undefined;
+  if (matchingLastResponse) {
+    keepFullerResponse(matchingLastResponse, session.lastResponse);
+  } else if (session.lastResponse) {
     current ||= ensureTurn(`response:${session.id}`);
     current.items.push({
       id: `response:${session.id}:${session.updatedAt}`,
@@ -1081,9 +1125,13 @@ function renderChat(sessions) {
     : "";
   chatFeed.innerHTML = permission + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
 
-  const canPrompt = scopes.includes("prompt") && session.capabilities?.canPrompt
-    && ["completed", "failed", "waiting_for_input"].includes(session.status);
+  const promptReady = ["completed", "failed", "waiting_for_input"].includes(session.status);
+  const agentWorking = session.status === "running";
+  const canPrompt = scopes.includes("prompt")
+    && session.capabilities?.canPrompt
+    && (promptReady || agentWorking);
   const promptSubmitting = submittingPromptSessions.has(session.id);
+  const sendLocked = promptSubmitting || agentWorking;
   const promptDraft = promptDrafts.get(session.id) || "";
   const attachments = promptAttachments.get(session.id) || [];
   const canAttachImages = Boolean(session.capabilities?.canAttachImages);
@@ -1092,17 +1140,15 @@ function renderChat(sessions) {
         ${attachments.length ? `<div class="mobile-pending-images">
           <small>${attachments.length === 1 ? "Photo attached" : `${attachments.length} photos attached`}</small>
           ${attachments.map((attachment, index) => `
-          <span title="${escapeHtml(attachment.name || "Attached image")}"><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="${escapeHtml(attachment.name || "Attached image")}" /><button type="button" data-remove-image="${index}" aria-label="Remove image">×</button></span>
+          <span title="${escapeHtml(attachment.name || "Attached image")}"><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="${escapeHtml(attachment.name || "Attached image")}" /><button type="button" data-remove-image="${index}" aria-label="Remove image" ${promptSubmitting ? "disabled" : ""}>×</button></span>
         `).join("")}</div>` : ""}
         ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/*" multiple hidden />
           <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
         <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
-        <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
+        <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${sendLocked || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
         <span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span>
       </form>`
-    : session.status === "running"
-      ? '<div class="mobile-composer-status"><span></span><span></span><span></span><p>Agent is working</p></div>'
-      : '<p class="mobile-composer-unavailable">Sending is unavailable for this session.</p>';
+    : '<p class="mobile-composer-unavailable">Sending is unavailable for this session.</p>';
 
   if (shouldFollow) {
     requestAnimationFrame(() => chatFeed.scrollTo({ top: chatFeed.scrollHeight, behavior: "smooth" }));
@@ -2022,8 +2068,9 @@ function imageDataUrl(image, maxDimension, quality) {
 }
 
 async function prepareMobileImage(file) {
-  if (file.type && !file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
-  if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name} is larger than 20 MB.`);
+  const fileName = file.name || `clipboard-image-${Date.now()}.png`;
+  if (file.type && !file.type.startsWith("image/")) throw new Error(`${fileName} is not an image.`);
+  if (file.size > 20 * 1024 * 1024) throw new Error(`${fileName} is larger than 20 MB.`);
   const source = await readMobileFileDataUrl(file);
   const nativeImages = nativePlatform() === "android"
     ? window.Capacitor?.Plugins?.LumeImages
@@ -2033,7 +2080,7 @@ async function prepareMobileImage(file) {
       dataBase64: source.slice(source.indexOf(",") + 1),
     });
     return {
-      name: file.name.replace(/\.[^.]+$/, "") + ".jpg",
+      name: fileName.replace(/\.[^.]+$/, "") + ".jpg",
       mimeType: prepared.mimeType,
       dataBase64: prepared.dataBase64,
       previewDataUrl: prepared.previewDataUrl,
@@ -2045,21 +2092,58 @@ async function prepareMobileImage(file) {
     dataUrl = imageDataUrl(image, dimension, quality);
     if (dataUrl.length <= 1_800_000) break;
   }
-  if (dataUrl.length > 1_800_000) throw new Error(`${file.name} could not be prepared for secure transfer.`);
+  if (dataUrl.length > 1_800_000) throw new Error(`${fileName} could not be prepared for secure transfer.`);
   return {
-    name: file.name.replace(/\.[^.]+$/, "") + ".jpg",
+    name: fileName.replace(/\.[^.]+$/, "") + ".jpg",
     mimeType: "image/jpeg",
     dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
     previewDataUrl: imageDataUrl(image, 360, 0.68),
   };
 }
 
+function clipboardImageFiles(event) {
+  const itemFiles = [...(event.clipboardData?.items || [])]
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  if (itemFiles.length) return itemFiles;
+  return [...(event.clipboardData?.files || [])]
+    .filter((file) => !file.type || file.type.startsWith("image/"));
+}
+
+async function attachMobileImages(sessionId, files) {
+  const existing = promptAttachments.get(sessionId) || [];
+  const selected = [...files].slice(0, 4 - existing.length);
+  const prepared = [];
+  for (const file of selected) prepared.push(await prepareMobileImage(file));
+  attachPreparedMobileImages(sessionId, prepared);
+}
+
+function attachPreparedMobileImages(sessionId, prepared) {
+  const existing = promptAttachments.get(sessionId) || [];
+  const available = Math.max(0, 4 - existing.length);
+  if (!prepared.length || !available) return;
+  promptAttachments.set(sessionId, [...existing, ...prepared.slice(0, available)]);
+  lastChatRenderKey = "";
+  renderChat(currentSnapshot?.sessions || []);
+}
+
+async function readNativeClipboardImage() {
+  const images = nativePlatform() === "android"
+    ? window.Capacitor?.Plugins?.LumeImages
+    : null;
+  if (!images?.readClipboardImage) return null;
+  return images.readClipboardImage();
+}
+
 async function submitPromptForm(form) {
+  const sessionId = form.dataset.session;
+  const session = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
+  if (session?.status === "running") return;
   if (!(await verifySensitiveAction())) return;
   const textarea = form.querySelector("textarea");
   const button = form.querySelector(".mobile-send-button, button[type='submit']");
   const status = form.querySelector(".prompt-send-state");
-  const sessionId = form.dataset.session;
   const submittedPrompt = textarea.value.trim();
   const attachments = promptAttachments.get(sessionId) || [];
   if ((!submittedPrompt && !attachments.length) || submittingPromptSessions.has(sessionId)) return;
@@ -2072,6 +2156,7 @@ async function submitPromptForm(form) {
   button.setAttribute("aria-label", "Sending prompt");
   button.innerHTML = sendSpinnerMarkup;
   if (status) status.textContent = "Sending prompt…";
+  let promptAccepted = false;
   try {
     await executeCommand({
       type: "submit_prompt",
@@ -2079,6 +2164,7 @@ async function submitPromptForm(form) {
       prompt: submittedPrompt,
       attachments,
     });
+    promptAccepted = true;
     promptDrafts.delete(sessionId);
     promptAttachments.delete(sessionId);
     textarea.value = "";
@@ -2090,7 +2176,11 @@ async function submitPromptForm(form) {
       form.classList.remove("is-sending");
       form.setAttribute("aria-busy", "false");
       textarea.disabled = false;
-      button.disabled = false;
+      const currentSession = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
+      button.disabled =
+        promptAccepted
+        || currentSession?.status === "running"
+        || (!textarea.value.trim() && !(promptAttachments.get(sessionId) || []).length);
       button.setAttribute("aria-label", "Send prompt");
       button.innerHTML = sendIconMarkup;
       if (status) status.textContent = "";
@@ -2107,8 +2197,10 @@ function rememberPromptDraft(event) {
   promptDrafts.set(form.dataset.session, textarea.value);
   const sendButton = form.querySelector(".mobile-send-button");
   if (sendButton && !submittingPromptSessions.has(form.dataset.session)) {
+    const session = currentSnapshot?.sessions?.find((item) => item.id === form.dataset.session);
     sendButton.disabled =
-      !textarea.value.trim() && !(promptAttachments.get(form.dataset.session) || []).length;
+      session?.status === "running"
+      || (!textarea.value.trim() && !(promptAttachments.get(form.dataset.session) || []).length);
   }
 }
 
@@ -2160,20 +2252,42 @@ chatScreen.addEventListener("submit", async (event) => {
   await submitPromptForm(form);
 });
 chatScreen.addEventListener("input", rememberPromptDraft);
+chatScreen.addEventListener("paste", async (event) => {
+  const form = event.target.closest?.(".mobile-chat-form");
+  const sessionId = form?.dataset.session;
+  const session = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
+  const files = clipboardImageFiles(event);
+  const clipboardTypes = [...(event.clipboardData?.types || [])];
+  const hasImageHint = clipboardTypes.some(
+    (type) => type === "Files" || type.toLowerCase().startsWith("image/"),
+  );
+  if (
+    !sessionId
+    || submittingPromptSessions.has(sessionId)
+    || !session?.capabilities?.canAttachImages
+    || (!files.length && !hasImageHint)
+  ) return;
+  event.preventDefault();
+  try {
+    if (files.length) {
+      await attachMobileImages(sessionId, files);
+    } else {
+      const prepared = await readNativeClipboardImage();
+      if (!prepared) throw new Error("Could not read the image from the clipboard.");
+      attachPreparedMobileImages(sessionId, [prepared]);
+    }
+  } catch (error) {
+    showBanner(error?.message || "Could not attach this image.", "error");
+  }
+});
 chatScreen.addEventListener("change", async (event) => {
   const input = event.target.closest(".mobile-image-input");
   if (!input) return;
   const form = input.closest(".mobile-chat-form");
   const sessionId = form?.dataset.session;
   if (!sessionId) return;
-  const existing = promptAttachments.get(sessionId) || [];
   try {
-    const selected = [...(input.files || [])].slice(0, 4 - existing.length);
-    const prepared = [];
-    for (const file of selected) prepared.push(await prepareMobileImage(file));
-    promptAttachments.set(sessionId, [...existing, ...prepared]);
-    lastChatRenderKey = "";
-    renderChat(currentSnapshot?.sessions || []);
+    await attachMobileImages(sessionId, input.files || []);
   } catch (error) {
     showBanner(error?.message || "Could not attach this image.", "error");
   }

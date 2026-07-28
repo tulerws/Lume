@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { convertFileSrc } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -30,8 +29,10 @@
     loadTerminalWindowState,
     moveTerminalWindow,
     openSessionSource,
+    readLocalImageDataUrl,
     refreshAgentRateLimits,
     resizeTerminalWindow,
+    setTerminalFileDialogActive,
     submitPrompt,
     syncTerminalWindowPosition,
     terminateSession,
@@ -92,6 +93,7 @@
   let terminateConfirm = $state(false);
   let terminating = $state(false);
   let activeTab = $state<"chat" | "changes">("chat");
+  let workTrayExpanded = $state(true);
   let rateLimitRefreshRequested = false;
   let outputElement = $state<HTMLDivElement | null>(null);
   let language = $state<Language>("en");
@@ -241,14 +243,23 @@
       .replace(/[ \t]+$/gm, "")
       .trim();
   }
+  function comparableResponseText(value?: string): string {
+    return chatTextKey(value).replace(/(?:…|\.\.\.)$/, "").trimEnd();
+  }
+  function sameResponseText(left?: string, right?: string): boolean {
+    const leftKey = comparableResponseText(left);
+    const rightKey = comparableResponseText(right);
+    if (!leftKey || !rightKey) return false;
+    if (leftKey === rightKey) return true;
+    const [shorter, longer] =
+      leftKey.length <= rightKey.length ? [leftKey, rightKey] : [rightKey, leftKey];
+    return shorter.length >= 256 && longer.startsWith(shorter);
+  }
+  function fullerResponseText(left?: string, right?: string): string | undefined {
+    return chatTextKey(right).length > chatTextKey(left).length ? right : left;
+  }
   const chatEntries = $derived.by<ChatEntry[]>(() => {
     let sequence = 0;
-    const entries = activities.map((activity) => ({
-      id: `activity:${activity.id}`,
-      activity,
-      files: activityChanges(activity),
-      sequence: sequence++,
-    }));
     const promptTimes = activities
       .filter((activity) => activity.kind === "prompt")
       .map((activity) => activity.createdAt)
@@ -261,6 +272,31 @@
       }
       return segment;
     };
+    const entries: ChatEntry[] = [];
+    for (const activity of activities) {
+      const files = activityChanges(activity);
+      const matchingMessage = activity.kind === "message"
+        ? [...entries].reverse().find((entry) =>
+            entry.activity.kind === "message" &&
+            sameResponseText(entry.activity.detail, activity.detail) &&
+            promptSegment(entry.activity.createdAt) === promptSegment(activity.createdAt)
+          )
+        : undefined;
+      if (matchingMessage) {
+        matchingMessage.activity.detail = fullerResponseText(
+          matchingMessage.activity.detail,
+          activity.detail,
+        );
+        mergeFileChanges(matchingMessage.files, files);
+        continue;
+      }
+      entries.push({
+        id: `activity:${activity.id}`,
+        activity: { ...activity },
+        files,
+        sequence: sequence++,
+      });
+    }
     for (const result of session?.results ?? []) {
       const resultFiles = summarizeFileChanges(
         result.response,
@@ -270,10 +306,14 @@
       const responseKey = chatTextKey(result.response);
       const matchingMessage = [...entries].reverse().find((entry) =>
         entry.activity.kind === "message" &&
-        chatTextKey(entry.activity.detail) === responseKey &&
+        sameResponseText(entry.activity.detail, responseKey) &&
         promptSegment(entry.activity.createdAt) === promptSegment(result.createdAt)
       );
       if (matchingMessage) {
+        matchingMessage.activity.detail = fullerResponseText(
+          matchingMessage.activity.detail,
+          result.response,
+        );
         mergeFileChanges(matchingMessage.files, resultFiles);
       } else if (result.response || resultFiles.length) {
         entries.push({
@@ -295,12 +335,17 @@
     if (session?.lastResponse) {
       const responseKey = chatTextKey(session.lastResponse);
       const segment = promptSegment(session.updatedAt);
-      const alreadyPresent = entries.some((entry) =>
+      const matchingMessage = entries.find((entry) =>
         entry.activity.kind === "message" &&
-        chatTextKey(entry.activity.detail) === responseKey &&
+        sameResponseText(entry.activity.detail, responseKey) &&
         promptSegment(entry.activity.createdAt) === segment
       );
-      if (!alreadyPresent) {
+      if (matchingMessage) {
+        matchingMessage.activity.detail = fullerResponseText(
+          matchingMessage.activity.detail,
+          session.lastResponse,
+        );
+      } else {
         entries.push({
           id: `last-response:${session.id}:${session.updatedAt}`,
           activity: {
@@ -877,11 +922,26 @@
     if (!canSubmit || !readyForPrompt || sending) return;
     message = null;
     try {
-      const selected = await openDialog({
-        multiple: true,
-        directory: false,
-        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
-      });
+      let terminalLowered = false;
+      let selected: string | string[] | null = null;
+      try {
+        try {
+          await setTerminalFileDialogActive(label, true);
+          terminalLowered = true;
+        } catch {
+          // The native picker can still open on window managers without topmost control.
+        }
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        selected = await openDialog({
+          multiple: true,
+          directory: false,
+          filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
+        });
+      } finally {
+        if (terminalLowered) {
+          await setTerminalFileDialogActive(label, false).catch(() => undefined);
+        }
+      }
       const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
         .filter((path): path is string => typeof path === "string");
       for (const path of paths.slice(0, 4 - promptAttachments.length)) {
@@ -905,20 +965,95 @@
     promptAttachments = promptAttachments.filter((_, current) => current !== index);
   }
 
-  function imagePreview(path: string): Promise<string> {
+  function loadImage(source: string): Promise<HTMLImageElement> {
     return new Promise((resolve, reject) => {
       const image = new Image();
-      image.onload = () => {
-        const scale = Math.min(1, 480 / Math.max(image.naturalWidth, image.naturalHeight));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-        canvas.getContext("2d")?.drawImage(image, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", 0.78));
-      };
+      image.onload = () => resolve(image);
       image.onerror = () => reject(new Error(tr("Could not preview this image", "Não foi possível visualizar esta imagem")));
-      image.src = convertFileSrc(path);
+      image.src = source;
     });
+  }
+
+  function imageDataUrl(image: HTMLImageElement, maxDimension: number, quality: number) {
+    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error(tr("Could not prepare this image", "Não foi possível preparar esta imagem"));
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", quality);
+  }
+
+  async function imagePreview(path: string): Promise<string> {
+    const source = await readLocalImageDataUrl(path);
+    return imageDataUrl(await loadImage(source), 480, 0.78);
+  }
+
+  function readFileDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        typeof reader.result === "string"
+          ? resolve(reader.result)
+          : reject(new Error(tr("Could not read this image", "Não foi possível ler esta imagem")));
+      reader.onerror = () =>
+        reject(new Error(tr("Could not read this image", "Não foi possível ler esta imagem")));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function prepareClipboardImage(
+    file: File,
+    index: number,
+  ): Promise<PromptAttachmentInput> {
+    if (file.size > 20 * 1024 * 1024) {
+      throw new Error(tr("The pasted image is too large", "A imagem colada é muito grande"));
+    }
+    const image = await loadImage(await readFileDataUrl(file));
+    let dataUrl = "";
+    for (const [dimension, quality] of [[1600, 0.82], [1400, 0.74], [1200, 0.68], [960, 0.6]]) {
+      dataUrl = imageDataUrl(image, dimension, quality);
+      if (dataUrl.length <= 6_900_000) break;
+    }
+    if (dataUrl.length > 6_900_000) {
+      throw new Error(tr("The pasted image is too large", "A imagem colada é muito grande"));
+    }
+    const baseName = (file.name || `clipboard-image-${index + 1}`)
+      .replace(/\.[^.]+$/, "");
+    return {
+      name: `${baseName}.jpg`,
+      mimeType: "image/jpeg",
+      dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
+      previewDataUrl: imageDataUrl(image, 480, 0.78),
+    };
+  }
+
+  async function pasteImages(event: ClipboardEvent) {
+    const itemFiles = [...(event.clipboardData?.items ?? [])]
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    const files = itemFiles.length
+      ? itemFiles
+      : [...(event.clipboardData?.files ?? [])]
+          .filter((file) => !file.type || file.type.startsWith("image/"));
+    if (!files.length) return;
+    if (!canSubmit || !readyForPrompt || sending || !capabilities?.canAttachImages) return;
+    event.preventDefault();
+    message = null;
+    try {
+      const available = 4 - promptAttachments.length;
+      const prepared = [];
+      for (const [index, file] of files.slice(0, available).entries()) {
+        prepared.push(await prepareClipboardImage(file, index));
+      }
+      promptAttachments = [...promptAttachments, ...prepared];
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
   }
 
   function sendPromptOnEnter(event: KeyboardEvent) {
@@ -1024,44 +1159,62 @@
       </header>
 
       {#if todo || goal}
-        <aside class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")}>
-          {#if todo}
-            <section class="work-card todo-card">
-              <div class="work-card-heading">
-                <strong>TO DO</strong>
-                <span>{completedTodoItems}/{todo.items.length}</span>
-              </div>
-              <i class="todo-progress" style={`--todo-progress: ${(completedTodoItems / todo.items.length) * 100}%`}>
-                <em></em>
-              </i>
-              <ul>
-                {#each todo.items.slice(0, 4) as item}
-                  <li class:active={item.status === "in_progress"} class:done={item.status === "completed"} title={workItemLabel(item.status)}>
-                    <span aria-hidden="true"></span>
-                    <small>{item.label}</small>
-                  </li>
-                {/each}
-              </ul>
-              {#if todo.items.length > 4}
-                <small class="work-more">+{todo.items.length - 4} {tr("more", "a mais")}</small>
+        <aside class:collapsed={!workTrayExpanded} class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")}>
+          <button
+            class="work-tray-toggle"
+            type="button"
+            aria-expanded={workTrayExpanded}
+            aria-label={workTrayExpanded ? tr("Collapse agent work", "Recolher trabalho do agente") : tr("Expand agent work", "Expandir trabalho do agente")}
+            onclick={() => (workTrayExpanded = !workTrayExpanded)}
+          >
+            <strong>{tr("Agent work", "Trabalho do agente")}</strong>
+            <span>
+              {#if todo}<small>TO DO {completedTodoItems}/{todo.items.length}</small>{/if}
+              {#if goal}<small>GOAL · {goalStatusLabel(goal.status)} · {elapsedGoalTime()}</small>{/if}
+            </span>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"></path></svg>
+          </button>
+          <div class="work-tray-body" aria-hidden={!workTrayExpanded}>
+            <div class="work-tray-grid">
+              {#if todo}
+                <section class="work-card todo-card">
+                  <div class="work-card-heading">
+                    <strong>TO DO</strong>
+                    <span>{completedTodoItems}/{todo.items.length}</span>
+                  </div>
+                  <i class="todo-progress" style={`--todo-progress: ${(completedTodoItems / todo.items.length) * 100}%`}>
+                    <em></em>
+                  </i>
+                  <ul>
+                    {#each todo.items.slice(0, 4) as item}
+                      <li class:active={item.status === "in_progress"} class:done={item.status === "completed"} title={workItemLabel(item.status)}>
+                        <span aria-hidden="true"></span>
+                        <small>{item.label}</small>
+                      </li>
+                    {/each}
+                  </ul>
+                  {#if todo.items.length > 4}
+                    <small class="work-more">+{todo.items.length - 4} {tr("more", "a mais")}</small>
+                  {/if}
+                </section>
               {/if}
-            </section>
-          {/if}
-          {#if goal}
-            <section class="work-card goal-card">
-              <div class="work-card-heading">
-                <strong>GOAL</strong>
-                <span class:complete={goal.status === "complete"} class:blocked={goal.status === "blocked"}>
-                  {goalStatusLabel(goal.status)}
-                </span>
-              </div>
-              <p title={goal.objective}>{goal.objective}</p>
-              <small class="goal-time">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"></circle><path d="M10 6v4l3 2"></path></svg>
-                {elapsedGoalTime()}
-              </small>
-            </section>
-          {/if}
+              {#if goal}
+                <section class="work-card goal-card">
+                  <div class="work-card-heading">
+                    <strong>GOAL</strong>
+                    <span class:complete={goal.status === "complete"} class:blocked={goal.status === "blocked"}>
+                      {goalStatusLabel(goal.status)}
+                    </span>
+                  </div>
+                  <p title={goal.objective}>{goal.objective}</p>
+                  <small class="goal-time">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"></circle><path d="M10 6v4l3 2"></path></svg>
+                    {elapsedGoalTime()}
+                  </small>
+                </section>
+              {/if}
+            </div>
+          </div>
         </aside>
       {/if}
 
@@ -1180,6 +1333,7 @@
         class="terminal-composer"
         class:sending
         aria-busy={sending}
+        onpaste={(event) => void pasteImages(event)}
         onsubmit={(event) => {
           event.preventDefault();
           void sendPrompt();
@@ -1296,7 +1450,17 @@
   .dock-button { color: #4a7564; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
-  .work-tray { padding: 6px 8px; display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 5px; overflow-x: hidden; overflow-y: auto; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
+  .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
+  .work-tray-toggle { width: 100%; min-height: 27px; padding: 4px 9px; display: flex; align-items: center; gap: 7px; border: 0; color: #62756c; background: transparent; cursor: pointer; }
+  .work-tray-toggle:hover { background: rgba(65, 100, 83, 0.035); }
+  .work-tray-toggle > strong { flex: 0 0 auto; font: 800 6px Inter, sans-serif; letter-spacing: 0.1em; text-transform: uppercase; }
+  .work-tray-toggle > span { min-width: 0; display: flex; flex: 1; justify-content: flex-end; gap: 5px; overflow: hidden; }
+  .work-tray-toggle small { min-width: 0; overflow: hidden; color: #83928b; font: 680 6px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .work-tray-toggle svg { width: 11px; height: 11px; flex: 0 0 auto; transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+  .work-tray.collapsed .work-tray-toggle svg { transform: rotate(-90deg); }
+  .work-tray-body { max-height: 150px; overflow: hidden; opacity: 1; transition: max-height 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 140ms ease; }
+  .work-tray.collapsed .work-tray-body { max-height: 0; opacity: 0; pointer-events: none; }
+  .work-tray-grid { max-height: 145px; padding: 0 8px 6px; display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 5px; overflow-x: hidden; overflow-y: auto; }
   .work-card { min-width: 0; padding: 6px 7px; display: grid; align-content: start; gap: 4px; overflow: hidden; border: 1px solid rgba(78, 106, 93, 0.09); border-radius: 8px; background: rgba(255, 255, 255, 0.34); }
   .work-card-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
   .work-card-heading strong { color: #587064; font: 800 6px Inter, sans-serif; letter-spacing: 0.12em; }
@@ -1436,6 +1600,9 @@
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
   .terminal-window.dark .pending-images { background: rgba(83, 174, 129, 0.055); }
   .terminal-window.dark .work-tray { border-color: rgba(190, 209, 200, 0.07); background: rgba(202, 222, 212, 0.018); }
+  .terminal-window.dark .work-tray-toggle { color: #99aea4; }
+  .terminal-window.dark .work-tray-toggle:hover { background: rgba(205, 225, 215, 0.025); }
+  .terminal-window.dark .work-tray-toggle small { color: #7f9188; }
   .terminal-window.dark .work-card { border-color: rgba(205, 222, 213, 0.07); background: rgba(218, 234, 226, 0.025); }
   .terminal-window.dark .work-card-heading strong { color: #93aa9f; }
   .terminal-window.dark .todo-card li { color: #77867f; }

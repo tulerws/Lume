@@ -1250,16 +1250,33 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
         }
     }
     if activity.kind == "message" {
-        let activity_detail = activity.detail.as_deref().map(normalized_chat_text);
+        let activity_detail = activity.detail.clone();
         let duplicate = session.activities.iter().rposition(|existing| {
             existing.kind == "message"
-                && existing.detail.as_deref().map(normalized_chat_text) == activity_detail
+                && match (existing.detail.as_deref(), activity_detail.as_deref()) {
+                    (Some(existing), Some(incoming)) => same_chat_response(existing, incoming),
+                    (None, None) => true,
+                    _ => false,
+                }
         });
         if let Some(index) = duplicate.filter(|index| {
             !session.activities[index.saturating_add(1)..]
                 .iter()
-                .any(|existing| existing.kind == "prompt")
+            .any(|existing| existing.kind == "prompt")
         }) {
+            if let Some(incoming) = activity.detail.take() {
+                let should_replace =
+                    session.activities[index]
+                        .detail
+                        .as_deref()
+                        .map_or(true, |existing| {
+                            normalized_chat_text(&incoming).len()
+                                > normalized_chat_text(existing).len()
+                        });
+                if should_replace {
+                    session.activities[index].detail = Some(incoming);
+                }
+            }
             session.activities[index].status = activity.status;
             for file in activity.files {
                 if !session.activities[index].files.contains(&file) {
@@ -1315,6 +1332,33 @@ fn normalized_chat_text(value: &str) -> String {
         .to_string()
 }
 
+fn comparable_chat_response(value: &str) -> String {
+    let normalized = normalized_chat_text(value);
+    normalized
+        .strip_suffix('…')
+        .or_else(|| normalized.strip_suffix("..."))
+        .unwrap_or(&normalized)
+        .trim_end()
+        .to_string()
+}
+
+fn same_chat_response(left: &str, right: &str) -> bool {
+    let left = comparable_chat_response(left);
+    let right = comparable_chat_response(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    let (shorter, longer) = if left.len() <= right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    shorter.len() >= 256 && longer.starts_with(shorter)
+}
+
 fn same_permission_request(current: &PermissionRequest, incoming: &PermissionRequest) -> bool {
     current.kind == incoming.kind
         && current.summary == incoming.summary
@@ -1336,7 +1380,7 @@ fn equivalent_result_in_same_turn(
     response: &str,
     created_at: i64,
 ) -> bool {
-    normalized_chat_text(&existing.response) == normalized_chat_text(response)
+    same_chat_response(&existing.response, response)
         && !has_prompt_between(session, existing.created_at, created_at)
 }
 
@@ -1969,6 +2013,40 @@ mod tests {
                 .filter(|activity| activity.kind == "message")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn truncated_agent_message_is_replaced_by_the_complete_response() {
+        let event = started_event("codex:complete-answer", 4242);
+        let mut session = session_from_event(&event, 1_000);
+        let complete = format!("{} resposta completa", "a".repeat(300));
+        let truncated = format!("{}…", "a".repeat(300));
+
+        for (id, detail, created_at) in [
+            ("app-server", truncated, 10_000),
+            ("rollout", complete.clone(), 11_000),
+        ] {
+            remember_activity(
+                &mut session,
+                SessionActivity {
+                    id: id.into(),
+                    kind: "message".into(),
+                    title: "Resposta do agente".into(),
+                    detail: Some(detail),
+                    status: "completed".into(),
+                    created_at,
+                    files: Vec::new(),
+                    attachments: Vec::new(),
+                    append_detail: false,
+                },
+            );
+        }
+
+        assert_eq!(session.activities.len(), 1);
+        assert_eq!(
+            session.activities[0].detail.as_deref(),
+            Some(complete.as_str())
         );
     }
 

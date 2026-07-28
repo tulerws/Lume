@@ -26,6 +26,7 @@ const DOCK_DISTANCE: i32 = 84;
 const SCREEN_MARGIN: i32 = 12;
 const DOCK_ANIMATION_STEPS: i32 = 9;
 const MAX_REASONABLE_COORDINATE: i32 = 65_536;
+const TERMINAL_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,7 @@ struct Placement {
     ready: bool,
     configured: bool,
     presented: bool,
+    created_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -200,11 +202,23 @@ impl Placement {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TerminalWindows {
     placements: Arc<Mutex<HashMap<String, Placement>>>,
     settling: Arc<Mutex<HashSet<String>>>,
     native_drags: Arc<Mutex<HashSet<String>>>,
+    visible: Arc<Mutex<bool>>,
+}
+
+impl Default for TerminalWindows {
+    fn default() -> Self {
+        Self {
+            placements: Arc::default(),
+            settling: Arc::default(),
+            native_drags: Arc::default(),
+            visible: Arc::new(Mutex::new(true)),
+        }
+    }
 }
 
 impl TerminalWindows {
@@ -219,13 +233,16 @@ impl TerminalWindows {
     ) -> Result<String, String> {
         let label = terminal_label(&session.id);
         if let Some(window) = app.get_webview_window(&label) {
-            let ready = self
-                .placements
-                .lock()
-                .ok()
-                .and_then(|placements| placements.get(&label).map(|placement| placement.ready))
-                .unwrap_or(false);
-            if !ready {
+            let loading = self.placements.lock().ok().and_then(|placements| {
+                placements
+                    .get(&label)
+                    .map(|placement| (!placement.ready, placement.created_at.elapsed()))
+            });
+            if loading.is_some_and(|(loading, elapsed)| loading && elapsed < TERMINAL_LOAD_TIMEOUT)
+            {
+                return Ok(label);
+            }
+            if loading.is_none_or(|(loading, _)| loading) {
                 let _ = window.close();
                 self.remove(&label);
                 return Err(
@@ -302,6 +319,7 @@ impl TerminalWindows {
             ready: false,
             configured: false,
             presented: false,
+            created_at: Instant::now(),
         };
 
         self.placements
@@ -331,8 +349,10 @@ impl TerminalWindows {
                 .resizable(true)
                 .visible(cfg!(target_os = "windows"))
                 .on_page_load(move |window, payload| {
-                    if matches!(payload.event(), PageLoadEvent::Finished) {
-                        ready_registry.mark_ready(&ready_label);
+                    let ready_event = matches!(payload.event(), PageLoadEvent::Finished)
+                        || (cfg!(target_os = "windows")
+                            && matches!(payload.event(), PageLoadEvent::Started));
+                    if ready_event && ready_registry.mark_ready(&ready_label) {
                         ready_registry.present_if_ready(&window, &ready_label);
                         emit_windows_changed(window.app_handle());
                     }
@@ -417,6 +437,35 @@ impl TerminalWindows {
             .get(label)
             .map(|placement| state_with_connections(&placements, placement))
             .ok_or_else(|| "Mini terminal não encontrado".to_string())
+    }
+
+    pub fn set_visible(&self, app: &AppHandle, visible: bool) -> Result<(), String> {
+        *self
+            .visible
+            .lock()
+            .map_err(|_| "Não foi possível alterar os mini terminais".to_string())? = visible;
+        let labels = self
+            .placements
+            .lock()
+            .map_err(|_| "Não foi possível acessar os mini terminais".to_string())?
+            .values()
+            .filter(|placement| placement.ready)
+            .map(|placement| placement.label.clone())
+            .collect::<Vec<_>>();
+
+        for label in labels {
+            let Some(window) = app.get_webview_window(&label) else {
+                continue;
+            };
+            if visible {
+                window.show().map_err(|error| error.to_string())?;
+            } else {
+                emit_dock_preview(app, &label, None);
+                window.hide().map_err(|error| error.to_string())?;
+            }
+        }
+        emit_windows_changed(app);
+        Ok(())
     }
 
     pub fn close(&self, app: &AppHandle, label: &str) -> Result<(), String> {
@@ -1017,12 +1066,17 @@ impl TerminalWindows {
             .unwrap_or(false)
     }
 
-    fn mark_ready(&self, label: &str) {
+    fn mark_ready(&self, label: &str) -> bool {
         if let Ok(mut placements) = self.placements.lock() {
             if let Some(placement) = placements.get_mut(label) {
+                if placement.ready {
+                    return false;
+                }
                 placement.ready = true;
+                return true;
             }
         }
+        false
     }
 
     fn mark_configured(&self, label: &str, layered: bool) {
@@ -1049,6 +1103,9 @@ impl TerminalWindows {
             })
             .unwrap_or(false);
         if !should_present {
+            return;
+        }
+        if !self.visible.lock().map(|visible| *visible).unwrap_or(true) {
             return;
         }
         if window.show().is_err() {
@@ -1552,6 +1609,7 @@ mod tests {
             ready: true,
             configured: true,
             presented: true,
+            created_at: Instant::now(),
         }
     }
 

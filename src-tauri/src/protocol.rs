@@ -400,8 +400,9 @@ struct GoalFields {
 fn goal_fields(detail: &str) -> Option<GoalFields> {
     let value = serde_json::from_str::<Value>(detail).ok()?;
     Some(GoalFields {
-        objective: find_json_value(&value, &["objective", "goal"])
+        objective: find_json_value(&value, &["objective"])
             .and_then(Value::as_str)
+            .or_else(|| find_json_value(&value, &["goal"]).and_then(Value::as_str))
             .map(str::to_string),
         status: find_json_value(&value, &["status"])
             .and_then(Value::as_str)
@@ -410,7 +411,8 @@ fn goal_fields(detail: &str) -> Option<GoalFields> {
             &value,
             &["startedAt", "started_at", "createdAt", "created_at"],
         )
-        .and_then(Value::as_i64),
+        .and_then(Value::as_i64)
+        .map(timestamp_millis),
         elapsed_ms: find_json_value(
             &value,
             &[
@@ -435,6 +437,14 @@ fn goal_fields(detail: &str) -> Option<GoalFields> {
             .map(|seconds| seconds.saturating_mul(1_000))
         }),
     })
+}
+
+fn timestamp_millis(timestamp: i64) -> i64 {
+    if timestamp.abs() < 100_000_000_000 {
+        timestamp.saturating_mul(1_000)
+    } else {
+        timestamp
+    }
 }
 
 fn find_json_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -959,6 +969,33 @@ mod tests {
             .as_ref()
             .expect("goal");
         assert_eq!(goal.started_at, 10_000);
+    }
+
+    #[test]
+    fn snapshot_normalizes_goal_start_time_from_seconds() {
+        let mut session = session();
+        session.activities.push(SessionActivity {
+            id: "goal-read-seconds".into(),
+            kind: "tool".into(),
+            title: "functions · get_goal".into(),
+            detail: Some(
+                r#"{"goal":{"objective":"Test goal","status":"active","createdAt":1785190621}}"#
+                    .into(),
+            ),
+            status: "completed".into(),
+            created_at: 1_785_190_942_000,
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+
+        let snapshot = HubSnapshot::new(vec![session]);
+        let goal = snapshot.sessions[0]
+            .work_summary
+            .goal
+            .as_ref()
+            .expect("goal");
+        assert_eq!(goal.started_at, 1_785_190_621_000);
     }
 
     #[test]

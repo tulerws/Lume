@@ -134,6 +134,17 @@ export async function submitPrompt(
   await invoke("submit_prompt", { sessionId, prompt, attachments });
 }
 
+export async function readLocalImageDataUrl(path: string): Promise<string> {
+  return invoke<string>("read_local_image_data_url", { path });
+}
+
+export async function setTerminalFileDialogActive(
+  label: string,
+  active: boolean,
+): Promise<void> {
+  await invoke("set_terminal_file_dialog_active", { label, active });
+}
+
 export async function refreshAgentRateLimits(agent: AgentSession["agent"]): Promise<void> {
   await invoke("refresh_agent_rate_limits", { agent });
 }
@@ -149,6 +160,11 @@ export async function openTerminalWindow(sessionId: string): Promise<string> {
 export async function loadTerminalWindows(): Promise<TerminalWindowState[]> {
   if (!inDesktop()) return [];
   return invoke<TerminalWindowState[]>("list_terminal_windows");
+}
+
+export async function setTerminalWindowsVisible(visible: boolean): Promise<void> {
+  if (!inDesktop()) return;
+  await invoke("set_terminal_windows_visible", { visible });
 }
 
 export async function loadTerminalWindowState(label: string): Promise<TerminalWindowState> {

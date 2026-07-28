@@ -269,6 +269,31 @@ fn submit_prompt(
 }
 
 #[tauri::command]
+fn read_local_image_data_url(path: String) -> Result<String, String> {
+    control::local_image_data_url(&path)
+}
+
+#[tauri::command]
+fn set_terminal_file_dialog_active(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: String,
+    active: bool,
+) -> Result<(), String> {
+    if !label.starts_with("terminal-") {
+        return Err("A janela informada não é um terminal do Lume".into());
+    }
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+    overlay::set_file_dialog_active(
+        &window,
+        active,
+        state.preferences()?.show_over_fullscreen,
+    )
+}
+
+#[tauri::command]
 fn refresh_agent_rate_limits(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -463,7 +488,7 @@ fn resize_overlay_surface(app: AppHandle, width: i32, height: i32) -> Result<(),
 }
 
 #[tauri::command]
-fn open_terminal_window(
+async fn open_terminal_window(
     app: AppHandle,
     state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
@@ -491,6 +516,15 @@ fn list_terminal_windows(
     terminals: State<'_, terminal_windows::TerminalWindows>,
 ) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
     terminals.list(&app)
+}
+
+#[tauri::command]
+fn set_terminal_windows_visible(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    visible: bool,
+) -> Result<(), String> {
+    terminals.set_visible(&app, visible)
 }
 
 #[tauri::command]
@@ -888,6 +922,8 @@ pub fn run() {
             resolve_permission,
             open_session_source,
             submit_prompt,
+            read_local_image_data_url,
+            set_terminal_file_dialog_active,
             refresh_agent_rate_limits,
             terminate_session,
             list_history,
@@ -903,6 +939,7 @@ pub fn run() {
             resize_overlay_surface,
             open_terminal_window,
             list_terminal_windows,
+            set_terminal_windows_visible,
             get_terminal_window_state,
             close_terminal_window,
             move_terminal_window,

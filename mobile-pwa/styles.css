@@ -1106,6 +1106,11 @@ body.install-modal-open { overflow: hidden; }
   font-size: 13px;
 }
 .mobile-chat-form textarea::placeholder { color: var(--muted); }
+.mobile-chat-form textarea:disabled {
+  opacity: 1;
+  color: var(--text);
+  -webkit-text-fill-color: var(--text);
+}
 .mobile-chat-form .mobile-send-button { width: 42px; min-height: 42px; align-self: end; display: grid; place-items: center; border: 0; border-radius: 11px; color: #122018; background: #7bc297; }
 .mobile-chat-form .mobile-attach-button { width: 38px; min-height: 42px; align-self: end; display: grid; place-items: center; border: 0; border-radius: 10px; color: var(--text-soft); background: transparent; }
 .mobile-chat-form button svg { width: 17px; height: 17px; }

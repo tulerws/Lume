@@ -1,9 +1,13 @@
 package com.tulerws.lume.mobile;
 
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.media.ExifInterface;
+import android.net.Uri;
 import android.util.Base64;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -12,6 +16,7 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -55,6 +60,65 @@ public class LumeImagePlugin extends Plugin {
                 rejectImage(call, error);
             }
         });
+    }
+
+    @PluginMethod
+    public void readClipboardImage(PluginCall call) {
+        ClipboardManager clipboard =
+            (ClipboardManager) getContext().getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+        ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        ClipDescription description = clipboard == null ? null : clipboard.getPrimaryClipDescription();
+        if (clip == null || clip.getItemCount() == 0) {
+            call.reject("The clipboard does not contain an image.", "NO_CLIPBOARD_IMAGE");
+            return;
+        }
+        ClipData.Item item = clip.getItemAt(0);
+        Uri uri = item.getUri();
+        if (uri == null && item.getIntent() != null) uri = item.getIntent().getData();
+        String resolvedType = uri == null ? null : getContext().getContentResolver().getType(uri);
+        boolean containsImage =
+            (description != null && description.hasMimeType("image/*"))
+            || (resolvedType != null && resolvedType.startsWith("image/"));
+        if (uri == null || !containsImage) {
+            call.reject("The clipboard image is unavailable.", "NO_CLIPBOARD_IMAGE");
+            return;
+        }
+        Uri imageUri = uri;
+        executor.submit(() -> {
+            try {
+                byte[] input = readClipboardBytes(imageUri);
+                PreparedImage prepared = prepare(input);
+                JSObject result = new JSObject();
+                result.put("name", "clipboard-image.jpg");
+                result.put("mimeType", "image/jpeg");
+                result.put("dataBase64", Base64.encodeToString(prepared.full, Base64.NO_WRAP));
+                result.put(
+                    "previewDataUrl",
+                    "data:image/jpeg;base64," + Base64.encodeToString(prepared.preview, Base64.NO_WRAP)
+                );
+                call.resolve(result);
+            } catch (Exception error) {
+                rejectImage(call, error);
+            }
+        });
+    }
+
+    private byte[] readClipboardBytes(Uri uri) throws Exception {
+        try (InputStream input = getContext().getContentResolver().openInputStream(uri)) {
+            if (input == null) throw new IllegalArgumentException("Clipboard image is unavailable.");
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[16 * 1024];
+            int total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > MAX_INPUT_BYTES) {
+                    throw new IllegalArgumentException("The clipboard image is larger than 20 MB.");
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toByteArray();
+        }
     }
 
     private void rejectImage(PluginCall call, Exception error) {

@@ -77,6 +77,7 @@
     savePreferences,
     saveResultNote,
     restoreTerminalLayout,
+    setTerminalWindowsVisible,
     submitPrompt,
     takePendingShortcutAction,
     terminateSession,
@@ -211,6 +212,9 @@
   let systemDark = $state(false);
   let mobileStatus = $state<MobileGatewayStatus | null>(null);
   let pairedDevices = $state<PairedDevice[]>(dev ? [devMobileDevice] : []);
+  let newMobileDevice = $state<PairedDevice | null>(null);
+  const knownMobileDeviceIds = new Set<string>();
+  let mobileDevicesInitialized = false;
   let pairingOffer = $state<MobilePairingOffer | null>(null);
   let pairingQr = $state<string | null>(null);
   let mobileBusy = $state(false);
@@ -226,6 +230,19 @@
     return dev && !devices.some((device) => device.id === devMobileDeviceId)
       ? [devMobileDevice, ...devices]
       : devices;
+  }
+
+  function applyPairedDevices(devices: PairedDevice[], announceNew: boolean) {
+    const realDevices = devices.filter((device) => device.id !== devMobileDeviceId);
+    const addedDevice = announceNew
+      ? [...realDevices]
+          .sort((left, right) => right.createdAt - left.createdAt)
+          .find((device) => !knownMobileDeviceIds.has(device.id))
+      : undefined;
+    for (const device of realDevices) knownMobileDeviceIds.add(device.id);
+    pairedDevices = withDevMobileDevice(realDevices);
+    mobileDevicesInitialized = true;
+    if (addedDevice) newMobileDevice = addedDevice;
   }
 
   function shown(value: string) {
@@ -346,6 +363,7 @@
     let stopTerminalListening: (() => void) | undefined;
     let stopShortcutListening: (() => void) | undefined;
     let stopCompanionUpdateListening: (() => void) | undefined;
+    let stopMobileDeviceListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -391,6 +409,23 @@
         sessions.find((session) => session.status === "permission_required")?.id ?? null;
 
       if (isTauri) {
+        stopMobileDeviceListening = await listen<PairedDevice>(
+          "lume://mobile-device-paired",
+          ({ payload }) => {
+            applyPairedDevices([
+              ...pairedDevices.filter(
+                (device) =>
+                  device.id !== devMobileDeviceId && device.id !== payload.id,
+              ),
+              payload,
+            ], true);
+          },
+        );
+        try {
+          applyPairedDevices(await loadPairedDevices(), false);
+        } catch {
+          // Mobile settings still expose the connection error when opened.
+        }
         stopListening = await listen("lume://sessions-changed", () => {
           void refreshSessions(true);
         });
@@ -418,6 +453,7 @@
       stopTerminalListening?.();
       stopShortcutListening?.();
       stopCompanionUpdateListening?.();
+      stopMobileDeviceListening?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       window.removeEventListener("keydown", handleAppShortcut);
       window.removeEventListener("pointerup", finishOverlayDragFromWindow, true);
@@ -619,6 +655,9 @@
     const opening = !expanded;
     let expandedTarget = currentExpandedSize();
 
+    void setTerminalWindowsVisible(opening).catch((error) => {
+      terminalMessage = String(error).replace(/^Error:\s*/, "");
+    });
     morphing = opening ? "opening" : "closing";
     contentVisible = false;
     if (opening) {
@@ -1218,7 +1257,7 @@
         loadPairedDevices(),
       ]);
       mobileStatus = status;
-      pairedDevices = withDevMobileDevice(devices);
+      applyPairedDevices(devices, mobileDevicesInitialized);
     } catch (error) {
       mobileMessageIsError = true;
       mobileMessage = String(error).replace(/^Error:\s*/, "");
@@ -1280,7 +1319,8 @@
     mobileMessage = null;
     try {
       await revokePairedDevice(id);
-      pairedDevices = withDevMobileDevice(await loadPairedDevices());
+      applyPairedDevices(await loadPairedDevices(), false);
+      if (newMobileDevice?.id === id) newMobileDevice = null;
       mobileMessageIsError = false;
       mobileMessage = tr("Device access revoked.", "Acesso do dispositivo revogado.");
     } catch (error) {
@@ -1308,7 +1348,7 @@
     mobileMessage = null;
     try {
       await setPairedDeviceScopes(device.id, scopes);
-      pairedDevices = withDevMobileDevice(await loadPairedDevices());
+      applyPairedDevices(await loadPairedDevices(), false);
       mobileMessageIsError = false;
       mobileMessage = tr("Device permissions updated.", "Permissões do dispositivo atualizadas.");
     } catch (error) {
@@ -1328,6 +1368,20 @@
       mobileMessageIsError = true;
       mobileMessage = tr("Could not copy this value.", "Não foi possível copiar este valor.");
     }
+  }
+
+  async function reviewNewMobileDevice() {
+    const deviceId = newMobileDevice?.id;
+    if (!deviceId) return;
+    await openView("settings");
+    await tick();
+    const section = document.querySelector<HTMLDetailsElement>("[data-mobile-access-section]");
+    if (section) section.open = true;
+    await tick();
+    const deviceCard = [...document.querySelectorAll<HTMLElement>("[data-mobile-device-id]")]
+      .find((element) => element.dataset.mobileDeviceId === deviceId);
+    (deviceCard ?? section)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    newMobileDevice = null;
   }
 
   async function openView(nextView: View) {
@@ -1972,6 +2026,21 @@
           </button>
         </div>
       </header>
+
+      {#if newMobileDevice}
+        <aside class="mobile-device-banner" transition:slide={{ duration: 180, easing: cubicOut }}>
+          <span class="mobile-device-banner-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20"><rect x="5.5" y="2.5" width="9" height="15" rx="2" /><path d="M8.5 5h3M9 14.5h2" /></svg>
+          </span>
+          <span>
+            <strong>{tr("New phone connected", "Novo celular conectado")}</strong>
+            <small>{newMobileDevice.name}</small>
+          </span>
+          <button type="button" onclick={reviewNewMobileDevice}>
+            {tr("Review permissions", "Ver permissões")}
+          </button>
+        </aside>
+      {/if}
 
       {#if launcherOpen}
         <div class="launcher-popover" transition:fly={{ y: -5, duration: 170, easing: cubicOut }}>
@@ -2644,7 +2713,7 @@
             {/if}
               </div>
             </details>
-            <details class="settings-section">
+            <details class="settings-section" data-mobile-access-section>
               <summary class="settings-section-label">{tr("Mobile access", "Acesso mobile")}</summary>
               <div class="settings-section-content">
                 <div class="mobile-access-card">
@@ -2710,7 +2779,7 @@
                       <strong>{tr("Phone permissions", "Permissões do telefone")}</strong>
                       </div>
                     {#each pairedDevices as device (device.id)}
-                      <article class="paired-device-card">
+                      <article class="paired-device-card" data-mobile-device-id={device.id}>
                         <div class="paired-device-header">
                           <span class="paired-device-info">
                             <strong>{device.name}</strong>
@@ -2870,6 +2939,7 @@
         <button
           class:active={view === "settings"}
           class:has-update={updateState === "available"}
+          class:has-mobile-device={newMobileDevice !== null}
           type="button"
           onclick={() => openView("settings")}
           aria-label={tr("Settings", "Configurações")}
@@ -2995,14 +3065,16 @@
   .panel footer,
   .panel .brand-lockup > div,
   .panel .header-actions,
-  .panel .launcher-popover {
+  .panel .launcher-popover,
+  .panel .mobile-device-banner {
     transition: opacity 150ms ease;
   }
   .panel:not(.content-visible) .panel-content,
   .panel:not(.content-visible) footer,
   .panel:not(.content-visible) .brand-lockup > div,
   .panel:not(.content-visible) .header-actions,
-  .panel:not(.content-visible) .launcher-popover {
+  .panel:not(.content-visible) .launcher-popover,
+  .panel:not(.content-visible) .mobile-device-banner {
     opacity: 0;
     pointer-events: none;
   }
@@ -3020,6 +3092,42 @@
   }
 
   .panel-header.dragging { cursor: grabbing; }
+
+  .mobile-device-banner {
+    min-height: 52px;
+    padding: 8px 12px;
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid rgba(84, 143, 112, 0.16);
+    background: rgba(91, 164, 126, 0.075);
+  }
+  .mobile-device-banner-icon {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 10px;
+    color: #4c8c6c;
+    background: rgba(88, 167, 125, 0.12);
+  }
+  .mobile-device-banner-icon svg { width: 16px; height: 16px; }
+  .mobile-device-banner > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
+  .mobile-device-banner strong { overflow: hidden; color: #315e49; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-device-banner small { overflow: hidden; color: #6d887b; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-device-banner > button {
+    min-height: 27px;
+    padding: 0 8px;
+    border: 1px solid rgba(75, 137, 105, 0.2);
+    border-radius: 8px;
+    color: #47745f;
+    background: rgba(255, 255, 255, 0.52);
+    font-size: 8px;
+    font-weight: 750;
+    cursor: pointer;
+  }
+  .mobile-device-banner > button:hover { background: rgba(255, 255, 255, 0.82); }
 
   .brand-lockup { display: flex; align-items: center; gap: 10px; color: #4e7567; }
   .brand-lockup div { display: grid; gap: 1px; }
@@ -3513,8 +3621,10 @@
   footer button:hover { color: #52615a; background: rgba(76, 100, 90, 0.045); }
   footer button.active { color: #476c5d; }
   footer button svg { width: 15px; height: 15px; }
-  footer button.has-update { position: relative; }
+  footer button.has-update,
+  footer button.has-mobile-device { position: relative; }
   footer button.has-update::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #5f8ac7; }
+  footer button.has-mobile-device::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #58a97d; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -3524,6 +3634,11 @@
   .overlay-shell.dark .lume-orb,
   .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
   .overlay-shell.dark .panel { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: #1b221f; }
+  .overlay-shell.dark .mobile-device-banner { border-color: rgba(111, 190, 151, 0.14); background: rgba(88, 167, 125, 0.07); }
+  .overlay-shell.dark .mobile-device-banner-icon { color: #87c6a7; background: rgba(88, 167, 125, 0.12); }
+  .overlay-shell.dark .mobile-device-banner strong { color: #b7dcc9; }
+  .overlay-shell.dark .mobile-device-banner small { color: #8fa99c; }
+  .overlay-shell.dark .mobile-device-banner > button { color: #a8d2bc; border-color: rgba(111, 190, 151, 0.18); background: rgba(216, 229, 223, 0.04); }
   .overlay-shell.dark .brand-lockup strong,
   .overlay-shell.dark .session-title-row strong,
   .overlay-shell.dark .board-intro strong,

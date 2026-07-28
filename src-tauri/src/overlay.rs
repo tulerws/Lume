@@ -339,7 +339,10 @@ mod linux {
         };
         let region = rounded_window_region(width, height, radius);
         surface.shape_combine_region(Some(&region), 0, 0);
-        surface.input_shape_combine_region(&region, 0, 0);
+        // Keep pointer input rectangular and let GTK track it across the
+        // asynchronous X11 resizes. Reusing the animated visual shape here can
+        // leave visible parts of the panel click-through on XWayland.
+        gtk_window.input_shape_combine_region(None);
     }
 
     pub fn forget_window(label: &str) {
@@ -560,6 +563,39 @@ mod linux {
             Some(position_y),
             &format!("lume-{}", window.label()),
         )
+    }
+
+    pub fn set_file_dialog_active(
+        window: &WebviewWindow,
+        active: bool,
+        show_over_fullscreen: bool,
+    ) -> bool {
+        let Ok(gtk_window) = window.gtk_window() else {
+            return false;
+        };
+        gtk_window.set_keep_above(!active);
+        let Some(api) = api() else {
+            return false;
+        };
+        unsafe {
+            let application_pointer: *mut gtk::ffi::GtkApplicationWindow =
+                gtk_window.to_glib_none().0;
+            let pointer = application_pointer.cast::<gtk::ffi::GtkWindow>();
+            if (api.is_layer_window)(pointer) == 0 {
+                return false;
+            }
+            (api.set_layer)(
+                pointer,
+                if active {
+                    1
+                } else if show_over_fullscreen {
+                    3
+                } else {
+                    2
+                },
+            );
+        }
+        true
     }
 
     pub fn move_to(window: &WebviewWindow, x: i32, y: i32, monitor_id: Option<&str>) -> bool {
@@ -833,6 +869,20 @@ pub fn configure_terminal(
         );
         false
     }
+}
+
+pub fn set_file_dialog_active(
+    window: &tauri::WebviewWindow,
+    active: bool,
+    show_over_fullscreen: bool,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux::set_file_dialog_active(window, active, show_over_fullscreen) {
+        return Ok(());
+    }
+    window
+        .set_always_on_top(!active)
+        .map_err(|error| error.to_string())
 }
 
 pub fn default_position(

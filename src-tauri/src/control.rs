@@ -26,6 +26,17 @@ struct PreparedPromptAttachment {
     display: PromptAttachment,
 }
 
+pub fn local_image_data_url(path: &str) -> Result<String, String> {
+    let path = fs::canonicalize(path).map_err(|_| "A imagem selecionada não existe".to_string())?;
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err("A imagem excede o limite de 5 MB".into());
+    }
+    let mime = detected_image_mime(&bytes)
+        .ok_or_else(|| "O arquivo selecionado não é uma imagem compatível".to_string())?;
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
 pub fn resolve_permission(
     state: &AppState,
     session_id: &str,
@@ -390,5 +401,25 @@ pub fn execute_hub_command(
             request_id,
             protocol::ProtocolError::from_control(message),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_image_preview_is_returned_as_a_valid_data_url() {
+        let path = std::env::temp_dir().join(format!(
+            "lume-preview-{}-{}.png",
+            std::process::id(),
+            crate::state::now_millis()
+        ));
+        fs::write(&path, b"\x89PNG\r\n\x1a\npreview").expect("imagem temporária");
+
+        let preview = local_image_data_url(path.to_str().expect("caminho")).expect("prévia");
+
+        assert!(preview.starts_with("data:image/png;base64,"));
+        let _ = fs::remove_file(path);
     }
 }

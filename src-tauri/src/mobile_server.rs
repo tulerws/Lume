@@ -25,7 +25,7 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tungstenite::{
     handshake::derive_accept_key,
     protocol::{frame::coding::CloseCode, CloseFrame, Message, Role},
@@ -1067,12 +1067,15 @@ fn route_core(
                 gateway.complete_pairing(state, &pairing.code, &pairing.device_name)
             });
         return match pairing {
-            Ok(credentials) => json_response(201, &credentials),
+            Ok(credentials) => {
+                emit_paired_device(app, &credentials.device);
+                json_response(201, &credentials)
+            }
             Err(message) => json_error(401, "pairing_failed", &message),
         };
     }
     if request.method == "POST" && request.path == "/api/v1/pair-secure" {
-        return secure_pairing_response(&request.body, state, gateway);
+        return secure_pairing_response(&request.body, state, gateway, app);
     }
     if request.method == "POST" && request.path == "/api/v1/secure" {
         return secure_transport_response(&request.body, state, gateway, app);
@@ -1167,7 +1170,12 @@ fn route_core(
     json_error(404, "not_found", "Rota não encontrada")
 }
 
-fn secure_pairing_response(body: &[u8], state: &AppState, gateway: &MobileGateway) -> String {
+fn secure_pairing_response(
+    body: &[u8],
+    state: &AppState,
+    gateway: &MobileGateway,
+    app: Option<&AppHandle>,
+) -> String {
     let envelope = match serde_json::from_slice::<EncryptedEnvelope>(body) {
         Ok(envelope) => envelope,
         Err(error) => return json_error(400, "invalid_envelope", &error.to_string()),
@@ -1192,9 +1200,16 @@ fn secure_pairing_response(body: &[u8], state: &AppState, gateway: &MobileGatewa
         Ok(credentials) => credentials,
         Err(message) => return json_error(401, "pairing_failed", &message),
     };
+    emit_paired_device(app, &credentials.device);
     match encrypt_json(&key, &credentials, b"lume-pair-response-v1") {
         Ok(envelope) => json_response(201, &envelope),
         Err(message) => json_error(500, "encryption_failed", &message),
+    }
+}
+
+fn emit_paired_device(app: Option<&AppHandle>, device: &PairedDevice) {
+    if let Some(app) = app {
+        let _ = app.emit("lume://mobile-device-paired", device);
     }
 }
 

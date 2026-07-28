@@ -39,6 +39,13 @@ struct ObservedFile {
     offset: u64,
     session: Option<SessionMetadata>,
     profile: Option<PermissionProfile>,
+    pending_goal_tools: HashMap<String, PendingGoalTool>,
+}
+
+#[derive(Debug)]
+struct PendingGoalTool {
+    name: String,
+    activity_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +86,12 @@ struct RecordPayload {
     last_agent_message: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    output: Option<Value>,
 }
 
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
@@ -148,6 +161,7 @@ fn initialize(root: &Path) -> HashMap<PathBuf, ObservedFile> {
             offset: file_metadata.len(),
             session: read_session_metadata(&path),
             profile: None,
+            pending_goal_tools: HashMap::new(),
         };
         observed.insert(path, file);
     }
@@ -180,6 +194,7 @@ fn poll_path(
             offset: 0,
             session: read_session_metadata(path),
             profile: None,
+            pending_goal_tools: HashMap::new(),
         };
         if let Some(event) = session_started_event(&file) {
             let _ = event_server::publish_event(state, app, event);
@@ -196,6 +211,7 @@ fn poll_path(
     if length < file.offset {
         file.offset = 0;
         file.profile = None;
+        file.pending_goal_tools.clear();
         file.session = read_session_metadata(path);
         if let Some(event) = session_started_event(file) {
             let _ = event_server::publish_event(state, app, event);
@@ -239,6 +255,18 @@ fn publish_appended_events(
 fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Vec<HookEvent> {
     let mut events = Vec::new();
     for record in records {
+        if record.kind == "response_item" {
+            match record.payload.r#type.as_deref() {
+                Some("function_call") => remember_goal_tool(&record.payload, file),
+                Some("function_call_output") => {
+                    if let Some(event) = goal_tool_output_event(&record.payload, file) {
+                        events.push(event);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
         if record.kind == "turn_context" {
             if let Some(session) = file.session.as_mut() {
                 if record.payload.cwd.is_some() {
@@ -293,6 +321,59 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
         }
     }
     events
+}
+
+fn remember_goal_tool(payload: &RecordPayload, file: &mut ObservedFile) {
+    let Some(name) = payload.name.as_deref().filter(|name| is_goal_tool(name)) else {
+        return;
+    };
+    let Some(call_id) = payload.call_id.as_ref() else {
+        return;
+    };
+    let activity_id = payload
+        .id
+        .as_ref()
+        .and_then(|id| file.session.as_ref().map(|session| format!("codex:{}:{id}", session.id)))
+        .unwrap_or_else(|| format!("codex-rollout-goal:{call_id}"));
+    file.pending_goal_tools.insert(
+        call_id.clone(),
+        PendingGoalTool {
+            name: name.into(),
+            activity_id,
+        },
+    );
+}
+
+fn goal_tool_output_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
+    let tool = file
+        .pending_goal_tools
+        .remove(payload.call_id.as_deref()?)?;
+    let detail = payload.output.as_ref().and_then(record_value_text)?;
+    let mut event = event_for(file, HookEventKind::Activity, "GOAL atualizada", None)?;
+    event.activity = Some(SessionActivity {
+        id: tool.activity_id,
+        kind: "tool".into(),
+        title: format!("functions · {}", tool.name),
+        detail: Some(detail),
+        status: "completed".into(),
+        created_at: now_millis(),
+        files: Vec::new(),
+        attachments: Vec::new(),
+        append_detail: false,
+    });
+    Some(event)
+}
+
+fn is_goal_tool(name: &str) -> bool {
+    matches!(name, "create_goal" | "get_goal" | "update_goal")
+}
+
+fn record_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => response_text(value),
+        Value::Null => None,
+        value => response_text(&value.to_string()),
+    }
 }
 
 fn activity_event_for(
@@ -539,6 +620,7 @@ mod tests {
                 source: SessionSource::Vscode,
             }),
             profile: None,
+            pending_goal_tools: HashMap::new(),
         };
         let records = vec![
             record(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#),
@@ -568,6 +650,7 @@ mod tests {
                 source: SessionSource::Vscode,
             }),
             profile: None,
+            pending_goal_tools: HashMap::new(),
         };
         let records = vec![
             record(
@@ -602,6 +685,41 @@ mod tests {
                 .map(|activity| activity.kind.as_str()),
             Some("message")
         );
+    }
+
+    #[test]
+    fn goal_tool_output_becomes_realtime_work_activity() {
+        let mut file = ObservedFile {
+            offset: 0,
+            session: Some(SessionMetadata {
+                id: "chat-1".into(),
+                cwd: Some("/work/lume".into()),
+                started_at: None,
+                source: SessionSource::Cli,
+            }),
+            profile: None,
+            pending_goal_tools: HashMap::new(),
+        };
+        let records = vec![
+            record(
+                r#"{"type":"response_item","payload":{"type":"function_call","id":"fc-goal","name":"get_goal","arguments":"{}","call_id":"call-goal"}}"#,
+            ),
+            record(
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-goal","output":"{\"goal\":{\"objective\":\"Test goal\",\"status\":\"active\",\"createdAt\":1785190621}}"}}"#,
+            ),
+        ];
+
+        let events = events_from_records(records, &mut file);
+
+        assert_eq!(events.len(), 1);
+        let activity = events[0].activity.as_ref().expect("goal activity");
+        assert_eq!(activity.id, "codex:chat-1:fc-goal");
+        assert_eq!(activity.kind, "tool");
+        assert_eq!(activity.title, "functions · get_goal");
+        assert!(activity
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("\"objective\":\"Test goal\"")));
     }
 
     #[test]
