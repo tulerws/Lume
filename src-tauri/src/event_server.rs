@@ -41,6 +41,7 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
                 .as_ref()
                 .is_some_and(|profile| profile.automatically_approves());
         let wait_for_decision = event.wait_for_decision;
+        let question_id = event.question.as_ref().map(|question| question.id.clone());
         if automatically_approved {
             event.event = HookEventKind::Running;
             event.status_label = Some("Executando".into());
@@ -53,10 +54,27 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
             return Ok(HookResponse {
                 ok: true,
                 action: wait_for_decision.then_some(PermissionAction::AllowOnce),
+                question_answers: None,
                 message: None,
             });
         }
         if wait_for_decision {
+            if let Some(question_id) = question_id {
+                let answers = state.wait_for_question_answer(
+                    &question_id,
+                    Duration::from_secs(15 * 60),
+                )?;
+                if answers.is_none() {
+                    state.expire_question(&question_id)?;
+                    crate::protocol::emit_sessions_changed(&app);
+                }
+                return Ok(HookResponse {
+                    ok: answers.is_some(),
+                    action: None,
+                    question_answers: answers,
+                    message: None,
+                });
+            }
             let permission_id = permission_id.ok_or_else(|| {
                 "O evento aguardava uma decisão, mas não continha permissão".to_string()
             })?;
@@ -64,6 +82,7 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
             return Ok(HookResponse {
                 ok: action.is_some(),
                 action,
+                question_answers: None,
                 message: None,
             });
         }
@@ -71,6 +90,7 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
         Ok(HookResponse {
             ok: true,
             action: None,
+            question_answers: None,
             message: None,
         })
     });
@@ -78,6 +98,7 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
     let response = response.unwrap_or_else(|message| HookResponse {
         ok: false,
         action: None,
+        question_answers: None,
         message: Some(message),
     });
     if let Ok(payload) = serde_json::to_string(&response) {
@@ -123,6 +144,7 @@ fn notification_for(
     let project = event.project.as_deref().unwrap_or("sessão local");
     let title = match event.event {
         crate::domain::HookEventKind::PermissionRequest => "Lume · Permissão necessária",
+        crate::domain::HookEventKind::QuestionRequest => "Lume · Resposta necessária",
         crate::domain::HookEventKind::Completed => "Lume · Tarefa finalizada",
         crate::domain::HookEventKind::Failed => "Lume · Erro na sessão",
         _ => return None,

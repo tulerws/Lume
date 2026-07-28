@@ -14,8 +14,9 @@ use tungstenite::{accept, connect, stream::MaybeTlsStream, Message, WebSocket};
 
 use crate::{
     domain::{
-        AccessMode, AgentKind, AgentRateLimit, HookEvent, HookEventKind, PermissionAction,
-        PermissionProfile, PermissionRequest, SessionActivity, SessionSource,
+        AccessMode, AgentKind, AgentRateLimit, HookEvent, HookEventKind, InteractiveQuestion,
+        PendingQuestion, PermissionAction, PermissionProfile, PermissionRequest, QuestionOption,
+        SessionActivity, SessionSource,
     },
     event_server,
     state::{now_millis, AppState},
@@ -458,6 +459,9 @@ fn intercept_server_message(
     if is_approval(method) && value.get("id").is_some() {
         return approval_response(&value, method, state, app, profiles).map(Some);
     }
+    if method == "item/tool/requestUserInput" && value.get("id").is_some() {
+        return user_input_response(&value, state, app, profiles).map(Some);
+    }
     remember_response(&value, method, responses);
     if let Some(event) = activity_event(&value, method) {
         let _ = event_server::publish_event(state, app, event);
@@ -564,6 +568,124 @@ fn is_approval(method: &str) -> bool {
     )
 }
 
+fn user_input_response(
+    value: &Value,
+    state: &AppState,
+    app: &AppHandle,
+    profiles: &HashMap<String, PermissionProfile>,
+) -> Result<Message, String> {
+    let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+    let thread_id = text_at(&params, "threadId").unwrap_or("unknown");
+    let item_id = text_at(&params, "itemId").unwrap_or("question");
+    let request_id = format!("codex-question:{thread_id}:{item_id}");
+    let questions = codex_questions(&params);
+    if questions.is_empty() {
+        let response = json!({
+            "id": value.get("id").cloned().unwrap_or(Value::Null),
+            "result": { "answers": {} }
+        });
+        return Ok(Message::Text(response.to_string().into()));
+    }
+
+    let event = HookEvent {
+        event: HookEventKind::QuestionRequest,
+        session_id: session_id(thread_id),
+        agent: AgentKind::Codex,
+        agent_label: Some("Codex".into()),
+        project: None,
+        source: None,
+        source_app: None,
+        status_label: Some("Aguardando sua resposta".into()),
+        started_at: None,
+        process_id: None,
+        native_session_id: Some(thread_id.into()),
+        working_directory: None,
+        permission_profile: Some(
+            profiles
+                .get(thread_id)
+                .cloned()
+                .unwrap_or_else(direct_profile),
+        ),
+        permission: None,
+        question: Some(PendingQuestion {
+            id: request_id.clone(),
+            questions,
+            requested_at: now_millis().to_string(),
+        }),
+        last_response: None,
+        activity: None,
+        activities: Vec::new(),
+        wait_for_decision: true,
+    };
+    event_server::publish_event(state, app, event)?;
+    let timeout = params
+        .get("autoResolutionMs")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(15 * 60));
+    let answers = match state.wait_for_question_answer(&request_id, timeout)? {
+        Some(answers) => answers,
+        None => {
+            state.expire_question(&request_id)?;
+            crate::protocol::emit_sessions_changed(app);
+            Vec::new()
+        }
+    };
+    let answers = answers
+        .into_iter()
+        .map(|answer| {
+            (
+                answer.question_id,
+                json!({ "answers": answer.answers }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let response = json!({
+        "id": value.get("id").cloned().unwrap_or(Value::Null),
+        "result": { "answers": answers }
+    });
+    Ok(Message::Text(response.to_string().into()))
+}
+
+fn codex_questions(params: &Value) -> Vec<InteractiveQuestion> {
+    params
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|question| {
+            let id = text_at(question, "id")?.to_string();
+            Some(InteractiveQuestion {
+                id,
+                header: text_at(question, "header").unwrap_or("Question").to_string(),
+                question: text_at(question, "question").unwrap_or_default().to_string(),
+                is_other: question
+                    .get("isOther")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_secret: question
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                options: question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| {
+                        Some(QuestionOption {
+                            label: text_at(option, "label")?.to_string(),
+                            description: text_at(option, "description")
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 fn approval_response(
     value: &Value,
     method: &str,
@@ -592,7 +714,7 @@ fn approval_response(
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
         project: cwd.as_deref().and_then(project_name),
-        source: Some(SessionSource::Cli),
+        source: None,
         source_app: None,
         status_label: Some("Aguardando sua permissão".into()),
         started_at: None,
@@ -608,8 +730,10 @@ fn approval_response(
             risk,
             requested_at: now_millis().to_string(),
         }),
+        question: None,
         last_response: None,
         activity: None,
+        activities: Vec::new(),
         wait_for_decision: true,
     };
     event_server::publish_event(state, app, event)?;
@@ -788,8 +912,10 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
         working_directory: None,
         permission_profile: None,
         permission: None,
+        question: None,
         last_response: None,
         activity: Some(activity),
+        activities: Vec::new(),
         wait_for_decision: false,
     })
 }
@@ -1163,8 +1289,10 @@ fn notification_event(
                 .unwrap_or_else(direct_profile),
         ),
         permission: None,
+        question: None,
         last_response,
         activity: None,
+        activities: Vec::new(),
         wait_for_decision: false,
     })
 }
@@ -1358,6 +1486,27 @@ mod tests {
         )
         .expect("aprovação automática");
         assert_eq!(response["decision"], "accept");
+    }
+
+    #[test]
+    fn interactive_user_input_is_distinct_from_approvals() {
+        assert!(!is_approval("item/tool/requestUserInput"));
+        let questions = codex_questions(&json!({
+            "questions": [{
+                "id": "approach",
+                "header": "Approach",
+                "question": "Which approach?",
+                "isOther": true,
+                "isSecret": false,
+                "options": [
+                    { "label": "A", "description": "First" },
+                    { "label": "B", "description": "Second" }
+                ]
+            }]
+        }));
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "approach");
+        assert_eq!(questions[0].options[1].label, "B");
     }
 
     #[test]

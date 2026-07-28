@@ -3,6 +3,7 @@ import type {
   AgentSession,
   PermissionAction,
   PromptAttachmentInput,
+  QuestionAnswer,
 } from "$lib/domain";
 import type { SessionCapabilities } from "$lib/sessionCapabilities";
 
@@ -53,6 +54,12 @@ export type HubCommand =
       sessionId: string;
       permissionId: string;
       action: PermissionAction;
+    }
+  | {
+      type: "resolve_question";
+      sessionId: string;
+      questionId: string;
+      answers: QuestionAnswer[];
     }
   | {
       type: "terminate_session";

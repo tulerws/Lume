@@ -59,6 +59,7 @@ let nativeRealtimeListenersReady = false;
 let currentDevice;
 let previousStatuses = new Map();
 let previousPermissionIds = new Map();
+let previousQuestionIds = new Map();
 let hasRenderedSnapshot = false;
 let currentSnapshot;
 let activeFilter = "all";
@@ -81,6 +82,7 @@ const expandedResults = new Set();
 const submittingPromptSessions = new Set();
 const promptDrafts = new Map();
 const promptAttachments = new Map();
+const questionSelections = new Map();
 const rateLimitRefreshes = new Map();
 const sendIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg>';
 const attachIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 1 1-7-7l8-8" /></svg>';
@@ -691,7 +693,8 @@ function updateInstallOptions() {
   pwaInstallButton.hidden = !deferredInstallPrompt;
 }
 
-function statusLabel(status) {
+function statusLabel(status, hasQuestion = false) {
+  if (status === "waiting_for_input" && hasQuestion) return "Question waiting";
   return {
     running: "Running",
     permission_required: "Permission required",
@@ -1052,7 +1055,7 @@ function renderChat(sessions) {
   chatAgentIcon.className = `agent-icon agent-${session.agent}`;
   chatAgentIcon.innerHTML = agentVisual(session);
   chatAgentName.textContent = session.agentLabel;
-  chatAgentStatus.textContent = `${session.project} · ${statusLabel(session.status)}`;
+  chatAgentStatus.textContent = `${session.project} · ${statusLabel(session.status, Boolean(session.pendingQuestion))}`;
   renderRateLimit(session);
   const scopes = currentDevice?.scopes || [];
   const canTerminate = scopes.includes("terminate") && session.capabilities?.canTerminate;
@@ -1064,6 +1067,7 @@ function renderChat(sessions) {
     session.status,
     session.updatedAt,
     session.pendingPermission,
+    session.pendingQuestion,
     session.activities,
     session.results,
     session.lastResponse,
@@ -1093,6 +1097,35 @@ function renderChat(sessions) {
                 data-permission="${escapeHtml(session.pendingPermission.id)}"
               >${action === "allow_once" ? "Allow once" : action === "allow_session" ? "Allow session" : "Deny"}</button>
             `).join("")}</div>`
+          : ""}
+      </article>`
+    : "";
+  const questionRequest = session.pendingQuestion
+    ? `<article class="mobile-chat-question">
+        <small>Agent question</small>
+        ${(session.pendingQuestion.questions || []).map((question) => `
+          <section>
+            <strong>${escapeHtml(question.header || "Question")}</strong>
+            <p>${escapeHtml(question.question)}</p>
+            ${(question.options || []).length ? `<div class="mobile-question-options">
+              ${question.options.map((option, index) => {
+                const selectionKey = `${session.pendingQuestion.id}:${question.id}`;
+                const selected = questionSelections.get(selectionKey) === option.label;
+                return `<button
+                  class="${selected ? "selected" : ""}"
+                  type="button"
+                  data-question-option="${escapeHtml(option.label)}"
+                  data-question-item="${escapeHtml(question.id)}"
+                  data-question-request="${escapeHtml(session.pendingQuestion.id)}"
+                  data-session="${escapeHtml(session.id)}"
+                ><b>${index + 1}</b><span>${escapeHtml(option.label)}${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}</span></button>`;
+              }).join("")}
+            </div>` : ""}
+            <em>Tap an option or type its number below.</em>
+          </section>
+        `).join("")}
+        ${(session.pendingQuestion.questions || []).length > 1
+          ? `<button class="mobile-question-submit" type="button" data-question-submit data-session="${escapeHtml(session.id)}">Answer</button>`
           : ""}
       </article>`
     : "";
@@ -1128,7 +1161,7 @@ function renderChat(sessions) {
   const typing = session.status === "running"
     ? `<div class="mobile-agent-typing" aria-label="${escapeHtml(session.agentLabel)} is working"><span></span><span></span><span></span></div>`
     : "";
-  chatFeed.innerHTML = permission + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
+  chatFeed.innerHTML = permission + questionRequest + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
 
   const promptReady = ["completed", "failed", "waiting_for_input"].includes(session.status);
   const agentWorking = session.status === "running";
@@ -1139,7 +1172,7 @@ function renderChat(sessions) {
   const sendLocked = promptSubmitting || agentWorking;
   const promptDraft = promptDrafts.get(session.id) || "";
   const attachments = promptAttachments.get(session.id) || [];
-  const canAttachImages = Boolean(session.capabilities?.canAttachImages);
+  const canAttachImages = Boolean(session.capabilities?.canAttachImages && !session.pendingQuestion);
   chatComposer.innerHTML = canPrompt
     ? `<form class="mobile-chat-form${canAttachImages ? " can-attach" : ""}${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
         ${attachments.length ? `<div class="mobile-pending-images">
@@ -1178,6 +1211,7 @@ function renderSessions(snapshot, trackChanges = true) {
   if (trackChanges && hasRenderedSnapshot && localStorage.getItem(notificationsKey) === "on") {
     for (const session of sessions) {
       const permissionId = session.pendingPermission?.id;
+      const questionId = session.pendingQuestion?.id;
       const isNewPermission =
         session.status === "permission_required"
         && permissionId
@@ -1185,7 +1219,9 @@ function renderSessions(snapshot, trackChanges = true) {
       const isStatusTransition =
         session.status !== "permission_required"
         && previousStatuses.get(session.id) !== session.status;
-      if (isNewPermission || isStatusTransition) {
+      const isNewQuestion =
+        questionId && previousQuestionIds.get(session.id) !== questionId;
+      if (isNewPermission || isNewQuestion || isStatusTransition) {
         void notifySession(session).catch((error) => {
           showBanner(error?.message || "Could not deliver the notification.", "error");
         });
@@ -1199,9 +1235,15 @@ function renderSessions(snapshot, trackChanges = true) {
       if (session.pendingPermission?.id) {
         previousPermissionIds.set(session.id, session.pendingPermission.id);
       }
+      if (session.pendingQuestion?.id) {
+        previousQuestionIds.set(session.id, session.pendingQuestion.id);
+      }
     }
     for (const sessionId of previousPermissionIds.keys()) {
       if (!openSessionIds.has(sessionId)) previousPermissionIds.delete(sessionId);
+    }
+    for (const sessionId of previousQuestionIds.keys()) {
+      if (!openSessionIds.has(sessionId)) previousQuestionIds.delete(sessionId);
     }
     hasRenderedSnapshot = true;
   }
@@ -1255,7 +1297,7 @@ function renderSessions(snapshot, trackChanges = true) {
           <span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span>
           <span class="session-heading"><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span>
           <span class="source-badge">${escapeHtml(sourceLabel(session))}</span>
-          <span class="status-badge"><i></i>${escapeHtml(statusLabel(session.status))}</span>
+          <span class="status-badge"><i></i>${escapeHtml(statusLabel(session.status, Boolean(session.pendingQuestion)))}</span>
           <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
         </button>
         <div class="session-details" ${expanded ? "" : "hidden"}>
@@ -1338,7 +1380,11 @@ async function notifySession(session) {
     failed: `${session.agentLabel} reported an error.`,
   };
   const body = messages[session.status];
-  if (!body) return;
+  const questionBody = session.pendingQuestion
+    ? `${session.agentLabel} is waiting for your answer.`
+    : null;
+  const notificationKey = session.pendingQuestion?.id || session.status;
+  if (!body && !questionBody) return;
   if (
     nativePlatform() === "android"
     && nativeCredentialsAvailable
@@ -1349,14 +1395,14 @@ async function notifySession(session) {
   const localNotifications = window.Capacitor?.Plugins?.LocalNotifications;
   if (nativePlatform() === "android" && localNotifications) {
     let identifier = 17;
-    for (const character of `${session.id}-${session.status}`) {
+    for (const character of `${session.id}-${notificationKey}`) {
       identifier = ((identifier * 31) + character.charCodeAt(0)) & 0x7fffffff;
     }
     await localNotifications.schedule({
       notifications: [{
         id: identifier || 1,
         title: "Lume",
-        body,
+        body: questionBody || body,
         channelId: "lume-agent-events",
         extra: { sessionId: session.id, status: session.status },
       }],
@@ -1367,12 +1413,15 @@ async function notifySession(session) {
   const registration = await navigator.serviceWorker?.ready.catch(() => null);
   if (registration) {
     registration.showNotification("Lume", {
-      body,
-      tag: `lume-${session.id}-${session.status}`,
+      body: questionBody || body,
+      tag: `lume-${session.id}-${notificationKey}`,
       icon: "./lume-mobile-icon.svg",
     });
   } else {
-    new Notification("Lume", { body, tag: `lume-${session.id}-${session.status}` });
+    new Notification("Lume", {
+      body: questionBody || body,
+      tag: `lume-${session.id}-${notificationKey}`,
+    });
   }
 }
 
@@ -2233,6 +2282,54 @@ async function runSessionCommand(button) {
   }
 }
 
+async function answerMobileQuestion(button) {
+  const session = currentSnapshot?.sessions?.find(
+    (item) => item.id === button.dataset.session,
+  );
+  const request = session?.pendingQuestion;
+  if (!request) return;
+
+  if (button.dataset.questionOption) {
+    const key = `${request.id}:${button.dataset.questionItem}`;
+    questionSelections.set(key, button.dataset.questionOption);
+    if (request.questions.length > 1) {
+      lastChatRenderKey = "";
+      renderChat(currentSnapshot?.sessions || []);
+      return;
+    }
+  }
+
+  const answers = request.questions.map((question) => {
+    const value = questionSelections.get(`${request.id}:${question.id}`);
+    return {
+      questionId: question.id,
+      answers: value ? [value] : [],
+    };
+  });
+  if (answers.some((answer) => answer.answers.length === 0)) {
+    showBanner("Choose one option for each question.", "error");
+    return;
+  }
+  if (!(await verifySensitiveAction())) return;
+  button.disabled = true;
+  try {
+    await executeCommand({
+      type: "resolve_question",
+      sessionId: session.id,
+      questionId: request.id,
+      answers,
+    });
+    for (const question of request.questions) {
+      questionSelections.delete(`${request.id}:${question.id}`);
+    }
+    await refreshSnapshot();
+  } catch (error) {
+    showBanner(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 sessionList.addEventListener("submit", async (event) => {
   const form = event.target.closest(".prompt-form");
   if (!form) return;
@@ -2315,6 +2412,13 @@ chatScreen.addEventListener("click", async (event) => {
     else promptAttachments.delete(sessionId);
     lastChatRenderKey = "";
     renderChat(currentSnapshot?.sessions || []);
+    return;
+  }
+  const questionButton = event.target.closest(
+    "button[data-question-option], button[data-question-submit]",
+  );
+  if (questionButton) {
+    await answerMobileQuestion(questionButton);
     return;
   }
   const button = event.target.closest("button[data-command]");

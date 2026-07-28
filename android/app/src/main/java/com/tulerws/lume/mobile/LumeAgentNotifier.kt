@@ -29,6 +29,7 @@ internal class LumeAgentNotifier(context: Context) {
             state.edit {
                 remove(STATUSES)
                 .remove(PERMISSIONS)
+                .remove(QUESTIONS)
             }
         }
     }
@@ -37,8 +38,10 @@ internal class LumeAgentNotifier(context: Context) {
         val sessions = snapshot.optJSONArray("sessions") ?: return
         val previous = decodeStatuses(state.getString(STATUSES, null))
         val previousPermissions = decodeStatuses(state.getString(PERMISSIONS, null))
+        val previousQuestions = decodeStatuses(state.getString(QUESTIONS, null))
         val current = linkedMapOf<String, String>()
         val currentPermissions = linkedMapOf<String, String>()
+        val currentQuestions = linkedMapOf<String, String>()
         for (index in 0 until sessions.length()) {
             val session = sessions.optJSONObject(index) ?: continue
             val id = session.optString("id").takeIf(String::isNotBlank) ?: continue
@@ -53,26 +56,40 @@ internal class LumeAgentNotifier(context: Context) {
             } else if (previousPermissions[id] != null) {
                 currentPermissions[id] = previousPermissions.getValue(id)
             }
+            val questionId = session
+                .optJSONObject("pendingQuestion")
+                ?.optString("id")
+                ?.takeIf(String::isNotBlank)
+            if (questionId != null) {
+                currentQuestions[id] = questionId
+            } else if (previousQuestions[id] != null) {
+                currentQuestions[id] = previousQuestions.getValue(id)
+            }
             val isNewPermission = status == "permission_required" &&
                 permissionId != null &&
                 previousPermissions[id] != permissionId
+            val isNewQuestion = status == "waiting_for_input" &&
+                questionId != null &&
+                previousQuestions[id] != questionId
             val isStatusTransition = status != "permission_required" &&
                 previous[id] != null &&
                 previous[id] != status
-            if (previous.isNotEmpty() && (isNewPermission || isStatusTransition)) {
-                notifyTransition(session, status)
+            if (previous.isNotEmpty() && (isNewPermission || isNewQuestion || isStatusTransition)) {
+                notifyTransition(session, status, questionId)
             }
         }
         state.edit {
             putString(STATUSES, JSONObject(current as Map<*, *>).toString())
                 .putString(PERMISSIONS, JSONObject(currentPermissions as Map<*, *>).toString())
+                .putString(QUESTIONS, JSONObject(currentQuestions as Map<*, *>).toString())
         }
     }
 
-    private fun notifyTransition(session: JSONObject, status: String) {
+    private fun notifyTransition(session: JSONObject, status: String, questionId: String?) {
         if (!LumeNativePreferences.notificationsEnabled(applicationContext)) return
         val body = when (status) {
             "permission_required" -> "Needs a permission decision."
+            "waiting_for_input" -> if (questionId != null) "Is waiting for your answer." else return
             "completed" -> "Finished a task."
             "failed" -> "Reported an error."
             else -> return
@@ -89,13 +106,14 @@ internal class LumeAgentNotifier(context: Context) {
         ensureChannel()
         val sessionId = session.optString("id")
         val agent = session.optString("agentLabel", "AI agent")
-        val project = session.optString("projectName")
+        val project = session.optString("project")
         val detail = if (project.isBlank()) body else "$body · $project"
+        val notificationKey = "$sessionId:$status:${questionId.orEmpty()}"
         val intent = Intent(applicationContext, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pendingIntent = PendingIntent.getActivity(
             applicationContext,
-            notificationId("$sessionId:$status"),
+            notificationId(notificationKey),
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -116,7 +134,7 @@ internal class LumeAgentNotifier(context: Context) {
             )
             .build()
         NotificationManagerCompat.from(applicationContext)
-            .notify(notificationId("$sessionId:$status"), notification)
+            .notify(notificationId(notificationKey), notification)
     }
 
     private fun ensureChannel() {
@@ -147,6 +165,7 @@ internal class LumeAgentNotifier(context: Context) {
         const val STATE_STORE = "lume-native-agent-notification-state"
         const val STATUSES = "session-statuses"
         const val PERMISSIONS = "session-permissions"
+        const val QUESTIONS = "session-questions"
         val notificationLock = Any()
     }
 }

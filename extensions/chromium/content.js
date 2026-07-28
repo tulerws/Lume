@@ -24,20 +24,23 @@
 
   const detectState = () => {
     const buttons = buttonText();
-    const permissionWords = [
-      "allow once",
-      "allow",
-      "approve",
-      "run command",
-      "permitir",
-      "permitir uma vez",
-      "aprovar",
-      "aceitar",
-      "executar comando",
-    ];
     const permissionDialog = [...document.querySelectorAll('[role="dialog"], [data-state="open"]')]
       .filter(visible)
-      .some((dialog) => permissionWords.some((word) => dialog.textContent?.toLowerCase().includes(word)));
+      .some((dialog) => {
+        const text = dialog.textContent?.toLowerCase() ?? "";
+        const actions = [...dialog.querySelectorAll("button")]
+          .filter(visible)
+          .map((button) => `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""}`.trim().toLowerCase());
+        const explicitPermission =
+          /permission required|approval required|allow once|run command|permissão necessária|aprovação necessária|permitir uma vez|executar comando/.test(text);
+        const hasAllow = actions.some((action) =>
+          /^(allow|approve|permitir|aprovar|aceitar)( once| this time)?$/.test(action),
+        );
+        const hasDeny = actions.some((action) =>
+          /^(deny|decline|reject|recusar|negar)$/.test(action),
+        );
+        return explicitPermission || (hasAllow && hasDeny);
+      });
     if (permissionDialog) return "permission_required";
 
     const runningSelectors = [

@@ -12,8 +12,8 @@ use crate::{
     domain::{
         AccessMode, AgentKind, AgentRateLimit, AgentSession, HistoryEntry, HookEvent,
         HookEventKind, PairedDevice, PermissionAction, PermissionProfile, PermissionRequest,
-        Preferences, PromptAttachment, ResultNote, SessionActivity, SessionResult, SessionSource,
-        SessionStatus,
+        Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity, SessionResult,
+        SessionSource, SessionStatus,
     },
     store::Store,
 };
@@ -34,6 +34,7 @@ pub struct AppState {
     sessions: Arc<Mutex<Vec<AgentSession>>>,
     store: Arc<Mutex<Store>>,
     decisions: Arc<(Mutex<HashMap<String, PermissionAction>>, Condvar)>,
+    question_answers: Arc<(Mutex<HashMap<String, Vec<QuestionAnswer>>>, Condvar)>,
     missing_process_scans: Arc<Mutex<HashMap<String, u8>>>,
     workspace_snapshots: Arc<Mutex<HashMap<String, WorkspaceSnapshot>>>,
     agent_rate_limits: Arc<Mutex<HashMap<AgentKind, Vec<AgentRateLimit>>>>,
@@ -54,6 +55,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(sessions)),
             store: Arc::new(Mutex::new(store)),
             decisions: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+            question_answers: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
             missing_process_scans: Arc::new(Mutex::new(HashMap::new())),
             workspace_snapshots: Arc::new(Mutex::new(HashMap::new())),
             agent_rate_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -505,6 +507,9 @@ impl AppState {
             .expect("a sessão acabou de ser inserida");
 
         apply_metadata(session, &event);
+        for activity in &event.activities {
+            remember_activity(session, activity.clone());
+        }
         if let Some(activity) = event.activity.as_ref() {
             remember_activity(session, activity.clone());
         }
@@ -519,6 +524,8 @@ impl AppState {
                 .as_ref()
                 .zip(event.permission.as_ref())
                 .is_some_and(|(current, incoming)| same_permission_request(current, incoming));
+        let repeated_question = matches!(&event.event, HookEventKind::QuestionRequest)
+            && session.pending_question.as_ref() == event.question.as_ref();
         let superseded_permission_id = session
             .pending_permission
             .as_ref()
@@ -535,6 +542,13 @@ impl AppState {
                 activity.status = "completed".into();
             }
         }
+        let superseded_question_id = session
+            .pending_question
+            .as_ref()
+            .filter(|_| {
+                !matches!(&event.event, HookEventKind::QuestionRequest) || !repeated_question
+            })
+            .map(|question| question.id.clone());
         let starts_task = matches!(&event.event, HookEventKind::Running)
             && !matches!(
                 session.status,
@@ -563,12 +577,14 @@ impl AppState {
                 session.status = SessionStatus::WaitingForInput;
                 session.status_label = "Esperando ação".into();
                 session.pending_permission = None;
+                session.pending_question = None;
                 None
             }
             HookEventKind::Running => {
                 session.status = SessionStatus::Running;
                 session.status_label = event.status_label.unwrap_or_else(|| "Executando".into());
                 session.pending_permission = None;
+                session.pending_question = None;
                 session.last_response = None;
                 None
             }
@@ -589,6 +605,7 @@ impl AppState {
                     .status_label
                     .unwrap_or_else(|| "Aguardando permissão".into());
                 session.pending_permission = Some(permission);
+                session.pending_question = None;
                 remember_activity(
                     session,
                     SessionActivity {
@@ -612,18 +629,51 @@ impl AppState {
                 );
                 Some(id)
             }
+            HookEventKind::QuestionRequest => {
+                let question = event
+                    .question
+                    .ok_or_else(|| "A solicitação não contém uma pergunta".to_string())?;
+                let id = question.id.clone();
+                session.status = SessionStatus::WaitingForInput;
+                session.status_label = event
+                    .status_label
+                    .unwrap_or_else(|| "Aguardando sua resposta".into());
+                session.pending_permission = None;
+                session.pending_question = Some(question);
+                remember_activity(
+                    session,
+                    SessionActivity {
+                        id: format!("question:{id}"),
+                        kind: "question".into(),
+                        title: "Pergunta do agente".into(),
+                        detail: session
+                            .pending_question
+                            .as_ref()
+                            .and_then(|request| request.questions.first())
+                            .map(|question| question.question.clone()),
+                        status: "waiting".into(),
+                        created_at: now,
+                        files: Vec::new(),
+                        attachments: Vec::new(),
+                        append_detail: false,
+                    },
+                );
+                None
+            }
             HookEventKind::WaitingForInput => {
                 session.status = SessionStatus::WaitingForInput;
                 session.status_label = event
                     .status_label
                     .unwrap_or_else(|| "Aguardando sua resposta".into());
                 session.pending_permission = None;
+                session.pending_question = None;
                 None
             }
             HookEventKind::Completed | HookEventKind::SessionEnded => {
                 session.status = SessionStatus::Completed;
                 session.status_label = event.status_label.unwrap_or_else(|| "Finalizado".into());
                 session.pending_permission = None;
+                session.pending_question = None;
                 for activity in session
                     .activities
                     .iter_mut()
@@ -637,6 +687,7 @@ impl AppState {
                 session.status = SessionStatus::Failed;
                 session.status_label = event.status_label.unwrap_or_else(|| "Falhou".into());
                 session.pending_permission = None;
+                session.pending_question = None;
                 for activity in session
                     .activities
                     .iter_mut()
@@ -697,6 +748,15 @@ impl AppState {
                 .map_err(|_| "Não foi possível liberar a permissão antiga".to_string())?
                 .insert(permission_id, PermissionAction::Deny);
             decision_changed.notify_all();
+        }
+        if let Some(question_id) = superseded_question_id {
+            let (answers, changed) = &*self.question_answers;
+            answers
+                .lock()
+                .map_err(|_| "Não foi possível liberar a pergunta antiga".to_string())?
+                .entry(question_id)
+                .or_default();
+            changed.notify_all();
         }
 
         let store = self
@@ -877,6 +937,145 @@ impl AppState {
         Ok(values.remove(permission_id))
     }
 
+    pub fn resolve_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        let pending = session
+            .pending_question
+            .as_ref()
+            .ok_or_else(|| "A sessão não possui uma pergunta pendente".to_string())?;
+        if pending.id != request_id {
+            return Err("A pergunta não corresponde à sessão".into());
+        }
+        for question in &pending.questions {
+            let answer = answers
+                .iter()
+                .find(|answer| answer.question_id == question.id)
+                .ok_or_else(|| format!("Responda à pergunta \"{}\"", question.header))?;
+            if answer.answers.iter().all(|answer| answer.trim().is_empty()) {
+                return Err(format!("A resposta para \"{}\" está vazia", question.header));
+            }
+        }
+        let answer_summary = pending
+            .questions
+            .iter()
+            .filter_map(|question| {
+                let answer = answers
+                    .iter()
+                    .find(|answer| answer.question_id == question.id)?;
+                let value = if question.is_secret {
+                    "••••••".into()
+                } else {
+                    answer.answers.join(", ")
+                };
+                Some(if pending.questions.len() == 1 {
+                    value
+                } else {
+                    format!("{}: {value}", question.header)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some(activity) = session
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == format!("question:{request_id}"))
+        {
+            activity.status = "completed".into();
+        }
+        remember_activity(
+            session,
+            SessionActivity {
+                id: format!("question-answer:{request_id}:{}", now_millis()),
+                kind: "prompt".into(),
+                title: "Resposta enviada".into(),
+                detail: Some(answer_summary),
+                status: "completed".into(),
+                created_at: now_millis(),
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+        );
+        session.status = SessionStatus::Running;
+        session.status_label = "Continuando a tarefa".into();
+        session.pending_question = None;
+        session.updated_at = now_millis();
+        let snapshot = session.clone();
+        drop(sessions);
+
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível salvar a resposta".to_string())?
+            .save_session(&snapshot)?;
+        let (values, changed) = &*self.question_answers;
+        values
+            .lock()
+            .map_err(|_| "Não foi possível entregar a resposta".to_string())?
+            .insert(request_id.into(), answers);
+        changed.notify_all();
+        Ok(())
+    }
+
+    pub fn wait_for_question_answer(
+        &self,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<Vec<QuestionAnswer>>, String> {
+        let (answers, changed) = &*self.question_answers;
+        let values = answers
+            .lock()
+            .map_err(|_| "Não foi possível aguardar a resposta".to_string())?;
+        let (mut values, _) = changed
+            .wait_timeout_while(values, timeout, |values| !values.contains_key(request_id))
+            .map_err(|_| "Não foi possível aguardar a resposta".to_string())?;
+        Ok(values.remove(request_id))
+    }
+
+    pub fn expire_question(&self, request_id: &str) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?;
+        let Some(session) = sessions.iter_mut().find(|session| {
+            session
+                .pending_question
+                .as_ref()
+                .is_some_and(|question| question.id == request_id)
+        }) else {
+            return Ok(());
+        };
+        session.pending_question = None;
+        session.status = SessionStatus::WaitingForInput;
+        session.status_label = "Esperando ação".into();
+        session.updated_at = now_millis();
+        if let Some(activity) = session
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == format!("question:{request_id}"))
+        {
+            activity.status = "failed".into();
+        }
+        let snapshot = session.clone();
+        drop(sessions);
+        self.store
+            .lock()
+            .map_err(|_| "Não foi possível salvar a sessão".to_string())?
+            .save_session(&snapshot)
+    }
+
     #[cfg(test)]
     pub fn reconcile_processes(&self, discovered: Vec<DiscoveredProcess>) -> Result<bool, String> {
         let live_pids = discovered
@@ -1045,6 +1244,15 @@ impl AppState {
                 let mut refreshed = false;
                 if session.working_directory != process.working_directory {
                     session.working_directory = process.working_directory.clone();
+                    if is_provisional_process(session) {
+                        session.project = process
+                            .working_directory
+                            .as_deref()
+                            .and_then(|path| Path::new(path).file_name())
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Sessão local")
+                            .to_string();
+                    }
                     refreshed = true;
                 }
                 if session.source != process.source {
@@ -1114,6 +1322,7 @@ impl AppState {
                 working_directory: process.working_directory,
                 permission_profile: default_profile(&process.agent),
                 pending_permission: None,
+                pending_question: None,
                 last_response: None,
                 results: Vec::new(),
                 activities: Vec::new(),
@@ -1231,9 +1440,10 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .clone()
             .unwrap_or_else(|| default_profile(&event.agent)),
         pending_permission: None,
+        pending_question: None,
         last_response: event.last_response.clone(),
         results: Vec::new(),
-        activities: event.activity.clone().into_iter().collect(),
+        activities: Vec::new(),
         rate_limits: Vec::new(),
     }
 }
@@ -1902,8 +2112,10 @@ mod tests {
             working_directory: Some("/work/lume".into()),
             permission_profile: None,
             permission: None,
+            question: None,
             last_response: None,
             activity: None,
+            activities: Vec::new(),
             wait_for_decision: false,
         }
     }
@@ -1935,6 +2147,43 @@ mod tests {
         assert_eq!(session.status, SessionStatus::WaitingForInput);
         assert_eq!(session.activities.len(), 1);
         assert_eq!(session.activities[0].status, "completed");
+    }
+
+    #[test]
+    fn transcript_activity_batch_is_ingested_and_deduplicated() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("claude:transcript", 4242);
+        event.activities = vec![
+            SessionActivity {
+                id: "transcript-thinking".into(),
+                kind: "thinking".into(),
+                title: "Thinking".into(),
+                detail: Some("Inspecting".into()),
+                status: "completed".into(),
+                created_at: 10,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+            SessionActivity {
+                id: "transcript-message".into(),
+                kind: "message".into(),
+                title: "Claude".into(),
+                detail: Some("Done".into()),
+                status: "completed".into(),
+                created_at: 20,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+        ];
+        state.ingest(event.clone()).expect("primeiro lote");
+        state.ingest(event).expect("lote repetido");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.activities.len(), 2);
+        assert_eq!(session.activities[0].kind, "thinking");
+        assert_eq!(session.activities[1].kind, "message");
     }
 
     #[test]
@@ -2307,6 +2556,24 @@ mod tests {
     }
 
     #[test]
+    fn corrected_process_directory_updates_the_provisional_project_name() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut process = discovered(4242);
+        process.working_directory = Some("/home/user".into());
+        state
+            .reconcile_processes(vec![process.clone()])
+            .expect("descoberta inicial");
+        process.working_directory = Some("/home/user/Documents/Projetos/Ideias/Lume".into());
+        state
+            .reconcile_processes(vec![process])
+            .expect("diretório corrigido");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project, "Lume");
+    }
+
+    #[test]
     fn sibling_processes_in_the_same_context_create_one_provisional_session() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -2538,8 +2805,10 @@ mod tests {
                     working_directory: Some("/work/lume".into()),
                     permission_profile: None,
                     permission: None,
+                    question: None,
                     last_response: None,
                     activity: None,
+                    activities: Vec::new(),
                     wait_for_decision: false,
                 })
                 .expect("chat do VS Code");
@@ -2729,6 +2998,50 @@ mod tests {
                 .expect("decisão"),
             Some(PermissionAction::Deny)
         );
+    }
+
+    #[test]
+    fn question_answer_is_delivered_without_becoming_a_permission() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut question = started_event("codex:chat-1", 4242);
+        question.event = HookEventKind::QuestionRequest;
+        question.question = Some(crate::domain::PendingQuestion {
+            id: "question-request".into(),
+            questions: vec![crate::domain::InteractiveQuestion {
+                id: "approach".into(),
+                header: "Approach".into(),
+                question: "Which approach?".into(),
+                is_other: true,
+                is_secret: false,
+                options: vec![crate::domain::QuestionOption {
+                    label: "Safe".into(),
+                    description: String::new(),
+                }],
+            }],
+            requested_at: "1".into(),
+        });
+        state.ingest(question).expect("pergunta");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::WaitingForInput);
+        assert!(session.pending_permission.is_none());
+        assert!(session.pending_question.is_some());
+
+        state
+            .resolve_question(
+                "codex:chat-1",
+                "question-request",
+                vec![QuestionAnswer {
+                    question_id: "approach".into(),
+                    answers: vec!["Safe".into()],
+                }],
+            )
+            .expect("resposta");
+        let answers = state
+            .wait_for_question_answer("question-request", Duration::ZERO)
+            .expect("entrega")
+            .expect("resposta presente");
+        assert_eq!(answers[0].answers, vec!["Safe"]);
     }
 
     #[test]

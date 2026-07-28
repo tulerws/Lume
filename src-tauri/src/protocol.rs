@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{
     domain::{
-        AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, SessionActivity,
-        SessionSource,
+        AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, QuestionAnswer,
+        SessionActivity, SessionSource,
     },
     state::now_millis,
 };
@@ -28,6 +28,7 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "image_prompts",
     "rate_limits",
     "permissions",
+    "interactive_questions",
     "termination",
     "realtime_stream",
     "coordinated_updates",
@@ -49,6 +50,7 @@ pub struct SessionCapabilities {
     pub can_prompt: bool,
     pub prompt_unavailable_reason: Option<PromptUnavailableReason>,
     pub can_approve: bool,
+    pub can_answer_question: bool,
     pub can_terminate: bool,
     pub can_open_source: bool,
     pub can_read_results: bool,
@@ -73,6 +75,7 @@ impl SessionCapabilities {
             prompt_unavailable_reason,
             can_approve: session.pending_permission.is_some()
                 && session.permission_profile.can_respond_from_lume,
+            can_answer_question: session.pending_question.is_some(),
             can_terminate: session.source == SessionSource::Cli && session.process_id.is_some(),
             can_open_source: matches!(session.source, SessionSource::Web | SessionSource::Vscode),
             can_read_results: !session.results.is_empty() || session.last_response.is_some(),
@@ -512,6 +515,11 @@ pub enum HubCommand {
         permission_id: String,
         action: PermissionAction,
     },
+    ResolveQuestion {
+        session_id: String,
+        question_id: String,
+        answers: Vec<QuestionAnswer>,
+    },
     TerminateSession {
         session_id: String,
     },
@@ -570,6 +578,48 @@ impl HubCommandRequest {
             } => {
                 validate_identifier("session_id", session_id, 512)?;
                 validate_identifier("permission_id", permission_id, 512)?;
+            }
+            HubCommand::ResolveQuestion {
+                session_id,
+                question_id,
+                answers,
+            } => {
+                validate_identifier("session_id", session_id, 512)?;
+                validate_identifier("question_id", question_id, 512)?;
+                if answers.is_empty() {
+                    return Err(ProtocolError::new(
+                        "answers_empty",
+                        "A resposta da pergunta está vazia",
+                    ));
+                }
+                if answers.len() > 4 {
+                    return Err(ProtocolError::new(
+                        "too_many_answers",
+                        "A solicitação aceita no máximo 4 perguntas",
+                    ));
+                }
+                for answer in answers {
+                    validate_identifier("answer.question_id", &answer.question_id, 256)?;
+                    if answer.answers.is_empty()
+                        || answer.answers.iter().all(|value| value.trim().is_empty())
+                    {
+                        return Err(ProtocolError::new(
+                            "answer_empty",
+                            "Uma das respostas está vazia",
+                        ));
+                    }
+                    if answer.answers.len() > 8
+                        || answer
+                            .answers
+                            .iter()
+                            .any(|value| value.len() > 16 * 1024)
+                    {
+                        return Err(ProtocolError::new(
+                            "answer_too_large",
+                            "Uma das respostas excede o limite permitido",
+                        ));
+                    }
+                }
             }
             HubCommand::TerminateSession { session_id }
             | HubCommand::OpenSessionSource { session_id } => {
@@ -822,6 +872,7 @@ mod tests {
                 available_actions: Vec::new(),
             },
             pending_permission: None,
+            pending_question: None,
             last_response: None,
             results: Vec::new(),
             activities: Vec::new(),

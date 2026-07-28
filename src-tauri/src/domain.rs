@@ -141,6 +141,39 @@ pub struct PromptAttachmentInput {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub is_other: bool,
+    pub is_secret: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingQuestion {
+    pub id: String,
+    pub questions: Vec<InteractiveQuestion>,
+    pub requested_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    pub answers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentRateLimit {
     pub id: String,
     pub label: String,
@@ -199,6 +232,8 @@ pub struct AgentSession {
     pub working_directory: Option<String>,
     pub permission_profile: PermissionProfile,
     pub pending_permission: Option<PermissionRequest>,
+    #[serde(default)]
+    pub pending_question: Option<PendingQuestion>,
     #[serde(default)]
     pub last_response: Option<String>,
     #[serde(default)]
@@ -326,6 +361,7 @@ pub enum HookEventKind {
     Running,
     Activity,
     PermissionRequest,
+    QuestionRequest,
     WaitingForInput,
     Completed,
     Failed,
@@ -335,6 +371,7 @@ pub enum HookEventKind {
 pub fn should_notify(event: &HookEventKind, previous: Option<&SessionStatus>) -> bool {
     match event {
         HookEventKind::PermissionRequest => previous != Some(&SessionStatus::PermissionRequired),
+        HookEventKind::QuestionRequest => true,
         HookEventKind::Completed => matches!(
             previous,
             Some(SessionStatus::Running | SessionStatus::PermissionRequired)
@@ -363,9 +400,13 @@ pub struct HookEvent {
     pub permission_profile: Option<PermissionProfile>,
     pub permission: Option<PermissionRequest>,
     #[serde(default)]
+    pub question: Option<PendingQuestion>,
+    #[serde(default)]
     pub last_response: Option<String>,
     #[serde(default)]
     pub activity: Option<SessionActivity>,
+    #[serde(default)]
+    pub activities: Vec<SessionActivity>,
     #[serde(default)]
     pub wait_for_decision: bool,
 }
@@ -421,5 +462,7 @@ mod tests {
 pub struct HookResponse {
     pub ok: bool,
     pub action: Option<PermissionAction>,
+    #[serde(default)]
+    pub question_answers: Option<Vec<QuestionAnswer>>,
     pub message: Option<String>,
 }

@@ -4,7 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
@@ -27,6 +27,7 @@
   import {
     beginLayeredTerminalResize,
     beginTerminalNativeDrag,
+    answerQuestion as answerInteractiveQuestion,
     cancelTerminalWindowMove,
     closeTerminalWindow,
     decidePermission,
@@ -59,6 +60,7 @@
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
   let message = $state<string | null>(null);
   let sending = $state(false);
+  let questionSelections = $state<Record<string, string>>({});
   let dragging = $state(false);
   let dragMoved = false;
   let pendingMove: { x: number; y: number } | null = null;
@@ -667,6 +669,7 @@
       test: "✓",
       tool: "⌁",
       permission: "!",
+      question: "?",
     }[activity.kind] ?? "·";
   }
 
@@ -1154,6 +1157,46 @@
     await refresh();
   }
 
+  async function selectQuestionOption(questionId: string, value: string) {
+    if (!session?.pendingQuestion) return;
+    questionSelections = { ...questionSelections, [questionId]: value };
+    if (session.pendingQuestion.questions.length === 1) {
+      await submitQuestionAnswers([{ questionId, answers: [value] }]);
+    }
+  }
+
+  async function submitSelectedQuestionAnswers() {
+    if (!session?.pendingQuestion) return;
+    const answers = session.pendingQuestion.questions
+      .map((question) => ({
+        questionId: question.id,
+        answers: questionSelections[question.id]
+          ? [questionSelections[question.id]]
+          : [],
+      }))
+      .filter((answer) => answer.answers.length > 0);
+    if (answers.length !== session.pendingQuestion.questions.length) {
+      message = tr("Choose one option for each question.", "Escolha uma opção para cada pergunta.");
+      return;
+    }
+    await submitQuestionAnswers(answers);
+  }
+
+  async function submitQuestionAnswers(answers: QuestionAnswer[]) {
+    if (!session?.pendingQuestion || sending) return;
+    sending = true;
+    message = null;
+    try {
+      await answerInteractiveQuestion(session.id, session.pendingQuestion.id, answers);
+      questionSelections = {};
+      await refresh();
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      sending = false;
+    }
+  }
+
   async function openOrigin() {
     if (!session) return;
     message = null;
@@ -1350,18 +1393,39 @@
       <div class="terminal-output" bind:this={outputElement}>
         <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
         <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
-        {#if session.pendingPermission}
-          <div class="permission">
-            <strong>{displayText(language, session.pendingPermission.summary)}</strong>
-            <code>{session.pendingPermission.resource}</code>
-            <div>
-              {#each session.permissionProfile.availableActions as action}
-                <button class:danger={action === "deny"} type="button" onclick={() => permission(action)}>
-                  {actionLabel(action)}
-                </button>
-              {/each}
-            </div>
-          </div>
+        {#if session.pendingQuestion}
+          <section class="agent-question" aria-label={tr("Agent question", "Pergunta do agente")}>
+            {#each session.pendingQuestion.questions as question}
+              <div class="agent-question-item">
+                <small>{displayText(language, question.header)}</small>
+                <strong>{displayText(language, question.question)}</strong>
+                {#if question.options.length}
+                  <div class="question-options">
+                    {#each question.options as option, index}
+                      <button
+                        class:selected={questionSelections[question.id] === option.label}
+                        disabled={sending}
+                        type="button"
+                        onclick={() => void selectQuestionOption(question.id, option.label)}
+                      >
+                        <b>{index + 1}</b>
+                        <span>
+                          {displayText(language, option.label)}
+                          {#if option.description}<small>{displayText(language, option.description)}</small>{/if}
+                        </span>
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+                <em>{tr("Click an option or type its number below.", "Clique em uma opção ou digite o número abaixo.")}</em>
+              </div>
+            {/each}
+            {#if session.pendingQuestion.questions.length > 1}
+              <button class="question-submit" disabled={sending} type="button" onclick={() => void submitSelectedQuestionAnswers()}>
+                {tr("Answer", "Responder")}
+              </button>
+            {/if}
+          </section>
         {/if}
 
         {#if activeTab === "chat"}
@@ -1417,6 +1481,19 @@
             {#if session.status === "running"}
               <div class="agent-typing" aria-label={tr(`${session.agentLabel} is working`, `${session.agentLabel} está trabalhando`)}>
                 <span></span><span></span><span></span>
+              </div>
+            {/if}
+            {#if session.pendingPermission}
+              <div class="permission">
+                <strong>{displayText(language, session.pendingPermission.summary)}</strong>
+                <code>{session.pendingPermission.resource}</code>
+                <div>
+                  {#each session.permissionProfile.availableActions as action}
+                    <button class:danger={action === "deny"} type="button" onclick={() => permission(action)}>
+                      {actionLabel(action)}
+                    </button>
+                  {/each}
+                </div>
               </div>
             {/if}
           </div>
@@ -1704,6 +1781,19 @@
   .permission > div { display: flex; gap: 4px; }
   .permission button { min-height: 23px; padding: 0 7px; border: 1px solid rgba(82, 101, 93, 0.15); border-radius: 6px; color: #4b5d55; background: rgba(255, 255, 255, 0.58); font: 700 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .permission button.danger { color: #a64d4d; }
+  .agent-question { margin: 8px 0 3px; padding: 9px; display: grid; gap: 9px; border: 1px solid rgba(48, 133, 176, 0.2); border-radius: 9px; background: rgba(48, 133, 176, 0.055); }
+  .agent-question-item { min-width: 0; display: grid; gap: 5px; }
+  .agent-question-item > small { color: #367b9c; font: 800 var(--chat-small-font-size)/1.2 Inter, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
+  .agent-question-item > strong { color: #344b52; font: 700 var(--chat-font-size)/1.4 Inter, sans-serif; overflow-wrap: anywhere; }
+  .agent-question-item > em { color: #698078; font: 500 var(--chat-small-font-size)/1.3 Inter, sans-serif; }
+  .question-options { display: grid; gap: 4px; }
+  .question-options button { min-width: 0; padding: 6px 7px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid rgba(65, 112, 133, 0.14); border-radius: 7px; color: #425a61; background: rgba(255, 255, 255, 0.55); text-align: left; cursor: pointer; }
+  .question-options button:hover,
+  .question-options button.selected { border-color: rgba(44, 137, 178, 0.42); background: rgba(48, 145, 187, 0.1); }
+  .question-options button b { color: #2f83aa; font-size: var(--chat-small-font-size); }
+  .question-options button span { min-width: 0; display: grid; gap: 2px; font: 700 var(--chat-small-font-size)/1.3 Inter, sans-serif; }
+  .question-options button small { color: #71827b; font: 500 var(--chat-small-font-size)/1.3 Inter, sans-serif; overflow-wrap: anywhere; }
+  .agent-question .question-submit { justify-self: end; min-height: 25px; padding: 0 10px; border: 0; border-radius: 7px; color: white; background: #318e62; font: 750 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .hint { color: #89948f; font-size: var(--chat-small-font-size); }
   .hint.docked { color: #4f7566; }
   .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 var(--chat-small-font-size)/1.35 Inter, sans-serif; }
@@ -1822,6 +1912,11 @@
   .terminal-window.dark .permission strong { color: #dfc6ac; }
   .terminal-window.dark .permission code,
   .terminal-window.dark .permission button { color: #bdcbc4; background: rgba(218, 232, 225, 0.055); }
+  .terminal-window.dark .agent-question { border-color: rgba(83, 165, 204, 0.2); background: rgba(55, 139, 178, 0.07); }
+  .terminal-window.dark .agent-question-item > strong { color: #d4e2dc; }
+  .terminal-window.dark .agent-question-item > em,
+  .terminal-window.dark .question-options button small { color: #8fa59b; }
+  .terminal-window.dark .question-options button { color: #c5d7cf; border-color: rgba(178, 210, 224, 0.12); background: rgba(219, 235, 228, 0.045); }
   @media (prefers-reduced-motion: reduce) {
     .terminal-card { transition-duration: 0.01ms; }
     .dock-silhouette { animation: none; }

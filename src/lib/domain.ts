@@ -38,6 +38,31 @@ export interface PermissionRequest {
   requestedAt: string;
 }
 
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface InteractiveQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: QuestionOption[];
+}
+
+export interface PendingQuestion {
+  id: string;
+  questions: InteractiveQuestion[];
+  requestedAt: string;
+}
+
+export interface QuestionAnswer {
+  questionId: string;
+  answers: string[];
+}
+
 export interface AgentSession {
   id: string;
   agent: AgentKind;
@@ -54,6 +79,7 @@ export interface AgentSession {
   workingDirectory?: string;
   permissionProfile: PermissionProfile;
   pendingPermission?: PermissionRequest;
+  pendingQuestion?: PendingQuestion;
   lastResponse?: string;
   results: SessionResult[];
   activities: SessionActivity[];
@@ -85,7 +111,7 @@ export interface AgentRateLimit {
 
 export interface SessionActivity {
   id: string;
-  kind: "prompt" | "message" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission";
+  kind: "prompt" | "message" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission" | "question";
   title: string;
   detail?: string;
   status: "running" | "completed" | "failed" | "waiting";

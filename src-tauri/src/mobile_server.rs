@@ -1116,6 +1116,7 @@ fn route_core(
         let required_scope = match &command.command {
             protocol::HubCommand::SubmitPrompt { .. } => MobileScope::Prompt,
             protocol::HubCommand::ResolvePermission { .. } => MobileScope::Approve,
+            protocol::HubCommand::ResolveQuestion { .. } => MobileScope::Prompt,
             protocol::HubCommand::TerminateSession { .. } => MobileScope::Terminate,
             protocol::HubCommand::OpenSessionSource { .. } => {
                 return json_error(

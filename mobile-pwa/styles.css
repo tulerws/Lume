@@ -1083,6 +1083,38 @@ body.install-modal-open { overflow: hidden; }
 .mobile-chat-permission > div { display: flex; gap: 6px; }
 .mobile-chat-permission button { min-height: 34px; flex: 1; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--text); background: rgba(255, 255, 255, 0.04); font-size: 10px; font-weight: 750; }
 .mobile-chat-permission button[data-command="deny"] { color: #e59a9a; }
+.mobile-chat-question {
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(82, 164, 207, 0.3);
+  border-radius: 13px;
+  background: rgba(64, 145, 188, 0.08);
+}
+.mobile-chat-question > small { color: #74b9db; font-size: 9px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+.mobile-chat-question section { min-width: 0; display: grid; gap: 6px; }
+.mobile-chat-question section > strong { color: var(--text); font-size: 11px; }
+.mobile-chat-question section > p { margin: 0; color: var(--text-soft); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.mobile-chat-question section > em { color: var(--muted); font-size: 9px; font-style: normal; }
+.mobile-question-options { display: grid; gap: 6px; }
+.mobile-question-options button {
+  min-width: 0;
+  min-height: 42px;
+  padding: 8px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.035);
+  text-align: left;
+}
+.mobile-question-options button.selected { border-color: rgba(90, 184, 226, 0.65); background: rgba(72, 160, 203, 0.16); }
+.mobile-question-options button b { color: #71bce0; font-size: 11px; }
+.mobile-question-options button span { min-width: 0; display: grid; gap: 2px; font-size: 11px; font-weight: 750; }
+.mobile-question-options button small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
+.mobile-question-submit { min-height: 36px; padding: 0 13px; justify-self: end; border: 0; border-radius: 9px; color: white; background: var(--green); font-size: 10px; font-weight: 800; }
 .mobile-chat-composer {
   padding: 9px 12px calc(9px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);

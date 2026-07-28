@@ -45,6 +45,7 @@
     PermissionAction,
     Preferences,
     PromptAttachmentInput,
+    QuestionAnswer,
     ResultNote,
     SessionStatus,
     TerminalWindowState,
@@ -55,6 +56,7 @@
     configureIntegration,
     configureVscode,
     beginMobilePairing,
+    answerQuestion,
     diagnoseIntegration,
     disableMobileGateway,
     decidePermission,
@@ -156,6 +158,7 @@
   });
   let selectedId = $state<string | null>(null);
   let permissionError = $state<string | null>(null);
+  let questionSelections = $state<Record<string, string>>({});
   let savingSettings = $state(false);
   let configuringIntegration = $state<IntegrationStatus["kind"] | null>(null);
   let diagnosingIntegration = $state<IntegrationStatus["kind"] | null>(null);
@@ -1312,6 +1315,37 @@
     }
   }
 
+  async function handleQuestionOption(
+    session: AgentSession,
+    questionId: string,
+    value: string,
+  ) {
+    const request = session.pendingQuestion;
+    if (!request) return;
+    const selections = {
+      ...questionSelections,
+      [`${request.id}:${questionId}`]: value,
+    };
+    questionSelections = selections;
+    const answers: QuestionAnswer[] = request.questions
+      .map((question) => ({
+        questionId: question.id,
+        answers: selections[`${request.id}:${question.id}`]
+          ? [selections[`${request.id}:${question.id}`]]
+          : [],
+      }))
+      .filter((answer) => answer.answers.length > 0);
+    if (answers.length !== request.questions.length) return;
+    permissionError = null;
+    try {
+      await answerQuestion(session.id, request.id, answers);
+      questionSelections = {};
+      await refreshSessions(false);
+    } catch (error) {
+      permissionError = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
   async function refreshMobileSettings() {
     if (!isTauri) return;
     try {
@@ -2243,6 +2277,33 @@
                             </button>
                           {/each}
                         </div>
+                        {#if permissionError}
+                          <p class="inline-error" transition:fade>{permissionError}</p>
+                        {/if}
+                      </div>
+                    {/if}
+                    {#if session.pendingQuestion}
+                      <div class="question-block">
+                        <span class="eyebrow">{tr("Agent question", "Pergunta do agente")}</span>
+                        {#each session.pendingQuestion.questions as question}
+                          <section>
+                            <strong>{shown(question.question)}</strong>
+                            {#if question.options.length}
+                              <div class="question-actions">
+                                {#each question.options as option, index}
+                                  <button
+                                    class:selected={questionSelections[`${session.pendingQuestion.id}:${question.id}`] === option.label}
+                                    type="button"
+                                    onclick={() => void handleQuestionOption(session, question.id, option.label)}
+                                  >
+                                    <b>{index + 1}</b> {shown(option.label)}
+                                  </button>
+                                {/each}
+                              </div>
+                            {/if}
+                            <small>{tr("Choose an option or type its number below.", "Escolha uma opção ou digite o número abaixo.")}</small>
+                          </section>
+                        {/each}
                         {#if permissionError}
                           <p class="inline-error" transition:fade>{permissionError}</p>
                         {/if}
@@ -3386,6 +3447,14 @@
 
   .permission-block { padding-left: 11px; border-left: 2px solid #d49350; display: grid; gap: 6px; }
   .permission-block > strong { color: #4d3b2a; font-size: 11px; font-weight: 650; line-height: 1.4; }
+  .question-block { padding: 9px; display: grid; gap: 8px; border: 1px solid rgba(48, 133, 176, 0.2); border-radius: 9px; background: rgba(48, 133, 176, 0.055); }
+  .question-block section { min-width: 0; display: grid; gap: 5px; }
+  .question-block section > strong { color: #344b52; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+  .question-block section > small { color: #6c8077; font-size: 9px; }
+  .question-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+  .question-actions button { min-height: 26px; padding: 0 8px; border: 1px solid rgba(65, 112, 133, 0.16); border-radius: 7px; color: #425a61; background: rgba(255, 255, 255, 0.52); font-size: 9px; font-weight: 700; cursor: pointer; }
+  .question-actions button.selected { border-color: rgba(44, 137, 178, 0.42); background: rgba(48, 145, 187, 0.12); }
+  .question-actions button b { color: #2f83aa; }
   code { padding: 7px 8px; overflow: hidden; border-radius: 7px; color: #46524d; background: rgba(70, 82, 77, 0.055); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
   .permission-actions { margin-top: 2px; display: flex; flex-wrap: wrap; gap: 5px; }
@@ -3793,6 +3862,10 @@
   .overlay-shell.dark code,
   .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
   .overlay-shell.dark .permission-block > strong { color: #e2d0bd; }
+  .overlay-shell.dark .question-block { border-color: rgba(83, 165, 204, 0.2); background: rgba(55, 139, 178, 0.07); }
+  .overlay-shell.dark .question-block section > strong { color: #d4e2dc; }
+  .overlay-shell.dark .question-block section > small { color: #8fa59b; }
+  .overlay-shell.dark .question-actions button { color: #c5d7cf; border-color: rgba(178, 210, 224, 0.12); background: rgba(219, 235, 228, 0.045); }
   .overlay-shell.dark .permission-actions button,
   .overlay-shell.dark .field-row select,
   .overlay-shell.dark .shortcut-input,

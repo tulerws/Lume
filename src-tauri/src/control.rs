@@ -8,8 +8,8 @@ use crate::{
     codex_bridge::CodexBridge,
     discovery,
     domain::{
-        AgentKind, PermissionAction, PromptAttachment, PromptAttachmentInput, SessionSource,
-        SessionStatus,
+        AgentKind, PendingQuestion, PermissionAction, PromptAttachment, PromptAttachmentInput,
+        QuestionAnswer, SessionSource, SessionStatus,
     },
     integrations::{self, IntegrationKind},
     launcher::{self, LaunchRequest},
@@ -44,6 +44,15 @@ pub fn resolve_permission(
     action: PermissionAction,
 ) -> Result<(), String> {
     state.resolve_permission(session_id, permission_id, action)
+}
+
+pub fn resolve_question(
+    state: &AppState,
+    session_id: &str,
+    question_id: &str,
+    answers: Vec<QuestionAnswer>,
+) -> Result<(), String> {
+    state.resolve_question(session_id, question_id, answers)
 }
 
 pub fn open_session_source(
@@ -94,6 +103,15 @@ pub fn submit_prompt(
         .into_iter()
         .find(|session| session.id == session_id)
         .ok_or_else(|| "Sessão não encontrada".to_string())?;
+    if let Some(question) = session.pending_question.as_ref() {
+        if !attachments.is_empty() {
+            return Err("Responda à pergunta antes de anexar uma imagem".into());
+        }
+        let answers = question_answers_from_prompt(question, prompt)?;
+        state.resolve_question(session_id, &question.id, answers)?;
+        protocol::emit_sessions_changed(app);
+        return Ok(());
+    }
     if matches!(
         session.status,
         SessionStatus::Running | SessionStatus::PermissionRequired
@@ -187,6 +205,56 @@ pub fn submit_prompt(
     )?;
     protocol::emit_sessions_changed(app);
     Ok(())
+}
+
+fn question_answers_from_prompt(
+    request: &PendingQuestion,
+    prompt: &str,
+) -> Result<Vec<QuestionAnswer>, String> {
+    let inputs = if request.questions.len() == 1 {
+        vec![prompt.trim()]
+    } else {
+        prompt.split(',').map(str::trim).collect::<Vec<_>>()
+    };
+    if inputs.len() != request.questions.len() {
+        return Err("Responda cada pergunta separando as opções por vírgula".into());
+    }
+    request
+        .questions
+        .iter()
+        .zip(inputs)
+        .map(|(question, input)| {
+            let value = input
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| question.options.get(index))
+                .map(|option| option.label.clone())
+                .or_else(|| {
+                    question
+                        .options
+                        .iter()
+                        .find(|option| option.label.eq_ignore_ascii_case(input))
+                        .map(|option| option.label.clone())
+                })
+                .or_else(|| {
+                    (question.options.is_empty() || question.is_other)
+                        .then(|| input.to_string())
+                })
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Digite um número de 1 a {} para responder \"{}\"",
+                        question.options.len(),
+                        question.header
+                    )
+                })?;
+            Ok(QuestionAnswer {
+                question_id: question.id.clone(),
+                answers: vec![value],
+            })
+        })
+        .collect()
 }
 
 fn prepare_prompt_attachments(
@@ -369,6 +437,11 @@ pub fn execute_hub_command(
             permission_id,
             action,
         } => resolve_permission(state, &session_id, &permission_id, action),
+        protocol::HubCommand::ResolveQuestion {
+            session_id,
+            question_id,
+            answers,
+        } => resolve_question(state, &session_id, &question_id, answers),
         protocol::HubCommand::TerminateSession { session_id } => {
             terminate_session(app, state, &session_id)
         }
@@ -421,5 +494,32 @@ mod tests {
 
         assert!(preview.starts_with("data:image/png;base64,"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn option_number_becomes_the_agent_answer() {
+        let request = PendingQuestion {
+            id: "request".into(),
+            questions: vec![crate::domain::InteractiveQuestion {
+                id: "approach".into(),
+                header: "Approach".into(),
+                question: "Which approach?".into(),
+                is_other: true,
+                is_secret: false,
+                options: vec![
+                    crate::domain::QuestionOption {
+                        label: "First".into(),
+                        description: String::new(),
+                    },
+                    crate::domain::QuestionOption {
+                        label: "Second".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+            requested_at: "0".into(),
+        };
+        let answers = question_answers_from_prompt(&request, "2").expect("resposta");
+        assert_eq!(answers[0].answers, vec!["Second"]);
     }
 }

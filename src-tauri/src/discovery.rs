@@ -65,6 +65,20 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
         .keys()
         .map(|pid| pid.as_u32())
         .collect::<HashSet<_>>();
+    let ignored_codex_pids = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let command = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            is_lume_codex_process(&command).then_some(*pid)
+        })
+        .collect::<Vec<_>>();
     let candidates = system
         .processes()
         .iter()
@@ -83,6 +97,12 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
             if is_lume_codex_process(&command) {
                 return None;
             }
+            if ignored_codex_pids
+                .iter()
+                .any(|root| process_descends_from(system, *pid, *root))
+            {
+                return None;
+            }
             let (agent, agent_label) = detect_agent(&name, &command)
                 .map(|agent| {
                     let label = match agent {
@@ -94,12 +114,19 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                     (agent, label.to_string())
                 })
                 .or_else(|| detect_external_agent(&name, &command, external_plugins))?;
-            Some((*pid, process.parent(), agent, agent_label))
+            let working_directory = command_working_directory(process.cmd());
+            Some((
+                *pid,
+                process.parent(),
+                agent,
+                agent_label,
+                working_directory,
+            ))
         })
         .collect::<Vec<_>>();
     let candidate_pids = candidates
         .iter()
-        .map(|(pid, _, _, _)| *pid)
+        .map(|(pid, _, _, _, _)| *pid)
         .collect::<Vec<_>>();
     if !candidate_pids.is_empty() {
         system.refresh_processes_specifics(
@@ -112,7 +139,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
     }
     let agents_by_pid = candidates
         .iter()
-        .map(|(pid, _, agent, label)| (*pid, (agent.clone(), label.clone())))
+        .map(|(pid, _, agent, label, _)| (*pid, (agent.clone(), label.clone())))
         .collect::<HashMap<_, _>>();
 
     let discovered = candidates
@@ -120,7 +147,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
         // Mantém o processo detectado mais próximo da raiz. Um comando executado
         // pelo agente pode conter "codex", "claude" ou "gemini" nos argumentos;
         // escolher esse descendente efêmero faria a sessão trocar de PID.
-        .filter(|(pid, _, agent, label)| {
+        .filter(|(pid, _, agent, label, _)| {
             !agents_by_pid
                 .iter()
                 .any(|(ancestor_pid, (ancestor_agent, ancestor_label))| {
@@ -129,13 +156,25 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                         && process_descends_from(&system, *pid, *ancestor_pid)
                 })
         })
-        .filter_map(|(pid, _, agent, agent_label)| {
+        .filter_map(|(pid, _, agent, agent_label, explicit_working_directory)| {
             let process = system.process(pid)?;
+            let working_directory = explicit_working_directory.or_else(|| {
+                process
+                    .cwd()
+                    .map(|path| path.to_string_lossy().to_string())
+            });
+            if agent == AgentKind::Codex
+                && working_directory
+                    .as_deref()
+                    .is_some_and(is_codex_internal_workspace)
+            {
+                return None;
+            }
             Some(DiscoveredProcess {
                 agent,
                 agent_label,
                 process_id: pid.as_u32(),
-                working_directory: process.cwd().map(|path| path.to_string_lossy().to_string()),
+                working_directory,
                 source: source_for(&system, pid),
             })
         })
@@ -149,6 +188,24 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
 
 fn is_lume_codex_process(command: &str) -> bool {
     command.contains("127.0.0.1:43130") || command.contains("--remote ws://127.0.0.1:43131")
+}
+
+fn command_working_directory(command: &[std::ffi::OsString]) -> Option<String> {
+    let mut parts = command.iter().map(|part| part.to_string_lossy());
+    while let Some(part) = parts.next() {
+        if part == "--command-cwd" {
+            return parts.next().map(|value| value.into_owned());
+        }
+        if let Some(value) = part.strip_prefix("--command-cwd=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn is_codex_internal_workspace(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_lowercase();
+    normalized.contains("/.codex/memories")
 }
 
 /// Subcomandos do Claude Code que são infraestrutura, não conversas.
@@ -341,6 +398,49 @@ mod tests {
         ));
         assert!(is_lume_codex_process(
             "codex --remote ws://127.0.0.1:43131 resume chat"
+        ));
+    }
+
+    #[test]
+    fn codex_sandbox_command_cwd_wins_over_wrapper_directory() {
+        let command = [
+            "codex-linux-sandbox",
+            "--sandbox-policy-cwd",
+            "/home/user",
+            "--command-cwd",
+            "/home/user/Documents/Projetos/Ideias/Lume",
+            "codex",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            command_working_directory(&command).as_deref(),
+            Some("/home/user/Documents/Projetos/Ideias/Lume")
+        );
+    }
+
+    #[test]
+    fn command_cwd_equals_syntax_is_supported() {
+        let command = [
+            "codex.exe",
+            "--command-cwd=C:\\Users\\user\\Documents\\Lume",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            command_working_directory(&command).as_deref(),
+            Some("C:\\Users\\user\\Documents\\Lume")
+        );
+    }
+
+    #[test]
+    fn codex_memory_maintenance_is_not_a_user_session() {
+        assert!(is_codex_internal_workspace(
+            "/home/user/.codex/memories"
+        ));
+        assert!(is_codex_internal_workspace(
+            "C:\\Users\\user\\.codex\\memories\\2026"
+        ));
+        assert!(!is_codex_internal_workspace(
+            "/home/user/Documents/memories"
         ));
     }
 

@@ -17,6 +17,7 @@ import type {
   PermissionAction,
   Preferences,
   PromptAttachmentInput,
+  QuestionAnswer,
   ResultNote,
   RestoredTerminalPlacement,
   ExternalAgentPlugin,
@@ -103,6 +104,18 @@ export async function decidePermission(
     sessionId,
     permissionId,
     action,
+  });
+}
+
+export async function answerQuestion(
+  sessionId: string,
+  questionId: string,
+  answers: QuestionAnswer[],
+): Promise<void> {
+  await invoke("resolve_question", {
+    sessionId,
+    questionId,
+    answers,
   });
 }
 

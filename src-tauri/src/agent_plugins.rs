@@ -93,9 +93,15 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
                 "UserPromptSubmit",
                 "PreToolUse",
                 "PermissionRequest",
+                "PermissionDenied",
                 "PostToolUse",
                 "PostToolUseFailure",
+                "PostToolBatch",
                 "Notification",
+                "SubagentStart",
+                "SubagentStop",
+                "TaskCreated",
+                "TaskCompleted",
                 "Stop",
                 "StopFailure",
                 "SessionEnd",
@@ -223,6 +229,12 @@ mod tests {
         assert!(claude.direct_permissions());
         assert!(claude.hook_events().contains(&"PermissionRequest"));
         assert!(claude.hook_events().contains(&"PostToolUse"));
+        assert!(claude.hook_events().contains(&"PermissionDenied"));
+        assert!(claude.hook_events().contains(&"PostToolBatch"));
+        assert!(claude.hook_events().contains(&"SubagentStart"));
+        assert!(claude.hook_events().contains(&"SubagentStop"));
+        assert!(claude.hook_events().contains(&"TaskCreated"));
+        assert!(claude.hook_events().contains(&"TaskCompleted"));
 
         let codex = plugins
             .iter()

@@ -9,6 +9,7 @@ export interface SessionCapabilities {
   canPrompt: boolean;
   promptUnavailableReason?: PromptUnavailableReason;
   canApprove: boolean;
+  canAnswerQuestion: boolean;
   canTerminate: boolean;
   canOpenSource: boolean;
   canReadResults: boolean;
@@ -33,6 +34,7 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
     canApprove: Boolean(
       session.pendingPermission && session.permissionProfile.canRespondFromLume,
     ),
+    canAnswerQuestion: Boolean(session.pendingQuestion),
     canTerminate: session.source === "cli" && Boolean(session.processId),
     canOpenSource: session.source === "web" || session.source === "vscode",
     canReadResults: session.results.length > 0 || Boolean(session.lastResponse),

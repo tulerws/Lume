@@ -1,13 +1,19 @@
-use std::io::Read;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+};
 
+use chrono::DateTime;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::{
     domain::{
-        AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        PermissionRequest, SessionActivity, SessionSource,
+        AccessMode, AgentKind, HookEvent, HookEventKind, InteractiveQuestion, PendingQuestion,
+        PermissionAction, PermissionProfile, PermissionRequest, QuestionAnswer, QuestionOption,
+        SessionActivity, SessionSource,
     },
     event_server,
     state::now_millis,
@@ -37,7 +43,11 @@ pub fn run_hook(provider: &str) -> i32 {
     };
 
     if provider == "claude" && event.wait_for_decision {
-        let output = claude_permission_output(response.action, &raw);
+        let output = if matches!(event.event, HookEventKind::QuestionRequest) {
+            claude_question_output(response.question_answers, &raw)
+        } else {
+            claude_permission_output(response.action, &raw)
+        };
         if let Some(output) = output {
             println!("{output}");
         }
@@ -57,10 +67,15 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         (_, "SessionStart") => HookEventKind::SessionStarted,
         ("codex", "UserPromptSubmit") | ("claude", "UserPromptSubmit") => HookEventKind::Running,
         ("gemini", "BeforeAgent") => HookEventKind::Running,
+        ("claude", "PreToolUse") if is_claude_question(raw) => HookEventKind::QuestionRequest,
         ("codex" | "claude", "PreToolUse") | ("gemini", "BeforeTool") => HookEventKind::Running,
         ("codex", "PostToolUse")
         | ("claude", "PostToolUse" | "PostToolUseFailure")
         | ("gemini", "AfterTool") => HookEventKind::Running,
+        ("claude", "PostToolBatch")
+        | ("claude", "PermissionDenied")
+        | ("claude", "SubagentStart" | "SubagentStop")
+        | ("claude", "TaskCreated" | "TaskCompleted") => HookEventKind::Activity,
         (_, "PermissionRequest") => HookEventKind::PermissionRequest,
         ("gemini", "Notification")
             if string(raw, "notification_type").as_deref() == Some("ToolPermission") =>
@@ -75,6 +90,15 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         {
             HookEventKind::WaitingForInput
         }
+        ("claude", "Notification")
+            if string(raw, "notification_type").as_deref() == Some("agent_completed") =>
+        {
+            if notification_reports_failure(raw) {
+                HookEventKind::Failed
+            } else {
+                HookEventKind::Completed
+            }
+        }
         ("codex", "Stop") | ("claude", "Stop") | ("gemini", "AfterAgent") => {
             HookEventKind::Completed
         }
@@ -88,7 +112,9 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     let (process_id, source) = agent_process_context(provider);
     let permission_mode = string(raw, "permission_mode");
     let is_permission = matches!(event, HookEventKind::PermissionRequest);
-    let direct_response = provider == "claude" && hook_name == "PermissionRequest";
+    let direct_response = provider == "claude"
+        && (hook_name == "PermissionRequest"
+            || matches!(event, HookEventKind::QuestionRequest));
     let permission_profile = if is_permission || permission_mode.is_some() {
         Some(permission_profile(
             provider,
@@ -104,19 +130,34 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     } else {
         None
     };
+    let question = if matches!(event, HookEventKind::QuestionRequest) {
+        claude_question_request(raw, &session_id)
+    } else {
+        None
+    };
     let last_response = matches!(
         &event,
-        HookEventKind::Completed | HookEventKind::SessionEnded
+        HookEventKind::Completed | HookEventKind::Failed | HookEventKind::SessionEnded
     )
     .then(|| hook_response(raw))
     .flatten();
-    let activity = hook_activity(
-        provider,
-        hook_name.as_str(),
-        raw,
-        &session_id,
-        last_response.as_deref(),
-    );
+    let activity = if matches!(event, HookEventKind::QuestionRequest) {
+        None
+    } else {
+        hook_activity(
+            provider,
+            hook_name.as_str(),
+            raw,
+            &session_id,
+            last_response.as_deref(),
+        )
+    };
+    let activities = if provider == "claude" {
+        claude_transcript_activities(raw, &session_id)
+    } else {
+        Vec::new()
+    };
+    let event_status_label = status_label(hook_name.as_str(), &event).map(str::to_string);
 
     Some(HookEvent {
         event,
@@ -126,15 +167,17 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         project: cwd.as_deref().and_then(project_name),
         source: Some(source),
         source_app: None,
-        status_label: status_label(hook_name.as_str()).map(str::to_string),
+        status_label: event_status_label,
         started_at: string(raw, "timestamp"),
         process_id,
         native_session_id: Some(session_id),
         working_directory: cwd,
         permission_profile,
         permission,
+        question,
         last_response,
         activity,
+        activities,
         wait_for_decision: direct_response,
     })
 }
@@ -169,6 +212,85 @@ fn hook_activity(
             title: "Resposta do agente".into(),
             detail: Some(truncate(response, 32 * 1024)),
             status: "completed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if hook_name == "StopFailure" {
+        let error = string(raw, "error_details")
+            .or_else(|| string(raw, "last_assistant_message"))
+            .or_else(|| string(raw, "error"))
+            .unwrap_or_else(|| "Claude could not finish the response".into());
+        return Some(SessionActivity {
+            id: format!("{provider}:{session_id}:failure:{}", now_millis()),
+            kind: "error".into(),
+            title: "Agent error".into(),
+            detail: Some(truncate(error.trim(), 16 * 1024)),
+            status: "failed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if hook_name == "PermissionDenied" {
+        let tool_name = string(raw, "tool_name").unwrap_or_else(|| "Tool".into());
+        let resource = raw
+            .get("tool_input")
+            .and_then(resource_from_input)
+            .unwrap_or_else(|| tool_name.clone());
+        return Some(SessionActivity {
+            id: format!(
+                "{provider}:{session_id}:denied:{}",
+                string(raw, "tool_use_id").unwrap_or_else(|| now_millis().to_string())
+            ),
+            kind: "permission".into(),
+            title: format!("{tool_name} denied"),
+            detail: string(raw, "reason").or(Some(resource)),
+            status: "failed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if matches!(hook_name, "SubagentStart" | "SubagentStop") {
+        let agent_id = string(raw, "agent_id").unwrap_or_else(|| now_millis().to_string());
+        let agent_type = string(raw, "agent_type").unwrap_or_else(|| "Subagent".into());
+        return Some(SessionActivity {
+            id: format!("{provider}:{session_id}:subagent:{agent_id}"),
+            kind: "subagent".into(),
+            title: agent_type,
+            detail: (hook_name == "SubagentStop")
+                .then(|| hook_response(raw))
+                .flatten(),
+            status: if hook_name == "SubagentStart" {
+                "running"
+            } else {
+                "completed"
+            }
+            .into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+    }
+    if matches!(hook_name, "TaskCreated" | "TaskCompleted") {
+        let task_id = string(raw, "task_id").unwrap_or_else(|| now_millis().to_string());
+        return Some(SessionActivity {
+            id: format!("{provider}:{session_id}:task:{task_id}"),
+            kind: "task".into(),
+            title: string(raw, "task_subject").unwrap_or_else(|| "Agent task".into()),
+            detail: string(raw, "task_description"),
+            status: if hook_name == "TaskCreated" {
+                "running"
+            } else {
+                "completed"
+            }
+            .into(),
             created_at: now_millis(),
             files: Vec::new(),
             attachments: Vec::new(),
@@ -324,6 +446,83 @@ fn permission_profile(
     }
 }
 
+fn is_claude_question(raw: &Value) -> bool {
+    string(raw, "tool_name").as_deref() == Some("AskUserQuestion")
+}
+
+fn notification_reports_failure(raw: &Value) -> bool {
+    ["message", "title"]
+        .into_iter()
+        .filter_map(|key| string(raw, key))
+        .any(|value| {
+            let value = value.to_lowercase();
+            ["failed", "failure", "error", "falhou", "erro"]
+                .iter()
+                .any(|needle| value.contains(needle))
+        })
+}
+
+fn claude_question_request(raw: &Value, session_id: &str) -> Option<PendingQuestion> {
+    let tool_input = raw.get("tool_input")?;
+    let raw_questions = tool_input.get("questions")?.as_array()?;
+    let questions = raw_questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let prompt = question.get("question")?.as_str()?.to_string();
+            Some(InteractiveQuestion {
+                id: claude_question_item_id(session_id, index),
+                header: question
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Question")
+                    .to_string(),
+                question: prompt,
+                is_other: true,
+                is_secret: false,
+                options: question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| {
+                        Some(QuestionOption {
+                            label: option.get("label")?.as_str()?.to_string(),
+                            description: option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if questions.is_empty() {
+        return None;
+    }
+    let tool_id = string(raw, "tool_use_id")
+        .or_else(|| string(raw, "toolUseId"))
+        .unwrap_or_else(|| {
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    format!("{session_id}\n{}", raw_questions.len()).as_bytes()
+                )
+            )
+        });
+    Some(PendingQuestion {
+        id: format!("claude-question:{session_id}:{tool_id}"),
+        questions,
+        requested_at: string(raw, "timestamp").unwrap_or_else(|| now_millis().to_string()),
+    })
+}
+
+fn claude_question_item_id(session_id: &str, index: usize) -> String {
+    format!("claude:{session_id}:question:{index}")
+}
+
 fn permission_request(provider: &str, raw: &Value, session_id: &str) -> PermissionRequest {
     let tool_name = string(raw, "tool_name").unwrap_or_else(|| "Ferramenta".into());
     let tool_input = raw.get("tool_input").or_else(|| raw.get("details"));
@@ -447,13 +646,58 @@ fn claude_permission_output(action: Option<PermissionAction>, raw: &Value) -> Op
     }))
 }
 
-fn status_label(hook: &str) -> Option<&'static str> {
+fn claude_question_output(answers: Option<Vec<QuestionAnswer>>, raw: &Value) -> Option<Value> {
+    let answers = answers?;
+    let session_id = string(raw, "session_id")?;
+    let mut updated_input = raw.get("tool_input")?.clone();
+    let questions = updated_input.get("questions")?.as_array()?.clone();
+    let mapped = questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let prompt = question.get("question")?.as_str()?;
+            let answer = answers
+                .iter()
+                .find(|answer| {
+                    answer.question_id == claude_question_item_id(&session_id, index)
+                })?
+                .answers
+                .join(", ");
+            Some((prompt.to_string(), Value::String(answer)))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    if mapped.len() != questions.len() {
+        return None;
+    }
+    updated_input
+        .as_object_mut()?
+        .insert("answers".into(), Value::Object(mapped));
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated_input
+        }
+    }))
+}
+
+fn status_label(hook: &str, event: &HookEventKind) -> Option<&'static str> {
     match hook {
         "SessionStart" => Some("Sessão detectada"),
-        "UserPromptSubmit" | "BeforeAgent" | "PostToolUse" | "PostToolUseFailure" | "AfterTool" => {
-            Some("Executando")
+        "UserPromptSubmit"
+        | "BeforeAgent"
+        | "PostToolUse"
+        | "PostToolUseFailure"
+        | "PostToolBatch"
+        | "AfterTool" => Some("Executando"),
+        "PermissionRequest" => Some("Aguardando permissão"),
+        "PermissionDenied" => Some("Permissão negada"),
+        "Notification" if matches!(event, HookEventKind::PermissionRequest) => {
+            Some("Aguardando permissão")
         }
-        "PermissionRequest" | "Notification" => Some("Aguardando permissão"),
+        "Notification" if matches!(event, HookEventKind::Completed) => Some("Finalizado"),
+        "Notification" if matches!(event, HookEventKind::Failed) => Some("Encerrado com erro"),
+        "Notification" => Some("Aguardando sua resposta"),
         "Stop" | "AfterAgent" | "SessionEnd" => Some("Finalizado"),
         "StopFailure" => Some("Encerrado com erro"),
         _ => None,
@@ -529,6 +773,194 @@ fn hook_response(value: &Value) -> Option<String> {
         .filter(|response| !response.is_empty())
 }
 
+const CLAUDE_TRANSCRIPT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT: usize = 160;
+const CLAUDE_TRANSCRIPT_LINE_LIMIT: usize = 512 * 1024;
+
+fn claude_transcript_activities(raw: &Value, session_id: &str) -> Vec<SessionActivity> {
+    let mut activities = Vec::new();
+    for path in ["transcript_path", "agent_transcript_path"]
+        .into_iter()
+        .filter_map(|key| string(raw, key))
+    {
+        read_claude_transcript(&path, session_id, &mut activities);
+    }
+    activities.sort_by_key(|activity| activity.created_at);
+    let mut seen = HashSet::new();
+    activities.retain(|activity| seen.insert(activity.id.clone()));
+    if activities.len() > CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT {
+        activities.drain(..activities.len() - CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT);
+    }
+    activities
+}
+
+fn read_claude_transcript(
+    path: &str,
+    session_id: &str,
+    activities: &mut Vec<SessionActivity>,
+) {
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+
+    let start = metadata.len().saturating_sub(CLAUDE_TRANSCRIPT_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut partial = Vec::new();
+        if reader.read_until(b'\n', &mut partial).is_err() {
+            return;
+        }
+    }
+
+    for line in reader.lines().map_while(Result::ok) {
+        if line.len() > CLAUDE_TRANSCRIPT_LINE_LIMIT {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let role = entry
+            .get("message")
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str);
+        if !matches!(role, Some("assistant" | "user")) {
+            continue;
+        }
+        if role == Some("user")
+            && (entry.get("isMeta").and_then(Value::as_bool) == Some(true)
+                || entry.get("isSidechain").and_then(Value::as_bool) == Some(true))
+        {
+            continue;
+        }
+        let entry_id = string(&entry, "uuid")
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(line.as_bytes())));
+        let created_at = string(&entry, "timestamp")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+            .map(|timestamp| timestamp.timestamp_millis())
+            .unwrap_or_else(now_millis);
+        let Some(content) = entry
+            .get("message")
+            .and_then(|message| message.get("content"))
+        else {
+            continue;
+        };
+        match content {
+            Value::String(text) => {
+                let (kind, title) = if role == Some("user") {
+                    ("prompt", "You")
+                } else {
+                    ("message", "Claude")
+                };
+                if role != Some("user") || visible_claude_user_text(text) {
+                    push_claude_transcript_activity(
+                        activities,
+                        session_id,
+                        &entry_id,
+                        0,
+                        kind,
+                        title,
+                        text,
+                        created_at,
+                    );
+                }
+            }
+            Value::Array(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    match string(block, "type").as_deref() {
+                        Some("text") => {
+                            if let Some(text) = string(block, "text") {
+                                let (kind, title) = if role == Some("user") {
+                                    ("prompt", "You")
+                                } else {
+                                    ("message", "Claude")
+                                };
+                                if role != Some("user") || visible_claude_user_text(&text) {
+                                    push_claude_transcript_activity(
+                                        activities,
+                                        session_id,
+                                        &entry_id,
+                                        index,
+                                        kind,
+                                        title,
+                                        &text,
+                                        created_at,
+                                    );
+                                }
+                            }
+                        }
+                        Some("thinking") if role == Some("assistant") => {
+                            if let Some(thinking) = string(block, "thinking") {
+                                push_claude_transcript_activity(
+                                    activities,
+                                    session_id,
+                                    &entry_id,
+                                    index,
+                                    "thinking",
+                                    "Thinking",
+                                    &thinking,
+                                    created_at,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn visible_claude_user_text(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && ![
+            "<command-",
+            "<local-command-",
+            "<system-reminder>",
+            "<available-deferred-tools>",
+        ]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_claude_transcript_activity(
+    activities: &mut Vec<SessionActivity>,
+    session_id: &str,
+    entry_id: &str,
+    block_index: usize,
+    kind: &str,
+    title: &str,
+    detail: &str,
+    created_at: i64,
+) {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return;
+    }
+    activities.push(SessionActivity {
+        id: format!("claude:{session_id}:transcript:{entry_id}:{block_index}"),
+        kind: kind.into(),
+        title: title.into(),
+        detail: Some(truncate(detail, 32 * 1024)),
+        status: "completed".into(),
+        created_at,
+        files: Vec::new(),
+        attachments: Vec::new(),
+        append_detail: false,
+    });
+}
+
 fn project_name(path: &str) -> Option<String> {
     std::path::Path::new(path)
         .file_name()
@@ -569,6 +1001,67 @@ mod tests {
         assert_eq!(
             output["hookSpecificOutput"]["decision"]["behavior"],
             "allow"
+        );
+    }
+
+    #[test]
+    fn claude_questions_are_not_mapped_as_permissions() {
+        let raw = json!({
+            "session_id": "session-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "tool-1",
+            "cwd": "/work/lume",
+            "tool_input": {
+                "questions": [{
+                    "header": "Approach",
+                    "question": "Which approach should I use?",
+                    "options": [
+                        { "label": "A", "description": "First approach" },
+                        { "label": "B", "description": "Second approach" }
+                    ],
+                    "multiSelect": false
+                }]
+            }
+        });
+        let event = map_event("claude", &raw).expect("pergunta Claude");
+        assert!(matches!(event.event, HookEventKind::QuestionRequest));
+        assert!(event.permission.is_none());
+        assert_eq!(
+            event.question.as_ref().unwrap().questions[0].options.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn claude_question_answers_use_updated_tool_input() {
+        let raw = json!({
+            "session_id": "session-1",
+            "tool_input": {
+                "questions": [{
+                    "header": "Approach",
+                    "question": "Which approach should I use?",
+                    "options": [{ "label": "A" }, { "label": "B" }],
+                    "multiSelect": false
+                }]
+            }
+        });
+        let output = claude_question_output(
+            Some(vec![QuestionAnswer {
+                question_id: claude_question_item_id("session-1", 0),
+                answers: vec!["B".into()],
+            }]),
+            &raw,
+        )
+        .expect("resposta Claude");
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["answers"]
+                ["Which approach should I use?"],
+            "B"
         );
     }
 
@@ -667,6 +1160,136 @@ mod tests {
                 .map(|activity| activity.kind.as_str()),
             Some("message")
         );
+    }
+
+    #[test]
+    fn claude_newer_lifecycle_events_are_preserved_as_activity() {
+        for hook in [
+            "PermissionDenied",
+            "PostToolBatch",
+            "SubagentStart",
+            "SubagentStop",
+            "TaskCreated",
+            "TaskCompleted",
+        ] {
+            let raw = json!({
+                "session_id": "claude-session",
+                "cwd": "/work/project",
+                "hook_event_name": hook,
+                "tool_name": "Bash",
+                "tool_input": { "command": "npm test" },
+                "tool_use_id": "tool-1",
+                "reason": "Blocked by classifier",
+                "agent_id": "agent-1",
+                "agent_type": "Explore",
+                "task_id": "task-1",
+                "task_subject": "Inspect hooks"
+            });
+            let event = map_event("claude", &raw).expect("evento novo do Claude");
+            assert!(matches!(event.event, HookEventKind::Activity));
+            if hook != "PostToolBatch" {
+                assert!(event.activity.is_some(), "{hook} deve produzir atividade");
+            }
+        }
+    }
+
+    #[test]
+    fn claude_agent_completed_notification_finishes_or_fails_the_session() {
+        let completed = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "hook_event_name": "Notification",
+                "notification_type": "agent_completed",
+                "message": "Background agent completed"
+            }),
+        )
+        .expect("notificação concluída");
+        assert!(matches!(completed.event, HookEventKind::Completed));
+
+        let failed = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "hook_event_name": "Notification",
+                "notification_type": "agent_completed",
+                "message": "Background agent failed"
+            }),
+        )
+        .expect("notificação de falha");
+        assert!(matches!(failed.event, HookEventKind::Failed));
+    }
+
+    #[test]
+    fn claude_transcript_exposes_intermediate_text_and_thinking() {
+        let path = std::env::temp_dir().join(format!(
+            "lume-claude-transcript-{}.jsonl",
+            now_millis()
+        ));
+        let transcript = [
+            json!({
+                "type": "user",
+                "uuid": "user-prompt",
+                "timestamp": "2026-07-28T11:59:59.000Z",
+                "isMeta": false,
+                "message": {
+                    "role": "user",
+                    "content": "Check the Claude hook."
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-thinking",
+                "timestamp": "2026-07-28T12:00:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "thinking", "thinking": "Inspect the hook contract." }]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-message",
+                "timestamp": "2026-07-28T12:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "The hook is connected." }]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "user-tool-result",
+                "timestamp": "2026-07-28T12:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "content": "ignored" }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|entry| serde_json::to_string(&entry).expect("json"))
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, transcript).expect("transcript");
+
+        let event = map_event(
+            "claude",
+            &json!({
+                "session_id": "claude-session",
+                "hook_event_name": "PostToolBatch",
+                "transcript_path": path
+            }),
+        )
+        .expect("evento com transcript");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(event.activities.len(), 3);
+        assert_eq!(event.activities[0].kind, "prompt");
+        assert_eq!(event.activities[1].kind, "thinking");
+        assert_eq!(
+            event.activities[2].detail.as_deref(),
+            Some("The hook is connected.")
+        );
+        assert!(event.activities[0].created_at < event.activities[2].created_at);
     }
 
     #[test]

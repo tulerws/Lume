@@ -436,8 +436,10 @@ fn event_for(
         working_directory: session.cwd.clone(),
         permission_profile: Some(file.profile.clone().unwrap_or_else(default_profile)),
         permission: None,
+        question: None,
         last_response: last_response.and_then(response_text),
         activity: None,
+        activities: Vec::new(),
         wait_for_decision: false,
     })
 }

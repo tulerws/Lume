@@ -292,6 +292,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
             available_actions: vec![PermissionAction::OpenSource],
         }),
         permission,
+        question: None,
         last_response: event
             .last_response
             .as_deref()
@@ -299,6 +300,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
             .filter(|response| !response.is_empty())
             .map(|response| truncate(response, 32 * 1024)),
         activity: None,
+        activities: Vec::new(),
         wait_for_decision: false,
     })
 }

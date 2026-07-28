@@ -23,7 +23,7 @@ use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
     AgentKind, AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput,
-    ResultNote,
+    QuestionAnswer, ResultNote,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -235,6 +235,16 @@ fn resolve_permission(
     action: PermissionAction,
 ) -> Result<(), String> {
     control::resolve_permission(state.inner(), &session_id, &permission_id, action)
+}
+
+#[tauri::command]
+fn resolve_question(
+    state: State<'_, AppState>,
+    session_id: String,
+    question_id: String,
+    answers: Vec<QuestionAnswer>,
+) -> Result<(), String> {
+    control::resolve_question(state.inner(), &session_id, &question_id, answers)
 }
 
 #[tauri::command]
@@ -921,6 +931,7 @@ pub fn run() {
             revoke_paired_device,
             set_paired_device_scopes,
             resolve_permission,
+            resolve_question,
             open_session_source,
             submit_prompt,
             read_local_image_data_url,

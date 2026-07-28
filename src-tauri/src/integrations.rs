@@ -299,7 +299,9 @@ fn add_handler(
         .as_array_mut()
         .ok_or_else(|| format!("A configuração do evento {event} não contém uma lista"))?;
     let provider = provider(kind);
-    let timeout = if event == "PermissionRequest" {
+    let interactive_claude_hook =
+        *kind == IntegrationKind::Claude && matches!(event, "PermissionRequest" | "PreToolUse");
+    let timeout = if interactive_claude_hook {
         900
     } else {
         10
@@ -650,6 +652,19 @@ mod tests {
             &IntegrationKind::Claude,
             "/opt/Lume App/lume"
         ));
+    }
+
+    #[test]
+    fn claude_question_hook_waits_for_the_lume_response() {
+        let mut hooks = json!({});
+        add_handler(
+            &mut hooks,
+            "PreToolUse",
+            &IntegrationKind::Claude,
+            "/opt/Lume/lume",
+        )
+        .expect("adiciona o hook");
+        assert_eq!(hooks["PreToolUse"][0]["hooks"][0]["timeout"], 900);
     }
 
     #[test]

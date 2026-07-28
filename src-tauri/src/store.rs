@@ -411,6 +411,7 @@ mod tests {
                 risk: "high".into(),
                 requested_at: "0".into(),
             }),
+            pending_question: None,
             last_response: Some("resposta que nao pode ser salva".into()),
             results: vec![crate::domain::SessionResult {
                 id: "result-1".into(),
