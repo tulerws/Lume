@@ -1,7 +1,9 @@
 import type { AgentSession, TerminalWindowState } from "$lib/domain";
 
 function normalizedDirectory(value?: string) {
-  return value?.trim().replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const normalized = value?.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  if (!normalized) return undefined;
+  return /^[a-z]:\//i.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export function terminalMatchesSession(
@@ -9,32 +11,55 @@ export function terminalMatchesSession(
   session: AgentSession,
 ) {
   if (terminal.sessionId === session.id) return true;
-  if (
-    terminal.sessionNativeId &&
-    session.nativeSessionId &&
-    terminal.sessionNativeId === session.nativeSessionId
-  ) {
-    return true;
+  if (terminal.sessionNativeId) {
+    return (
+      terminal.sessionNativeId === session.nativeSessionId &&
+      terminal.sessionAgent === session.agent &&
+      terminal.sessionSource === session.source
+    );
   }
-  if (
+  return Boolean(
     terminal.sessionProcessId &&
     session.processId &&
     terminal.sessionProcessId === session.processId &&
-    terminal.sessionAgent === session.agent
-  ) {
-    return true;
-  }
-  return false;
+    terminal.sessionAgent === session.agent &&
+    terminal.sessionSource === session.source &&
+    !session.nativeSessionId
+  );
 }
 
 export function resolveTerminalSession<T extends AgentSession>(
   terminal: TerminalWindowState,
   sessions: T[],
 ) {
-  const direct = sessions.find((session) => terminalMatchesSession(terminal, session));
-  if (direct) return direct;
+  const exact = sessions.find((session) => terminal.sessionId === session.id);
+  if (exact) return exact;
+
+  if (terminal.sessionNativeId) {
+    return sessions.find((session) =>
+      terminal.sessionNativeId === session.nativeSessionId &&
+      terminal.sessionAgent === session.agent &&
+      terminal.sessionSource === session.source
+    );
+  }
 
   const expectedDirectory = normalizedDirectory(terminal.sessionWorkingDirectory);
+  if (terminal.sessionProcessId) {
+    const processMatches = sessions.filter((session) =>
+      terminal.sessionProcessId === session.processId &&
+      terminal.sessionAgent === session.agent &&
+      terminal.sessionSource === session.source
+    );
+    const contextualProcessMatches = expectedDirectory
+      ? processMatches.filter((session) =>
+          normalizedDirectory(session.workingDirectory) === expectedDirectory
+        )
+      : [];
+    if (contextualProcessMatches.length === 1) return contextualProcessMatches[0];
+    if (processMatches.length === 1) return processMatches[0];
+    return undefined;
+  }
+
   const contextual = sessions.filter((session) =>
     session.agent === terminal.sessionAgent &&
     session.source === terminal.sessionSource &&

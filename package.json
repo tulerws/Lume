@@ -1,15 +1,16 @@
 {
   "name": "lume",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "Monitor local e discreto para agentes de IA no Windows e Linux.",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run test:session-identity",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "check:mobile": "node scripts/validate-mobile-assets.mjs && node scripts/test-response-dedup.mjs",
+    "test:session-identity": "node --experimental-strip-types scripts/test-session-identity.mjs",
     "build:vscode": "node scripts/package-vscode.mjs",
     "mobile:sync": "npm run check:mobile && cap sync",
     "mobile:android": "cap open android",

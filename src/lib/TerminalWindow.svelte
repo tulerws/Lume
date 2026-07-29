@@ -60,11 +60,28 @@
   const currentWindow = getCurrentWindow();
   const label = currentWindow.label;
   type ResizeDirection = "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest";
+  type SlashCommandName =
+    | "plan"
+    | "default"
+    | "stop"
+    | "steer"
+    | "rename"
+    | "detach"
+    | "zoom-in"
+    | "zoom-out"
+    | "close";
+  type SlashCommand = {
+    name: SlashCommandName;
+    description: string;
+  };
   let windowState = $state<TerminalWindowState | null>(null);
   let session = $state<HubSession | null>(null);
   let initializationError = $state<string | null>(null);
   let initializationRun = 0;
   let prompt = $state("");
+  let promptInput = $state<HTMLTextAreaElement | null>(null);
+  let slashCommandIndex = $state(0);
+  let slashMenuDismissed = $state(false);
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
   let message = $state<string | null>(null);
   let sending = $state(false);
@@ -140,6 +157,7 @@
   } | null = null;
   let textZoom = $state(1);
   let textZoomOpen = $state(false);
+  let headerActionsOpen = $state(false);
   const effectiveDark = $derived(darkMode ?? systemDark);
   const displayedComposerHeight = $derived.by(() => {
     const hasQueuedPrompt = pendingQueuedPrompts(session).length > 0;
@@ -274,6 +292,63 @@
       ),
     ),
   );
+
+  function slashCommandQuery() {
+    const value = prompt.trimStart();
+    if (!value.startsWith("/") || /\s/.test(value)) return null;
+    return value.slice(1).toLowerCase();
+  }
+
+  function availableSlashCommands(): SlashCommand[] {
+    const commands: SlashCommand[] = [];
+    if (session?.agent === "codex" && !promptIsRunning) {
+      commands.push(
+        { name: "plan", description: tr("Switch Codex to Plan mode", "Mudar o Codex para o modo Plan") },
+        { name: "default", description: tr("Switch Codex to Default mode", "Mudar o Codex para o modo Default") },
+      );
+    }
+    if (canInterruptRunningPrompt) {
+      commands.push({ name: "stop", description: tr("Interrupt the current prompt", "Interromper o prompt atual") });
+    }
+    if (nextQueuedPrompt && canSendWhileRunning) {
+      commands.push({ name: "steer", description: tr("Steer the next queued prompt now", "Enviar agora o próximo prompt da fila") });
+    }
+    commands.push(
+      { name: "rename", description: tr("Rename this session", "Renomear esta sessão") },
+      { name: "zoom-in", description: tr("Increase chat text size", "Aumentar os textos do chat") },
+      { name: "zoom-out", description: tr("Decrease chat text size", "Diminuir os textos do chat") },
+    );
+    if (windowState?.docked) {
+      commands.push({ name: "detach", description: tr("Undock this terminal", "Desacoplar este terminal") });
+    }
+    commands.push({ name: "close", description: tr("Close this terminal", "Fechar este terminal") });
+    return commands;
+  }
+
+  function filteredSlashCommands() {
+    const query = slashCommandQuery();
+    if (query === null || slashMenuDismissed) return [];
+    return availableSlashCommands().filter((command) =>
+      !query
+      || command.name.includes(query)
+      || command.description.toLowerCase().includes(query)
+    );
+  }
+
+  async function selectSlashCommand(command: SlashCommand) {
+    prompt = `/${command.name} `;
+    slashCommandIndex = 0;
+    slashMenuDismissed = true;
+    await tick();
+    promptInput?.focus();
+    promptInput?.setSelectionRange(prompt.length, prompt.length);
+  }
+
+  function handlePromptInput() {
+    slashCommandIndex = 0;
+    slashMenuDismissed = false;
+  }
+
   const activeRateLimit = $derived.by(() => {
     const limits = (session?.rateLimits ?? [])
       .filter((limit) => Number.isFinite(Number(limit.usedPercent)));
@@ -561,9 +636,10 @@
         message = String(error).replace(/^Error:\s*/, "");
       });
     };
-    const closeTextZoom = (event: PointerEvent) => {
+    const closeHeaderPopovers = (event: PointerEvent) => {
       if (!(event.target instanceof Element)) return;
       if (!event.target.closest(".text-zoom-control")) textZoomOpen = false;
+      if (!event.target.closest(".header-overflow")) headerActionsOpen = false;
     };
     const interruptOnEscape = (event: KeyboardEvent) => {
       if (
@@ -596,7 +672,7 @@
     syncSystemTheme(colorScheme);
     colorScheme.addEventListener("change", syncSystemTheme);
     document.addEventListener("click", openMarkdownLink);
-    document.addEventListener("pointerdown", closeTextZoom);
+    document.addEventListener("pointerdown", closeHeaderPopovers);
     window.addEventListener("keydown", interruptOnEscape);
     void (async () => {
       const [nextPreferences, nextDisplayBackend] = await Promise.all([
@@ -692,7 +768,7 @@
       stopNativeDragEnded?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       document.removeEventListener("click", openMarkdownLink);
-      document.removeEventListener("pointerdown", closeTextZoom);
+      document.removeEventListener("pointerdown", closeHeaderPopovers);
       window.removeEventListener("keydown", interruptOnEscape);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
@@ -1173,23 +1249,73 @@
     }
   }
 
-  async function toggleCollaborationMode() {
+  async function applyCollaborationMode(nextMode: CollaborationMode) {
     if (
       !session
       || session.agent !== "codex"
       || promptIsRunning
       || collaborationModeChanging
-    ) return;
+    ) return false;
     collaborationModeChanging = true;
     message = null;
-    const nextMode: CollaborationMode = collaborationMode === "plan" ? "default" : "plan";
     try {
       collaborationMode = await setSessionCollaborationMode(session.id, nextMode);
+      return true;
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
+      return false;
     } finally {
       collaborationModeChanging = false;
     }
+  }
+
+  async function toggleCollaborationMode() {
+    const nextMode: CollaborationMode = collaborationMode === "plan" ? "default" : "plan";
+    await applyCollaborationMode(nextMode);
+  }
+
+  async function runSlashCommand(value: string) {
+    const command = value.trim().toLowerCase();
+    if (!availableSlashCommands().some((item) => `/${item.name}` === command)) {
+      return false;
+    }
+    let handled = true;
+    switch (command) {
+      case "/plan":
+        await applyCollaborationMode("plan");
+        break;
+      case "/default":
+        await applyCollaborationMode("default");
+        break;
+      case "/stop":
+        await interruptAgentPrompt();
+        break;
+      case "/steer":
+        await steerNextQueuedPrompt();
+        break;
+      case "/rename":
+        beginSessionRename();
+        break;
+      case "/detach":
+        await detach();
+        break;
+      case "/zoom-in":
+        setTextZoom(textZoom + 0.1);
+        break;
+      case "/zoom-out":
+        setTextZoom(textZoom - 0.1);
+        break;
+      case "/close":
+        await closeTerminal();
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) {
+      prompt = "";
+      slashMenuDismissed = false;
+    }
+    return handled;
   }
 
   async function sendPrompt() {
@@ -1200,6 +1326,7 @@
       || !canSubmit
       || !readyForPrompt
     ) return;
+    if (promptAttachments.length === 0 && await runSlashCommand(prompt)) return;
     sending = true;
     message = null;
     try {
@@ -1325,6 +1452,32 @@
   }
 
   function sendPromptOnEnter(event: KeyboardEvent) {
+    const slashCommands = filteredSlashCommands();
+    if (slashCommands.length) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        slashCommandIndex =
+          (slashCommandIndex + direction + slashCommands.length) % slashCommands.length;
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        slashMenuDismissed = true;
+        return;
+      }
+      if (
+        (event.key === "Enter" && !event.shiftKey)
+        || (event.key === "Tab" && !event.shiftKey)
+      ) {
+        event.preventDefault();
+        void selectSlashCommand(
+          slashCommands[Math.min(slashCommandIndex, slashCommands.length - 1)],
+        );
+        return;
+      }
+    }
     if (
       event.key === "Tab"
       && !event.shiftKey
@@ -1480,54 +1633,105 @@
             <i><em style={`width: ${rateLimitRemaining}%`}></em></i>
           </div>
         {/if}
-        <span class="text-zoom-control">
-          <button
-            class:active={textZoomOpen}
-            class="text-zoom-button"
-            type="button"
-            aria-expanded={textZoomOpen}
-            aria-label={tr("Adjust terminal text size", "Ajustar tamanho dos textos do terminal")}
-            title={tr("Text size", "Tamanho do texto")}
-            onclick={() => (textZoomOpen = !textZoomOpen)}
-          >
-            <svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="4.5"></circle><path d="m12 12 4 4M8.5 6.5v4M6.5 8.5h4"></path></svg>
-          </button>
-          {#if textZoomOpen}
-            <span
-              class="text-zoom-popover"
-              role="group"
-              aria-label={tr("Terminal text size", "Tamanho dos textos do terminal")}
-              onpointerdown={(event) => event.stopPropagation()}
+        <span class="header-actions">
+          <span class="text-zoom-control">
+            <button
+              class:active={textZoomOpen}
+              class="text-zoom-button"
+              type="button"
+              aria-expanded={textZoomOpen}
+              aria-label={tr("Adjust terminal text size", "Ajustar tamanho dos textos do terminal")}
+              title={tr("Text size", "Tamanho do texto")}
+              onclick={() => (textZoomOpen = !textZoomOpen)}
             >
-              <button
-                disabled={textZoom <= textZoomMin}
-                type="button"
-                aria-label={tr("Decrease text size", "Diminuir textos")}
-                onclick={() => setTextZoom(textZoom - 0.1)}
-              >−</button>
-              <output>{Math.round(textZoom * 100)}%</output>
-              <button
-                disabled={textZoom >= textZoomMax}
-                type="button"
-                aria-label={tr("Increase text size", "Aumentar textos")}
-                onclick={() => setTextZoom(textZoom + 0.1)}
-              >+</button>
+              <svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="4.5"></circle><path d="m12 12 4 4M8.5 6.5v4M6.5 8.5h4"></path></svg>
+            </button>
+            {#if textZoomOpen}
+              <span
+                class="text-zoom-popover"
+                role="group"
+                aria-label={tr("Terminal text size", "Tamanho dos textos do terminal")}
+                onpointerdown={(event) => event.stopPropagation()}
+              >
+                <button
+                  disabled={textZoom <= textZoomMin}
+                  type="button"
+                  aria-label={tr("Decrease text size", "Diminuir textos")}
+                  onclick={() => setTextZoom(textZoom - 0.1)}
+                >−</button>
+                <output>{Math.round(textZoom * 100)}%</output>
+                <button
+                  disabled={textZoom >= textZoomMax}
+                  type="button"
+                  aria-label={tr("Increase text size", "Aumentar textos")}
+                  onclick={() => setTextZoom(textZoom + 0.1)}
+                >+</button>
+              </span>
+            {/if}
+          </span>
+          {#if windowState?.docked}
+            <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
+              <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
+            </button>
+          {/if}
+          {#if session.source === "cli" && session.processId}
+            <button class="terminate-button" type="button" onclick={() => (terminateConfirm = !terminateConfirm)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
+              <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+            </button>
+          {/if}
+          <button class="close-button" type="button" onclick={closeTerminal} aria-label={tr("Close terminal", "Fechar terminal")}>
+            <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
+          </button>
+        </span>
+        <span class="header-overflow">
+          <button
+            class:active={headerActionsOpen}
+            class="header-overflow-trigger"
+            type="button"
+            aria-expanded={headerActionsOpen}
+            aria-haspopup="menu"
+            aria-label={tr("Terminal actions", "Ações do terminal")}
+            title={tr("Terminal actions", "Ações do terminal")}
+            onclick={() => (headerActionsOpen = !headerActionsOpen)}
+          >
+            <svg viewBox="0 0 20 20"><circle cx="5" cy="10" r="1"></circle><circle cx="10" cy="10" r="1"></circle><circle cx="15" cy="10" r="1"></circle></svg>
+          </button>
+          {#if headerActionsOpen}
+            <span class="header-actions-menu" role="menu" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+              {#if !renamingSession}
+                <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; beginSessionRename(); }}>
+                  <svg viewBox="0 0 20 20"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
+                  <span>{tr("Rename session", "Renomear sessão")}</span>
+                </button>
+              {/if}
+              <span class="header-menu-zoom" role="group" aria-label={tr("Terminal text size", "Tamanho dos textos do terminal")}>
+                <span>
+                  <svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="4.5"></circle><path d="m12 12 4 4M8.5 6.5v4M6.5 8.5h4"></path></svg>
+                  {tr("Text size", "Tamanho do texto")}
+                </span>
+                <button disabled={textZoom <= textZoomMin} type="button" aria-label={tr("Decrease text size", "Diminuir textos")} onclick={() => setTextZoom(textZoom - 0.1)}>−</button>
+                <output>{Math.round(textZoom * 100)}%</output>
+                <button disabled={textZoom >= textZoomMax} type="button" aria-label={tr("Increase text size", "Aumentar textos")} onclick={() => setTextZoom(textZoom + 0.1)}>+</button>
+              </span>
+              {#if windowState?.docked}
+                <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
+                  <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
+                  <span>{tr("Undock terminal", "Desacoplar terminal")}</span>
+                </button>
+              {/if}
+              {#if session.source === "cli" && session.processId}
+                <button class="danger" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; terminateConfirm = !terminateConfirm; }}>
+                  <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+                  <span>{tr("Stop agent", "Encerrar agente")}</span>
+                </button>
+              {/if}
+              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void closeTerminal(); }}>
+                <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
+                <span>{tr("Close terminal", "Fechar terminal")}</span>
+              </button>
             </span>
           {/if}
         </span>
-        {#if windowState?.docked}
-          <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
-            <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
-          </button>
-        {/if}
-        {#if session.source === "cli" && session.processId}
-          <button class="terminate-button" type="button" onclick={() => (terminateConfirm = !terminateConfirm)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
-            <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
-          </button>
-        {/if}
-        <button class="close-button" type="button" onclick={closeTerminal} aria-label={tr("Close terminal", "Fechar terminal")}>
-          <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
-        </button>
       </header>
 
       {#if todo || goal}
@@ -1755,6 +1959,25 @@
           onpointerup={endComposerResize}
           onpointercancel={endComposerResize}
         ><span></span></button>
+        {#if filteredSlashCommands().length}
+          <div class="slash-command-menu" aria-label={tr("Slash commands", "Comandos com barra")}>
+            <div class="slash-command-heading">
+              <strong>{tr("Commands", "Comandos")}</strong>
+              <small><kbd>↑↓</kbd> {tr("navigate", "navegar")} · <kbd>Enter</kbd> {tr("select", "selecionar")}</small>
+            </div>
+            {#each filteredSlashCommands() as command, index (command.name)}
+              <button
+                class:active={slashCommandIndex === index}
+                type="button"
+                onmouseenter={() => (slashCommandIndex = index)}
+                onclick={() => void selectSlashCommand(command)}
+              >
+                <code>/{command.name}</code>
+                <span>{command.description}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
         {#if promptAttachments.length}
           <div class="pending-images">
             <small class="pending-images-label">
@@ -1820,8 +2043,10 @@
             </div>
           {/if}
           <textarea
+            bind:this={promptInput}
             bind:value={prompt}
             disabled={!canSubmit || !readyForPrompt || sending}
+            oninput={handlePromptInput}
             onkeydown={sendPromptOnEnter}
             rows="2"
             aria-label={tr(`Prompt for ${sessionDisplayName(session)}`, `Prompt para ${sessionDisplayName(session)}`)}
@@ -1936,6 +2161,25 @@
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   header button.active { color: #347b5b; background: rgba(52, 139, 94, 0.09); }
   header .rename-button { width: 21px; height: 21px; }
+  .header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+  .header-overflow { position: relative; z-index: 60; display: none; flex: 0 0 auto; }
+  .header-actions-menu { position: absolute; z-index: 70; top: 30px; right: 0; width: 178px; padding: 5px; display: grid; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 10px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 10px 28px rgba(30, 55, 43, 0.17); cursor: default; }
+  header .header-actions-menu > button { z-index: auto; width: 100%; min-height: 29px; height: auto; padding: 0 8px; display: flex; justify-content: flex-start; gap: 8px; border-radius: 7px; color: #53665d; font: 700 8px Inter, sans-serif; text-align: left; }
+  header .header-actions-menu > button:hover { color: #287452; background: rgba(57, 145, 99, 0.08); }
+  header .header-actions-menu > button.danger { color: #9d615c; }
+  .header-actions-menu > button svg { width: 13px; height: 13px; flex: 0 0 auto; }
+  .header-menu-zoom { min-height: 29px; padding: 0 4px 0 8px; display: grid; grid-template-columns: minmax(0, 1fr) 23px 35px 23px; align-items: center; gap: 2px; color: #53665d; font: 700 8px Inter, sans-serif; }
+  .header-menu-zoom > span { min-width: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .header-menu-zoom > span svg { width: 13px; height: 13px; flex: 0 0 auto; }
+  header .header-menu-zoom > button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 12px/1 Inter, sans-serif; }
+  header .header-menu-zoom > button:hover { color: #287452; background: rgba(57, 145, 99, 0.1); }
+  header .header-menu-zoom > button:disabled { opacity: 0.32; cursor: default; }
+  .header-menu-zoom output { color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
+  @container (max-width: 390px) {
+    header .rename-button,
+    .header-actions { display: none; }
+    .header-overflow { display: flex; }
+  }
   .text-zoom-control { position: relative; z-index: 45; display: flex; flex: 0 0 auto; }
   .text-zoom-popover { position: absolute; z-index: 50; top: 30px; right: 0; min-width: 91px; height: 31px; padding: 3px; display: flex; align-items: center; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 9px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 8px 22px rgba(30, 55, 43, 0.15); cursor: default; }
   .text-zoom-popover button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 13px/1 Inter, sans-serif; }
@@ -2093,6 +2337,16 @@
   .composer-controls textarea:disabled { opacity: 0.58; }
   .send-status { padding-bottom: 9px; color: #70827a; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
+  .slash-command-menu { position: absolute; z-index: 45; right: 8px; bottom: calc(100% + 5px); left: 10px; max-height: min(230px, 48vh); padding: 5px; display: grid; gap: 2px; overflow-x: hidden; overflow-y: auto; border: 1px solid rgba(80, 105, 94, 0.15); border-radius: 11px; color: #53665d; background: #f8fbf9; box-shadow: 0 12px 32px rgba(28, 52, 41, 0.2); }
+  .slash-command-heading { min-height: 24px; padding: 2px 7px 4px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid rgba(80, 105, 94, 0.08); }
+  .slash-command-heading strong { color: #667970; font: 800 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
+  .slash-command-heading small { color: #8b9892; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; }
+  .slash-command-heading kbd { padding: 1px 3px; border: 1px solid rgba(80, 105, 94, 0.13); border-radius: 4px; color: #718079; background: rgba(80, 105, 94, 0.045); font: inherit; }
+  .terminal-composer .slash-command-menu > button { width: 100%; min-height: 35px; height: auto; padding: 5px 7px; display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr); align-items: center; gap: 8px; place-items: initial; border-radius: 7px; color: #63746c; background: transparent; text-align: left; }
+  .terminal-composer .slash-command-menu > button:hover,
+  .terminal-composer .slash-command-menu > button.active { color: #2e7657; background: rgba(54, 143, 97, 0.08); }
+  .slash-command-menu code { color: #397d5d; font: 750 var(--chat-small-font-size) "SFMono-Regular", Consolas, "Liberation Mono", monospace; white-space: nowrap; }
+  .slash-command-menu button > span { min-width: 0; overflow: hidden; font: 620 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .terminal-composer .interrupt-submit { background: #bd5c52; }
   .terminal-composer .interrupt-submit:hover:not(:disabled) { background: #aa4d44; }
   .terminal-composer .queued-prompt-tray { width: 100%; height: 35px; padding: 0 7px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(80, 119, 160, 0.13); border-radius: 9px; color: #4f6d83; background: rgba(74, 119, 157, 0.055); text-align: left; }
@@ -2153,6 +2407,14 @@
   .terminal-window.dark .source-badge { color: #a7b5ae; }
   .terminal-window.dark .text-zoom-button.active { color: #86cbaa; background: rgba(102, 190, 149, 0.09); }
   .terminal-window.dark .terminal-name-editor input { color: #d9e5df; border-color: rgba(195, 218, 207, 0.14); background: rgba(219, 233, 226, 0.055); }
+  .terminal-window.dark .header-actions-menu { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.3); }
+  .terminal-window.dark header .header-actions-menu > button,
+  .terminal-window.dark .header-menu-zoom { color: #b7c8bf; }
+  .terminal-window.dark header .header-actions-menu > button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.08); }
+  .terminal-window.dark header .header-actions-menu > button.danger { color: #d48b83; }
+  .terminal-window.dark header .header-menu-zoom > button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
+  .terminal-window.dark header .header-menu-zoom > button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
+  .terminal-window.dark .header-menu-zoom output { color: #a5b6ad; }
   .terminal-window.dark .text-zoom-popover { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
   .terminal-window.dark .text-zoom-popover button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
   .terminal-window.dark .text-zoom-popover button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
@@ -2161,6 +2423,16 @@
   .terminal-window.dark .pending-images-label { color: #8f9f97; }
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
   .terminal-window.dark .pending-images { background: rgba(83, 174, 129, 0.055); }
+  .terminal-window.dark .slash-command-menu { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: #18231e; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.34); }
+  .terminal-window.dark .slash-command-heading { border-color: rgba(205, 222, 213, 0.08); }
+  .terminal-window.dark .slash-command-heading strong,
+  .terminal-window.dark .slash-command-heading kbd { color: #9cafa5; }
+  .terminal-window.dark .slash-command-heading small { color: #81938a; }
+  .terminal-window.dark .slash-command-heading kbd { border-color: rgba(205, 222, 213, 0.11); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .terminal-composer .slash-command-menu > button { color: #a8b9b0; }
+  .terminal-window.dark .terminal-composer .slash-command-menu > button:hover,
+  .terminal-window.dark .terminal-composer .slash-command-menu > button.active { color: #98d3b7; background: rgba(91, 174, 132, 0.1); }
+  .terminal-window.dark .slash-command-menu code { color: #8dceb0; }
   .terminal-window.dark .terminal-composer .queued-prompt-tray { color: #a7bdcd; border-color: rgba(125, 166, 199, 0.13); background: rgba(91, 143, 184, 0.065); }
   .terminal-window.dark .terminal-composer .queued-prompt-tray:hover:not(:disabled) { border-color: rgba(128, 177, 216, 0.23); background: rgba(91, 143, 184, 0.1); }
   .terminal-window.dark .queue-mark { color: #87b8dc; background: rgba(105, 166, 210, 0.11); }

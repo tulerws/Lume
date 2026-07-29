@@ -3,7 +3,10 @@ use std::{
     io::ErrorKind,
     net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -26,6 +29,8 @@ const SERVER_ADDRESS: &str = "127.0.0.1:43130";
 const SERVER_URL: &str = "ws://127.0.0.1:43130";
 const PROXY_ADDRESS: &str = "127.0.0.1:43131";
 pub const PROXY_URL: &str = "ws://127.0.0.1:43131";
+static NEXT_PROXY_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct QueuedPrompt {
@@ -36,28 +41,50 @@ struct QueuedPrompt {
     profile: PermissionProfile,
 }
 
+struct ProxyPrompt {
+    request_id: String,
+    thread_id: String,
+    prompt: String,
+    attachment_paths: Vec<String>,
+    profile: PermissionProfile,
+    response: mpsc::Sender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct ActiveProxyConnection {
+    connection_id: u64,
+    sender: mpsc::Sender<ProxyPrompt>,
+}
+
+type ActiveProxyThreads = Arc<Mutex<HashMap<String, ActiveProxyConnection>>>;
+
 pub struct CodexBridge {
     process: Arc<Mutex<Option<Child>>>,
     queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
     collaboration_modes: Arc<Mutex<HashMap<String, String>>>,
+    active_proxy_threads: ActiveProxyThreads,
 }
 
 impl CodexBridge {
     pub fn start(state: AppState, app: AppHandle) -> Result<Self, String> {
         let listener = TcpListener::bind(PROXY_ADDRESS)
             .map_err(|error| format!("Could not start the Codex bridge: {error}"))?;
+        let active_proxy_threads = Arc::new(Mutex::new(HashMap::new()));
         let proxy_state = state.clone();
         let proxy_app = app.clone();
+        let proxy_threads = active_proxy_threads.clone();
         thread::Builder::new()
             .name("lume-codex-proxy".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let state = proxy_state.clone();
                     let app = proxy_app.clone();
+                    let active_threads = proxy_threads.clone();
                     let _ = thread::Builder::new()
                         .name("lume-codex-client".into())
                         .spawn(move || {
-                            if let Err(error) = proxy_connection(stream, state, app) {
+                            if let Err(error) = proxy_connection(stream, state, app, active_threads)
+                            {
                                 eprintln!("Ponte do Codex encerrada: {error}");
                             }
                         });
@@ -72,6 +99,7 @@ impl CodexBridge {
             process,
             queued_prompts,
             collaboration_modes,
+            active_proxy_threads,
         })
     }
 
@@ -120,6 +148,9 @@ impl CodexBridge {
         app: AppHandle,
     ) -> Result<(), String> {
         self.ensure_server()?;
+        if self.submit_through_active_proxy(thread_id, prompt, attachment_paths, profile.clone())? {
+            return Ok(());
+        }
         let mut server =
             prompt_connection(thread_id, prompt, attachment_paths, profile, &state, &app)?;
         let thread_id = thread_id.to_string();
@@ -132,6 +163,57 @@ impl CodexBridge {
             })
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    fn submit_through_active_proxy(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        attachment_paths: &[String],
+        profile: PermissionProfile,
+    ) -> Result<bool, String> {
+        let active = self
+            .active_proxy_threads
+            .lock()
+            .map_err(|_| "Could not access active Codex sessions".to_string())?
+            .get(thread_id)
+            .cloned();
+        let Some(active) = active else {
+            return Ok(false);
+        };
+        let request_id = format!(
+            "lume-prompt:{}",
+            NEXT_PROXY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let (response, receiver) = mpsc::channel();
+        if active
+            .sender
+            .send(ProxyPrompt {
+                request_id,
+                thread_id: thread_id.to_string(),
+                prompt: prompt.to_string(),
+                attachment_paths: attachment_paths.to_vec(),
+                profile,
+                response,
+            })
+            .is_err()
+        {
+            if let Ok(mut threads) = self.active_proxy_threads.lock() {
+                threads.retain(|_, connection| connection.connection_id != active.connection_id);
+            }
+            return Ok(false);
+        }
+        receiver
+            .recv_timeout(Duration::from_secs(8))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    "The active Codex session did not acknowledge the prompt in time".to_string()
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "The active Codex session closed before accepting the prompt".to_string()
+                }
+            })??;
+        Ok(true)
     }
 
     pub fn steer_prompt(
@@ -435,49 +517,148 @@ fn start_queue_dispatcher(
         .map_err(|error| error.to_string())
 }
 
-fn proxy_connection(stream: TcpStream, state: AppState, app: AppHandle) -> Result<(), String> {
+fn proxy_connection(
+    stream: TcpStream,
+    state: AppState,
+    app: AppHandle,
+    active_proxy_threads: ActiveProxyThreads,
+) -> Result<(), String> {
     let mut client = accept(stream).map_err(|error| error.to_string())?;
     let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
     configure_client_timeout(&mut client)?;
     configure_server_timeout(&mut server)?;
+    let connection_id = NEXT_PROXY_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let (proxy_sender, proxy_receiver) = mpsc::channel::<ProxyPrompt>();
+    let mut pending_prompts = HashMap::new();
     let mut profiles = HashMap::new();
     let mut responses = HashMap::new();
 
-    loop {
-        match client.read() {
-            Ok(message) => {
-                let closing = matches!(message, Message::Close(_));
-                observe_client_message(&message, &mut profiles);
-                server.send(message).map_err(|error| error.to_string())?;
-                if closing {
-                    break;
-                }
+    let result = (|| -> Result<(), String> {
+        loop {
+            while let Ok(request) = proxy_receiver.try_recv() {
+                profiles.insert(request.thread_id.clone(), request.profile);
+                let turn = prompt_turn_request_with_id(
+                    &request.thread_id,
+                    &request.prompt,
+                    &request.attachment_paths,
+                    Value::String(request.request_id.clone()),
+                );
+                server
+                    .send(Message::Text(turn.to_string().into()))
+                    .map_err(|error| error.to_string())?;
+                pending_prompts.insert(request.request_id, request.response);
             }
-            Err(tungstenite::Error::ConnectionClosed) => break,
-            Err(tungstenite::Error::Io(error)) if transient(&error) => {}
-            Err(error) => return Err(error.to_string()),
-        }
 
-        match server.read() {
-            Ok(message) => {
-                let closing = matches!(message, Message::Close(_));
-                if let Some(response) =
-                    intercept_server_message(&message, &state, &app, &profiles, &mut responses)?
-                {
-                    server.send(response).map_err(|error| error.to_string())?;
-                } else {
-                    client.send(message).map_err(|error| error.to_string())?;
+            match client.read() {
+                Ok(message) => {
+                    let closing = matches!(message, Message::Close(_));
+                    observe_client_message(&message, &mut profiles);
+                    server.send(message).map_err(|error| error.to_string())?;
+                    if closing {
+                        break;
+                    }
                 }
-                if closing {
-                    break;
-                }
+                Err(tungstenite::Error::ConnectionClosed) => break,
+                Err(tungstenite::Error::Io(error)) if transient(&error) => {}
+                Err(error) => return Err(error.to_string()),
             }
-            Err(tungstenite::Error::ConnectionClosed) => break,
-            Err(tungstenite::Error::Io(error)) if transient(&error) => {}
-            Err(error) => return Err(error.to_string()),
+
+            match server.read() {
+                Ok(message) => {
+                    let closing = matches!(message, Message::Close(_));
+                    if let Some((thread_id, started)) = proxy_thread_lifecycle(&message) {
+                        if started {
+                            active_proxy_threads
+                                .lock()
+                                .map_err(|_| {
+                                    "Could not register the active Codex session".to_string()
+                                })?
+                                .insert(
+                                    thread_id,
+                                    ActiveProxyConnection {
+                                        connection_id,
+                                        sender: proxy_sender.clone(),
+                                    },
+                                );
+                        } else {
+                            if let Ok(mut threads) = active_proxy_threads.lock() {
+                                threads.retain(|id, connection| {
+                                    id != &thread_id || connection.connection_id != connection_id
+                                });
+                            }
+                        }
+                    }
+                    if let Some((request_id, outcome)) = proxy_prompt_response(&message) {
+                        if let Some(response) = pending_prompts.remove(&request_id) {
+                            let _ = response.send(outcome);
+                            continue;
+                        }
+                    }
+                    if let Some(response) =
+                        intercept_server_message(&message, &state, &app, &profiles, &mut responses)?
+                    {
+                        server.send(response).map_err(|error| error.to_string())?;
+                    } else {
+                        client.send(message).map_err(|error| error.to_string())?;
+                    }
+                    if closing {
+                        break;
+                    }
+                }
+                Err(tungstenite::Error::ConnectionClosed) => break,
+                Err(tungstenite::Error::Io(error)) if transient(&error) => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
+        Ok(())
+    })();
+
+    if let Ok(mut threads) = active_proxy_threads.lock() {
+        threads.retain(|_, connection| connection.connection_id != connection_id);
     }
-    Ok(())
+    for response in pending_prompts.into_values() {
+        let _ = response.send(Err(
+            "The active Codex session closed before accepting the prompt".into(),
+        ));
+    }
+    result
+}
+
+fn proxy_thread_lifecycle(message: &Message) -> Option<(String, bool)> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    match value.get("method").and_then(Value::as_str)? {
+        "thread/started" => Some((
+            text_at(value.get("params")?.get("thread")?, "id")?.to_string(),
+            true,
+        )),
+        "thread/closed" => Some((
+            text_at(value.get("params")?, "threadId")?.to_string(),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+fn proxy_prompt_response(message: &Message) -> Option<(String, Result<(), String>)> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let request_id = value.get("id")?.as_str()?.to_string();
+    if !request_id.starts_with("lume-prompt:") {
+        return None;
+    }
+    let outcome = value.get("error").map_or(Ok(()), |error| {
+        Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Codex refused the prompt")
+            .to_string())
+    });
+    Some((request_id, outcome))
 }
 
 fn configure_client_timeout(socket: &mut WebSocket<TcpStream>) -> Result<(), String> {
@@ -548,9 +729,18 @@ fn prompt_connection(
 }
 
 fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String]) -> Value {
+    prompt_turn_request_with_id(thread_id, prompt, attachment_paths, json!(3))
+}
+
+fn prompt_turn_request_with_id(
+    thread_id: &str,
+    prompt: &str,
+    attachment_paths: &[String],
+    request_id: Value,
+) -> Value {
     json!({
         "method": "turn/start",
-        "id": 3,
+        "id": request_id,
         "params": {
             "threadId": thread_id,
             "input": prompt_input(prompt, attachment_paths)
@@ -1895,6 +2085,7 @@ mod tests {
             process: Arc::new(Mutex::new(None)),
             queued_prompts: Arc::new(Mutex::new(HashMap::new())),
             collaboration_modes: Arc::new(Mutex::new(HashMap::new())),
+            active_proxy_threads: Arc::new(Mutex::new(HashMap::new())),
         };
         bridge
             .queue_prompt(
@@ -2027,6 +2218,79 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn active_proxy_prompt_keeps_its_private_request_id() {
+        assert_eq!(
+            prompt_turn_request_with_id(
+                "thread-live",
+                "Primeiro prompt",
+                &[],
+                json!("lume-prompt:7"),
+            ),
+            json!({
+                "method": "turn/start",
+                "id": "lume-prompt:7",
+                "params": {
+                    "threadId": "thread-live",
+                    "input": [{ "type": "text", "text": "Primeiro prompt" }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn proxy_tracks_live_thread_lifecycle() {
+        let started = Message::Text(
+            json!({
+                "method": "thread/started",
+                "params": { "thread": { "id": "thread-live" } }
+            })
+            .to_string()
+            .into(),
+        );
+        let closed = Message::Text(
+            json!({
+                "method": "thread/closed",
+                "params": { "threadId": "thread-live" }
+            })
+            .to_string()
+            .into(),
+        );
+        assert_eq!(
+            proxy_thread_lifecycle(&started),
+            Some(("thread-live".into(), true))
+        );
+        assert_eq!(
+            proxy_thread_lifecycle(&closed),
+            Some(("thread-live".into(), false))
+        );
+    }
+
+    #[test]
+    fn proxy_consumes_only_lume_prompt_responses() {
+        let accepted = Message::Text(
+            json!({ "id": "lume-prompt:8", "result": { "turn": { "id": "turn-1" } } })
+                .to_string()
+                .into(),
+        );
+        let rejected = Message::Text(
+            json!({ "id": "lume-prompt:9", "error": { "message": "turn unavailable" } })
+                .to_string()
+                .into(),
+        );
+        let unrelated = Message::Text(json!({ "id": 3, "result": {} }).to_string().into());
+
+        assert_eq!(
+            proxy_prompt_response(&accepted),
+            Some(("lume-prompt:8".into(), Ok(())))
+        );
+        assert_eq!(
+            proxy_prompt_response(&rejected),
+            Some(("lume-prompt:9".into(), Err("turn unavailable".into())))
+        );
+        assert_eq!(proxy_prompt_response(&unrelated), None);
     }
 
     #[test]

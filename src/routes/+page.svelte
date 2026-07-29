@@ -30,7 +30,7 @@
     prepareClipboardImage,
   } from "$lib/imageAttachments";
   import { sessionCapabilities } from "$lib/sessionCapabilities";
-  import { resolveTerminalSession, terminalMatchesSession } from "$lib/sessionIdentity";
+  import { resolveTerminalSession } from "$lib/sessionIdentity";
   import type {
     AgentKind,
     AgentSession,
@@ -230,6 +230,11 @@
     pointerId: number;
     startX: number;
     startY: number;
+    lastX: number;
+    lastY: number;
+    originX: number;
+    originY: number;
+    scale: number;
     target: HTMLElement;
     compact: boolean;
   } | null = null;
@@ -932,6 +937,11 @@
       pointerId: event.pointerId,
       startX: event.screenX,
       startY: event.screenY,
+      lastX: event.screenX,
+      lastY: event.screenY,
+      originX: overlayPosition.x,
+      originY: overlayPosition.y,
+      scale: monitorBounds.scale,
       target,
       compact,
     };
@@ -950,20 +960,29 @@
 
   function moveOverlayDrag(event: PointerEvent) {
     if (!dragState || dragState.pointerId !== event.pointerId) return;
-    const dx = event.screenX - dragState.startX;
-    const dy = event.screenY - dragState.startY;
-    const pointerJumpLimit = Math.max(120, 160 * monitorBounds.scale);
-    if (Math.hypot(dx, dy) > pointerJumpLimit) {
+    const stepX = (event.screenX - dragState.lastX) * dragState.scale;
+    const stepY = (event.screenY - dragState.lastY) * dragState.scale;
+    const pointerJumpLimit = Math.max(120, 160 * dragState.scale);
+    if (Math.hypot(stepX, stepY) > pointerJumpLimit) {
       dragState.startX = event.screenX;
       dragState.startY = event.screenY;
+      dragState.lastX = event.screenX;
+      dragState.lastY = event.screenY;
+      dragState.originX = overlayPosition.x;
+      dragState.originY = overlayPosition.y;
       return;
     }
+    dragState.lastX = event.screenX;
+    dragState.lastY = event.screenY;
+    const dx = (event.screenX - dragState.startX) * dragState.scale;
+    const dy = (event.screenY - dragState.startY) * dragState.scale;
     if (!dragging && Math.hypot(dx, dy) < 3) return;
     dragging = true;
     event.preventDefault();
-    dragState.startX = event.screenX;
-    dragState.startY = event.screenY;
-    overlayPosition = clampOverlayPosition(overlayPosition.x + dx, overlayPosition.y + dy);
+    overlayPosition = clampOverlayPosition(
+      dragState.originX + dx,
+      dragState.originY + dy,
+    );
     if (moveFrame !== null) cancelAnimationFrame(moveFrame);
     moveFrame = requestAnimationFrame(() => {
       moveFrame = null;
@@ -1438,7 +1457,9 @@
   }
 
   function terminalIsOpen(session: AgentSession) {
-    return terminalWindows.some((terminal) => terminalMatchesSession(terminal, session));
+    return terminalWindows.some(
+      (terminal) => resolveTerminalSession(terminal, sessions)?.id === session.id,
+    );
   }
 
   async function handlePermission(session: AgentSession, action: PermissionAction) {
@@ -2297,7 +2318,7 @@
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class:measuring={measuringPanel} class:palette-open={paletteOpen} class="panel">
+    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class:measuring={measuringPanel} class:palette-open={paletteOpen} class:launcher-open={launcherOpen} class="panel">
       <header
         role="banner"
         class:dragging
@@ -3496,6 +3517,10 @@
     min-height: 390px;
   }
 
+  .panel.launcher-open {
+    min-height: 500px;
+  }
+
   .panel.morphing:not(.measuring) {
     width: var(--morph-width);
     height: var(--morph-height);
@@ -3622,7 +3647,7 @@
   }
 
   .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
-  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: 430px; padding: 10px 11px; overflow-x: hidden; overflow-y: auto; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
+  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: 430px; padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
   .launcher-row .agent-avatar { width: 25px; height: 25px; border-radius: 8px; font-size: 9px; }
