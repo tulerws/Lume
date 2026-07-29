@@ -40,6 +40,7 @@
     loadPreferences,
     loadHubSnapshot,
     loadTerminalWindowState,
+    markTerminalFrontendReady,
     moveTerminalWindow,
     openSessionSource,
     readLocalImageDataUrl,
@@ -51,7 +52,9 @@
     steerQueuedPrompt,
     submitPrompt,
     syncTerminalWindowPosition,
+    terminalGroupFullscreenActive,
     terminateSession,
+    toggleTerminalGroupFullscreen,
     undockTerminalWindow,
     type CollaborationMode,
     type DisplayBackend,
@@ -59,20 +62,13 @@
 
   const currentWindow = getCurrentWindow();
   const label = currentWindow.label;
+  const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
   type ResizeDirection = "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest";
-  type SlashCommandName =
-    | "plan"
-    | "default"
-    | "stop"
-    | "steer"
-    | "rename"
-    | "detach"
-    | "zoom-in"
-    | "zoom-out"
-    | "close";
   type SlashCommand = {
-    name: SlashCommandName;
+    name: string;
     description: string;
+    source: "agent" | "lume";
+    action?: "plan" | "default" | "interrupt" | "steer" | "rename" | "detach" | "fullscreen" | "zoom-in" | "zoom-out" | "close";
   };
   let windowState = $state<TerminalWindowState | null>(null);
   let session = $state<HubSession | null>(null);
@@ -82,6 +78,8 @@
   let promptInput = $state<HTMLTextAreaElement | null>(null);
   let slashCommandIndex = $state(0);
   let slashMenuDismissed = $state(false);
+  let slashCommandMenu = $state<HTMLDivElement | null>(null);
+  let fullscreen = $state(false);
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
   let message = $state<string | null>(null);
   let sending = $state(false);
@@ -299,30 +297,130 @@
     return value.slice(1).toLowerCase();
   }
 
+  const codexSlashCommands: Array<[string, string]> = [
+    ["model", "Choose the model and reasoning effort"],
+    ["fast", "Toggle the faster service tier"],
+    ["personality", "Choose how Codex communicates"],
+    ["permissions", "Change approval and sandbox permissions"],
+    ["plan", "Switch to Plan mode"],
+    ["goal", "View or manage the current task goal"],
+    ["status", "Show session configuration and token usage"],
+    ["usage", "Show account usage and rate limits"],
+    ["diff", "Show working tree changes"],
+    ["review", "Review the current working tree"],
+    ["mention", "Attach a file or folder to the prompt"],
+    ["compact", "Summarize the chat to free context"],
+    ["new", "Start a new chat"],
+    ["rename", "Rename the current chat"],
+    ["resume", "Resume a saved chat"],
+    ["fork", "Fork the current chat"],
+    ["side", "Start an ephemeral side chat"],
+    ["agent", "Switch between agent threads"],
+    ["ps", "Show background terminals"],
+    ["stop", "Stop background terminals"],
+    ["approve", "Retry a recent auto-review denial"],
+    ["experimental", "Configure experimental features"],
+    ["memories", "Configure memory use and generation"],
+    ["skills", "Browse and use skills"],
+    ["import", "Import setup and chats from Claude Code"],
+    ["ide", "Include current IDE context"],
+    ["apps", "Browse connected apps"],
+    ["plugins", "Browse and manage plugins"],
+    ["hooks", "View and manage lifecycle hooks"],
+    ["mcp", "List configured MCP tools"],
+    ["init", "Generate an AGENTS.md file"],
+    ["copy", "Copy the latest completed response"],
+    ["raw", "Toggle raw scrollback"],
+    ["clear", "Clear the terminal and start a new chat"],
+    ["archive", "Archive this session and exit"],
+    ["delete", "Permanently delete this session"],
+    ["statusline", "Configure status-line items"],
+    ["title", "Configure terminal title items"],
+    ["theme", "Choose the syntax theme"],
+    ["pets", "Choose or hide the terminal pet"],
+    ["keymap", "Configure TUI keyboard shortcuts"],
+    ["vim", "Toggle Vim mode"],
+    ["app", "Continue this session in the desktop app"],
+    ["feedback", "Send feedback to Codex"],
+    ["logout", "Sign out of Codex"],
+    ["quit", "Exit Codex"],
+  ];
+
+  const claudeSlashCommands: Array<[string, string]> = [
+    ["model", "Choose the Claude model"],
+    ["permissions", "View or update tool permissions"],
+    ["plan", "Enter plan mode"],
+    ["btw", "Ask a side question without interrupting the task"],
+    ["compact", "Compact the conversation context"],
+    ["context", "Inspect context usage"],
+    ["cost", "Show token usage and cost"],
+    ["diff", "Review changed files"],
+    ["doctor", "Check the Claude Code installation"],
+    ["hooks", "Manage lifecycle hooks"],
+    ["ide", "Manage the IDE integration"],
+    ["mcp", "Manage MCP servers"],
+    ["memory", "Edit project memory"],
+    ["review", "Review current changes"],
+    ["resume", "Resume another conversation"],
+    ["rename", "Rename the current conversation"],
+    ["status", "Show session status"],
+    ["vim", "Toggle Vim editing mode"],
+    ["clear", "Clear conversation history"],
+    ["help", "Show Claude Code help"],
+    ["exit", "Exit Claude Code"],
+  ];
+
+  const geminiSlashCommands: Array<[string, string]> = [
+    ["model", "Choose the Gemini model"],
+    ["memory", "Manage saved context"],
+    ["chat", "Manage conversation history"],
+    ["compress", "Compress the conversation context"],
+    ["directory", "Manage workspace directories"],
+    ["extensions", "Manage Gemini CLI extensions"],
+    ["mcp", "Manage MCP servers"],
+    ["settings", "Open Gemini CLI settings"],
+    ["stats", "Show session usage statistics"],
+    ["tools", "List available tools"],
+    ["help", "Show Gemini CLI help"],
+    ["clear", "Clear the screen and conversation"],
+    ["quit", "Exit Gemini CLI"],
+  ];
+
+  function agentSlashCommands(): SlashCommand[] {
+    const catalog =
+      session?.agent === "codex"
+        ? codexSlashCommands
+        : session?.agent === "claude"
+          ? claudeSlashCommands
+          : session?.agent === "gemini"
+            ? geminiSlashCommands
+            : [];
+    return catalog.map(([name, description]) => ({ name, description, source: "agent" }));
+  }
+
   function availableSlashCommands(): SlashCommand[] {
-    const commands: SlashCommand[] = [];
+    const commands = agentSlashCommands();
+    const lumeCommands: SlashCommand[] = [];
     if (session?.agent === "codex" && !promptIsRunning) {
-      commands.push(
-        { name: "plan", description: tr("Switch Codex to Plan mode", "Mudar o Codex para o modo Plan") },
-        { name: "default", description: tr("Switch Codex to Default mode", "Mudar o Codex para o modo Default") },
-      );
+      lumeCommands.push({ name: "lume-default", description: "Switch Codex to Default mode", source: "lume", action: "default" });
     }
     if (canInterruptRunningPrompt) {
-      commands.push({ name: "stop", description: tr("Interrupt the current prompt", "Interromper o prompt atual") });
+      lumeCommands.push({ name: "lume-interrupt", description: "Interrupt the current prompt", source: "lume", action: "interrupt" });
     }
     if (nextQueuedPrompt && canSendWhileRunning) {
-      commands.push({ name: "steer", description: tr("Steer the next queued prompt now", "Enviar agora o próximo prompt da fila") });
+      lumeCommands.push({ name: "lume-steer", description: "Steer the next queued prompt now", source: "lume", action: "steer" });
     }
-    commands.push(
-      { name: "rename", description: tr("Rename this session", "Renomear esta sessão") },
-      { name: "zoom-in", description: tr("Increase chat text size", "Aumentar os textos do chat") },
-      { name: "zoom-out", description: tr("Decrease chat text size", "Diminuir os textos do chat") },
+    lumeCommands.push(
+      { name: "lume-rename", description: "Rename this session", source: "lume", action: "rename" },
+      { name: "lume-zoom-in", description: "Increase chat text size", source: "lume", action: "zoom-in" },
+      { name: "lume-zoom-out", description: "Decrease chat text size", source: "lume", action: "zoom-out" },
     );
     if (windowState?.docked) {
-      commands.push({ name: "detach", description: tr("Undock this terminal", "Desacoplar este terminal") });
+      lumeCommands.push({ name: "lume-detach", description: "Undock this terminal", source: "lume", action: "detach" });
     }
-    commands.push({ name: "close", description: tr("Close this terminal", "Fechar este terminal") });
-    return commands;
+    lumeCommands.push({ name: "lume-fullscreen", description: fullscreen ? "Exit full screen" : "Enter full screen", source: "lume", action: "fullscreen" });
+    lumeCommands.push({ name: "lume-close", description: "Close this terminal", source: "lume", action: "close" });
+    return [...commands, ...lumeCommands];
   }
 
   function filteredSlashCommands() {
@@ -336,7 +434,7 @@
   }
 
   async function selectSlashCommand(command: SlashCommand) {
-    prompt = `/${command.name} `;
+    prompt = `/${command.name}`;
     slashCommandIndex = 0;
     slashMenuDismissed = true;
     await tick();
@@ -344,9 +442,17 @@
     promptInput?.setSelectionRange(prompt.length, prompt.length);
   }
 
-  function handlePromptInput() {
+  function handlePromptInput(event: Event) {
+    prompt = (event.currentTarget as HTMLTextAreaElement).value;
     slashCommandIndex = 0;
     slashMenuDismissed = false;
+  }
+
+  async function revealSelectedSlashCommand() {
+    await tick();
+    slashCommandMenu
+      ?.querySelector<HTMLElement>(`[data-slash-index="${slashCommandIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
   }
 
   const activeRateLimit = $derived.by(() => {
@@ -682,7 +788,13 @@
       language = nextPreferences.language;
       darkMode = nextPreferences.darkMode;
       displayBackend = nextDisplayBackend;
+      fullscreen = await currentWindow.isFullscreen().catch(() => false);
+      if (!fullscreen) fullscreen = await terminalGroupFullscreenActive(label).catch(() => false);
       await initializeTerminal();
+      if (disposed) return;
+      await tick();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await markTerminalFrontendReady(label);
       if (disposed) return;
       stopListening = await listen("lume://sessions-changed", async () => {
         if (session && windowState) {
@@ -697,6 +809,7 @@
       stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
         try {
           windowState = await loadTerminalWindowState(label);
+          fullscreen = await terminalGroupFullscreenActive(label);
         } catch {
           // The window may be closing.
         }
@@ -732,14 +845,14 @@
         },
       );
       stopMoved = await currentWindow.onMoved(({ payload }) => {
-        if (displayBackend !== "native-gnome" || !nativeDragActive) return;
+        if ((!isWindows && displayBackend !== "native-gnome") || !nativeDragActive) return;
         nativePosition = { x: payload.x, y: payload.y };
         queueNativePositionSync(payload.x, payload.y, false);
         if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
         nativeDragEndTimer = setTimeout(() => {
           nativeDragEndTimer = undefined;
-          finishNativeGnomeDrag();
-        }, 450);
+          finishNativeWindowDrag();
+        }, isWindows ? 180 : 450);
       });
       stopResized = await currentWindow.onResized(() => {
         if (settling) return;
@@ -918,7 +1031,12 @@
 
   function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
+    if (fullscreen && windowState.docked) return;
     if ((event.target as HTMLElement).closest("button, input, textarea, form")) return;
+    if (displayBackend === "gnome-wayland-limited") {
+      message = "Window dragging requires XWayland in GNOME.";
+      return;
+    }
     if (displayBackend === "xwayland-fallback") {
       event.preventDefault();
       dragging = true;
@@ -933,7 +1051,7 @@
         });
       return;
     }
-    if (displayBackend === "native-gnome") {
+    if (isWindows || displayBackend === "native-gnome") {
       event.preventDefault();
       dragging = true;
       nativeDragActive = true;
@@ -987,7 +1105,7 @@
 
   function endDrag(event: PointerEvent) {
     if (nativeDragActive) {
-      if (displayBackend === "native-gnome") finishNativeGnomeDrag();
+      if (isWindows || displayBackend === "native-gnome") finishNativeWindowDrag();
       return;
     }
     if (!dragState || dragState.pointerId !== event.pointerId) return;
@@ -1031,7 +1149,7 @@
     }
   }
 
-  function finishNativeGnomeDrag() {
+  function finishNativeWindowDrag() {
     if (!nativeDragActive) return;
     nativeDragActive = false;
     dragging = false;
@@ -1062,12 +1180,36 @@
   }
 
   async function detach() {
+    if (windowState?.docked && await terminalGroupFullscreenActive(label)) {
+      await toggleTerminalGroupFullscreen(label);
+      fullscreen = false;
+    }
     windowState = await undockTerminalWindow(label);
+  }
+
+  async function toggleFullscreen() {
+    try {
+      if (windowState?.docked) {
+        const groupFullscreen = await toggleTerminalGroupFullscreen(label);
+        if (groupFullscreen !== null) {
+          fullscreen = groupFullscreen;
+          headerActionsOpen = false;
+          return;
+        }
+      }
+      const next = !await currentWindow.isFullscreen();
+      await currentWindow.setFullscreen(next);
+      fullscreen = next;
+      headerActionsOpen = false;
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
   }
 
   async function beginResize(event: PointerEvent, direction: ResizeDirection) {
     const state = windowState;
     if (event.button !== 0 || !state) return;
+    if (fullscreen && state.docked) return;
     event.preventDefault();
     event.stopPropagation();
     dragging = false;
@@ -1125,8 +1267,8 @@
     const south = resizeDragState.direction.startsWith("South");
     const desiredWidth = resizeDragState.originWidth + (east ? dx : -dx) / scale;
     const desiredHeight = resizeDragState.originHeight + (south ? dy : -dy) / scale;
-    const width = Math.max(300, Math.min(760, Math.round(desiredWidth)));
-    const height = Math.max(240, Math.min(640, Math.round(desiredHeight)));
+    const width = Math.max(300, Math.round(desiredWidth));
+    const height = Math.max(240, Math.round(desiredHeight));
     pendingResize = {
       x: east
         ? resizeDragState.originX
@@ -1276,36 +1418,44 @@
 
   async function runSlashCommand(value: string) {
     const command = value.trim().toLowerCase();
-    if (!availableSlashCommands().some((item) => `/${item.name}` === command)) {
+    const selected = availableSlashCommands().find((item) => `/${item.name}` === command);
+    if (!selected) {
       return false;
     }
+    const action = selected.action
+      ?? (session?.agent === "codex" && selected.name === "plan" ? "plan" : undefined)
+      ?? (selected.name === "rename" ? "rename" : undefined);
+    if (!action) return false;
     let handled = true;
-    switch (command) {
-      case "/plan":
+    switch (action) {
+      case "plan":
         await applyCollaborationMode("plan");
         break;
-      case "/default":
+      case "default":
         await applyCollaborationMode("default");
         break;
-      case "/stop":
+      case "interrupt":
         await interruptAgentPrompt();
         break;
-      case "/steer":
+      case "steer":
         await steerNextQueuedPrompt();
         break;
-      case "/rename":
+      case "rename":
         beginSessionRename();
         break;
-      case "/detach":
+      case "detach":
         await detach();
         break;
-      case "/zoom-in":
+      case "fullscreen":
+        await toggleFullscreen();
+        break;
+      case "zoom-in":
         setTextZoom(textZoom + 0.1);
         break;
-      case "/zoom-out":
+      case "zoom-out":
         setTextZoom(textZoom - 0.1);
         break;
-      case "/close":
+      case "close":
         await closeTerminal();
         break;
       default:
@@ -1459,6 +1609,7 @@
         const direction = event.key === "ArrowDown" ? 1 : -1;
         slashCommandIndex =
           (slashCommandIndex + direction + slashCommands.length) % slashCommands.length;
+        void revealSelectedSlashCommand();
         return;
       }
       if (event.key === "Escape") {
@@ -1669,6 +1820,13 @@
               </span>
             {/if}
           </span>
+          <button class="fullscreen-button" type="button" onclick={toggleFullscreen} aria-label={fullscreen ? tr("Exit full screen", "Sair da tela cheia") : tr("Enter full screen", "Entrar em tela cheia")} title={fullscreen ? tr("Exit full screen", "Sair da tela cheia") : tr("Full screen", "Tela cheia")}>
+            {#if fullscreen}
+              <svg viewBox="0 0 20 20"><path d="M8 3v5H3M12 3v5h5M8 17v-5H3M12 17v-5h5" /></svg>
+            {:else}
+              <svg viewBox="0 0 20 20"><path d="M3 8V3h5M12 3h5v5M3 12v5h5M17 12v5h-5" /></svg>
+            {/if}
+          </button>
           {#if windowState?.docked}
             <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
               <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
@@ -1713,6 +1871,15 @@
                 <output>{Math.round(textZoom * 100)}%</output>
                 <button disabled={textZoom >= textZoomMax} type="button" aria-label={tr("Increase text size", "Aumentar textos")} onclick={() => setTextZoom(textZoom + 0.1)}>+</button>
               </span>
+              <button type="button" role="menuitem" onclick={() => void toggleFullscreen()}>
+                {#if fullscreen}
+                  <svg viewBox="0 0 20 20"><path d="M8 3v5H3M12 3v5h5M8 17v-5H3M12 17v-5h5" /></svg>
+                  <span>{tr("Exit full screen", "Sair da tela cheia")}</span>
+                {:else}
+                  <svg viewBox="0 0 20 20"><path d="M3 8V3h5M12 3h5v5M3 12v5h5M17 12v5h-5" /></svg>
+                  <span>{tr("Enter full screen", "Entrar em tela cheia")}</span>
+                {/if}
+              </button>
               {#if windowState?.docked}
                 <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
                   <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
@@ -1960,7 +2127,7 @@
           onpointercancel={endComposerResize}
         ><span></span></button>
         {#if filteredSlashCommands().length}
-          <div class="slash-command-menu" aria-label={tr("Slash commands", "Comandos com barra")}>
+          <div bind:this={slashCommandMenu} class="slash-command-menu" aria-label={tr("Slash commands", "Comandos com barra")}>
             <div class="slash-command-heading">
               <strong>{tr("Commands", "Comandos")}</strong>
               <small><kbd>↑↓</kbd> {tr("navigate", "navegar")} · <kbd>Enter</kbd> {tr("select", "selecionar")}</small>
@@ -1968,12 +2135,13 @@
             {#each filteredSlashCommands() as command, index (command.name)}
               <button
                 class:active={slashCommandIndex === index}
+                data-slash-index={index}
                 type="button"
                 onmouseenter={() => (slashCommandIndex = index)}
                 onclick={() => void selectSlashCommand(command)}
               >
                 <code>/{command.name}</code>
-                <span>{command.description}</span>
+                <span>{command.description}<small>{command.source === "agent" ? session.agentLabel : "Lume"}</small></span>
               </button>
             {/each}
           </div>
@@ -2346,7 +2514,8 @@
   .terminal-composer .slash-command-menu > button:hover,
   .terminal-composer .slash-command-menu > button.active { color: #2e7657; background: rgba(54, 143, 97, 0.08); }
   .slash-command-menu code { color: #397d5d; font: 750 var(--chat-small-font-size) "SFMono-Regular", Consolas, "Liberation Mono", monospace; white-space: nowrap; }
-  .slash-command-menu button > span { min-width: 0; overflow: hidden; font: 620 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .slash-command-menu button > span { min-width: 0; display: grid; gap: 2px; overflow: hidden; font: 620 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .slash-command-menu button > span small { overflow: hidden; color: #8b9892; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; text-overflow: ellipsis; text-transform: uppercase; }
   .terminal-composer .interrupt-submit { background: #bd5c52; }
   .terminal-composer .interrupt-submit:hover:not(:disabled) { background: #aa4d44; }
   .terminal-composer .queued-prompt-tray { width: 100%; height: 35px; padding: 0 7px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(80, 119, 160, 0.13); border-radius: 9px; color: #4f6d83; background: rgba(74, 119, 157, 0.055); text-align: left; }

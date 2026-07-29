@@ -425,6 +425,7 @@ fn display_backend() -> &'static str {
     match std::env::var("LUME_LINUX_BACKEND").ok().as_deref() {
         Some("xwayland-fallback") => return "xwayland-fallback",
         Some("native-gnome") => return "native-gnome",
+        Some("gnome-wayland-limited") => return "gnome-wayland-limited",
         _ => {}
     }
     "native"
@@ -576,6 +577,32 @@ fn open_terminal_window(
         preferences.overlay_y.unwrap_or(44),
         preferences.show_over_fullscreen,
     )
+}
+
+#[tauri::command]
+fn terminal_frontend_ready(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<(), String> {
+    terminals.frontend_ready(&app, &label)
+}
+
+#[tauri::command]
+fn toggle_terminal_group_fullscreen(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<Option<bool>, String> {
+    terminals.toggle_group_fullscreen(&app, &label)
+}
+
+#[tauri::command]
+fn terminal_group_fullscreen_active(
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> bool {
+    terminals.group_fullscreen_active(&label)
 }
 
 #[tauri::command]
@@ -1028,6 +1055,9 @@ pub fn run() {
             move_overlay,
             resize_overlay_surface,
             open_terminal_window,
+            terminal_frontend_ready,
+            toggle_terminal_group_fullscreen,
+            terminal_group_fullscreen_active,
             list_terminal_windows,
             set_terminal_windows_visible,
             get_terminal_window_state,

@@ -3517,10 +3517,6 @@
     min-height: 390px;
   }
 
-  .panel.launcher-open {
-    min-height: 500px;
-  }
-
   .panel.morphing:not(.measuring) {
     width: var(--morph-width);
     height: var(--morph-height);
@@ -3647,7 +3643,7 @@
   }
 
   .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
-  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: 430px; padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
+  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; bottom: 12px; width: 320px; max-height: calc(100% - 65px); padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
   .launcher-row .agent-avatar { width: 25px; height: 25px; border-radius: 8px; font-size: 9px; }

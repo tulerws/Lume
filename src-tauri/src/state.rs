@@ -1444,6 +1444,9 @@ impl AppState {
                 is_provisional_process(session)
                     && session_matches_process(session, &process)
                     && session.source == process.source
+                    && session
+                        .process_id
+                        .is_none_or(|pid| pid == process.process_id || !active_pids.contains(&pid))
                     && same_directory(
                         session.working_directory.as_deref(),
                         process.working_directory.as_deref(),
@@ -2068,11 +2071,8 @@ fn same_provisional_context(left: &AgentSession, right: &AgentSession) -> bool {
             &right.agent_label,
         )
         && left.source == right.source
-        && (left.process_id.is_some() && left.process_id == right.process_id
-            || same_directory(
-                left.working_directory.as_deref(),
-                right.working_directory.as_deref(),
-            ))
+        && left.process_id.is_some()
+        && left.process_id == right.process_id
 }
 
 fn same_session_identity(left: &AgentSession, right: &AgentSession) -> bool {
@@ -2196,11 +2196,7 @@ fn coalesce_discovered_processes(discovered: Vec<DiscoveredProcess>) -> Vec<Disc
                 &process.agent,
                 &process.agent_label,
             ) && existing.source == process.source
-                && (existing.process_id == process.process_id
-                    || same_directory(
-                        existing.working_directory.as_deref(),
-                        process.working_directory.as_deref(),
-                    ))
+                && existing.process_id == process.process_id
         }) {
             if process.process_id < existing.process_id {
                 *existing = process;
@@ -2904,15 +2900,20 @@ mod tests {
     }
 
     #[test]
-    fn sibling_processes_in_the_same_context_create_one_provisional_session() {
+    fn independent_processes_in_the_same_context_create_distinct_sessions() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
             .reconcile_processes(vec![discovered(4242), discovered(4343)])
             .expect("descoberta");
 
         let sessions = state.sessions().expect("sessões");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].process_id, Some(4242));
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .any(|session| session.process_id == Some(4242)));
+        assert!(sessions
+            .iter()
+            .any(|session| session.process_id == Some(4343)));
     }
 
     #[test]
@@ -2994,7 +2995,7 @@ mod tests {
             .expect("descoberta");
         let mut duplicate = state.sessions().expect("sessões")[0].clone();
         duplicate.id = "process:claude:4343".into();
-        duplicate.process_id = Some(4343);
+        duplicate.process_id = Some(4242);
         state
             .sessions
             .lock()
@@ -3008,7 +3009,7 @@ mod tests {
             .expect("persistência");
 
         state
-            .reconcile_processes(vec![discovered(4343)])
+            .reconcile_processes(vec![discovered(4242)])
             .expect("limpeza");
 
         assert_eq!(state.sessions().expect("sessões").len(), 1);

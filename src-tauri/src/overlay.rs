@@ -411,6 +411,27 @@ mod linux {
         })
     }
 
+    pub fn monitor_work_area(
+        window: &WebviewWindow,
+        monitor_id: Option<&str>,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let display = gtk::gdk::Display::default()?;
+        let monitor = monitor_index(window, monitor_id)
+            .and_then(|index| display.monitor(index as i32))
+            .or_else(|| display.primary_monitor())
+            .or_else(|| display.monitor(0))?;
+        let geometry = monitor.geometry();
+        let workarea = monitor.workarea();
+        let scale = f64::from(monitor.scale_factor()).max(1.0);
+        let physical = |value: i32| (f64::from(value) * scale).round() as i32;
+        Some((
+            physical(workarea.x() - geometry.x()),
+            physical(workarea.y() - geometry.y()),
+            physical(workarea.width()).max(1) as u32,
+            physical(workarea.height()).max(1) as u32,
+        ))
+    }
+
     fn configure_layer(
         window: &WebviewWindow,
         show_over_fullscreen: bool,
@@ -733,6 +754,21 @@ pub fn drag_snapshot(window: &tauri::WebviewWindow) -> Option<(bool, i32, i32)> 
     }
 }
 
+pub fn monitor_work_area(
+    window: &tauri::WebviewWindow,
+    monitor_id: Option<&str>,
+) -> Option<(i32, i32, u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::monitor_work_area(window, monitor_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (window, monitor_id);
+        None
+    }
+}
+
 pub fn resize_surface(
     window: &tauri::WebviewWindow,
     width: i32,
@@ -942,24 +978,20 @@ pub fn start_fullscreen_guard(
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name("lume-fullscreen-guard".into())
-        .spawn(move || {
-            let mut last_topmost = None;
-            loop {
-                let show_over_fullscreen = state
-                    .preferences()
-                    .map(|preferences| preferences.show_over_fullscreen)
-                    .unwrap_or(false);
-                if let Some(fullscreen) = foreground_is_fullscreen() {
-                    let topmost = show_over_fullscreen || !fullscreen;
-                    if last_topmost != Some(topmost) {
-                        if let Some(window) = tauri::Manager::get_webview_window(&app, "main") {
-                            let _ = window.set_always_on_top(topmost);
-                        }
-                        last_topmost = Some(topmost);
+        .spawn(move || loop {
+            let show_over_fullscreen = state
+                .preferences()
+                .map(|preferences| preferences.show_over_fullscreen)
+                .unwrap_or(false);
+            if let Some(fullscreen) = foreground_is_fullscreen() {
+                let topmost = show_over_fullscreen || !fullscreen;
+                for (label, window) in tauri::Manager::webview_windows(&app) {
+                    if label == "main" || label.starts_with("terminal-") {
+                        let _ = window.set_always_on_top(topmost);
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(900));
             }
+            std::thread::sleep(std::time::Duration::from_millis(900));
         })
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -1004,7 +1036,10 @@ fn foreground_is_fullscreen() -> Option<bool> {
 
 #[cfg(target_os = "linux")]
 fn foreground_is_fullscreen() -> Option<bool> {
-    if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("x11") {
+    let session_is_x11 = std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("x11");
+    let lume_uses_xwayland =
+        std::env::var("LUME_LINUX_BACKEND").ok().as_deref() == Some("xwayland-fallback");
+    if (!session_is_x11 && !lume_uses_xwayland) || std::env::var_os("DISPLAY").is_none() {
         return None;
     }
     let root = std::process::Command::new("xprop")

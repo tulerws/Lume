@@ -35,6 +35,26 @@ fn should_use_native_gnome_drag(session_type: &str, desktop: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_limited_gnome_wayland(
+    session_type: &str,
+    desktop: &str,
+    display: Option<&str>,
+    force_native_wayland: bool,
+) -> bool {
+    let desktop_parts = desktop.split([':', ';']).map(str::trim).collect::<Vec<_>>();
+    let is_gnome = desktop_parts.iter().any(|part| {
+        part.eq_ignore_ascii_case("gnome") || part.to_lowercase().starts_with("gnome-")
+    });
+    let is_pop = desktop_parts
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("pop"));
+    session_type.eq_ignore_ascii_case("wayland")
+        && is_gnome
+        && !is_pop
+        && (force_native_wayland || display.is_none_or(|value| value.trim().is_empty()))
+}
+
+#[cfg(target_os = "linux")]
 fn configure_linux_display_backend() {
     let force_native_wayland = std::env::var("LUME_FORCE_NATIVE_WAYLAND")
         .ok()
@@ -58,6 +78,16 @@ fn configure_linux_display_backend() {
     } else if should_use_native_gnome_drag(&session_type, &desktop) {
         std::env::set_var("LUME_LINUX_BACKEND", "native-gnome");
         eprintln!("Lume: usando Wayland nativo com arraste do GNOME");
+    } else if is_limited_gnome_wayland(
+        &session_type,
+        &desktop,
+        display.as_deref(),
+        force_native_wayland,
+    ) {
+        std::env::set_var("LUME_LINUX_BACKEND", "gnome-wayland-limited");
+        eprintln!(
+            "Lume: GNOME Wayland sem XWayland; posicionamento e docking de janelas estão limitados"
+        );
     }
 }
 
@@ -87,7 +117,9 @@ fn main() {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{should_use_native_gnome_drag, should_use_xwayland_fallback};
+    use super::{
+        is_limited_gnome_wayland, should_use_native_gnome_drag, should_use_xwayland_fallback,
+    };
 
     #[test]
     fn uses_xwayland_on_fedora_gnome_wayland() {
@@ -151,6 +183,34 @@ mod tests {
             "GNOME",
             Some(":0"),
             true
+        ));
+    }
+
+    #[test]
+    fn reports_gnome_wayland_when_xwayland_is_unavailable_or_disabled() {
+        assert!(is_limited_gnome_wayland(
+            "wayland",
+            "ubuntu:GNOME",
+            None,
+            false
+        ));
+        assert!(is_limited_gnome_wayland(
+            "wayland",
+            "GNOME",
+            Some(":1"),
+            true
+        ));
+        assert!(!is_limited_gnome_wayland(
+            "wayland",
+            "pop:GNOME",
+            None,
+            false
+        ));
+        assert!(!is_limited_gnome_wayland(
+            "x11",
+            "ubuntu:GNOME",
+            None,
+            false
         ));
     }
 }

@@ -204,6 +204,18 @@ export async function openTerminalWindow(sessionId: string): Promise<string> {
   return invoke<string>("open_terminal_window", { sessionId });
 }
 
+export async function markTerminalFrontendReady(label: string): Promise<void> {
+  await invoke("terminal_frontend_ready", { label });
+}
+
+export async function toggleTerminalGroupFullscreen(label: string): Promise<boolean | null> {
+  return invoke<boolean | null>("toggle_terminal_group_fullscreen", { label });
+}
+
+export async function terminalGroupFullscreenActive(label: string): Promise<boolean> {
+  return invoke<boolean>("terminal_group_fullscreen_active", { label });
+}
+
 export async function loadTerminalWindows(): Promise<TerminalWindowState[]> {
   if (!inDesktop()) return [];
   return invoke<TerminalWindowState[]>("list_terminal_windows");
@@ -331,7 +343,11 @@ export async function loadPreferences(): Promise<Preferences> {
   }
 }
 
-export type DisplayBackend = "native" | "native-gnome" | "xwayland-fallback";
+export type DisplayBackend =
+  | "native"
+  | "native-gnome"
+  | "xwayland-fallback"
+  | "gnome-wayland-limited";
 
 export async function loadDisplayBackend(): Promise<DisplayBackend> {
   if (!inDesktop()) return "native";
