@@ -385,6 +385,7 @@ mod tests {
             id: "session".into(),
             agent: AgentKind::Codex,
             agent_label: "Codex".into(),
+            session_name: "Codex · Lume".into(),
             project: "Lume".into(),
             source: SessionSource::Cli,
             source_app: None,
@@ -439,6 +440,7 @@ mod tests {
         assert!(preferences.dark_mode.is_none());
         assert_eq!(preferences.language, "en");
         assert!(preferences.project_profiles.is_empty());
+        assert!(preferences.session_aliases.is_empty());
         assert!(preferences.whiteboard_layouts.is_empty());
         assert_eq!(preferences.global_shortcut, "Ctrl+Shift+Space");
     }

@@ -1,4 +1,4 @@
-import type { AgentSession } from "$lib/domain";
+import type { AgentSession, PromptDelivery } from "$lib/domain";
 
 export type PromptUnavailableReason =
   | "unsupported_agent"
@@ -14,6 +14,8 @@ export interface SessionCapabilities {
   canOpenSource: boolean;
   canReadResults: boolean;
   canAttachImages: boolean;
+  canInterrupt: boolean;
+  promptDeliveries: PromptDelivery[];
 }
 
 export function sessionCapabilities(session: AgentSession): SessionCapabilities {
@@ -39,5 +41,13 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
     canOpenSource: session.source === "web" || session.source === "vscode",
     canReadResults: session.results.length > 0 || Boolean(session.lastResponse),
     canAttachImages: session.source !== "web" && session.agent !== "unknown",
+    canInterrupt:
+      ["running", "permission_required"].includes(session.status)
+      && session.agent === "codex"
+      && Boolean(session.nativeSessionId),
+    promptDeliveries:
+      session.agent === "codex"
+        ? ["new_turn", "steer", "queue"]
+        : ["new_turn"],
   };
 }

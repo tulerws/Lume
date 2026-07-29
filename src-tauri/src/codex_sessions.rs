@@ -333,7 +333,11 @@ fn remember_goal_tool(payload: &RecordPayload, file: &mut ObservedFile) {
     let activity_id = payload
         .id
         .as_ref()
-        .and_then(|id| file.session.as_ref().map(|session| format!("codex:{}:{id}", session.id)))
+        .and_then(|id| {
+            file.session
+                .as_ref()
+                .map(|session| format!("codex:{}:{id}", session.id))
+        })
         .unwrap_or_else(|| format!("codex-rollout-goal:{call_id}"));
     file.pending_goal_tools.insert(
         call_id.clone(),
@@ -426,6 +430,7 @@ fn event_for(
         session_id: format!("codex-app-server:{}", session.id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
+        session_name: None,
         project,
         source: Some(session.source.clone()),
         source_app: None,

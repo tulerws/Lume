@@ -17,7 +17,9 @@ import type {
   PermissionAction,
   Preferences,
   PromptAttachmentInput,
+  PromptDelivery,
   QuestionAnswer,
+  ResumableSession,
   ResultNote,
   RestoredTerminalPlacement,
   ExternalAgentPlugin,
@@ -39,6 +41,7 @@ export const defaultPreferences: Preferences = {
   historyRetentionDays: 30,
   launchTarget: "auto",
   projectProfiles: {},
+  sessionAliases: {},
   whiteboardLayouts: [],
   globalShortcut: "Ctrl+Shift+Space",
   openShortcut: "Ctrl+Alt+Shift+L",
@@ -52,6 +55,10 @@ export async function loadSessions(): Promise<AgentSession[]> {
   } catch {
     return inDesktop() ? [] : structuredClone(demoSessions);
   }
+}
+
+export async function renameSession(sessionId: string, name: string): Promise<string> {
+  return invoke<string>("rename_session", { sessionId, name });
 }
 
 export async function loadHubSnapshot(): Promise<HubSnapshot> {
@@ -143,8 +150,9 @@ export async function submitPrompt(
   sessionId: string,
   prompt: string,
   attachments: PromptAttachmentInput[] = [],
+  delivery: PromptDelivery = "new_turn",
 ): Promise<void> {
-  await invoke("submit_prompt", { sessionId, prompt, attachments });
+  await invoke("submit_prompt", { sessionId, prompt, attachments, delivery });
 }
 
 export async function readLocalImageDataUrl(path: string): Promise<string> {
@@ -164,6 +172,10 @@ export async function refreshAgentRateLimits(agent: AgentSession["agent"]): Prom
 
 export async function terminateSession(sessionId: string): Promise<void> {
   await invoke("terminate_session", { sessionId });
+}
+
+export async function interruptPrompt(sessionId: string): Promise<void> {
+  await invoke("interrupt_prompt", { sessionId });
 }
 
 export async function openTerminalWindow(sessionId: string): Promise<string> {
@@ -340,6 +352,13 @@ export async function configureIntegration(
   enabled: boolean,
 ): Promise<void> {
   await invoke("configure_integration", { kind, enabled });
+}
+
+export async function loadResumableSessions(
+  kind: IntegrationStatus["kind"],
+): Promise<ResumableSession[]> {
+  if (!("__TAURI_INTERNALS__" in window)) return [];
+  return invoke<ResumableSession[]>("list_resumable_sessions", { kind });
 }
 
 export async function diagnoseIntegration(

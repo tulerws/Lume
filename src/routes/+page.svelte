@@ -46,7 +46,9 @@
     PermissionAction,
     Preferences,
     PromptAttachmentInput,
+    PromptDelivery,
     QuestionAnswer,
+    ResumableSession,
     ResultNote,
     SessionStatus,
     TerminalWindowState,
@@ -66,6 +68,7 @@
     loadDisplayBackend,
     loadHistory,
     loadResultNotes,
+    loadResumableSessions,
     loadIntegrationStatuses,
     loadMobileGatewayStatus,
     loadOverlayPosition,
@@ -80,8 +83,10 @@
     moveOverlay,
     resizeOverlaySurface,
     installExternalPlugin,
+    interruptPrompt,
     removeExternalPlugin,
     readLocalImageDataUrl,
+    renameSession,
     revealBrowserCompanion,
     revokePairedDevice,
     launchAgentSession,
@@ -168,6 +173,9 @@
   let launcherOpen = $state(false);
   let launching = $state<IntegrationStatus["kind"] | null>(null);
   let launchError = $state<string | null>(null);
+  let resumeAgent = $state<IntegrationStatus["kind"] | null>(null);
+  let resumableSessions = $state<ResumableSession[]>([]);
+  let loadingResumeAgent = $state<IntegrationStatus["kind"] | null>(null);
   let browserCompanionPath = $state<string | null>(null);
   let settingsMessage = $state<string | null>(null);
   let settingsMessageIsError = $state(false);
@@ -176,11 +184,17 @@
   let composerSessionId = $state<string | null>(null);
   let composerPrompt = $state("");
   let composerAttachments = $state<PromptAttachmentInput[]>([]);
+  let composerDelivery = $state<PromptDelivery>("new_turn");
   let composerMessage = $state<string | null>(null);
   let composerSending = $state(false);
   let terminateConfirmId = $state<string | null>(null);
   let terminatingSessionId = $state<string | null>(null);
+  let interruptingSessionId = $state<string | null>(null);
   let sessionActionMessage = $state<string | null>(null);
+  let renamingSessionId = $state<string | null>(null);
+  let renameDraft = $state("");
+  let renameError = $state<string | null>(null);
+  let renamingSession = $state(false);
   let copiedResultId = $state<string | null>(null);
   let savingNoteId = $state<string | null>(null);
   let noteMessage = $state<string | null>(null);
@@ -260,6 +274,10 @@
 
   function shown(value: string) {
     return displayText(preferences.language, value);
+  }
+
+  function sessionDisplayName(session: AgentSession) {
+    return session.sessionName?.trim() || session.project?.trim() || session.agentLabel;
   }
 
   function currentExpandedSize() {
@@ -987,18 +1005,74 @@
     sessionActionMessage = null;
   }
 
+  function beginSessionRename(session: AgentSession) {
+    renamingSessionId = session.id;
+    renameDraft = sessionDisplayName(session);
+    renameError = null;
+  }
+
+  function cancelSessionRename() {
+    renamingSessionId = null;
+    renameDraft = "";
+    renameError = null;
+  }
+
+  async function saveSessionRename(session: AgentSession) {
+    if (renamingSession) return;
+    const requested = renameDraft.trim();
+    if (!requested) {
+      renameError = tr("Enter a name for this session.", "Digite um nome para esta sessão.");
+      return;
+    }
+    renamingSession = true;
+    renameError = null;
+    try {
+      const finalName = isTauri
+        ? await renameSession(session.id, requested)
+        : uniqueLocalSessionName(requested, session.id);
+      sessions = sessions.map((item) =>
+        item.id === session.id ? { ...item, sessionName: finalName } : item
+      );
+      cancelSessionRename();
+    } catch (error) {
+      renameError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      renamingSession = false;
+    }
+  }
+
+  function uniqueLocalSessionName(requested: string, sessionId: string) {
+    const used = new Set(
+      sessions
+        .filter((session) => session.id !== sessionId)
+        .map((session) => sessionDisplayName(session).toLocaleLowerCase())
+    );
+    if (!used.has(requested.toLocaleLowerCase())) return requested;
+    for (let suffix = 2; ; suffix += 1) {
+      const candidate = `${requested} (${suffix})`;
+      if (!used.has(candidate.toLocaleLowerCase())) return candidate;
+    }
+  }
+
   function canSubmitToSession(session: AgentSession) {
     return sessionCapabilities(session).canPrompt;
   }
 
   function canContinueSession(session: AgentSession) {
-    return ["completed", "failed", "waiting_for_input"].includes(session.status);
+    return (
+      ["completed", "failed", "waiting_for_input"].includes(session.status)
+      || (
+        session.status === "running"
+        && sessionCapabilities(session).promptDeliveries.includes("steer")
+      )
+    );
   }
 
   function toggleSessionComposer(session: AgentSession) {
     composerSessionId = composerSessionId === session.id ? null : session.id;
     composerPrompt = "";
     composerAttachments = [];
+    composerDelivery = session.status === "running" ? "queue" : "new_turn";
     composerMessage = null;
   }
 
@@ -1008,7 +1082,13 @@
     composerSending = true;
     composerMessage = null;
     try {
-      if (isTauri) await submitPrompt(session.id, prompt, composerAttachments);
+      const delivery =
+        session.status === "running"
+          ? composerDelivery === "new_turn" ? "queue" : composerDelivery
+          : "new_turn";
+      if (isTauri) {
+        await submitPrompt(session.id, prompt, composerAttachments, delivery);
+      }
       sessions = sessions.map((item) =>
         item.id === session.id
           ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined }
@@ -1080,6 +1160,24 @@
     return sessionCapabilities(session).canTerminate;
   }
 
+  function canInterruptSession(session: AgentSession) {
+    return sessionCapabilities(session).canInterrupt;
+  }
+
+  async function interruptSessionPrompt(session: AgentSession) {
+    if (!canInterruptSession(session) || interruptingSessionId) return;
+    interruptingSessionId = session.id;
+    sessionActionMessage = null;
+    try {
+      if (isTauri) await interruptPrompt(session.id);
+      await refreshSessions(false);
+    } catch (error) {
+      sessionActionMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      interruptingSessionId = null;
+    }
+  }
+
   async function copyResult(resultId: string, response: string) {
     try {
       await navigator.clipboard.writeText(response);
@@ -1097,7 +1195,7 @@
     savingNoteId = resultId;
     noteMessage = null;
     try {
-      const note = await saveResultNote(session.id, resultId, `${session.agentLabel} · ${session.project}`);
+      const note = await saveResultNote(session.id, resultId, sessionDisplayName(session));
       resultNotes = [note, ...resultNotes.filter((item) => item.id !== note.id)];
       noteMessage = tr("Result saved as a local note.", "Resultado salvo como nota local.");
     } catch (error) {
@@ -1157,7 +1255,10 @@
         await openTerminalWindow(session.id);
         await refreshTerminalWindows();
       } else {
-        terminalMessage = `O mini terminal de ${session.agentLabel} abre em uma janela separada no app.`;
+        terminalMessage = tr(
+          `${sessionDisplayName(session)} opens in a separate window.`,
+          `${sessionDisplayName(session)} abre em uma janela separada.`,
+        );
       }
     } catch (error) {
       terminalMessage = String(error).replace(/^Error:\s*/, "");
@@ -1527,7 +1628,7 @@
   function paletteCommands(): PaletteCommand[] {
     const commands: PaletteCommand[] = [
       { id: "sessions", label: tr("Sessions", "Sessões"), detail: tr("Show active agents", "Mostrar agentes ativos"), run: () => openView("sessions") },
-      { id: "whiteboard", label: "Whiteboard", detail: tr("Open floating terminals", "Abrir terminais flutuantes"), run: () => openView("board") },
+      { id: "whiteboard", label: tr("Terminals", "Terminais"), detail: tr("Open floating terminals", "Abrir terminais flutuantes"), run: () => openView("board") },
       { id: "history", label: tr("History and notes", "Histórico e notas"), detail: tr("Open completed results", "Abrir resultados finalizados"), run: () => openView("history") },
       { id: "settings", label: tr("Settings", "Ajustes"), detail: tr("Configure Lume", "Configurar o Lume"), run: () => openView("settings") },
       { id: "new-session", label: tr("New agent session", "Nova sessão de agente"), detail: tr("Open the agent launcher", "Abrir o iniciador de agentes"), run: async () => { await openView("sessions"); launcherOpen = true; } },
@@ -1535,7 +1636,7 @@
     for (const session of sessions) {
       commands.push({
         id: `session-${session.id}`,
-        label: `${session.agentLabel} · ${session.project}`,
+        label: sessionDisplayName(session),
         detail: shown(session.statusLabel),
         run: async () => {
           await openView("sessions");
@@ -1545,7 +1646,7 @@
       if (!terminalIsOpen(session)) {
         commands.push({
           id: `terminal-${session.id}`,
-          label: tr(`Open ${session.agentLabel} terminal`, `Abrir terminal ${session.agentLabel}`),
+          label: tr(`Open ${sessionDisplayName(session)} terminal`, `Abrir terminal ${sessionDisplayName(session)}`),
           detail: `${session.project} · ${tr("Chat and changed files", "Chat e arquivos alterados")}`,
           run: async () => {
             await openView("board");
@@ -1556,7 +1657,7 @@
       if (canSubmitToSession(session)) {
         commands.push({
           id: `prompt-${session.id}`,
-          label: tr(`Send prompt to ${session.agentLabel}`, `Enviar prompt para ${session.agentLabel}`),
+          label: tr(`Send prompt to ${sessionDisplayName(session)}`, `Enviar prompt para ${sessionDisplayName(session)}`),
           detail: session.project,
           run: async () => {
             await openView("sessions");
@@ -1685,12 +1786,16 @@
   async function toggleLauncher() {
     launcherOpen = !launcherOpen;
     launchError = null;
+    if (!launcherOpen) {
+      resumeAgent = null;
+      resumableSessions = [];
+    }
     if (launcherOpen && integrations.length === 0) {
       integrations = await loadIntegrationStatuses();
     }
   }
 
-  async function startSession(agent: IntegrationStatus["kind"], resume: boolean) {
+  async function startSession(agent: IntegrationStatus["kind"]) {
     if (!isTauri) {
       launcherOpen = false;
       return;
@@ -1698,9 +1803,7 @@
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: resume
-        ? tr("Project of the session to resume", "Projeto da sessão a retomar")
-        : tr("Project for the new session", "Projeto da nova sessão"),
+      title: tr("Project for the new session", "Projeto da nova sessão"),
     });
     if (!selected || Array.isArray(selected)) return;
 
@@ -1711,13 +1814,54 @@
       await launchAgentSession(
         agent,
         selected,
-        resume,
+        false,
         undefined,
         profile?.launchTarget ?? preferences.launchTarget,
-        resume ? undefined : profile?.permissionMode,
-        resume ? undefined : profile?.approvalPolicy,
+        profile?.permissionMode,
+        profile?.approvalPolicy,
       );
       launcherOpen = false;
+    } catch (error) {
+      launchError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      launching = null;
+    }
+  }
+
+  async function toggleResumeSessions(agent: IntegrationStatus["kind"]) {
+    if (resumeAgent === agent) {
+      resumeAgent = null;
+      resumableSessions = [];
+      return;
+    }
+    resumeAgent = agent;
+    resumableSessions = [];
+    loadingResumeAgent = agent;
+    launchError = null;
+    try {
+      resumableSessions = await loadResumableSessions(agent);
+    } catch (error) {
+      launchError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      loadingResumeAgent = null;
+    }
+  }
+
+  async function resumeStoredSession(stored: ResumableSession) {
+    launching = stored.agent;
+    launchError = null;
+    try {
+      const profile = preferences.projectProfiles[projectKey(stored.workingDirectory)];
+      await launchAgentSession(
+        stored.agent,
+        stored.workingDirectory,
+        true,
+        stored.id,
+        profile?.launchTarget ?? preferences.launchTarget,
+      );
+      launcherOpen = false;
+      resumeAgent = null;
+      resumableSessions = [];
     } catch (error) {
       launchError = String(error).replace(/^Error:\s*/, "");
     } finally {
@@ -2144,11 +2288,43 @@
         <div class="launcher-popover" transition:fly={{ y: -5, duration: 170, easing: cubicOut }}>
           <span class="launcher-title">{tr("Open session", "Abrir sessão")}</span>
           {#each launcherIntegrations() as integration}
-            <div class="launcher-row">
-              <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
-              <strong>{integration.label}</strong>
-              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, false)}>{tr("New", "Nova")}</button>
-              <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind, true)}>{tr("Resume", "Retomar")}</button>
+            <div class:expanded={resumeAgent === integration.kind} class="launcher-agent">
+              <div class="launcher-row">
+                <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
+                <strong>{integration.label}</strong>
+                <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind)}>{tr("New", "Nova")}</button>
+                {#if integration.kind !== "gemini"}
+                  <button
+                    class:active={resumeAgent === integration.kind}
+                    disabled={launching !== null || loadingResumeAgent !== null}
+                    type="button"
+                    onclick={() => toggleResumeSessions(integration.kind)}
+                  >{loadingResumeAgent === integration.kind ? "…" : tr("Resume", "Retomar")}</button>
+                {/if}
+              </div>
+              {#if resumeAgent === integration.kind}
+                <div class="resume-session-list">
+                  {#each resumableSessions as stored (stored.id)}
+                    <button
+                      class="resume-session"
+                      disabled={launching !== null}
+                      type="button"
+                      title={stored.workingDirectory}
+                      onclick={() => resumeStoredSession(stored)}
+                    >
+                      <span>
+                        <strong>{stored.project}</strong>
+                        <small>{stored.source} · {relativeTime(stored.updatedAt)}</small>
+                      </span>
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h8v8M13.5 5.5 5 14" /></svg>
+                    </button>
+                  {:else}
+                    {#if loadingResumeAgent !== integration.kind}
+                      <p>{tr("No resumable sessions were found.", "Nenhuma sessão retomável foi encontrada.")}</p>
+                    {/if}
+                  {/each}
+                </div>
+              {/if}
             </div>
           {:else}
             <p>{tr("No compatible CLI was found.", "Nenhuma CLI compatível foi encontrada.")}</p>
@@ -2200,7 +2376,7 @@
                   <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={20} /></span>
                   <span class="session-copy">
                     <span class="session-title-row">
-                      <strong>{session.agentLabel}</strong>
+                      <strong>{sessionDisplayName(session)}</strong>
                       <span class="source-label">
                         <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
                         {sourceLabel(session)}
@@ -2212,7 +2388,7 @@
                         <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
                       {/if}
                     </span>
-                    <span class="project-name">{session.project}</span>
+                    <span class="project-name">{session.agentLabel} · {session.project}</span>
                     <span class="status-line status-{session.status}">
                       {#if session.status === "running"}
                         <span class="running-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -2236,6 +2412,29 @@
                 {#if selectedId === session.id}
                   {@const capabilities = sessionCapabilities(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
+                    {#if renamingSessionId === session.id}
+                      <form class="session-name-editor" onsubmit={(event) => { event.preventDefault(); void saveSessionRename(session); }}>
+                        <input
+                          maxlength="80"
+                          bind:value={renameDraft}
+                          aria-label={tr("Session name", "Nome da sessão")}
+                          onkeydown={(event) => {
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              cancelSessionRename();
+                            }
+                          }}
+                        />
+                        <button class="primary" disabled={renamingSession} type="submit">{tr("Save", "Salvar")}</button>
+                        <button disabled={renamingSession} type="button" onclick={cancelSessionRename}>{tr("Cancel", "Cancelar")}</button>
+                        {#if renameError}<small>{renameError}</small>{/if}
+                      </form>
+                    {:else}
+                      <button class="rename-session-button" type="button" onclick={() => beginSessionRename(session)}>
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
+                        {tr("Rename session", "Renomear sessão")}
+                      </button>
+                    {/if}
                     {#if capabilities.canOpenSource}
                       <div class="capability-bar">
                         <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
@@ -2346,9 +2545,15 @@
                             </div>
                           {/if}
                           <div class="inline-composer-controls">
+                            {#if session.status === "running"}
+                              <select bind:value={composerDelivery} aria-label={tr("Prompt delivery", "Forma de envio")}>
+                                <option value="steer">{tr("Steer now", "Orientar agora")}</option>
+                                <option value="queue">{tr("Queue next", "Colocar na fila")}</option>
+                              </select>
+                            {/if}
                             <textarea
                               bind:value={composerPrompt}
-                              aria-label={tr(`New prompt for ${session.agentLabel}`, `Novo prompt para ${session.agentLabel}`)}
+                              aria-label={tr(`New prompt for ${sessionDisplayName(session)}`, `Novo prompt para ${sessionDisplayName(session)}`)}
                               placeholder={tr("Paste an image or enter the next prompt…", "Cole uma imagem ou digite o próximo prompt…")}
                               rows="2"
                             ></textarea>
@@ -2363,6 +2568,20 @@
                         </form>
                         {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
                       {/if}
+                    {/if}
+
+                    {#if canInterruptSession(session)}
+                      <button
+                        class="interrupt-prompt-control"
+                        disabled={interruptingSessionId === session.id}
+                        type="button"
+                        onclick={() => void interruptSessionPrompt(session)}
+                      >
+                        <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
+                        {interruptingSessionId === session.id
+                          ? tr("Interrupting…", "Interrompendo…")
+                          : tr("Interrupt prompt", "Interromper prompt")}
+                      </button>
                     {/if}
 
                     {#if canTerminateSession(session)}
@@ -2380,9 +2599,9 @@
                           </button>
                         {/if}
                       </div>
-                      {#if sessionActionMessage && (terminateConfirmId === session.id || terminatingSessionId === session.id)}
-                        <p class="inline-error">{sessionActionMessage}</p>
-                      {/if}
+                    {/if}
+                    {#if sessionActionMessage && selectedId === session.id}
+                      <p class="inline-error">{sessionActionMessage}</p>
                     {/if}
                   </div>
                 {/if}
@@ -2397,10 +2616,6 @@
           </div>
         {:else if view === "board"}
           <div class="whiteboard" in:fade={{ duration: 150 }}>
-            <div class="board-intro">
-              <strong>{tr("A separate space for each chat", "Um espaço separado para cada chat")}</strong>
-            </div>
-
             <div class="layout-toolbar">
               <select
                 aria-label={tr("Saved whiteboard layout", "Layout salvo do whiteboard")}
@@ -2431,8 +2646,8 @@
                 <div class="terminal-picker-row">
                   <span class="agent-avatar agent-{session.agent}"><BrandIcon name={session.agent} size={18} /></span>
                   <span class="terminal-picker-copy">
-                    <strong>{session.agentLabel}</strong>
-                    <small>{session.project}</small>
+                    <strong>{sessionDisplayName(session)}</strong>
+                    <small>{session.agentLabel} · {session.project}</small>
                   </span>
                   <span class="source-label">
                     <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
@@ -2487,7 +2702,7 @@
                 <article class="result-card">
                   <div class="result-heading">
                     <span class="agent-avatar agent-{item.session.agent}"><BrandIcon name={item.session.agent} size={15} /></span>
-                    <span><strong>{item.session.agentLabel}</strong><small>{item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
+                    <span><strong>{sessionDisplayName(item.session)}</strong><small>{item.session.agentLabel} · {item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
                   </div>
                   <p>{item.result.response}</p>
                   {#if item.result.files?.length || item.result.tests?.length}
@@ -2511,8 +2726,6 @@
                     {/if}
                   </div>
                 </article>
-              {:else}
-                <p class="results-empty">{tr("Completed agent responses will appear here.", "As respostas de agentes finalizados aparecerão aqui.")}</p>
               {/each}
             </div>
             {#if noteMessage}<p class="board-message">{noteMessage}</p>{/if}
@@ -3062,13 +3275,13 @@
           class:active={view === "board"}
           type="button"
           onclick={() => openView("board")}
-          aria-label="Whiteboard"
+          aria-label={tr("Terminals", "Terminais")}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <circle cx="5" cy="6" r="2" /><circle cx="15" cy="6" r="2" /><circle cx="10" cy="15" r="2" />
             <path d="m6.7 7 2.2 6M13.3 7l-2.2 6M7 6h6" />
           </svg>
-          <span>{tr("Board", "Mesa")}</span>
+          <span>{tr("Terminals", "Terminais")}</span>
         </button>
         <button
           class:active={view === "history"}
@@ -3316,14 +3529,25 @@
   }
 
   .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
-  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 250px; padding: 10px 11px; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
+  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: 430px; padding: 10px 11px; overflow-x: hidden; overflow-y: auto; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
   .launcher-row .agent-avatar { width: 25px; height: 25px; border-radius: 8px; font-size: 9px; }
   .launcher-row strong { min-width: 0; flex: 1; color: #35423d; font-size: 10px; }
   .launcher-row button { height: 25px; padding: 0 7px; border: 0; border-radius: 7px; color: #60736a; background: rgba(78, 105, 93, 0.055); font-size: 9px; font-weight: 700; cursor: pointer; }
   .launcher-row button:hover { background: rgba(78, 105, 93, 0.1); }
+  .launcher-row button.active { color: #327a58; background: rgba(57, 139, 96, 0.1); }
   .launcher-row button:disabled { opacity: 0.45; }
+  .resume-session-list { max-height: 238px; padding: 2px 0 7px 32px; display: grid; gap: 3px; overflow-x: hidden; overflow-y: auto; }
+  .resume-session-list > p { margin: 8px 2px; color: #89938f; font-size: 9px; }
+  .resume-session { width: 100%; min-height: 39px; padding: 5px 7px 5px 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; border: 0; border-radius: 9px; color: #51665c; background: rgba(76, 104, 91, 0.045); text-align: left; cursor: pointer; }
+  .resume-session:hover { background: rgba(61, 132, 96, 0.09); }
+  .resume-session:disabled { opacity: 0.45; cursor: default; }
+  .resume-session > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .resume-session strong, .resume-session small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .resume-session strong { color: #3e5048; font-size: 9px; }
+  .resume-session small { color: #89958f; font-size: 7px; }
+  .resume-session svg { width: 12px; height: 12px; flex: 0 0 auto; }
   .launcher-popover > p { margin: 8px 3px; color: #89938f; font-size: 10px; }
   .launcher-popover .launcher-error { color: #a54c4c; }
   .command-palette-layer { position: absolute; z-index: 12; inset: 0 0 16px; display: grid; place-items: start center; padding-top: 66px; }
@@ -3442,6 +3666,25 @@
   .selected .chevron { transform: rotate(90deg); }
 
   .session-details { padding: 0 2px 13px 43px; }
+  .rename-session-button {
+    margin: -2px 0 8px;
+    padding: 3px 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 0;
+    color: #728079;
+    background: transparent;
+    font-size: 9px;
+  }
+  .rename-session-button:hover { color: #3f745d; }
+  .rename-session-button svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+  .session-name-editor { margin: -2px 0 9px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .session-name-editor input { min-width: 0; flex: 1 1 130px; padding: 6px 8px; border: 1px solid rgba(75, 101, 89, 0.14); border-radius: 7px; color: #314139; background: rgba(255, 255, 255, 0.5); font: inherit; font-size: 10px; outline: none; }
+  .session-name-editor input:focus { border-color: rgba(64, 132, 99, 0.42); box-shadow: 0 0 0 2px rgba(64, 132, 99, 0.08); }
+  .session-name-editor button { padding: 5px 7px; border: 1px solid rgba(75, 101, 89, 0.12); border-radius: 7px; color: #66746d; background: rgba(75, 101, 89, 0.06); font-size: 9px; }
+  .session-name-editor button.primary { color: #fff; background: #3e8e68; }
+  .session-name-editor small { flex-basis: 100%; color: #ad5555; font-size: 8px; }
   .capability-bar { margin: -2px 0 9px; display: flex; align-items: center; gap: 5px; }
   .capability-bar button { height: 24px; padding: 0 7px; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 7px; color: #63786e; background: rgba(77, 105, 92, 0.035); font-size: 8px; font-weight: 700; cursor: pointer; }
   .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
@@ -3491,12 +3734,16 @@
   .continue-trigger.active svg { transform: translateX(2px); }
   .inline-composer { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
   .inline-composer-controls { display: flex; align-items: flex-end; gap: 6px; }
+  .inline-composer-controls select { width: 76px; min-height: 30px; padding: 0 6px; flex: 0 0 auto; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 9px; outline: none; color: #5b6f66; background: rgba(83, 108, 97, 0.055); font: 720 8px Inter, sans-serif; }
   .inline-composer textarea { resize: none; outline: none; font: inherit; }
   .inline-composer textarea { min-width: 0; min-height: 52px; flex: 1; padding: 8px 9px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 10px; color: #34423c; background: rgba(255, 255, 255, 0.48); font-size: 10px; line-height: 1.4; }
   .inline-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
   .inline-composer-controls > button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
   .inline-composer-controls > button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer-controls > button:disabled { opacity: 0.35; cursor: default; }
+  .interrupt-prompt-control { min-height: 26px; margin-top: 9px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid rgba(189, 137, 49, 0.16); border-radius: 8px; color: #a2762f; background: rgba(189, 137, 49, 0.055); font-size: 8px; font-weight: 750; cursor: pointer; }
+  .interrupt-prompt-control svg { width: 12px; height: 12px; }
+  .interrupt-prompt-control:disabled { opacity: 0.45; cursor: default; }
   .inline-attachments { min-width: 0; display: flex; gap: 6px; overflow-x: auto; }
   .inline-attachments > span { position: relative; width: 44px; height: 44px; flex: 0 0 auto; overflow: hidden; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 9px; background: rgba(71, 98, 86, 0.05); }
   .inline-attachments img { width: 100%; height: 100%; display: block; object-fit: cover; }
@@ -3521,9 +3768,6 @@
   .reset-settings-control button:disabled { opacity: 0.45; cursor: default; }
 
   .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
-  .board-intro { padding: 8px 1px 14px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
-  .board-intro strong { color: #2d3a35; font-size: 12px; }
-  .board-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; line-height: 1.45; }
   .layout-toolbar { padding: 8px 0 4px; display: grid; grid-template-columns: minmax(72px, 1fr) minmax(70px, 1fr) auto auto auto; gap: 4px; }
   .layout-toolbar select, .layout-toolbar input { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; outline: 0; color: #52625b; background: rgba(255, 255, 255, 0.42); font: inherit; font-size: 8px; }
   .layout-toolbar button { height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; color: #567165; background: rgba(255, 255, 255, 0.4); font-size: 8px; cursor: pointer; }
@@ -3791,6 +4035,10 @@
   .overlay-shell.dark { color-scheme: dark; }
   .overlay-shell.dark .lume-orb,
   .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
+  .overlay-shell.dark .resume-session { color: #afc0b7; background: rgba(216, 229, 223, 0.035); }
+  .overlay-shell.dark .resume-session:hover { background: rgba(101, 180, 141, 0.08); }
+  .overlay-shell.dark .resume-session strong { color: #dbe7e1; }
+  .overlay-shell.dark .resume-session small { color: #899a91; }
   .overlay-shell.dark .panel { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: #1b221f; }
   .overlay-shell.dark .mobile-device-banner { border-color: rgba(111, 190, 151, 0.14); background: rgba(88, 167, 125, 0.07); }
   .overlay-shell.dark .mobile-device-banner-icon { color: #87c6a7; background: rgba(88, 167, 125, 0.12); }
@@ -3799,7 +4047,6 @@
   .overlay-shell.dark .mobile-device-banner > button { color: #a8d2bc; border-color: rgba(111, 190, 151, 0.18); background: rgba(216, 229, 223, 0.04); }
   .overlay-shell.dark .brand-lockup strong,
   .overlay-shell.dark .session-title-row strong,
-  .overlay-shell.dark .board-intro strong,
   .overlay-shell.dark .terminal-picker-copy strong,
   .overlay-shell.dark .history-row strong,
   .overlay-shell.dark .setting-row strong,
@@ -3818,8 +4065,12 @@
   .overlay-shell.dark .settings-section[open] > .settings-section-label::after { color: #8eb9a5; }
   .overlay-shell.dark .session-row:hover,
   .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
+  .overlay-shell.dark .rename-session-button { color: #8fa199; }
+  .overlay-shell.dark .rename-session-button:hover { color: #9fd0b7; }
+  .overlay-shell.dark .session-name-editor input,
+  .overlay-shell.dark .session-name-editor button { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .session-name-editor button.primary { color: #f4faf7; background: #397b5c; }
   .overlay-shell.dark .project-name,
-  .overlay-shell.dark .board-intro p,
   .overlay-shell.dark .terminal-picker-copy small,
   .overlay-shell.dark .history-row span,
   .overlay-shell.dark .settings-feedback { color: #adbab4; }
@@ -3871,6 +4122,7 @@
   .overlay-shell.dark .field-row select,
   .overlay-shell.dark .shortcut-input,
   .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .inline-composer-controls select { color: #aabbb3; border-color: rgba(207, 223, 215, 0.1); background: #1a2520; }
   .overlay-shell.dark .inline-attachments > span { border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .final-response,
   .overlay-shell.dark .response-preview { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }
@@ -3883,7 +4135,6 @@
   .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
   .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
   .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }
-  .overlay-shell.dark .board-intro,
   .overlay-shell.dark .terminal-picker-row,
   .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }

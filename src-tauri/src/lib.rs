@@ -23,7 +23,7 @@ use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
     AgentKind, AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput,
-    QuestionAnswer, ResultNote,
+    PromptDelivery, QuestionAnswer, ResultNote,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -147,6 +147,18 @@ fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String
 }
 
 #[tauri::command]
+fn rename_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    name: String,
+) -> Result<String, String> {
+    let name = state.rename_session(&session_id, &name)?;
+    protocol::emit_sessions_changed(&app);
+    Ok(name)
+}
+
+#[tauri::command]
 fn get_hub_snapshot(state: State<'_, AppState>) -> Result<protocol::HubSnapshot, String> {
     Ok(protocol::HubSnapshot::new(state.sessions()?))
 }
@@ -265,6 +277,7 @@ fn submit_prompt(
     session_id: String,
     prompt: String,
     attachments: Vec<PromptAttachmentInput>,
+    delivery: Option<PromptDelivery>,
 ) -> Result<(), String> {
     control::submit_prompt(
         &app,
@@ -274,6 +287,7 @@ fn submit_prompt(
         &session_id,
         &prompt,
         attachments,
+        delivery.unwrap_or_default(),
         true,
     )
 }
@@ -296,11 +310,7 @@ fn set_terminal_file_dialog_active(
     let window = app
         .get_webview_window(&label)
         .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-    overlay::set_file_dialog_active(
-        &window,
-        active,
-        state.preferences()?.show_over_fullscreen,
-    )
+    overlay::set_file_dialog_active(&window, active, state.preferences()?.show_over_fullscreen)
 }
 
 #[tauri::command]
@@ -324,6 +334,16 @@ fn terminate_session(
     session_id: String,
 ) -> Result<(), String> {
     control::terminate_session(&app, state.inner(), &session_id)
+}
+
+#[tauri::command]
+fn interrupt_prompt(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+) -> Result<(), String> {
+    control::interrupt_prompt(&app, state.inner(), bridge.inner(), &session_id)
 }
 
 #[tauri::command]
@@ -666,6 +686,22 @@ fn integration_statuses() -> Result<Vec<IntegrationStatus>, String> {
 }
 
 #[tauri::command]
+fn list_resumable_sessions(
+    kind: IntegrationKind,
+    state: State<'_, AppState>,
+) -> Result<Vec<integrations::ResumableSession>, String> {
+    let open_sessions = state
+        .sessions()?
+        .into_iter()
+        .filter_map(|session| session.native_session_id)
+        .collect::<HashSet<_>>();
+    Ok(integrations::resumable_sessions(&kind)?
+        .into_iter()
+        .filter(|session| !open_sessions.contains(&session.id))
+        .collect())
+}
+
+#[tauri::command]
 fn diagnose_integration(
     kind: IntegrationKind,
     state: State<'_, AppState>,
@@ -844,17 +880,16 @@ pub fn run() {
             browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;
             app.manage(browser_control);
             let mobile_gateway = mobile_gateway::MobileGateway::default();
-            let mobile_server =
-                mobile_server::MobileServer::start_loopback(
-                    state.clone(),
-                    mobile_gateway.clone(),
-                    app.handle().clone(),
-                    database_path.parent().unwrap_or(&database_path),
-                )
-                .unwrap_or_else(|error| {
-                    eprintln!("{error}");
-                    mobile_server::MobileServer::default()
-                });
+            let mobile_server = mobile_server::MobileServer::start_loopback(
+                state.clone(),
+                mobile_gateway.clone(),
+                app.handle().clone(),
+                database_path.parent().unwrap_or(&database_path),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                mobile_server::MobileServer::default()
+            });
             app.manage(mobile_gateway);
             app.manage(mobile_server);
             app.manage(terminal_windows::TerminalWindows::default());
@@ -922,6 +957,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            rename_session,
             get_hub_snapshot,
             execute_hub_command,
             begin_mobile_pairing,
@@ -938,6 +974,7 @@ pub fn run() {
             read_local_image_data_url,
             set_terminal_file_dialog_active,
             refresh_agent_rate_limits,
+            interrupt_prompt,
             terminate_session,
             list_history,
             list_result_notes,
@@ -966,6 +1003,7 @@ pub fn run() {
             undock_terminal_window,
             restore_terminal_layout,
             integration_statuses,
+            list_resumable_sessions,
             diagnose_integration,
             configure_integration,
             vscode_status,

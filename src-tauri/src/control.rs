@@ -9,7 +9,7 @@ use crate::{
     discovery,
     domain::{
         AgentKind, PendingQuestion, PermissionAction, PromptAttachment, PromptAttachmentInput,
-        QuestionAnswer, SessionSource, SessionStatus,
+        PromptDelivery, QuestionAnswer, SessionSource, SessionStatus,
     },
     integrations::{self, IntegrationKind},
     launcher::{self, LaunchRequest},
@@ -89,6 +89,7 @@ pub fn submit_prompt(
     session_id: &str,
     prompt: &str,
     attachments: Vec<PromptAttachmentInput>,
+    delivery: PromptDelivery,
     allow_local_paths: bool,
 ) -> Result<(), String> {
     let prompt = prompt.trim();
@@ -112,18 +113,59 @@ pub fn submit_prompt(
         protocol::emit_sessions_changed(app);
         return Ok(());
     }
-    if matches!(
+    let is_running = matches!(
         session.status,
         SessionStatus::Running | SessionStatus::PermissionRequired
-    ) {
-        return Err("Aguarde o agente terminar antes de enviar outro prompt".into());
-    }
+    );
     let attachments = prepare_prompt_attachments(app, attachments, allow_local_paths)?;
     let attachment_paths = attachments
         .iter()
         .map(|attachment| attachment.path.clone())
         .collect::<Vec<_>>();
-    let result = if session.source == SessionSource::Web {
+    let display_attachments = attachments
+        .iter()
+        .map(|attachment| attachment.display.clone())
+        .collect::<Vec<_>>();
+    let queued_for_later = is_running && delivery == PromptDelivery::Queue;
+    let result = if is_running {
+        if session.agent != AgentKind::Codex {
+            return Err(
+                "This running agent cannot receive queued or side prompts through Lume yet".into(),
+            );
+        }
+        let thread_id = session
+            .native_session_id
+            .clone()
+            .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+        match delivery {
+            PromptDelivery::Steer => {
+                bridge.steer_prompt(&thread_id, prompt, &attachment_paths, state, app)
+            }
+            PromptDelivery::Queue => {
+                let mut profile = session.permission_profile.clone();
+                profile.can_respond_from_lume = true;
+                let activity_id =
+                    format!("local:{}:queued:{}", session.id, crate::state::now_millis());
+                bridge.queue_prompt(
+                    &session.id,
+                    &activity_id,
+                    &thread_id,
+                    prompt,
+                    &attachment_paths,
+                    profile,
+                )?;
+                state.record_queued_prompt_activity(
+                    &session.id,
+                    &activity_id,
+                    prompt,
+                    display_attachments.clone(),
+                )
+            }
+            PromptDelivery::NewTurn => {
+                return Err("Choose Steer now or Queue next while Codex is running".into());
+            }
+        }
+    } else if session.source == SessionSource::Web {
         if !attachments.is_empty() {
             return Err("Esta origem web ainda não aceita imagens pelo Lume".into());
         }
@@ -195,14 +237,43 @@ pub fn submit_prompt(
         )
     };
     result?;
-    state.record_prompt_activity(
-        &session.id,
-        prompt,
-        attachments
-            .into_iter()
-            .map(|attachment| attachment.display)
-            .collect(),
-    )?;
+    if !queued_for_later {
+        state.record_prompt_activity(&session.id, prompt, display_attachments)?;
+    }
+    protocol::emit_sessions_changed(app);
+    Ok(())
+}
+
+pub fn interrupt_prompt(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if !matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::PermissionRequired
+    ) {
+        return Err("This agent does not have a prompt running right now".into());
+    }
+    if session.agent == AgentKind::Codex {
+        let thread_id = session
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+        bridge.interrupt_prompt(thread_id, state, app)?;
+    } else {
+        let process_id = session
+            .process_id
+            .ok_or_else(|| "This session cannot be interrupted safely".to_string())?;
+        discovery::interrupt_agent_process(process_id, &session.agent)?;
+    }
+    state.mark_prompt_interrupted(session_id)?;
     protocol::emit_sessions_changed(app);
     Ok(())
 }
@@ -238,8 +309,7 @@ fn question_answers_from_prompt(
                         .map(|option| option.label.clone())
                 })
                 .or_else(|| {
-                    (question.options.is_empty() || question.is_other)
-                        .then(|| input.to_string())
+                    (question.options.is_empty() || question.is_other).then(|| input.to_string())
                 })
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
@@ -420,18 +490,18 @@ pub fn execute_hub_command(
             session_id,
             prompt,
             attachments,
-        } => {
-            submit_prompt(
-                app,
-                state,
-                bridge,
-                browser,
-                &session_id,
-                &prompt,
-                attachments,
-                false,
-            )
-        }
+            delivery,
+        } => submit_prompt(
+            app,
+            state,
+            bridge,
+            browser,
+            &session_id,
+            &prompt,
+            attachments,
+            delivery,
+            false,
+        ),
         protocol::HubCommand::ResolvePermission {
             session_id,
             permission_id,
@@ -444,6 +514,9 @@ pub fn execute_hub_command(
         } => resolve_question(state, &session_id, &question_id, answers),
         protocol::HubCommand::TerminateSession { session_id } => {
             terminate_session(app, state, &session_id)
+        }
+        protocol::HubCommand::InterruptPrompt { session_id } => {
+            interrupt_prompt(app, state, bridge, &session_id)
         }
         protocol::HubCommand::OpenSessionSource { session_id } => {
             open_session_source(state, browser, &session_id)

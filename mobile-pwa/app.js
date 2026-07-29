@@ -34,6 +34,7 @@ const chatStopButton = document.querySelector("#chat-stop");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
+connectionLabel.textContent = "Starting";
 const headerMascot = document.querySelector("#header-mascot");
 const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
@@ -47,10 +48,10 @@ const mobileUpdateButton = document.querySelector("#mobile-update-button");
 const mobileUpdateDetail = document.querySelector("#mobile-update-detail");
 const mobileVersionLabel = document.querySelector("#mobile-version-label");
 const mobileUpdateProgress = document.querySelector("#mobile-update-progress");
-let token = localStorage.getItem(tokenKey);
-let deviceId = localStorage.getItem(deviceKey);
-let apiBase = localStorage.getItem(baseKey) || "";
-let desktopId = localStorage.getItem(desktopKey);
+let token = storedValue(tokenKey);
+let deviceId = storedValue(deviceKey);
+let apiBase = storedValue(baseKey) || "";
+let desktopId = storedValue(desktopKey);
 let nativeCredentialsAvailable = false;
 let transportKeyPromise;
 let pollTimer;
@@ -83,11 +84,20 @@ const expandedResults = new Set();
 const submittingPromptSessions = new Set();
 const promptDrafts = new Map();
 const promptAttachments = new Map();
+const promptDeliveries = new Map();
 const questionSelections = new Map();
 const rateLimitRefreshes = new Map();
 const sendIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1z" /></svg>';
 const attachIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 1 1-7-7l8-8" /></svg>';
 const sendSpinnerMarkup = '<span class="prompt-send-spinner" aria-hidden="true"></span>';
+
+function storedValue(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
 
 const escapeHtml = (value = "") =>
   String(value).replace(/[&<>"']/g, (character) => ({
@@ -100,6 +110,12 @@ const escapeHtml = (value = "") =>
 
 function cleanFilePath(value, workingDirectory) {
   let path = String(value || "").trim().replace(/^["']|["']$/g, "");
+  const patchPath = path.match(
+    /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?=\s+(?:\*\*\*|@@)|$)/,
+  );
+  if (patchPath) path = patchPath[1].trim();
+  path = path.split(/\s@@\s/, 1)[0].split(/\s\*\*\*\s/, 1)[0].trim();
+  if (/[\r\n]/.test(path)) return null;
   if (!path || path === "/dev/null") return null;
   if (path.startsWith("a/") || path.startsWith("b/")) path = path.slice(2);
   const root = String(workingDirectory || "").replace(/[\\/]+$/, "");
@@ -166,8 +182,17 @@ function summarizeFileChanges(detail = "", reportedFiles = [], workingDirectory)
     if (line.startsWith("-") && !line.startsWith("---")) removed += 1;
   }
   flush();
+  const inlinePatch =
+    /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?=\s+(?:\*\*\*|@@)|[\r\n]|$)/g;
+  for (const match of String(detail || "").matchAll(inlinePatch)) {
+    mergeFileChange(summaries, cleanFilePath(match[1], workingDirectory));
+  }
   for (const reported of reportedFiles || []) {
-    if (String(reported).includes("\n") || String(reported).includes("*** Begin Patch")) {
+    if (
+      String(reported).includes("\n") ||
+      String(reported).includes("*** Begin Patch") ||
+      /\*\*\*\s+(?:Update|Add|Delete)\s+File:/.test(String(reported))
+    ) {
       for (const change of summarizeFileChanges(reported, [], workingDirectory)) {
         mergeFileChange(summaries, change.path, change.added, change.removed);
       }
@@ -175,7 +200,9 @@ function summarizeFileChanges(detail = "", reportedFiles = [], workingDirectory)
       mergeFileChange(summaries, cleanFilePath(reported, workingDirectory));
     }
   }
-  return [...summaries.values()];
+  return [...summaries.values()].filter(
+    (change) => change.added > 0 || change.removed > 0,
+  );
 }
 
 function mergeFileChanges(target, incoming) {
@@ -664,9 +691,13 @@ async function initializePairingDeepLinks() {
   const appPlugin = window.Capacitor?.Plugins?.App;
   if (!appPlugin) return handled;
 
-  await appPlugin.addListener("appUrlOpen", ({ url }) => {
-    handlePairingUrl(url);
-  });
+  try {
+    await appPlugin.addListener("appUrlOpen", ({ url }) => {
+      handlePairingUrl(url);
+    });
+  } catch {
+    // A missing deep-link bridge must not prevent the local dashboard from starting.
+  }
   try {
     const launch = await appPlugin.getLaunchUrl();
     handled = handlePairingUrl(launch?.url) || handled;
@@ -757,6 +788,14 @@ function filterSessions(sessions) {
   return sessions;
 }
 
+function sessionDisplayName(session) {
+  const customName = String(session.sessionName || "").trim();
+  if (customName) return customName;
+  const agent = String(session.agentLabel || "AI").trim();
+  const project = String(session.project || "").trim();
+  return project || agent;
+}
+
 function agentVisual(session) {
   if (session.agent === "codex") {
     return '<svg viewBox="0 0 256 260" aria-hidden="true"><path d="M239.184 106.203a64.716 64.716 0 0 0-5.576-53.103C219.452 28.459 191 15.784 163.213 21.74A65.586 65.586 0 0 0 52.096 45.22a64.716 64.716 0 0 0-43.23 31.36c-14.31 24.602-11.061 55.634 8.033 76.74a64.665 64.665 0 0 0 5.525 53.102c14.174 24.65 42.644 37.324 70.446 31.36a64.72 64.72 0 0 0 48.754 21.744c28.481.025 53.714-18.361 62.414-45.481a64.767 64.767 0 0 0 43.229-31.36c14.137-24.558 10.875-55.423-8.083-76.483Zm-97.56 136.338a48.397 48.397 0 0 1-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 0 0 4.247-7.367v-72.85l21.845 12.636c.218.111.37.32.409.563v60.367c-.056 26.818-21.783 48.545-48.601 48.601Zm-104.466-44.61a48.345 48.345 0 0 1-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 0 0 8.441 0l63.181-36.425v25.221a.87.87 0 0 1-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803ZM23.549 85.38a48.499 48.499 0 0 1 25.58-21.333v61.39a8.288 8.288 0 0 0 4.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 0 1-.767 0L41.353 151.53c-23.211-13.454-31.171-43.144-17.804-66.405Zm179.466 41.695-63.08-36.63L161.73 77.86a.819.819 0 0 1 .768 0l52.233 30.184a48.6 48.6 0 0 1-7.316 87.635v-61.391a8.544 8.544 0 0 0-4.4-7.213Zm21.742-32.69-1.535-.922-51.619-30.081a8.39 8.39 0 0 0-8.492 0L99.98 99.808V74.587a.716.716 0 0 1 .307-.665l52.233-30.133a48.652 48.652 0 0 1 72.236 50.391ZM88.061 139.097l-21.845-12.585a.87.87 0 0 1-.41-.614V65.685a48.652 48.652 0 0 1 79.757-37.346l-1.535.87-51.67 29.825a8.595 8.595 0 0 0-4.246 7.367l-.051 72.697Zm11.868-25.58L128.067 97.3l28.188 16.218v32.434l-28.086 16.218-28.188-16.218Z"/></svg>';
@@ -804,6 +843,7 @@ function chatTextKey(value) {
 
 function buildChatTurns(session) {
   const turns = [];
+  const queuedPrompts = [];
   const ensureTurn = (id) => {
     const turn = { id, items: [], files: [] };
     turns.push(turn);
@@ -811,6 +851,10 @@ function buildChatTurns(session) {
   };
   let current;
   for (const activity of session.activities || []) {
+    if (activity.kind === "queued_prompt") {
+      queuedPrompts.push(activity);
+      continue;
+    }
     if (activity.kind === "prompt") {
       current = ensureTurn(activity.id);
       current.prompt = activity;
@@ -912,6 +956,14 @@ function buildChatTurns(session) {
       status: "completed",
       createdAt: session.updatedAt,
       files: [],
+    });
+  }
+  for (const prompt of queuedPrompts) {
+    turns.push({
+      id: `queued:${prompt.id}`,
+      items: [],
+      files: [],
+      queuedPrompt: prompt,
     });
   }
   return turns;
@@ -1062,14 +1114,17 @@ function renderChat(sessions) {
 
   chatAgentIcon.className = `agent-icon agent-${session.agent}`;
   chatAgentIcon.innerHTML = agentVisual(session);
-  chatAgentName.textContent = session.agentLabel;
+  chatAgentName.textContent = sessionDisplayName(session);
   chatAgentStatus.textContent = `${session.project} · ${statusLabel(session.status, Boolean(session.pendingQuestion))}`;
   renderRateLimit(session);
   const scopes = currentDevice?.scopes || [];
+  const canInterrupt = scopes.includes("terminate") && session.capabilities?.canInterrupt;
   const canTerminate = scopes.includes("terminate") && session.capabilities?.canTerminate;
-  chatStopButton.hidden = !canTerminate;
+  chatStopButton.hidden = !(canInterrupt || canTerminate);
   chatStopButton.dataset.session = session.id;
-  chatStopButton.dataset.command = "terminate";
+  chatStopButton.dataset.command = canInterrupt ? "interrupt" : "terminate";
+  chatStopButton.textContent = canInterrupt ? "Interrupt" : "Stop";
+  chatStopButton.classList.toggle("interrupt", canInterrupt);
 
   const renderKey = JSON.stringify([
     session.status,
@@ -1084,6 +1139,7 @@ function renderChat(sessions) {
     scopes,
     submittingPromptSessions.has(session.id),
     promptAttachments.get(session.id),
+    promptDeliveries.get(session.id),
   ]);
   if (renderKey === lastChatRenderKey) return;
   const shouldFollow =
@@ -1140,6 +1196,12 @@ function renderChat(sessions) {
   const turns = buildChatTurns(session);
   const conversation = turns.map((turn) => `
     <article class="mobile-chat-turn">
+      ${turn.queuedPrompt?.detail || turn.queuedPrompt?.attachments?.length ? `
+        <div class="mobile-chat-message user queued">
+          <header><strong>You</strong><span class="mobile-queued-badge">Queued</span><time>${activityTime(turn.queuedPrompt.createdAt)}</time></header>
+          ${turn.queuedPrompt.detail ? `<p>${escapeHtml(turn.queuedPrompt.detail)}</p>` : ""}
+          ${messageImagesMarkup(turn.queuedPrompt.attachments)}
+        </div>` : ""}
       ${turn.prompt?.detail || turn.prompt?.attachments?.length ? `
         <div class="mobile-chat-message user">
           <header><strong>You</strong><time>${activityTime(turn.prompt.createdAt)}</time></header>
@@ -1149,7 +1211,7 @@ function renderChat(sessions) {
       ${(turn.items || []).map((item) => {
         if (item.kind === "message" && item.detail) {
           return `<div class="mobile-chat-message agent">
-            <header><strong>${escapeHtml(session.agentLabel)}</strong><time>${activityTime(item.createdAt)}</time></header>
+            <header><strong>${escapeHtml(sessionDisplayName(session))}</strong><time>${activityTime(item.createdAt)}</time></header>
             <div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>
           </div>`;
         }
@@ -1167,19 +1229,23 @@ function renderChat(sessions) {
     </article>
   `).join("");
   const typing = session.status === "running"
-    ? `<div class="mobile-agent-typing" aria-label="${escapeHtml(session.agentLabel)} is working"><span></span><span></span><span></span></div>`
+    ? `<div class="mobile-agent-typing" aria-label="${escapeHtml(sessionDisplayName(session))} is working"><span></span><span></span><span></span></div>`
     : "";
   chatFeed.innerHTML = permission + questionRequest + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
 
   const promptReady = ["completed", "failed", "waiting_for_input"].includes(session.status);
   const agentWorking = session.status === "running";
+  const supportsRunningPrompt =
+    agentWorking
+    && session.capabilities?.promptDeliveries?.includes("steer");
   const canPrompt = scopes.includes("prompt")
     && session.capabilities?.canPrompt
-    && (promptReady || agentWorking);
+    && (promptReady || supportsRunningPrompt);
   const promptSubmitting = submittingPromptSessions.has(session.id);
-  const sendLocked = promptSubmitting || agentWorking;
+  const sendLocked = promptSubmitting;
   const promptDraft = promptDrafts.get(session.id) || "";
   const attachments = promptAttachments.get(session.id) || [];
+  const promptDelivery = promptDeliveries.get(session.id) || "queue";
   const canAttachImages = Boolean(session.capabilities?.canAttachImages && !session.pendingQuestion);
   chatComposer.innerHTML = canPrompt
     ? `<form class="mobile-chat-form${canAttachImages ? " can-attach" : ""}${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
@@ -1188,9 +1254,13 @@ function renderChat(sessions) {
           ${attachments.map((attachment, index) => `
           <span title="${escapeHtml(attachment.name || "Attached image")}"><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="${escapeHtml(attachment.name || "Attached image")}" /><button type="button" data-remove-image="${index}" aria-label="Remove image" ${promptSubmitting ? "disabled" : ""}>×</button></span>
         `).join("")}</div>` : ""}
+        ${supportsRunningPrompt ? `<select class="mobile-prompt-delivery" aria-label="Prompt delivery">
+          <option value="steer" ${promptDelivery === "steer" ? "selected" : ""}>Steer now</option>
+          <option value="queue" ${promptDelivery === "queue" ? "selected" : ""}>Queue next</option>
+        </select>` : ""}
         ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/*" multiple hidden />
           <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
-        <textarea maxlength="16384" placeholder="Message ${escapeHtml(session.agentLabel)}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
+        <textarea maxlength="16384" placeholder="Message ${escapeHtml(sessionDisplayName(session))}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
         <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${sendLocked || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
         <span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span>
       </form>`
@@ -1294,16 +1364,16 @@ function renderSessions(snapshot, trackChanges = true) {
     const promptSubmitting = submittingPromptSessions.has(session.id);
     const promptDraft = promptDrafts.get(session.id) || "";
     const prompt = canPrompt
-      ? `<form class="prompt-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(session.agentLabel)}" placeholder="Continue with a new prompt…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea><button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button><span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span></form>`
+      ? `<form class="prompt-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(sessionDisplayName(session))}" placeholder="Continue with a new prompt…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea><button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button><span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span></form>`
       : "";
     const stop = scopes.includes("terminate") && session.capabilities?.canTerminate
       ? `<button class="stop-agent" data-command="terminate" data-session="${escapeHtml(session.id)}">Stop agent</button>`
       : "";
     return `
       <article class="session tone-${statusClass(session.status)} ${expanded ? "expanded" : ""}">
-        <button class="session-summary" data-chat-session="${escapeHtml(session.id)}" type="button" aria-label="Open chat with ${escapeHtml(session.agentLabel)}">
+        <button class="session-summary" data-chat-session="${escapeHtml(session.id)}" type="button" aria-label="Open chat with ${escapeHtml(sessionDisplayName(session))}">
           <span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span>
-          <span class="session-heading"><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span>
+          <span class="session-heading"><strong>${escapeHtml(sessionDisplayName(session))}</strong><small>${escapeHtml(session.agentLabel)} · ${escapeHtml(session.project)}</small></span>
           <span class="source-badge">${escapeHtml(sourceLabel(session))}</span>
           <span class="status-badge"><i></i>${escapeHtml(statusLabel(session.status, Boolean(session.pendingQuestion)))}</span>
           <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
@@ -1352,7 +1422,7 @@ function renderResults(sessions) {
       <article class="result-card ${expanded ? "expanded" : ""}">
         <button class="result-summary" data-result="${escapeHtml(resultKey)}" type="button" aria-expanded="${expanded}">
           <span class="agent-icon agent-${escapeHtml(session.agent)}">${agentVisual(session)}</span>
-          <span><strong>${escapeHtml(session.agentLabel)}</strong><small>${escapeHtml(session.project)}</small></span>
+          <span><strong>${escapeHtml(sessionDisplayName(session))}</strong><small>${escapeHtml(session.agentLabel)} · ${escapeHtml(session.project)}</small></span>
           <time>${activityTime(result.createdAt)}</time>
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
         </button>
@@ -1383,13 +1453,13 @@ function renderDevice() {
 
 async function notifySession(session) {
   const messages = {
-    permission_required: `${session.agentLabel} needs a permission decision.`,
-    completed: `${session.agentLabel} finished a task.`,
-    failed: `${session.agentLabel} reported an error.`,
+    permission_required: `${sessionDisplayName(session)} needs a permission decision.`,
+    completed: `${sessionDisplayName(session)} finished a task.`,
+    failed: `${sessionDisplayName(session)} reported an error.`,
   };
   const body = messages[session.status];
   const questionBody = session.pendingQuestion
-    ? `${session.agentLabel} is waiting for your answer.`
+    ? `${sessionDisplayName(session)} is waiting for your answer.`
     : null;
   const notificationKey = session.pendingQuestion?.id || session.status;
   if (!body && !questionBody) return;
@@ -1937,9 +2007,17 @@ async function showDashboard() {
   loadingView.hidden = false;
   updateInstallOptions();
   document.querySelector("#refresh-button").hidden = false;
-  await syncNotificationPreference();
+  await Promise.race([
+    syncNotificationPreference(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Native monitoring startup timed out")), 2_000)
+    ),
+  ]).catch(() => undefined);
   updateSecurityControls();
-  await initializeNativeRealtime();
+  await Promise.race([
+    initializeNativeRealtime(),
+    new Promise((resolve) => setTimeout(() => resolve(false), 4_000)),
+  ]);
   await refreshSnapshot();
   if (openUpdateViewRequested) {
     setView("device");
@@ -2201,13 +2279,18 @@ async function readNativeClipboardImage() {
 async function submitPromptForm(form) {
   const sessionId = form.dataset.session;
   const session = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
-  if (session?.status === "running") return;
+  const runningDelivery = session?.capabilities?.promptDeliveries?.includes("steer");
+  if (session?.status === "running" && !runningDelivery) return;
   if (!(await verifySensitiveAction())) return;
   const textarea = form.querySelector("textarea");
   const button = form.querySelector(".mobile-send-button, button[type='submit']");
   const status = form.querySelector(".prompt-send-state");
   const submittedPrompt = textarea.value.trim();
   const attachments = promptAttachments.get(sessionId) || [];
+  const delivery =
+    session?.status === "running"
+      ? form.querySelector(".mobile-prompt-delivery")?.value || "queue"
+      : "new_turn";
   if ((!submittedPrompt && !attachments.length) || submittingPromptSessions.has(sessionId)) return;
   submittingPromptSessions.add(sessionId);
   promptDrafts.set(sessionId, textarea.value);
@@ -2225,6 +2308,7 @@ async function submitPromptForm(form) {
       sessionId,
       prompt: submittedPrompt,
       attachments,
+      delivery,
     });
     promptAccepted = true;
     promptDrafts.delete(sessionId);
@@ -2238,10 +2322,8 @@ async function submitPromptForm(form) {
       form.classList.remove("is-sending");
       form.setAttribute("aria-busy", "false");
       textarea.disabled = false;
-      const currentSession = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
       button.disabled =
         promptAccepted
-        || currentSession?.status === "running"
         || (!textarea.value.trim() && !(promptAttachments.get(sessionId) || []).length);
       button.setAttribute("aria-label", "Send prompt");
       button.innerHTML = sendIconMarkup;
@@ -2259,10 +2341,8 @@ function rememberPromptDraft(event) {
   promptDrafts.set(form.dataset.session, textarea.value);
   const sendButton = form.querySelector(".mobile-send-button");
   if (sendButton && !submittingPromptSessions.has(form.dataset.session)) {
-    const session = currentSnapshot?.sessions?.find((item) => item.id === form.dataset.session);
     sendButton.disabled =
-      session?.status === "running"
-      || (!textarea.value.trim() && !(promptAttachments.get(form.dataset.session) || []).length);
+      !textarea.value.trim() && !(promptAttachments.get(form.dataset.session) || []).length;
   }
 }
 
@@ -2275,6 +2355,9 @@ async function runSessionCommand(button) {
     if (command === "terminate") {
       await executeCommand({ type: "terminate_session", sessionId: button.dataset.session });
       showBanner("Agent stopped.", "success");
+    } else if (command === "interrupt") {
+      await executeCommand({ type: "interrupt_prompt", sessionId: button.dataset.session });
+      showBanner("Prompt interrupted.", "success");
     } else {
       await executeCommand({
         type: "resolve_permission",
@@ -2362,6 +2445,12 @@ chatScreen.addEventListener("submit", async (event) => {
   await submitPromptForm(form);
 });
 chatScreen.addEventListener("input", rememberPromptDraft);
+chatScreen.addEventListener("change", (event) => {
+  const select = event.target.closest?.(".mobile-prompt-delivery");
+  const form = select?.closest(".mobile-chat-form");
+  if (!form?.dataset.session) return;
+  promptDeliveries.set(form.dataset.session, select.value);
+});
 chatScreen.addEventListener("paste", async (event) => {
   const form = event.target.closest?.(".mobile-chat-form");
   const sessionId = form?.dataset.session;
@@ -2529,5 +2618,18 @@ async function startApp() {
   else showEntryView();
 }
 
-void startApp();
+void startApp().catch((error) => {
+  loadingView.hidden = true;
+  appContent.hidden = true;
+  pairView.hidden = true;
+  emptyAuthView.hidden = false;
+  connectionDot.className = "offline";
+  connectionLabel.textContent = "Setup needed";
+  setHeaderMascotState("sleeping");
+  showBanner(
+    error?.message || "Lume Mobile could not finish starting. Scan the pairing QR code again.",
+    "error",
+    "connection",
+  );
+});
 setInterval(updateGoalElapsedTimes, 30_000);

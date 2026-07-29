@@ -38,6 +38,7 @@ pub struct AppState {
     missing_process_scans: Arc<Mutex<HashMap<String, u8>>>,
     workspace_snapshots: Arc<Mutex<HashMap<String, WorkspaceSnapshot>>>,
     agent_rate_limits: Arc<Mutex<HashMap<AgentKind, Vec<AgentRateLimit>>>>,
+    session_aliases: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -59,6 +60,7 @@ impl AppState {
             missing_process_scans: Arc::new(Mutex::new(HashMap::new())),
             workspace_snapshots: Arc::new(Mutex::new(HashMap::new())),
             agent_rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            session_aliases: Arc::new(Mutex::new(preferences.session_aliases)),
         })
     }
 
@@ -69,6 +71,12 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível acessar as sessões".to_string())?
             .clone();
+        let aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| "Não foi possível acessar os nomes das sessões".to_string())?
+            .clone();
+        apply_session_aliases(&mut sessions, &aliases);
         let agent_rate_limits = self
             .agent_rate_limits
             .lock()
@@ -139,8 +147,54 @@ impl AppState {
                     && native_vscode_agents.contains(&session.agent)))
         });
         let mut sessions = deduplicated;
+        ensure_unique_session_names(&mut sessions);
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
         Ok(sessions)
+    }
+
+    pub fn rename_session(&self, session_id: &str, name: &str) -> Result<String, String> {
+        let requested = normalized_session_name(name)
+            .ok_or_else(|| "O nome da sessão não pode ficar vazio".to_string())?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível renomear a sessão".to_string())?;
+        if !sessions.iter().any(|session| session.id == session_id) {
+            return Err("Sessão não encontrada".into());
+        }
+
+        let mut aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| "Não foi possível atualizar o nome da sessão".to_string())?;
+        let mut named_sessions = sessions.clone();
+        apply_session_aliases(&mut named_sessions, &aliases);
+        ensure_unique_session_names(&mut named_sessions);
+        let used = named_sessions
+            .iter()
+            .filter(|session| session.id != session_id)
+            .map(|session| session.session_name.to_lowercase())
+            .collect::<HashSet<_>>();
+        let unique_name = unique_session_name(&requested, &used);
+        let alias_key = {
+            let session = sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .expect("a sessão foi verificada acima");
+            session.session_name.clone_from(&unique_name);
+            persistent_session_alias_key(session)
+        };
+        if let Some(key) = alias_key {
+            aliases.insert(key, unique_name.clone());
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "Não foi possível salvar o nome da sessão".to_string())?;
+            let mut preferences = store.load_preferences()?;
+            preferences.session_aliases.clone_from(&aliases);
+            store.save_preferences(&preferences)?;
+        }
+        Ok(unique_name)
     }
 
     pub fn record_prompt_activity(
@@ -169,6 +223,106 @@ impl AppState {
                 created_at: now,
                 files: Vec::new(),
                 attachments,
+                append_detail: false,
+            },
+        );
+        session.updated_at = now;
+        Ok(())
+    }
+
+    pub fn record_queued_prompt_activity(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+        prompt: &str,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<(), String> {
+        let now = now_millis();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not update the Codex prompt queue".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        remember_activity(
+            session,
+            SessionActivity {
+                id: activity_id.to_string(),
+                kind: "queued_prompt".into(),
+                title: "Queued prompt".into(),
+                detail: (!prompt.is_empty()).then(|| prompt.to_string()),
+                status: "waiting".into(),
+                created_at: now,
+                files: Vec::new(),
+                attachments,
+                append_detail: false,
+            },
+        );
+        session.updated_at = now;
+        Ok(())
+    }
+
+    pub fn promote_queued_prompt_activity(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+    ) -> Result<(), String> {
+        let now = now_millis();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not start the queued Codex prompt".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        let activity = session
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == activity_id)
+            .ok_or_else(|| "Queued prompt not found".to_string())?;
+        activity.kind = "prompt".into();
+        activity.title = "Prompt sent by Lume".into();
+        activity.status = "completed".into();
+        activity.created_at = now;
+        session.updated_at = now;
+        Ok(())
+    }
+
+    pub fn mark_prompt_interrupted(&self, session_id: &str) -> Result<(), String> {
+        let now = now_millis();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not update the interrupted prompt".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        session.status = SessionStatus::WaitingForInput;
+        session.status_label = "Prompt interrupted".into();
+        session.pending_permission = None;
+        session.pending_question = None;
+        for activity in session
+            .activities
+            .iter_mut()
+            .filter(|activity| activity.status == "running")
+        {
+            activity.status = "interrupted".into();
+        }
+        remember_activity(
+            session,
+            SessionActivity {
+                id: format!("local:{session_id}:interrupted:{now}"),
+                kind: "activity".into(),
+                title: "Prompt interrupted".into(),
+                detail: None,
+                status: "completed".into(),
+                created_at: now,
+                files: Vec::new(),
+                attachments: Vec::new(),
                 append_detail: false,
             },
         );
@@ -205,11 +359,17 @@ impl AppState {
     }
 
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<(), String> {
+        let mut preferences = preferences.clone();
+        preferences.session_aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| "Não foi possível preservar os nomes das sessões".to_string())?
+            .clone();
         let store = self
             .store
             .lock()
             .map_err(|_| "Não foi possível salvar as preferências".to_string())?;
-        store.save_preferences(preferences)?;
+        store.save_preferences(&preferences)?;
         let cutoff =
             now_millis() - i64::from(preferences.history_retention_days) * 24 * 60 * 60 * 1_000;
         store.purge_history(cutoff)
@@ -964,7 +1124,10 @@ impl AppState {
                 .find(|answer| answer.question_id == question.id)
                 .ok_or_else(|| format!("Responda à pergunta \"{}\"", question.header))?;
             if answer.answers.iter().all(|answer| answer.trim().is_empty()) {
-                return Err(format!("A resposta para \"{}\" está vazia", question.header));
+                return Err(format!(
+                    "A resposta para \"{}\" está vazia",
+                    question.header
+                ));
             }
         }
         let answer_summary = pending
@@ -1310,6 +1473,7 @@ impl AppState {
                 ),
                 agent: process.agent.clone(),
                 agent_label: agent_name,
+                session_name: String::new(),
                 project,
                 source: process.source,
                 source_app: None,
@@ -1425,6 +1589,7 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
             .agent_label
             .clone()
             .unwrap_or_else(|| agent_label(&event.agent).into()),
+        session_name: event.session_name.clone().unwrap_or_default(),
         project,
         source: event.source.clone().unwrap_or(SessionSource::Cli),
         source_app: event.source_app.clone(),
@@ -1472,7 +1637,7 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
         if let Some(index) = duplicate.filter(|index| {
             !session.activities[index.saturating_add(1)..]
                 .iter()
-            .any(|existing| existing.kind == "prompt")
+                .any(|existing| existing.kind == "prompt")
         }) {
             if let Some(incoming) = activity.detail.take() {
                 let should_replace =
@@ -1777,19 +1942,15 @@ fn merge_results(target: &mut AgentSession, source: &AgentSession) {
         remember_activity(target, activity.clone());
     }
     for result in &source.results {
-        if !target
-            .results
-            .iter()
-            .any(|existing| {
-                existing.id == result.id
-                    || equivalent_result_in_same_turn(
-                        target,
-                        existing,
-                        &result.response,
-                        result.created_at,
-                    )
-            })
-        {
+        if !target.results.iter().any(|existing| {
+            existing.id == result.id
+                || equivalent_result_in_same_turn(
+                    target,
+                    existing,
+                    &result.response,
+                    result.created_at,
+                )
+        }) {
             target.results.push(result.clone());
         }
     }
@@ -1802,6 +1963,15 @@ fn merge_results(target: &mut AgentSession, source: &AgentSession) {
 fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(label) = &event.agent_label {
         session.agent_label = label.clone();
+    }
+    if session.session_name.trim().is_empty() {
+        if let Some(name) = event
+            .session_name
+            .as_deref()
+            .and_then(normalized_session_name)
+        {
+            session.session_name = name;
+        }
     }
     if let Some(project) = &event.project {
         session.project = project.clone();
@@ -1943,9 +2113,7 @@ fn session_matches_process(session: &AgentSession, process: &DiscoveredProcess) 
 fn session_can_own_process(session: &AgentSession, now: i64) -> bool {
     matches!(
         session.status,
-        SessionStatus::Running
-            | SessionStatus::PermissionRequired
-            | SessionStatus::WaitingForInput
+        SessionStatus::Running | SessionStatus::PermissionRequired | SessionStatus::WaitingForInput
     ) || now.saturating_sub(session.updated_at) < RECENT_NATIVE_SESSION_MS
 }
 
@@ -2074,6 +2242,77 @@ fn agent_label(agent: &AgentKind) -> &'static str {
     }
 }
 
+fn ensure_unique_session_names(sessions: &mut [AgentSession]) {
+    let mut used = HashSet::new();
+    for session in sessions {
+        let base = normalized_session_name(&session.session_name)
+            .unwrap_or_else(|| default_session_name(session));
+        let unique = unique_session_name(&base, &used);
+        used.insert(unique.to_lowercase());
+        session.session_name = unique;
+    }
+}
+
+fn apply_session_aliases(sessions: &mut [AgentSession], aliases: &HashMap<String, String>) {
+    for session in sessions {
+        let Some(alias) = persistent_session_alias_key(session)
+            .and_then(|key| aliases.get(&key))
+            .and_then(|alias| normalized_session_name(alias))
+        else {
+            continue;
+        };
+        session.session_name = alias;
+    }
+}
+
+fn persistent_session_alias_key(session: &AgentSession) -> Option<String> {
+    let native_id = session.native_session_id.as_deref()?.trim();
+    if native_id.is_empty() {
+        return None;
+    }
+    let agent = match session.agent {
+        AgentKind::Codex => "codex".to_string(),
+        AgentKind::Claude => "claude".to_string(),
+        AgentKind::Gemini => "gemini".to_string(),
+        AgentKind::Unknown => format!("unknown:{}", session.agent_label.to_lowercase()),
+    };
+    Some(format!("{agent}:{native_id}"))
+}
+
+fn default_session_name(session: &AgentSession) -> String {
+    let agent = normalized_session_name(&session.agent_label)
+        .unwrap_or_else(|| agent_label(&session.agent).to_string());
+    let Some(project) = normalized_session_name(&session.project) else {
+        return agent;
+    };
+    if project.eq_ignore_ascii_case("Sessão local")
+        || project.eq_ignore_ascii_case("Sessão sem projeto")
+    {
+        agent
+    } else {
+        project
+    }
+}
+
+fn normalized_session_name(name: &str) -> Option<String> {
+    let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.chars().take(80).collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn unique_session_name(base: &str, used: &HashSet<String>) -> String {
+    if !used.contains(&base.to_lowercase()) {
+        return base.to_string();
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base} ({suffix})");
+        if !used.contains(&candidate.to_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("há sempre um próximo sufixo numérico")
+}
+
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2102,6 +2341,7 @@ mod tests {
             session_id: session_id.into(),
             agent: AgentKind::Claude,
             agent_label: None,
+            session_name: None,
             project: Some("lume".into()),
             source: Some(SessionSource::Cli),
             source_app: None,
@@ -2118,6 +2358,69 @@ mod tests {
             activities: Vec::new(),
             wait_for_decision: false,
         }
+    }
+
+    #[test]
+    fn session_names_are_unique_per_native_thread() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let first = started_event("claude:first", 4101);
+        let mut second = started_event("claude:second", 4102);
+        second.native_session_id = Some("native-session-2".into());
+        state.ingest(first).expect("primeira sessão");
+        state.ingest(second).expect("segunda sessão");
+
+        let names = state
+            .sessions()
+            .expect("sessões")
+            .into_iter()
+            .map(|session| session.session_name)
+            .collect::<HashSet<_>>();
+        assert_eq!(names, HashSet::from(["lume".into(), "lume (2)".into()]));
+    }
+
+    #[test]
+    fn provider_thread_name_is_kept_separate_from_project() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("claude:named", 4150);
+        event.session_name = Some("Review authentication".into());
+        state.ingest(event).expect("sessão");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.session_name, "Review authentication");
+        assert_eq!(session.project, "lume");
+        assert_eq!(session.agent_label, "Claude");
+    }
+
+    #[test]
+    fn renaming_a_session_adds_a_suffix_instead_of_colliding() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let first = started_event("claude:first", 4201);
+        let mut second = started_event("claude:second", 4202);
+        second.native_session_id = Some("native-session-2".into());
+        state.ingest(first).expect("primeira sessão");
+        state.ingest(second).expect("segunda sessão");
+
+        assert_eq!(
+            state
+                .rename_session("claude:first", " Release review ")
+                .expect("renomeação"),
+            "Release review"
+        );
+        assert_eq!(
+            state
+                .rename_session("claude:second", "release review")
+                .expect("renomeação"),
+            "release review (2)"
+        );
+        assert_eq!(
+            state
+                .preferences()
+                .expect("preferências")
+                .session_aliases
+                .get("claude:native-session-2")
+                .map(String::as_str),
+            Some("release review (2)")
+        );
     }
 
     #[test]
@@ -2147,6 +2450,33 @@ mod tests {
         assert_eq!(session.status, SessionStatus::WaitingForInput);
         assert_eq!(session.activities.len(), 1);
         assert_eq!(session.activities[0].status, "completed");
+    }
+
+    #[test]
+    fn queued_prompt_is_promoted_only_when_it_starts() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:queue", 4242))
+            .expect("sessão");
+        state
+            .record_queued_prompt_activity(
+                "claude:queue",
+                "queued-1",
+                "Run after this task",
+                Vec::new(),
+            )
+            .expect("prompt na fila");
+
+        let queued = state.sessions().expect("sessões").remove(0);
+        assert_eq!(queued.activities[0].kind, "queued_prompt");
+        assert_eq!(queued.activities[0].status, "waiting");
+
+        state
+            .promote_queued_prompt_activity("claude:queue", "queued-1")
+            .expect("prompt iniciado");
+        let started = state.sessions().expect("sessões").remove(0);
+        assert_eq!(started.activities[0].kind, "prompt");
+        assert_eq!(started.activities[0].status, "completed");
     }
 
     #[test]
@@ -2795,6 +3125,7 @@ mod tests {
                     session_id: format!("codex-app-server:{chat}"),
                     agent: AgentKind::Codex,
                     agent_label: Some("Codex".into()),
+                    session_name: None,
                     project: Some("lume".into()),
                     source: Some(SessionSource::Vscode),
                     source_app: None,

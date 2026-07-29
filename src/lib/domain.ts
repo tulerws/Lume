@@ -7,6 +7,8 @@ export type SessionStatus =
   | "completed"
   | "failed";
 
+export type PromptDelivery = "new_turn" | "steer" | "queue";
+
 export type AccessMode =
   | "full_access"
   | "workspace_write"
@@ -67,6 +69,7 @@ export interface AgentSession {
   id: string;
   agent: AgentKind;
   agentLabel: string;
+  sessionName?: string;
   project: string;
   source: "cli" | "vscode" | "web" | "desktop";
   sourceApp?: "chrome" | "edge" | "brave";
@@ -111,10 +114,10 @@ export interface AgentRateLimit {
 
 export interface SessionActivity {
   id: string;
-  kind: "prompt" | "message" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission" | "question";
+  kind: "prompt" | "queued_prompt" | "message" | "activity" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission" | "question";
   title: string;
   detail?: string;
-  status: "running" | "completed" | "failed" | "waiting";
+  status: "running" | "completed" | "failed" | "waiting" | "interrupted";
   createdAt: number;
   files: string[];
   attachments?: PromptAttachment[];
@@ -161,6 +164,7 @@ export interface Preferences {
   historyRetentionDays: number;
   launchTarget: "auto" | "terminal" | "vscode";
   projectProfiles: Record<string, ProjectProfile>;
+  sessionAliases: Record<string, string>;
   whiteboardLayouts: WhiteboardLayout[];
   globalShortcut: string;
   openShortcut: string;
@@ -207,6 +211,15 @@ export interface IntegrationStatus {
   configured: boolean;
   directPermissions: boolean;
   detail: string;
+}
+
+export interface ResumableSession {
+  id: string;
+  agent: IntegrationStatus["kind"];
+  project: string;
+  workingDirectory: string;
+  source: string;
+  updatedAt: number;
 }
 
 export interface DiagnosticCheck {

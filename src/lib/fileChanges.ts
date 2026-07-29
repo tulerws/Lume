@@ -6,6 +6,12 @@ export interface FileChangeSummary {
 
 function cleanPath(value: string, workingDirectory?: string): string | null {
   let path = value.trim().replace(/^["']|["']$/g, "");
+  const patchPath = path.match(
+    /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?=\s+(?:\*\*\*|@@)|$)/,
+  );
+  if (patchPath) path = patchPath[1].trim();
+  path = path.split(/\s@@\s/, 1)[0].split(/\s\*\*\*\s/, 1)[0].trim();
+  if (/[\r\n]/.test(path)) return null;
   if (path === "/dev/null") return null;
   if (path.startsWith("a/") || path.startsWith("b/")) path = path.slice(2);
   const root = workingDirectory?.replace(/[\\/]+$/, "");
@@ -84,7 +90,11 @@ export function summarizeFileChanges(
   }
 
   for (const reported of reportedFiles) {
-    if (reported.includes("\n") || reported.includes("*** Begin Patch")) {
+    if (
+      reported.includes("\n") ||
+      reported.includes("*** Begin Patch") ||
+      /\*\*\*\s+(?:Update|Add|Delete)\s+File:/.test(reported)
+    ) {
       for (const summary of summarizeFileChanges(reported, [], workingDirectory)) {
         record(summaries, summary.path, summary.added, summary.removed);
       }
@@ -92,7 +102,9 @@ export function summarizeFileChanges(
     }
     record(summaries, cleanPath(reported, workingDirectory));
   }
-  return [...summaries.values()];
+  return [...summaries.values()].filter(
+    (change) => change.added > 0 || change.removed > 0,
+  );
 }
 
 export function mergeFileChanges(

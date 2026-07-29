@@ -30,6 +30,15 @@ pub enum SessionStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDelivery {
+    #[default]
+    NewTurn,
+    Steer,
+    Queue,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
@@ -219,6 +228,8 @@ pub struct AgentSession {
     pub id: String,
     pub agent: AgentKind,
     pub agent_label: String,
+    #[serde(default)]
+    pub session_name: String,
     pub project: String,
     pub source: SessionSource,
     #[serde(default)]
@@ -324,6 +335,7 @@ pub struct Preferences {
     pub history_retention_days: u16,
     pub launch_target: String,
     pub project_profiles: HashMap<String, ProjectProfile>,
+    pub session_aliases: HashMap<String, String>,
     pub whiteboard_layouts: Vec<WhiteboardLayout>,
     pub global_shortcut: String,
     pub open_shortcut: String,
@@ -345,6 +357,7 @@ impl Default for Preferences {
             history_retention_days: 30,
             launch_target: "auto".into(),
             project_profiles: HashMap::new(),
+            session_aliases: HashMap::new(),
             whiteboard_layouts: Vec::new(),
             global_shortcut: "Ctrl+Shift+Space".into(),
             open_shortcut: "Ctrl+Alt+Shift+L".into(),
@@ -388,6 +401,8 @@ pub struct HookEvent {
     pub session_id: String,
     pub agent: AgentKind,
     pub agent_label: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
     pub project: Option<String>,
     pub source: Option<SessionSource>,
     #[serde(default)]

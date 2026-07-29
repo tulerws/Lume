@@ -60,10 +60,8 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
         }
         if wait_for_decision {
             if let Some(question_id) = question_id {
-                let answers = state.wait_for_question_answer(
-                    &question_id,
-                    Duration::from_secs(15 * 60),
-                )?;
+                let answers =
+                    state.wait_for_question_answer(&question_id, Duration::from_secs(15 * 60))?;
                 if answers.is_none() {
                     state.expire_question(&question_id)?;
                     crate::protocol::emit_sessions_changed(&app);

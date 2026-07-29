@@ -158,11 +158,8 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
         })
         .filter_map(|(pid, _, agent, agent_label, explicit_working_directory)| {
             let process = system.process(pid)?;
-            let working_directory = explicit_working_directory.or_else(|| {
-                process
-                    .cwd()
-                    .map(|path| path.to_string_lossy().to_string())
-            });
+            let working_directory = explicit_working_directory
+                .or_else(|| process.cwd().map(|path| path.to_string_lossy().to_string()));
             if agent == AgentKind::Codex
                 && working_directory
                     .as_deref()
@@ -368,6 +365,46 @@ pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> R
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn interrupt_agent_process(process_id: u32, expected_agent: &AgentKind) -> Result<(), String> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let target_pid = Pid::from_u32(process_id);
+    let Some(target) = system.process(target_pid) else {
+        return Err("The agent process is no longer open".into());
+    };
+    let command = target
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let name = target.name().to_string_lossy().to_lowercase();
+    if detect_agent(&name, &command).as_ref() != Some(expected_agent) {
+        return Err("The session PID no longer belongs to the expected agent".into());
+    }
+    if target.kill_with(Signal::Interrupt).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err("The operating system could not interrupt this prompt safely".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn interrupt_agent_process(
+    _process_id: u32,
+    _expected_agent: &AgentKind,
+) -> Result<(), String> {
+    Err("Prompt interruption for external CLI agents is not available on Windows yet".into())
+}
+
 fn process_depth(system: &System, mut pid: Pid) -> usize {
     let mut depth = 0;
     for _ in 0..32 {
@@ -433,9 +470,7 @@ mod tests {
 
     #[test]
     fn codex_memory_maintenance_is_not_a_user_session() {
-        assert!(is_codex_internal_workspace(
-            "/home/user/.codex/memories"
-        ));
+        assert!(is_codex_internal_workspace("/home/user/.codex/memories"));
         assert!(is_codex_internal_workspace(
             "C:\\Users\\user\\.codex\\memories\\2026"
         ));

@@ -65,30 +65,6 @@
           <button class="primary-button" type="submit">Connect securely</button>
           <p id="pair-message" class="message" aria-live="polite"></p>
         </form>
-        <aside id="pair-install-prompt" class="pair-install-prompt" hidden>
-          <div
-            class="pair-install-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="pair-install-title"
-          >
-            <button id="close-pair-install" class="pair-install-close" type="button" aria-label="Close">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
-            </button>
-            <img src="./lume-mobile-icon.svg" alt="" />
-            <span>
-              <small>Lume for Android</small>
-              <strong id="pair-install-title">Continue in the mobile app</strong>
-              <p>Open the installed app, or download it before pairing.</p>
-            </span>
-            <a id="open-lume-mobile" class="primary-button" href="#">Open Lume Mobile</a>
-            <a
-              class="pair-download-link"
-              href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
-              rel="noopener"
-            >Download the app</a>
-          </div>
-        </aside>
         <p class="privacy-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 9V6a5 5 0 0 1 10 0v3M4 9h12v8H4z" /></svg>Encrypted locally. No certificate or Lume cloud account required.</p>
       </section>
 
@@ -268,6 +244,30 @@
       </div>
       <div id="dashboard-message" class="toast" role="status" aria-live="polite"></div>
     </main>
+    <aside id="pair-install-prompt" class="pair-install-prompt" hidden>
+      <div
+        class="pair-install-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pair-install-title"
+      >
+        <button id="close-pair-install" class="pair-install-close" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
+        </button>
+        <img src="./lume-mobile-icon.svg" alt="" />
+        <span>
+          <small>Lume for Android</small>
+          <strong id="pair-install-title">Continue in the mobile app</strong>
+          <p>Open the installed app, or download it before pairing.</p>
+        </span>
+        <a id="open-lume-mobile" class="primary-button" href="#">Open Lume Mobile</a>
+        <a
+          class="pair-download-link"
+          href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
+          rel="noopener"
+        >Download the app</a>
+      </div>
+    </aside>
     <script src="./app.js" type="module"></script>
   </body>
 </html>

@@ -3,6 +3,7 @@ import type {
   AgentSession,
   PermissionAction,
   PromptAttachmentInput,
+  PromptDelivery,
   QuestionAnswer,
 } from "$lib/domain";
 import type { SessionCapabilities } from "$lib/sessionCapabilities";
@@ -48,6 +49,7 @@ export type HubCommand =
       sessionId: string;
       prompt: string;
       attachments?: PromptAttachmentInput[];
+      delivery?: PromptDelivery;
     }
   | {
       type: "resolve_permission";
@@ -63,6 +65,10 @@ export type HubCommand =
     }
   | {
       type: "terminate_session";
+      sessionId: string;
+    }
+  | {
+      type: "interrupt_prompt";
       sessionId: string;
     }
   | {

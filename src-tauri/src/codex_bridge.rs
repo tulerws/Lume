@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::ErrorKind,
     net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -27,20 +27,32 @@ const SERVER_URL: &str = "ws://127.0.0.1:43130";
 const PROXY_ADDRESS: &str = "127.0.0.1:43131";
 pub const PROXY_URL: &str = "ws://127.0.0.1:43131";
 
+#[derive(Clone)]
+struct QueuedPrompt {
+    session_id: String,
+    activity_id: String,
+    prompt: String,
+    attachment_paths: Vec<String>,
+    profile: PermissionProfile,
+}
+
 pub struct CodexBridge {
-    process: Mutex<Option<Child>>,
+    process: Arc<Mutex<Option<Child>>>,
+    queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
 }
 
 impl CodexBridge {
     pub fn start(state: AppState, app: AppHandle) -> Result<Self, String> {
         let listener = TcpListener::bind(PROXY_ADDRESS)
             .map_err(|error| format!("Could not start the Codex bridge: {error}"))?;
+        let proxy_state = state.clone();
+        let proxy_app = app.clone();
         thread::Builder::new()
             .name("lume-codex-proxy".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    let state = state.clone();
-                    let app = app.clone();
+                    let state = proxy_state.clone();
+                    let app = proxy_app.clone();
                     let _ = thread::Builder::new()
                         .name("lume-codex-client".into())
                         .spawn(move || {
@@ -51,39 +63,17 @@ impl CodexBridge {
                 }
             })
             .map_err(|error| error.to_string())?;
+        let process = Arc::new(Mutex::new(None));
+        let queued_prompts = Arc::new(Mutex::new(HashMap::new()));
+        start_queue_dispatcher(process.clone(), queued_prompts.clone(), state, app)?;
         Ok(Self {
-            process: Mutex::new(None),
+            process,
+            queued_prompts,
         })
     }
 
     pub fn ensure_server(&self) -> Result<(), String> {
-        if server_available() {
-            return Ok(());
-        }
-        let mut process = command_for_server()?
-            .spawn()
-            .map_err(|error| format!("Could not start `codex app-server`: {error}"))?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if server_available() {
-                *self
-                    .process
-                    .lock()
-                    .map_err(|_| "Não foi possível guardar o processo do Codex".to_string())? =
-                    Some(process);
-                return Ok(());
-            }
-            if process
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                return Err("O servidor do Codex encerrou antes de ficar disponível".into());
-            }
-            thread::sleep(Duration::from_millis(80));
-        }
-        let _ = process.kill();
-        Err("O servidor do Codex não respondeu a tempo".into())
+        ensure_server_process(&self.process)
     }
 
     pub fn submit_prompt(
@@ -96,14 +86,8 @@ impl CodexBridge {
         app: AppHandle,
     ) -> Result<(), String> {
         self.ensure_server()?;
-        let mut server = prompt_connection(
-            thread_id,
-            prompt,
-            attachment_paths,
-            profile,
-            &state,
-            &app,
-        )?;
+        let mut server =
+            prompt_connection(thread_id, prompt, attachment_paths, profile, &state, &app)?;
         let thread_id = thread_id.to_string();
         thread::Builder::new()
             .name("lume-codex-prompt".into())
@@ -114,6 +98,76 @@ impl CodexBridge {
             })
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn steer_prompt(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        attachment_paths: &[String],
+        state: &AppState,
+        app: &AppHandle,
+    ) -> Result<(), String> {
+        self.ensure_server()?;
+        let (mut server, turn_id, profiles) = active_turn_connection(thread_id, state, app)?;
+        send_json(
+            &mut server,
+            json!({
+                "method": "turn/steer",
+                "id": 3,
+                "params": {
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": prompt_input(prompt, attachment_paths)
+                }
+            }),
+        )?;
+        wait_for_response(&mut server, 3, state, app, &profiles)
+    }
+
+    pub fn queue_prompt(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+        thread_id: &str,
+        prompt: &str,
+        attachment_paths: &[String],
+        profile: PermissionProfile,
+    ) -> Result<(), String> {
+        let mut queues = self
+            .queued_prompts
+            .lock()
+            .map_err(|_| "Could not access the Codex prompt queue".to_string())?;
+        queues
+            .entry(thread_id.to_string())
+            .or_default()
+            .push_back(QueuedPrompt {
+                session_id: session_id.to_string(),
+                activity_id: activity_id.to_string(),
+                prompt: prompt.to_string(),
+                attachment_paths: attachment_paths.to_vec(),
+                profile,
+            });
+        Ok(())
+    }
+
+    pub fn interrupt_prompt(
+        &self,
+        thread_id: &str,
+        state: &AppState,
+        app: &AppHandle,
+    ) -> Result<(), String> {
+        self.ensure_server()?;
+        let (mut server, turn_id, profiles) = active_turn_connection(thread_id, state, app)?;
+        send_json(
+            &mut server,
+            json!({
+                "method": "turn/interrupt",
+                "id": 3,
+                "params": { "threadId": thread_id, "turnId": turn_id }
+            }),
+        )?;
+        wait_for_response(&mut server, 3, state, app, &profiles)
     }
 
     pub fn refresh_rate_limits(&self, state: &AppState, app: &AppHandle) -> Result<(), String> {
@@ -145,9 +199,45 @@ impl CodexBridge {
     }
 }
 
+fn ensure_server_process(process_slot: &Mutex<Option<Child>>) -> Result<(), String> {
+    if server_available() {
+        return Ok(());
+    }
+    let mut stored_process = process_slot
+        .lock()
+        .map_err(|_| "Não foi possível guardar o processo do Codex".to_string())?;
+    if server_available() {
+        return Ok(());
+    }
+    if let Some(mut stale_process) = stored_process.take() {
+        let _ = stale_process.kill();
+        let _ = stale_process.wait();
+    }
+    let mut process = command_for_server()?
+        .spawn()
+        .map_err(|error| format!("Could not start `codex app-server`: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if server_available() {
+            *stored_process = Some(process);
+            return Ok(());
+        }
+        if process
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("O servidor do Codex encerrou antes de ficar disponível".into());
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    let _ = process.kill();
+    Err("O servidor do Codex não respondeu a tempo".into())
+}
+
 impl Drop for CodexBridge {
     fn drop(&mut self) {
-        if let Ok(process) = self.process.get_mut() {
+        if let Ok(mut process) = self.process.lock() {
             if let Some(process) = process.as_mut() {
                 let _ = process.kill();
                 let _ = process.wait();
@@ -177,6 +267,93 @@ fn server_available() -> bool {
         .ok()
         .and_then(|address| TcpStream::connect_timeout(&address, Duration::from_millis(120)).ok())
         .is_some()
+}
+
+fn start_queue_dispatcher(
+    process: Arc<Mutex<Option<Child>>>,
+    queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
+    state: AppState,
+    app: AppHandle,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("lume-codex-queue".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let sessions = match state.sessions() {
+                Ok(sessions) => sessions,
+                Err(_) => continue,
+            };
+            let candidates = {
+                let mut queues = match queued_prompts.lock() {
+                    Ok(queues) => queues,
+                    Err(_) => continue,
+                };
+                queues.retain(|thread_id, queue| {
+                    !queue.is_empty()
+                        && sessions.iter().any(|session| {
+                            session.native_session_id.as_deref() == Some(thread_id.as_str())
+                        })
+                });
+                queues.keys().cloned().collect::<Vec<_>>()
+            };
+            if candidates.is_empty() || ensure_server_process(&process).is_err() {
+                continue;
+            }
+            for thread_id in candidates {
+                match control_connection(&thread_id, &state, &app) {
+                    Ok((_, Some(_), _)) => continue,
+                    Err(_) => continue,
+                    Ok((_, None, _)) => {}
+                }
+                let queued = queued_prompts
+                    .lock()
+                    .ok()
+                    .and_then(|mut queues| queues.get_mut(&thread_id)?.pop_front());
+                let Some(queued) = queued else {
+                    continue;
+                };
+                match prompt_connection(
+                    &thread_id,
+                    &queued.prompt,
+                    &queued.attachment_paths,
+                    queued.profile.clone(),
+                    &state,
+                    &app,
+                ) {
+                    Ok(mut server) => {
+                        if let Err(error) = state
+                            .promote_queued_prompt_activity(&queued.session_id, &queued.activity_id)
+                        {
+                            eprintln!("Could not promote the queued prompt: {error}");
+                        }
+                        crate::protocol::emit_sessions_changed(&app);
+                        let monitor_thread = thread_id.clone();
+                        let monitor_state = state.clone();
+                        let monitor_app = app.clone();
+                        let _ = thread::Builder::new()
+                            .name("lume-codex-queued-prompt".into())
+                            .spawn(move || {
+                                if let Err(error) = monitor_prompt(
+                                    &mut server,
+                                    &monitor_thread,
+                                    &monitor_state,
+                                    &monitor_app,
+                                ) {
+                                    eprintln!("Prompt enfileirado do Lume encerrado: {error}");
+                                }
+                            });
+                    }
+                    Err(error) => {
+                        eprintln!("Prompt enfileirado do Lume aguardando nova tentativa: {error}");
+                        if let Ok(mut queues) = queued_prompts.lock() {
+                            queues.entry(thread_id).or_default().push_front(queued);
+                        }
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn proxy_connection(stream: TcpStream, state: AppState, app: AppHandle) -> Result<(), String> {
@@ -292,6 +469,17 @@ fn prompt_connection(
 }
 
 fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String]) -> Value {
+    json!({
+        "method": "turn/start",
+        "id": 3,
+        "params": {
+            "threadId": thread_id,
+            "input": prompt_input(prompt, attachment_paths)
+        }
+    })
+}
+
+fn prompt_input(prompt: &str, attachment_paths: &[String]) -> Vec<Value> {
     let mut input = Vec::new();
     if !prompt.is_empty() {
         input.push(json!({ "type": "text", "text": prompt }));
@@ -301,14 +489,81 @@ fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String
             .iter()
             .map(|path| json!({ "type": "localImage", "path": path })),
     );
-    json!({
-        "method": "turn/start",
-        "id": 3,
-        "params": {
-            "threadId": thread_id,
-            "input": input
-        }
-    })
+    input
+}
+
+fn active_turn_connection(
+    thread_id: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<
+    (
+        WebSocket<MaybeTlsStream<TcpStream>>,
+        String,
+        HashMap<String, PermissionProfile>,
+    ),
+    String,
+> {
+    let (server, active_turn, profiles) = control_connection(thread_id, state, app)?;
+    let turn_id = active_turn
+        .ok_or_else(|| "This agent does not have a prompt running right now".to_string())?;
+    Ok((server, turn_id, profiles))
+}
+
+fn control_connection(
+    thread_id: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<
+    (
+        WebSocket<MaybeTlsStream<TcpStream>>,
+        Option<String>,
+        HashMap<String, PermissionProfile>,
+    ),
+    String,
+> {
+    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+    let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }
+        }),
+    )?;
+    wait_for_response(&mut server, 1, state, app, &profiles)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+    send_json(
+        &mut server,
+        json!({
+            "method": "thread/read",
+            "id": 2,
+            "params": { "threadId": thread_id, "includeTurns": true }
+        }),
+    )?;
+    let response = wait_for_value_response(&mut server, 2, state, app, &profiles)?;
+    let active_turn = response
+        .pointer("/result/thread/turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns.iter().rev().find(|turn| {
+                matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("inProgress" | "in_progress")
+                )
+            })
+        })
+        .and_then(|turn| text_at(turn, "id"))
+        .map(str::to_string);
+    Ok((server, active_turn, profiles))
 }
 
 fn set_server_timeout(
@@ -353,6 +608,38 @@ fn wait_for_response(
                             .to_string());
                     }
                     return Ok(());
+                }
+            }
+        }
+        if let Some(response) =
+            intercept_server_message(&message, state, app, profiles, &mut responses)?
+        {
+            socket.send(response).map_err(|error| error.to_string())?;
+        }
+    }
+}
+
+fn wait_for_value_response(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    expected_id: i64,
+    state: &AppState,
+    app: &AppHandle,
+    profiles: &HashMap<String, PermissionProfile>,
+) -> Result<Value, String> {
+    let mut responses = HashMap::new();
+    loop {
+        let message = socket.read().map_err(|error| error.to_string())?;
+        if let Message::Text(text) = &message {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                if value.get("id").and_then(Value::as_i64) == Some(expected_id) {
+                    if let Some(error) = value.get("error") {
+                        return Err(error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex refused the request")
+                            .to_string());
+                    }
+                    return Ok(value);
                 }
             }
         }
@@ -450,9 +737,7 @@ fn intercept_server_message(
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
     if method == "account/rateLimits/updated" {
         let limits = rate_limits_from_message(&value);
-        if !limits.is_empty()
-            && state.set_agent_rate_limits(AgentKind::Codex, limits)?
-        {
+        if !limits.is_empty() && state.set_agent_rate_limits(AgentKind::Codex, limits)? {
             crate::protocol::emit_sessions_changed(app);
         }
     }
@@ -473,7 +758,10 @@ fn intercept_server_message(
 }
 
 fn rate_limits_from_message(value: &Value) -> Vec<AgentRateLimit> {
-    let root = value.get("result").or_else(|| value.get("params")).unwrap_or(value);
+    let root = value
+        .get("result")
+        .or_else(|| value.get("params"))
+        .unwrap_or(value);
     if let Some(buckets) = root.get("rateLimitsByLimitId").and_then(Value::as_object) {
         let mut limits = Vec::new();
         for (id, snapshot) in buckets {
@@ -592,6 +880,7 @@ fn user_input_response(
         session_id: session_id(thread_id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
+        session_name: None,
         project: None,
         source: None,
         source_app: None,
@@ -633,12 +922,7 @@ fn user_input_response(
     };
     let answers = answers
         .into_iter()
-        .map(|answer| {
-            (
-                answer.question_id,
-                json!({ "answers": answer.answers }),
-            )
-        })
+        .map(|answer| (answer.question_id, json!({ "answers": answer.answers })))
         .collect::<serde_json::Map<_, _>>();
     let response = json!({
         "id": value.get("id").cloned().unwrap_or(Value::Null),
@@ -657,8 +941,12 @@ fn codex_questions(params: &Value) -> Vec<InteractiveQuestion> {
             let id = text_at(question, "id")?.to_string();
             Some(InteractiveQuestion {
                 id,
-                header: text_at(question, "header").unwrap_or("Question").to_string(),
-                question: text_at(question, "question").unwrap_or_default().to_string(),
+                header: text_at(question, "header")
+                    .unwrap_or("Question")
+                    .to_string(),
+                question: text_at(question, "question")
+                    .unwrap_or_default()
+                    .to_string(),
                 is_other: question
                     .get("isOther")
                     .and_then(Value::as_bool)
@@ -713,6 +1001,7 @@ fn approval_response(
         session_id: session_id(thread_id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
+        session_name: None,
         project: cwd.as_deref().and_then(project_name),
         source: None,
         source_app: None,
@@ -902,6 +1191,7 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
         session_id: session_id(thread_id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
+        session_name: None,
         project: None,
         source: None,
         source_app: None,
@@ -1086,15 +1376,25 @@ fn user_message_text(item: &Value) -> Option<String> {
 fn files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
-        let Some(path) = line
+        let Some(raw_path) = line
             .strip_prefix("+++ b/")
             .or_else(|| line.strip_prefix("--- a/"))
             .or_else(|| line.strip_prefix("*** Update File: "))
             .or_else(|| line.strip_prefix("*** Add File: "))
             .or_else(|| line.strip_prefix("*** Delete File: "))
+            .or_else(|| line.split_once("*** Update File: ").map(|(_, path)| path))
+            .or_else(|| line.split_once("*** Add File: ").map(|(_, path)| path))
+            .or_else(|| line.split_once("*** Delete File: ").map(|(_, path)| path))
         else {
             continue;
         };
+        let path = raw_path
+            .split_once(" @@")
+            .map_or(raw_path, |(path, _)| path);
+        let path = path
+            .split_once(" *** ")
+            .map_or(path, |(path, _)| path)
+            .trim();
         if path != "/dev/null" && !files.iter().any(|existing| existing == path) {
             files.push(path.to_string());
         }
@@ -1246,10 +1546,10 @@ fn notification_event(
                 .get("turn")
                 .and_then(|turn| text_at(turn, "status"))
                 .unwrap_or("completed");
-            let (event, label) = if status == "failed" {
-                (HookEventKind::Failed, "Tarefa encerrada com erro")
-            } else {
-                (HookEventKind::Completed, "Tarefa finalizada")
+            let (event, label) = match status {
+                "failed" => (HookEventKind::Failed, "Tarefa encerrada com erro"),
+                "interrupted" => (HookEventKind::WaitingForInput, "Prompt interrompido"),
+                _ => (HookEventKind::Completed, "Tarefa finalizada"),
             };
             let last_response = responses
                 .remove(thread_id)
@@ -1272,9 +1572,8 @@ fn notification_event(
         session_id: session_id(thread_id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
-        project: name
-            .map(str::to_string)
-            .or_else(|| cwd.and_then(project_name)),
+        session_name: name.map(str::to_string),
+        project: cwd.and_then(project_name),
         source: Some(SessionSource::Cli),
         source_app: None,
         status_label: Some(status_label.into()),
@@ -1416,6 +1715,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_prompts_keep_their_order_until_the_active_turn_finishes() {
+        let bridge = CodexBridge {
+            process: Arc::new(Mutex::new(None)),
+            queued_prompts: Arc::new(Mutex::new(HashMap::new())),
+        };
+        bridge
+            .queue_prompt(
+                "session-1",
+                "activity-1",
+                "thread-1",
+                "First",
+                &[],
+                direct_profile(),
+            )
+            .expect("first queued prompt");
+        bridge
+            .queue_prompt(
+                "session-1",
+                "activity-2",
+                "thread-1",
+                "Second",
+                &[],
+                direct_profile(),
+            )
+            .expect("second queued prompt");
+
+        let queues = bridge.queued_prompts.lock().expect("prompt queues");
+        let queue = queues.get("thread-1").expect("thread queue");
+        assert_eq!(queue[0].prompt, "First");
+        assert_eq!(queue[1].prompt, "Second");
+    }
+
+    #[test]
     fn maps_command_decisions_to_codex_protocol() {
         let params = json!({});
         assert_eq!(
@@ -1479,12 +1811,9 @@ mod tests {
             "command": "npm test"
         });
 
-        let response = automatic_approval_result(
-            &profile,
-            "item/commandExecution/requestApproval",
-            &params,
-        )
-        .expect("aprovação automática");
+        let response =
+            automatic_approval_result(&profile, "item/commandExecution/requestApproval", &params)
+                .expect("aprovação automática");
         assert_eq!(response["decision"], "accept");
     }
 
@@ -1593,6 +1922,47 @@ mod tests {
     }
 
     #[test]
+    fn started_thread_keeps_its_name_separate_from_the_project() {
+        let event = notification_event(
+            &json!({
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "Review authentication",
+                        "cwd": "/work/lume"
+                    }
+                }
+            }),
+            "thread/started",
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .expect("evento da thread");
+
+        assert_eq!(event.session_name.as_deref(), Some("Review authentication"));
+        assert_eq!(event.project.as_deref(), Some("lume"));
+    }
+
+    #[test]
+    fn interrupted_turn_returns_to_waiting_without_a_completion_result() {
+        let event = notification_event(
+            &json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thread-1", "turn": { "status": "interrupted" } }
+            }),
+            "turn/completed",
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .expect("interrupted event");
+
+        assert!(matches!(event.event, HookEventKind::WaitingForInput));
+        assert_eq!(event.status_label.as_deref(), Some("Prompt interrompido"));
+        assert!(event.last_response.is_none());
+    }
+
+    #[test]
     fn codex_items_expose_commands_and_changed_files() {
         let command = codex_item_activity(
             "thread-1",
@@ -1632,6 +2002,12 @@ mod tests {
                 "*** Begin Patch\n*** Update File: src/lib/TerminalWindow.svelte\n@@\n-old\n+new\n*** End Patch"
             ),
             vec!["src/lib/TerminalWindow.svelte"]
+        );
+        assert_eq!(
+            files_from_diff(
+                "*** Begin Patch *** Update File: /work/lume/src-tauri/src/control.rs @@ old + new *** End Patch"
+            ),
+            vec!["/work/lume/src-tauri/src/control.rs"]
         );
     }
 

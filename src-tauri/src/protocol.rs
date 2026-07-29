@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{
     domain::{
-        AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, QuestionAnswer,
-        SessionActivity, SessionSource,
+        AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, PromptDelivery,
+        QuestionAnswer, SessionActivity, SessionSource, SessionStatus,
     },
     state::now_millis,
 };
@@ -33,6 +33,8 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "realtime_stream",
     "coordinated_updates",
     "work_status",
+    "prompt_interruption",
+    "prompt_delivery",
 ];
 pub const STREAM_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 
@@ -55,6 +57,8 @@ pub struct SessionCapabilities {
     pub can_open_source: bool,
     pub can_read_results: bool,
     pub can_attach_images: bool,
+    pub can_interrupt: bool,
+    pub prompt_deliveries: Vec<PromptDelivery>,
 }
 
 impl SessionCapabilities {
@@ -81,7 +85,34 @@ impl SessionCapabilities {
             can_read_results: !session.results.is_empty() || session.last_response.is_some(),
             can_attach_images: session.source != SessionSource::Web
                 && session.agent != AgentKind::Unknown,
+            can_interrupt: matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::PermissionRequired
+            ) && can_interrupt_session(session),
+            prompt_deliveries: if session.agent == AgentKind::Codex {
+                vec![
+                    PromptDelivery::NewTurn,
+                    PromptDelivery::Steer,
+                    PromptDelivery::Queue,
+                ]
+            } else {
+                vec![PromptDelivery::NewTurn]
+            },
         }
+    }
+}
+
+fn can_interrupt_session(session: &AgentSession) -> bool {
+    if session.agent == AgentKind::Codex && session.native_session_id.is_some() {
+        return true;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        session.source == SessionSource::Cli && session.process_id.is_some()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        false
     }
 }
 
@@ -509,6 +540,8 @@ pub enum HubCommand {
         prompt: String,
         #[serde(default)]
         attachments: Vec<PromptAttachmentInput>,
+        #[serde(default)]
+        delivery: PromptDelivery,
     },
     ResolvePermission {
         session_id: String,
@@ -521,6 +554,9 @@ pub enum HubCommand {
         answers: Vec<QuestionAnswer>,
     },
     TerminateSession {
+        session_id: String,
+    },
+    InterruptPrompt {
         session_id: String,
     },
     OpenSessionSource {
@@ -550,6 +586,7 @@ impl HubCommandRequest {
                 session_id,
                 prompt,
                 attachments,
+                ..
             } => {
                 validate_identifier("session_id", session_id, 512)?;
                 if prompt.trim().is_empty() && attachments.is_empty() {
@@ -609,10 +646,7 @@ impl HubCommandRequest {
                         ));
                     }
                     if answer.answers.len() > 8
-                        || answer
-                            .answers
-                            .iter()
-                            .any(|value| value.len() > 16 * 1024)
+                        || answer.answers.iter().any(|value| value.len() > 16 * 1024)
                     {
                         return Err(ProtocolError::new(
                             "answer_too_large",
@@ -622,6 +656,7 @@ impl HubCommandRequest {
                 }
             }
             HubCommand::TerminateSession { session_id }
+            | HubCommand::InterruptPrompt { session_id }
             | HubCommand::OpenSessionSource { session_id } => {
                 validate_identifier("session_id", session_id, 512)?;
             }
@@ -853,6 +888,7 @@ mod tests {
             id: "codex:thread-1".into(),
             agent: AgentKind::Codex,
             agent_label: "Codex".into(),
+            session_name: "Codex · Lume".into(),
             project: "Lume".into(),
             source: SessionSource::Cli,
             source_app: None,
@@ -1097,6 +1133,7 @@ mod tests {
                 session_id: "codex:thread-1".into(),
                 prompt: "Continue".into(),
                 attachments: Vec::new(),
+                delivery: PromptDelivery::NewTurn,
             }
         );
         let serialized = serde_json::to_value(request).expect("json");
@@ -1112,6 +1149,7 @@ mod tests {
                 session_id: "codex:thread-1".into(),
                 prompt: "  ".into(),
                 attachments: Vec::new(),
+                delivery: PromptDelivery::NewTurn,
             },
         };
         assert_eq!(

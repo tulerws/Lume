@@ -1118,6 +1118,7 @@ fn route_core(
             protocol::HubCommand::ResolvePermission { .. } => MobileScope::Approve,
             protocol::HubCommand::ResolveQuestion { .. } => MobileScope::Prompt,
             protocol::HubCommand::TerminateSession { .. } => MobileScope::Terminate,
+            protocol::HubCommand::InterruptPrompt { .. } => MobileScope::Terminate,
             protocol::HubCommand::OpenSessionSource { .. } => {
                 return json_error(
                     403,

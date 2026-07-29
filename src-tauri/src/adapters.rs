@@ -113,8 +113,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     let permission_mode = string(raw, "permission_mode");
     let is_permission = matches!(event, HookEventKind::PermissionRequest);
     let direct_response = provider == "claude"
-        && (hook_name == "PermissionRequest"
-            || matches!(event, HookEventKind::QuestionRequest));
+        && (hook_name == "PermissionRequest" || matches!(event, HookEventKind::QuestionRequest));
     let permission_profile = if is_permission || permission_mode.is_some() {
         Some(permission_profile(
             provider,
@@ -164,6 +163,9 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         session_id: format!("{provider}:{session_id}"),
         agent,
         agent_label: None,
+        session_name: ["session_name", "thread_name", "conversation_name", "slug"]
+            .into_iter()
+            .find_map(|key| string(raw, key)),
         project: cwd.as_deref().and_then(project_name),
         source: Some(source),
         source_app: None,
@@ -507,9 +509,7 @@ fn claude_question_request(raw: &Value, session_id: &str) -> Option<PendingQuest
         .unwrap_or_else(|| {
             format!(
                 "{:x}",
-                Sha256::digest(
-                    format!("{session_id}\n{}", raw_questions.len()).as_bytes()
-                )
+                Sha256::digest(format!("{session_id}\n{}", raw_questions.len()).as_bytes())
             )
         });
     Some(PendingQuestion {
@@ -658,9 +658,7 @@ fn claude_question_output(answers: Option<Vec<QuestionAnswer>>, raw: &Value) -> 
             let prompt = question.get("question")?.as_str()?;
             let answer = answers
                 .iter()
-                .find(|answer| {
-                    answer.question_id == claude_question_item_id(&session_id, index)
-                })?
+                .find(|answer| answer.question_id == claude_question_item_id(&session_id, index))?
                 .answers
                 .join(", ");
             Some((prompt.to_string(), Value::String(answer)))
@@ -684,12 +682,8 @@ fn claude_question_output(answers: Option<Vec<QuestionAnswer>>, raw: &Value) -> 
 fn status_label(hook: &str, event: &HookEventKind) -> Option<&'static str> {
     match hook {
         "SessionStart" => Some("Sessão detectada"),
-        "UserPromptSubmit"
-        | "BeforeAgent"
-        | "PostToolUse"
-        | "PostToolUseFailure"
-        | "PostToolBatch"
-        | "AfterTool" => Some("Executando"),
+        "UserPromptSubmit" | "BeforeAgent" | "PostToolUse" | "PostToolUseFailure"
+        | "PostToolBatch" | "AfterTool" => Some("Executando"),
         "PermissionRequest" => Some("Aguardando permissão"),
         "PermissionDenied" => Some("Permissão negada"),
         "Notification" if matches!(event, HookEventKind::PermissionRequest) => {
@@ -794,11 +788,7 @@ fn claude_transcript_activities(raw: &Value, session_id: &str) -> Vec<SessionAct
     activities
 }
 
-fn read_claude_transcript(
-    path: &str,
-    session_id: &str,
-    activities: &mut Vec<SessionActivity>,
-) {
+fn read_claude_transcript(path: &str, session_id: &str, activities: &mut Vec<SessionActivity>) {
     let Ok(mut file) = File::open(path) else {
         return;
     };
@@ -862,14 +852,7 @@ fn read_claude_transcript(
                 };
                 if role != Some("user") || visible_claude_user_text(text) {
                     push_claude_transcript_activity(
-                        activities,
-                        session_id,
-                        &entry_id,
-                        0,
-                        kind,
-                        title,
-                        text,
-                        created_at,
+                        activities, session_id, &entry_id, 0, kind, title, text, created_at,
                     );
                 }
             }
@@ -885,14 +868,8 @@ fn read_claude_transcript(
                                 };
                                 if role != Some("user") || visible_claude_user_text(&text) {
                                     push_claude_transcript_activity(
-                                        activities,
-                                        session_id,
-                                        &entry_id,
-                                        index,
-                                        kind,
-                                        title,
-                                        &text,
-                                        created_at,
+                                        activities, session_id, &entry_id, index, kind, title,
+                                        &text, created_at,
                                     );
                                 }
                             }
@@ -900,14 +877,8 @@ fn read_claude_transcript(
                         Some("thinking") if role == Some("assistant") => {
                             if let Some(thinking) = string(block, "thinking") {
                                 push_claude_transcript_activity(
-                                    activities,
-                                    session_id,
-                                    &entry_id,
-                                    index,
-                                    "thinking",
-                                    "Thinking",
-                                    &thinking,
-                                    created_at,
+                                    activities, session_id, &entry_id, index, "thinking",
+                                    "Thinking", &thinking, created_at,
                                 );
                             }
                         }
@@ -1054,13 +1025,9 @@ mod tests {
             &raw,
         )
         .expect("resposta Claude");
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(
-            output["hookSpecificOutput"]["permissionDecision"],
-            "allow"
-        );
-        assert_eq!(
-            output["hookSpecificOutput"]["updatedInput"]["answers"]
-                ["Which approach should I use?"],
+            output["hookSpecificOutput"]["updatedInput"]["answers"]["Which approach should I use?"],
             "B"
         );
     }
@@ -1222,10 +1189,8 @@ mod tests {
 
     #[test]
     fn claude_transcript_exposes_intermediate_text_and_thinking() {
-        let path = std::env::temp_dir().join(format!(
-            "lume-claude-transcript-{}.jsonl",
-            now_millis()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("lume-claude-transcript-{}.jsonl", now_millis()));
         let transcript = [
             json!({
                 "type": "user",

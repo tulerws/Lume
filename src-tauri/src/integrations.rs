@@ -1,4 +1,11 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    env, fs,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    process::Command,
+    time::UNIX_EPOCH,
+};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -23,6 +30,17 @@ pub struct IntegrationStatus {
     pub configured: bool,
     pub direct_permissions: bool,
     pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumableSession {
+    pub id: String,
+    pub agent: IntegrationKind,
+    pub project: String,
+    pub working_directory: String,
+    pub source: String,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,6 +111,156 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
             }
         })
         .collect()
+}
+
+pub fn resumable_sessions(kind: &IntegrationKind) -> Result<Vec<ResumableSession>, String> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "Could not find the user home directory".to_string())?;
+    let mut sessions = match kind {
+        IntegrationKind::Codex => {
+            let root = env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("sessions");
+            codex_resumable_sessions(&root)
+        }
+        IntegrationKind::Claude => claude_resumable_sessions(&home.join(".claude/projects")),
+        IntegrationKind::Gemini => Vec::new(),
+    };
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    sessions.truncate(250);
+    Ok(sessions)
+}
+
+fn codex_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
+    resume_files(root)
+        .into_iter()
+        .filter_map(|path| {
+            let file = fs::File::open(&path).ok()?;
+            let first_line = BufReader::new(file).lines().next()?.ok()?;
+            let value = serde_json::from_str::<Value>(&first_line).ok()?;
+            codex_resume_metadata(&value, file_updated_at(&path))
+        })
+        .collect()
+}
+
+fn codex_resume_metadata(value: &Value, updated_at: i64) -> Option<ResumableSession> {
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload
+        .get("parent_thread_id")
+        .is_some_and(|value| !value.is_null())
+        || payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
+        || payload.pointer("/source/subagent").is_some()
+    {
+        return None;
+    }
+    let id = payload.get("id")?.as_str()?.to_string();
+    let working_directory = payload.get("cwd")?.as_str()?.to_string();
+    let source = match (
+        payload.get("originator").and_then(Value::as_str),
+        payload.get("source").and_then(Value::as_str),
+    ) {
+        (Some("codex_vscode"), _) | (_, Some("vscode")) => "VS Code",
+        _ => "CLI",
+    }
+    .to_string();
+    Some(ResumableSession {
+        id,
+        agent: IntegrationKind::Codex,
+        project: resume_project_name(&working_directory),
+        working_directory,
+        source,
+        updated_at,
+    })
+}
+
+fn claude_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
+    let mut seen = HashSet::new();
+    resume_files(root)
+        .into_iter()
+        .filter_map(|path| {
+            let file = fs::File::open(&path).ok()?;
+            let mut bytes_read = 0usize;
+            for line in BufReader::new(file).lines().take(128) {
+                let line = line.ok()?;
+                bytes_read = bytes_read.saturating_add(line.len());
+                if bytes_read > 256 * 1024 {
+                    break;
+                }
+                let value = serde_json::from_str::<Value>(&line).ok()?;
+                if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let Some(id) = value.get("sessionId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(working_directory) = value.get("cwd").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !seen.insert(id.to_string()) {
+                    return None;
+                }
+                return Some(ResumableSession {
+                    id: id.to_string(),
+                    agent: IntegrationKind::Claude,
+                    project: resume_project_name(working_directory),
+                    working_directory: working_directory.to_string(),
+                    source: "CLI".into(),
+                    updated_at: file_updated_at(&path),
+                });
+            }
+            None
+        })
+        .collect()
+}
+
+fn resume_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_resume_files(root, &mut files);
+    files
+}
+
+fn collect_resume_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_resume_files(&path, files);
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn file_updated_at(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|updated| updated.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn resume_project_name(working_directory: &str) -> String {
+    working_directory
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(working_directory)
+        .to_string()
 }
 
 pub fn diagnose(
@@ -301,11 +469,7 @@ fn add_handler(
     let provider = provider(kind);
     let interactive_claude_hook =
         *kind == IntegrationKind::Claude && matches!(event, "PermissionRequest" | "PreToolUse");
-    let timeout = if interactive_claude_hook {
-        900
-    } else {
-        10
-    };
+    let timeout = if interactive_claude_hook { 900 } else { 10 };
     let status_message = if event == "PermissionRequest" {
         "Aguardando decisão no Lume"
     } else {
@@ -602,6 +766,39 @@ pub(crate) fn code_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_resume_metadata_excludes_subagents_and_keeps_project_context() {
+        let session = codex_resume_metadata(
+            &json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-1",
+                    "cwd": "/work/lume",
+                    "originator": "codex_vscode",
+                    "source": "vscode"
+                }
+            }),
+            42,
+        )
+        .expect("sessão retomável");
+        assert_eq!(session.project, "lume");
+        assert_eq!(session.source, "VS Code");
+        assert_eq!(session.updated_at, 42);
+
+        assert!(codex_resume_metadata(
+            &json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-child",
+                    "cwd": "/work/lume",
+                    "source": { "subagent": { "other": "worker" } }
+                }
+            }),
+            43,
+        )
+        .is_none());
+    }
 
     #[test]
     fn adding_and_removing_lume_keeps_existing_hooks() {

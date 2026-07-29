@@ -4,7 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, PromptDelivery, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
@@ -34,6 +34,7 @@
     closeTerminalWindow,
     decidePermission,
     finishLayeredTerminalResize,
+    interruptPrompt,
     loadDisplayBackend,
     loadPreferences,
     loadHubSnapshot,
@@ -42,6 +43,7 @@
     openSessionSource,
     readLocalImageDataUrl,
     refreshAgentRateLimits,
+    renameSession,
     resizeTerminalWindow,
     setTerminalFileDialogActive,
     submitPrompt,
@@ -60,6 +62,7 @@
   let initializationRun = 0;
   let prompt = $state("");
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
+  let promptDelivery = $state<PromptDelivery>("new_turn");
   let message = $state<string | null>(null);
   let sending = $state(false);
   let questionSelections = $state<Record<string, string>>({});
@@ -104,6 +107,10 @@
   let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
   let terminateConfirm = $state(false);
   let terminating = $state(false);
+  let interrupting = $state(false);
+  let renamingSession = $state(false);
+  let renameDraft = $state("");
+  let savingSessionName = $state(false);
   let activeTab = $state<"chat" | "changes">("chat");
   let workTrayExpanded = $state(true);
   let rateLimitRefreshRequested = false;
@@ -139,6 +146,10 @@
 
   function tr(english: string, portuguese: string) {
     return localize(language, english, portuguese);
+  }
+
+  function sessionDisplayName(item: AgentSession) {
+    return item.sessionName?.trim() || item.project?.trim() || item.agentLabel;
   }
 
   function terminalStorageKey(setting: string) {
@@ -214,11 +225,32 @@
     persistTerminalSetting("composer-height", composerHeight);
   }
 
-  const capabilities = $derived(session ? sessionCapabilities(session) : null);
-  const canSubmit = $derived(Boolean(capabilities?.canPrompt));
-  const readyForPrompt = $derived(
-    Boolean(session && ["completed", "failed", "waiting_for_input"].includes(session.status)),
+  const capabilities = $derived(
+    session ? session.capabilities ?? sessionCapabilities(session) : null,
   );
+  const canSubmit = $derived(Boolean(capabilities?.canPrompt));
+  const canSendWhileRunning = $derived(
+    Boolean(
+      session?.status === "running"
+      && capabilities?.promptDeliveries.includes("steer"),
+    ),
+  );
+  const readyForPrompt = $derived(
+    Boolean(
+      session
+      && (
+        ["completed", "failed", "waiting_for_input"].includes(session.status)
+        || canSendWhileRunning
+      ),
+    ),
+  );
+  $effect(() => {
+    if (canSendWhileRunning && promptDelivery === "new_turn") {
+      promptDelivery = "queue";
+    } else if (!canSendWhileRunning && promptDelivery !== "new_turn") {
+      promptDelivery = "new_turn";
+    }
+  });
   const activeRateLimit = $derived.by(() => {
     const limits = (session?.rateLimits ?? [])
       .filter((limit) => Number.isFinite(Number(limit.usedPercent)));
@@ -474,9 +506,14 @@
         });
       }
     }
-    return entries.sort((left, right) =>
-      left.activity.createdAt - right.activity.createdAt || left.sequence - right.sequence
-    );
+    return entries.sort((left, right) => {
+      const queuedOrder =
+        Number(left.activity.kind === "queued_prompt") -
+        Number(right.activity.kind === "queued_prompt");
+      return queuedOrder ||
+        left.activity.createdAt - right.activity.createdAt ||
+        left.sequence - right.sequence;
+    });
   });
 
   onMount(() => {
@@ -538,11 +575,14 @@
       displayBackend = nextDisplayBackend;
       await initializeTerminal();
       if (disposed) return;
-      stopListening = await listen("lume://sessions-changed", () => {
+      stopListening = await listen("lume://sessions-changed", async () => {
         if (session && windowState) {
-          void refresh();
+          await refresh();
+          if (!session && windowState.sessionSource === "cli") {
+            await closeTerminal();
+          }
         } else {
-          void initializeTerminal();
+          await initializeTerminal();
         }
       });
       stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
@@ -653,6 +693,10 @@
       if (run !== initializationRun) return;
     }
     if (run !== initializationRun) return;
+    if (windowState?.sessionSource === "cli") {
+      await closeTerminal();
+      return;
+    }
     initializationError = lastError;
   }
 
@@ -670,7 +714,9 @@
   function activityMark(activity: SessionActivity) {
     return {
       prompt: "›",
+      queued_prompt: "⌛",
       message: "◆",
+      activity: "·",
       analysis: "···",
       plan: "≡",
       command: "$",
@@ -755,7 +801,7 @@
 
   function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
-    if ((event.target as HTMLElement).closest("button, textarea")) return;
+    if ((event.target as HTMLElement).closest("button, input, textarea, form")) return;
     if (displayBackend === "xwayland-fallback") {
       event.preventDefault();
       dragging = true;
@@ -1029,6 +1075,33 @@
     }
   }
 
+  function beginSessionRename() {
+    if (!session) return;
+    renameDraft = sessionDisplayName(session);
+    renamingSession = true;
+    message = null;
+  }
+
+  async function saveSessionRename() {
+    if (!session || savingSessionName) return;
+    const requested = renameDraft.trim();
+    if (!requested) {
+      message = tr("Enter a name for this session.", "Digite um nome para esta sessão.");
+      return;
+    }
+    savingSessionName = true;
+    message = null;
+    try {
+      const sessionName = await renameSession(session.id, requested);
+      session = { ...session, sessionName };
+      renamingSession = false;
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      savingSessionName = false;
+    }
+  }
+
   async function terminateAgent() {
     if (!session?.processId || session.source !== "cli" || terminating) return;
     terminating = true;
@@ -1044,6 +1117,21 @@
     }
   }
 
+  async function interruptAgentPrompt() {
+    if (!session || !capabilities?.canInterrupt || interrupting) return;
+    interrupting = true;
+    message = null;
+    try {
+      await interruptPrompt(session.id);
+      message = tr("Prompt interrupted.", "Prompt interrompido.");
+      await refresh();
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      interrupting = false;
+    }
+  }
+
   async function sendPrompt() {
     if (
       !session
@@ -1055,10 +1143,24 @@
     sending = true;
     message = null;
     try {
-      await submitPrompt(session.id, prompt.trim(), promptAttachments);
+      const delivery =
+        session.status === "running"
+          ? promptDelivery === "new_turn" ? "queue" : promptDelivery
+          : "new_turn";
+      await submitPrompt(session.id, prompt.trim(), promptAttachments, delivery);
       prompt = "";
       promptAttachments = [];
-      session = { ...session, status: "running", statusLabel: "Prompt sent by Lume", lastResponse: undefined };
+      session = {
+        ...session,
+        status: "running",
+        statusLabel:
+          delivery === "queue"
+            ? tr("Prompt queued", "Prompt na fila")
+            : delivery === "steer"
+              ? tr("Context added to this run", "Contexto adicionado à execução")
+              : "Prompt sent by Lume",
+        lastResponse: delivery === "new_turn" ? undefined : session.lastResponse,
+      };
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
@@ -1259,10 +1361,25 @@
       >
         <LumeMascot status={session.status} size={25} />
         <span class="agent-icon"><BrandIcon name={session.agent} size={16} /></span>
-        <div class="identity">
-          <strong>{session.agentLabel}</strong>
-          <small>{session.project}</small>
-        </div>
+        {#if renamingSession}
+          <form class="terminal-name-editor" onsubmit={(event) => { event.preventDefault(); void saveSessionRename(); }}>
+            <input maxlength="80" bind:value={renameDraft} aria-label={tr("Session name", "Nome da sessão")} />
+            <button disabled={savingSessionName} type="submit" aria-label={tr("Save session name", "Salvar nome da sessão")}>
+              <svg viewBox="0 0 20 20"><path d="m5 10 3 3 7-7"></path></svg>
+            </button>
+            <button disabled={savingSessionName} type="button" aria-label={tr("Cancel rename", "Cancelar renomeação")} onclick={() => (renamingSession = false)}>
+              <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8"></path></svg>
+            </button>
+          </form>
+        {:else}
+          <div class="identity">
+            <strong>{sessionDisplayName(session)}</strong>
+            <small>{session.agentLabel} · {session.project}</small>
+          </div>
+          <button class="rename-button" type="button" onclick={beginSessionRename} aria-label={tr("Rename session", "Renomear sessão")} title={tr("Rename session", "Renomear sessão")}>
+            <svg viewBox="0 0 20 20"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
+          </button>
+        {/if}
         <span class="source-badge">
           <BrandIcon name={sourceIcon(session)} size={10} />
           {sourceLabel(session)}
@@ -1318,6 +1435,11 @@
         {#if windowState?.docked}
           <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
             <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
+          </button>
+        {/if}
+        {#if capabilities?.canInterrupt}
+          <button class="interrupt-button" disabled={interrupting} type="button" onclick={() => void interruptAgentPrompt()} aria-label={tr("Interrupt current prompt", "Interromper prompt atual")} title={tr("Interrupt prompt", "Interromper prompt")}>
+            <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
           </button>
         {/if}
         {#if session.source === "cli" && session.processId}
@@ -1441,10 +1563,13 @@
           <div class="chat-feed">
             {#each chatEntries as entry (entry.id)}
               {@const item = entry.activity}
-              {#if item.kind === "prompt" && (item.detail || item.attachments?.length)}
-                <div class="chat-message user-message">
+              {#if (item.kind === "prompt" || item.kind === "queued_prompt") && (item.detail || item.attachments?.length)}
+                <div class:queued-message={item.kind === "queued_prompt"} class="chat-message user-message">
                   <header>
                     <strong>{tr("You", "Você")}</strong>
+                    {#if item.kind === "queued_prompt"}
+                      <span class="queued-badge">{tr("Queued", "Na fila")}</span>
+                    {/if}
                     <time>{activityTime(item.createdAt)}</time>
                   </header>
                   {#if item.detail}<pre>{item.detail}</pre>{/if}
@@ -1488,7 +1613,7 @@
               <p class="empty-state">{tr("Messages and agent activity will appear here in real time.", "As mensagens e a atividade do agente aparecerão aqui em tempo real.")}</p>
             {/each}
             {#if session.status === "running"}
-              <div class="agent-typing" aria-label={tr(`${session.agentLabel} is working`, `${session.agentLabel} está trabalhando`)}>
+              <div class="agent-typing" aria-label={tr(`${sessionDisplayName(session)} is working`, `${sessionDisplayName(session)} está trabalhando`)}>
                 <span></span><span></span><span></span>
               </div>
             {/if}
@@ -1571,6 +1696,12 @@
           </div>
         {/if}
         <div class="composer-controls">
+          {#if canSendWhileRunning}
+            <select class="delivery-select" bind:value={promptDelivery} aria-label={tr("Prompt delivery", "Forma de envio")}>
+              <option value="steer">{tr("Steer now", "Orientar agora")}</option>
+              <option value="queue">{tr("Queue next", "Colocar na fila")}</option>
+            </select>
+          {/if}
           {#if canSubmit && capabilities?.canAttachImages}
             <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
               <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
@@ -1581,8 +1712,8 @@
             disabled={!canSubmit || !readyForPrompt || sending}
             onkeydown={sendPromptOnEnter}
             rows="2"
-            aria-label={tr(`Prompt for ${session.agentLabel}`, `Prompt para ${session.agentLabel}`)}
-            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : readyForPrompt ? tr(`Prompt for ${session.agentLabel}…`, `Prompt para ${session.agentLabel}…`) : tr("Agent is running…", "Agente em execução…")}
+            aria-label={tr(`Prompt for ${sessionDisplayName(session)}`, `Prompt para ${sessionDisplayName(session)}`)}
+            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Add context now or queue the next prompt…", "Adicione contexto agora ou coloque o próximo prompt na fila…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
           ></textarea>
           {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
           {#if canSubmit}
@@ -1616,7 +1747,13 @@
       </div>
     </section>
   {:else}
-    <section class="terminal-card loading"><LumeLogo size={34} /><span>{tr("Connecting to session…", "Conectando à sessão…")}</span></section>
+    <section class="terminal-card loading">
+      <button class="loading-close" type="button" onclick={() => void closeTerminal()} aria-label={tr("Close terminal", "Fechar terminal")}>
+        <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
+      </button>
+      <LumeLogo size={34} />
+      <span>{tr("Connecting to session…", "Conectando à sessão…")}</span>
+    </section>
   {/if}
 </main>
 
@@ -1652,8 +1789,12 @@
   @keyframes dock-breathe { from { opacity: 0.7; } to { opacity: 1; } }
   .agent-icon { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 8px; background: rgba(80, 105, 94, 0.06); }
   .identity { min-width: 0; flex: 1; display: grid; gap: 1px; }
-  .identity strong { color: #26342e; font-size: 11px; }
+  .identity strong { overflow: hidden; color: #26342e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
   .identity small { overflow: hidden; color: #829089; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-name-editor { min-width: 100px; display: flex; flex: 1; align-items: center; gap: 3px; }
+  .terminal-name-editor input { min-width: 0; height: 27px; flex: 1; padding: 0 7px; border: 1px solid rgba(67, 116, 94, 0.25); border-radius: 7px; color: #26342e; background: rgba(255, 255, 255, 0.68); font: 650 10px Inter, sans-serif; outline: none; }
+  .terminal-name-editor input:focus { border-color: rgba(48, 139, 96, 0.5); box-shadow: 0 0 0 2px rgba(48, 139, 96, 0.08); }
+  .terminal-name-editor button { width: 22px; height: 22px; }
   .source-badge { padding: 3px 5px; display: inline-flex; align-items: center; gap: 3px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 7px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
   .rate-limit-meter { width: clamp(58px, 21cqw, 96px); min-width: 58px; display: grid; flex: 0 1 auto; gap: 3px; color: #438161; pointer-events: none; }
   .rate-limit-meter > span { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; font: 750 7px Inter, sans-serif; white-space: nowrap; }
@@ -1666,6 +1807,7 @@
   header button { position: relative; z-index: 25; width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   header button.active { color: #347b5b; background: rgba(52, 139, 94, 0.09); }
+  header .rename-button { width: 21px; height: 21px; }
   .text-zoom-control { position: relative; z-index: 45; display: flex; flex: 0 0 auto; }
   .text-zoom-popover { position: absolute; z-index: 50; top: 30px; right: 0; min-width: 91px; height: 31px; padding: 3px; display: flex; align-items: center; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 9px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 8px 22px rgba(30, 55, 43, 0.15); cursor: default; }
   .text-zoom-popover button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 13px/1 Inter, sans-serif; }
@@ -1673,6 +1815,7 @@
   .text-zoom-popover button:disabled { opacity: 0.32; cursor: default; }
   .text-zoom-popover output { min-width: 35px; color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
   .dock-button { color: #4a7564; }
+  .interrupt-button { color: #b5822f; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
@@ -1722,10 +1865,12 @@
   .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 7px; overflow-x: hidden; }
   .chat-message { width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: hidden; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
+  .chat-message.user-message.queued-message { border-style: dashed; border-color: rgba(176, 129, 45, 0.3); background: rgba(176, 129, 45, 0.07); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
   .chat-message header { display: flex; align-items: center; gap: 6px; }
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
+  .queued-badge { padding: 2px 5px; border-radius: 999px; color: #987021; background: rgba(176, 129, 45, 0.12); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; }
   .chat-message.user-message > pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
   .markdown-content { min-width: 0; max-width: 100%; margin-top: 5px; overflow: hidden; color: #4b5c54; font: var(--chat-font-size)/1.55 Inter, sans-serif; overflow-wrap: anywhere; word-break: break-word; }
   .markdown-content :global(> :first-child) { margin-top: 0; }
@@ -1812,6 +1957,7 @@
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
+  .delivery-select { width: 72px; min-height: 29px; padding: 0 5px; flex: 0 0 auto; border: 1px solid rgba(82, 106, 95, 0.12); border-radius: 8px; outline: none; color: #53675e; background: rgba(80, 105, 94, 0.055); font: 720 var(--chat-tiny-font-size) Inter, sans-serif; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
   .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
@@ -1846,6 +1992,8 @@
   .resize-se { right: 0; bottom: 0; cursor: nwse-resize; }
   .resize-se::after { right: 3px; bottom: 3px; border-right: 1px solid #668276; border-bottom: 1px solid #668276; }
   .loading { align-items: center; justify-content: center; gap: 9px; padding: 18px; color: #78857f; font-size: 9px; text-align: center; }
+  .loading .loading-close { position: absolute; top: 8px; right: 8px; width: 27px; height: 27px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 8px; color: #718079; background: transparent; cursor: pointer; }
+  .loading .loading-close:hover { color: #3f5149; background: rgba(72, 99, 87, 0.07); }
   .loading-actions { display: flex; gap: 6px; }
   .loading-actions button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 8px; color: #4d6f61; background: rgba(255, 255, 255, 0.55); font-size: 8px; font-weight: 720; cursor: pointer; }
 
@@ -1866,6 +2014,7 @@
   .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .source-badge { color: #a7b5ae; }
   .terminal-window.dark .text-zoom-button.active { color: #86cbaa; background: rgba(102, 190, 149, 0.09); }
+  .terminal-window.dark .terminal-name-editor input { color: #d9e5df; border-color: rgba(195, 218, 207, 0.14); background: rgba(219, 233, 226, 0.055); }
   .terminal-window.dark .text-zoom-popover { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
   .terminal-window.dark .text-zoom-popover button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
   .terminal-window.dark .text-zoom-popover button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
@@ -1914,6 +2063,7 @@
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
   .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .delivery-select { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: #1a2520; }
   .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
   .terminal-window.dark .terminal-composer .composer-resize-handle:hover,
   .terminal-window.dark .terminal-composer .composer-resize-handle:focus-visible { background: rgba(205, 225, 215, 0.045); }
