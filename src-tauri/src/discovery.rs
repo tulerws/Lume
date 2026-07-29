@@ -76,7 +76,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 .collect::<Vec<_>>()
                 .join(" ")
                 .to_lowercase();
-            is_lume_codex_process(&command).then_some(*pid)
+            is_lume_codex_infrastructure_process(&command).then_some(*pid)
         })
         .collect::<Vec<_>>();
     let candidates = system
@@ -94,7 +94,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 .join(" ")
                 .to_lowercase();
             let name = process.name().to_string_lossy().to_lowercase();
-            if is_lume_codex_process(&command) {
+            if is_lume_codex_infrastructure_process(&command) {
                 return None;
             }
             if ignored_codex_pids
@@ -183,8 +183,8 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
     }
 }
 
-fn is_lume_codex_process(command: &str) -> bool {
-    command.contains("127.0.0.1:43130") || command.contains("--remote ws://127.0.0.1:43131")
+fn is_lume_codex_infrastructure_process(command: &str) -> bool {
+    command.contains("127.0.0.1:43130")
 }
 
 fn command_working_directory(command: &[std::ffi::OsString]) -> Option<String> {
@@ -423,19 +423,23 @@ mod tests {
 
     #[test]
     fn vscode_codex_app_server_is_not_ignored() {
-        assert!(!is_lume_codex_process(
+        assert!(!is_lume_codex_infrastructure_process(
             "/home/user/.vscode/extensions/openai.chatgpt/bin/codex app-server"
         ));
     }
 
     #[test]
-    fn lume_codex_bridge_processes_are_ignored() {
-        assert!(is_lume_codex_process(
+    fn lume_codex_app_server_is_ignored_but_its_user_cli_is_detectable() {
+        assert!(is_lume_codex_infrastructure_process(
             "codex app-server --listen ws://127.0.0.1:43130"
         ));
-        assert!(is_lume_codex_process(
+        assert!(!is_lume_codex_infrastructure_process(
             "codex --remote ws://127.0.0.1:43131 resume chat"
         ));
+        assert_eq!(
+            detect_agent("codex", "codex --remote ws://127.0.0.1:43131 resume chat"),
+            Some(AgentKind::Codex)
+        );
     }
 
     #[test]

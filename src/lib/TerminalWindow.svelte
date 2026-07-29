@@ -34,6 +34,7 @@
     closeTerminalWindow,
     decidePermission,
     finishLayeredTerminalResize,
+    getSessionCollaborationMode,
     interruptPrompt,
     loadDisplayBackend,
     loadPreferences,
@@ -45,12 +46,14 @@
     refreshAgentRateLimits,
     renameSession,
     resizeTerminalWindow,
+    setSessionCollaborationMode,
     setTerminalFileDialogActive,
     steerQueuedPrompt,
     submitPrompt,
     syncTerminalWindowPosition,
     terminateSession,
     undockTerminalWindow,
+    type CollaborationMode,
     type DisplayBackend,
   } from "$lib/lume";
 
@@ -66,6 +69,8 @@
   let message = $state<string | null>(null);
   let sending = $state(false);
   let steeringQueued = $state(false);
+  let collaborationMode = $state<CollaborationMode>("default");
+  let collaborationModeChanging = $state(false);
   let questionSelections = $state<Record<string, string>>({});
   let dragging = $state(false);
   let dragMoved = false;
@@ -138,15 +143,16 @@
   const effectiveDark = $derived(darkMode ?? systemDark);
   const displayedComposerHeight = $derived.by(() => {
     const hasQueuedPrompt = pendingQueuedPrompts(session).length > 0;
+    const modeControlHeight = session?.agent === "codex" ? 16 : 0;
     const desired = Math.max(
       composerHeight,
-      promptAttachments.length && hasQueuedPrompt
+      (promptAttachments.length && hasQueuedPrompt
         ? composerAttachmentQueueMinHeight
         : promptAttachments.length
           ? composerAttachmentMinHeight
           : hasQueuedPrompt
             ? composerQueueMinHeight
-            : composerMinHeight,
+            : composerMinHeight) + modeControlHeight,
     );
     return Math.min(desired, composerHeightLimit());
   });
@@ -247,11 +253,15 @@
     session ? session.capabilities ?? sessionCapabilities(session) : null,
   );
   const canSubmit = $derived(Boolean(capabilities?.canPrompt));
+  const promptIsRunning = $derived(session?.status === "running");
   const canSendWhileRunning = $derived(
     Boolean(
-      session?.status === "running"
+      promptIsRunning
       && capabilities?.promptDeliveries.includes("steer"),
     ),
+  );
+  const canInterruptRunningPrompt = $derived(
+    Boolean(promptIsRunning && capabilities?.canInterrupt),
   );
   const queuedPrompts = $derived(pendingQueuedPrompts(session));
   const nextQueuedPrompt = $derived(queuedPrompts[0] ?? null);
@@ -555,6 +565,18 @@
       if (!(event.target instanceof Element)) return;
       if (!event.target.closest(".text-zoom-control")) textZoomOpen = false;
     };
+    const interruptOnEscape = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape"
+        || event.repeat
+        || event.isComposing
+        || !canInterruptRunningPrompt
+        || interrupting
+      ) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void interruptAgentPrompt();
+    };
     try {
       const savedComposerHeight = Number(
         localStorage.getItem(terminalStorageKey("composer-height")),
@@ -575,6 +597,7 @@
     colorScheme.addEventListener("change", syncSystemTheme);
     document.addEventListener("click", openMarkdownLink);
     document.addEventListener("pointerdown", closeTextZoom);
+    window.addEventListener("keydown", interruptOnEscape);
     void (async () => {
       const [nextPreferences, nextDisplayBackend] = await Promise.all([
         loadPreferences(),
@@ -670,6 +693,7 @@
       colorScheme.removeEventListener("change", syncSystemTheme);
       document.removeEventListener("click", openMarkdownLink);
       document.removeEventListener("pointerdown", closeTextZoom);
+      window.removeEventListener("keydown", interruptOnEscape);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
       clearInterval(workClockInterval);
@@ -688,11 +712,18 @@
         windowState = await loadTerminalWindowState(label);
         await refresh();
         if (session) {
-          if (session.agent === "codex" && !rateLimitRefreshRequested) {
-            rateLimitRefreshRequested = true;
-            void refreshAgentRateLimits(session.agent)
-              .then(() => refresh())
-              .catch(() => undefined);
+          if (session.agent === "codex") {
+            try {
+              collaborationMode = await getSessionCollaborationMode(session.id);
+            } catch {
+              collaborationMode = "default";
+            }
+            if (!rateLimitRefreshRequested) {
+              rateLimitRefreshRequested = true;
+              void refreshAgentRateLimits(session.agent)
+                .then(() => refresh())
+                .catch(() => undefined);
+            }
           }
           return;
         }
@@ -1142,6 +1173,25 @@
     }
   }
 
+  async function toggleCollaborationMode() {
+    if (
+      !session
+      || session.agent !== "codex"
+      || promptIsRunning
+      || collaborationModeChanging
+    ) return;
+    collaborationModeChanging = true;
+    message = null;
+    const nextMode: CollaborationMode = collaborationMode === "plan" ? "default" : "plan";
+    try {
+      collaborationMode = await setSessionCollaborationMode(session.id, nextMode);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      collaborationModeChanging = false;
+    }
+  }
+
   async function sendPrompt() {
     if (
       !session
@@ -1470,11 +1520,6 @@
             <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
           </button>
         {/if}
-        {#if capabilities?.canInterrupt}
-          <button class="interrupt-button" disabled={interrupting} type="button" onclick={() => void interruptAgentPrompt()} aria-label={tr("Interrupt current prompt", "Interromper prompt atual")} title={tr("Interrupt prompt", "Interromper prompt")}>
-            <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
-          </button>
-        {/if}
         {#if session.source === "cli" && session.processId}
           <button class="terminate-button" type="button" onclick={() => (terminateConfirm = !terminateConfirm)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
             <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
@@ -1742,10 +1787,37 @@
           </button>
         {/if}
         <div class="composer-controls">
-          {#if canSubmit && capabilities?.canAttachImages}
-            <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
-              <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
-            </button>
+          {#if session.agent === "codex" || (canSubmit && capabilities?.canAttachImages)}
+            <div class="composer-leading-actions">
+              {#if session.agent === "codex"}
+                <button
+                  class:plan={collaborationMode === "plan"}
+                  class="mode-button"
+                  disabled={promptIsRunning || collaborationModeChanging}
+                  type="button"
+                  onclick={() => void toggleCollaborationMode()}
+                  aria-label={collaborationMode === "plan" ? tr("Plan mode enabled. Switch to Default mode", "Modo Plan ativo. Mudar para o modo Default") : tr("Default mode enabled. Switch to Plan mode", "Modo Default ativo. Mudar para o modo Plan")}
+                  title={promptIsRunning ? tr("Mode can be changed after the current prompt", "O modo pode ser alterado após o prompt atual") : collaborationMode === "plan" ? tr("Plan mode — switch to Default", "Modo Plan — mudar para Default") : tr("Default mode — switch to Plan", "Modo Default — mudar para Plan")}
+                >
+                  {#if collaborationModeChanging}
+                    <span class="send-spinner" aria-hidden="true"></span>
+                  {:else if collaborationMode === "plan"}
+                    <svg aria-hidden="true" viewBox="0 0 20 20">
+                      <path d="m4.8 5.8 1.3 1.3 2-2.2M10 6h5M4.8 10 6.1 11.3l2-2.2M10 10.2h5M4.8 14.2l1.3 1.3 2-2.2M10 14.4h5" />
+                    </svg>
+                  {:else}
+                    <svg aria-hidden="true" viewBox="0 0 20 20">
+                      <path d="M11 3.5 5.8 10H10l-1 6.5 5.2-7.5H10z" />
+                    </svg>
+                  {/if}
+                </button>
+              {/if}
+              {#if canSubmit && capabilities?.canAttachImages}
+                <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
+                  <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
+                </button>
+              {/if}
+            </div>
           {/if}
           <textarea
             bind:value={prompt}
@@ -1753,10 +1825,26 @@
             onkeydown={sendPromptOnEnter}
             rows="2"
             aria-label={tr(`Prompt for ${sessionDisplayName(session)}`, `Prompt para ${sessionDisplayName(session)}`)}
-            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Write the next prompt…", "Escreva o próximo prompt…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
+            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Write the next prompt and press Enter to queue…", "Escreva o próximo prompt e pressione Enter para adicionar à fila…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
           ></textarea>
           {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
-          {#if canSubmit}
+          {#if promptIsRunning}
+            <button
+              class="interrupt-submit"
+              disabled={!canInterruptRunningPrompt || interrupting}
+              type="button"
+              onclick={() => void interruptAgentPrompt()}
+              aria-keyshortcuts="Escape"
+              aria-label={interrupting ? tr("Interrupting prompt", "Interrompendo prompt") : canInterruptRunningPrompt ? tr("Interrupt current prompt", "Interromper prompt atual") : tr("Prompt interruption unavailable", "Interrupção do prompt indisponível")}
+              title={canInterruptRunningPrompt ? tr("Interrupt prompt (Esc)", "Interromper prompt (Esc)") : tr("This source cannot be interrupted safely", "Esta origem não pode ser interrompida com segurança")}
+            >
+              {#if interrupting}
+                <span class="send-spinner" aria-hidden="true"></span>
+              {:else}
+                <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
+              {/if}
+            </button>
+          {:else if canSubmit}
             <button disabled={(!prompt.trim() && promptAttachments.length === 0) || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
               {#if sending}
                 <span class="send-spinner" aria-hidden="true"></span>
@@ -1855,7 +1943,6 @@
   .text-zoom-popover button:disabled { opacity: 0.32; cursor: default; }
   .text-zoom-popover output { min-width: 35px; color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
   .dock-button { color: #4a7564; }
-  .interrupt-button { color: #b5822f; }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
@@ -1995,6 +2082,7 @@
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
+  .composer-leading-actions { display: flex; flex: 0 0 auto; flex-direction: column; justify-content: flex-end; gap: 4px; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
   .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
@@ -2005,6 +2093,8 @@
   .composer-controls textarea:disabled { opacity: 0.58; }
   .send-status { padding-bottom: 9px; color: #70827a; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
+  .terminal-composer .interrupt-submit { background: #bd5c52; }
+  .terminal-composer .interrupt-submit:hover:not(:disabled) { background: #aa4d44; }
   .terminal-composer .queued-prompt-tray { width: 100%; height: 35px; padding: 0 7px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(80, 119, 160, 0.13); border-radius: 9px; color: #4f6d83; background: rgba(74, 119, 157, 0.055); text-align: left; }
   .queued-prompt-tray:hover:not(:disabled) { border-color: rgba(67, 119, 164, 0.24); background: rgba(74, 119, 157, 0.09); }
   .queue-mark { width: 17px; height: 17px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 5px; color: #477fa9; background: rgba(66, 127, 174, 0.1); font: 800 11px Inter, sans-serif; }
@@ -2014,7 +2104,9 @@
   .queue-shortcut { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; color: #748b9a; }
   .queue-shortcut kbd { min-width: 23px; padding: 2px 4px; border: 1px solid rgba(75, 106, 127, 0.17); border-bottom-width: 2px; border-radius: 5px; color: #547286; background: rgba(255, 255, 255, 0.48); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-align: center; }
   .queue-shortcut small { font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; }
+  .terminal-composer .mode-button,
   .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
+  .terminal-composer .mode-button.plan { color: #527aa0; border-color: rgba(79, 123, 164, 0.2); background: rgba(75, 124, 169, 0.1); }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .terminal-composer.sending button:disabled { opacity: 0.82; }
   .terminal-composer .composer-resize-handle { position: absolute; z-index: 18; top: -6px; left: 50%; width: 54px; height: 12px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 999px; color: #7c8d85; background: transparent; cursor: ns-resize; touch-action: none; transform: translateX(-50%); }
@@ -2115,7 +2207,9 @@
   .terminal-window.dark .change-list code { color: #bdcbc4; }
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
+  .terminal-window.dark .terminal-composer .mode-button,
   .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .terminal-composer .mode-button.plan { color: #9abddd; border-color: rgba(138, 183, 220, 0.18); background: rgba(91, 143, 184, 0.1); }
   .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
   .terminal-window.dark .terminal-composer .composer-resize-handle:hover,
   .terminal-window.dark .terminal-composer .composer-resize-handle:focus-visible { background: rgba(205, 225, 215, 0.045); }

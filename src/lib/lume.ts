@@ -178,6 +178,21 @@ export async function interruptPrompt(sessionId: string): Promise<void> {
   await invoke("interrupt_prompt", { sessionId });
 }
 
+export type CollaborationMode = "default" | "plan";
+
+export async function getSessionCollaborationMode(
+  sessionId: string,
+): Promise<CollaborationMode> {
+  return invoke<CollaborationMode>("get_session_collaboration_mode", { sessionId });
+}
+
+export async function setSessionCollaborationMode(
+  sessionId: string,
+  mode: CollaborationMode,
+): Promise<CollaborationMode> {
+  return invoke<CollaborationMode>("set_session_collaboration_mode", { sessionId, mode });
+}
+
 export async function steerQueuedPrompt(
   sessionId: string,
   activityId: string,

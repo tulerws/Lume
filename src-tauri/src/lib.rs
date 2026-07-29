@@ -347,6 +347,26 @@ fn interrupt_prompt(
 }
 
 #[tauri::command]
+fn get_session_collaboration_mode(
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+) -> Result<String, String> {
+    control::session_collaboration_mode(state.inner(), bridge.inner(), &session_id)
+}
+
+#[tauri::command]
+fn set_session_collaboration_mode(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+    mode: String,
+) -> Result<String, String> {
+    control::set_session_collaboration_mode(&app, state.inner(), bridge.inner(), &session_id, &mode)
+}
+
+#[tauri::command]
 fn steer_queued_prompt(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -992,6 +1012,8 @@ pub fn run() {
             set_terminal_file_dialog_active,
             refresh_agent_rate_limits,
             interrupt_prompt,
+            get_session_collaboration_mode,
+            set_session_collaboration_mode,
             steer_queued_prompt,
             terminate_session,
             list_history,

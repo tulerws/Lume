@@ -397,6 +397,19 @@
     let stopMobileDeviceListening: (() => void) | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
+    let resumeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshAfterResume = () => {
+      void refreshSessions(false);
+      if (resumeRefreshTimer) clearTimeout(resumeRefreshTimer);
+      resumeRefreshTimer = setTimeout(() => void refreshSessions(false), 2_500);
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") refreshAfterResume();
+    };
+
+    window.addEventListener("focus", refreshAfterResume);
+    window.addEventListener("pageshow", refreshAfterResume);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
     updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
 
@@ -486,11 +499,15 @@
       stopCompanionUpdateListening?.();
       stopMobileDeviceListening?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
+      window.removeEventListener("focus", refreshAfterResume);
+      window.removeEventListener("pageshow", refreshAfterResume);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
       window.removeEventListener("keydown", handleAppShortcut);
       window.removeEventListener("pointerup", finishOverlayDragFromWindow, true);
       window.removeEventListener("pointercancel", finishOverlayDragFromWindow, true);
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
+      if (resumeRefreshTimer) clearTimeout(resumeRefreshTimer);
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
       if (pendingUpdate) void pendingUpdate.close();
     };

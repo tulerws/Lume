@@ -39,6 +39,7 @@ struct QueuedPrompt {
 pub struct CodexBridge {
     process: Arc<Mutex<Option<Child>>>,
     queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
+    collaboration_modes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl CodexBridge {
@@ -65,15 +66,48 @@ impl CodexBridge {
             .map_err(|error| error.to_string())?;
         let process = Arc::new(Mutex::new(None));
         let queued_prompts = Arc::new(Mutex::new(HashMap::new()));
+        let collaboration_modes = Arc::new(Mutex::new(HashMap::new()));
         start_queue_dispatcher(process.clone(), queued_prompts.clone(), state, app)?;
         Ok(Self {
             process,
             queued_prompts,
+            collaboration_modes,
         })
     }
 
     pub fn ensure_server(&self) -> Result<(), String> {
         ensure_server_process(&self.process)
+    }
+
+    pub fn collaboration_mode(&self, thread_id: &str) -> Result<String, String> {
+        self.collaboration_modes
+            .lock()
+            .map_err(|_| "Could not read the Codex collaboration mode".to_string())
+            .map(|modes| {
+                modes
+                    .get(thread_id)
+                    .cloned()
+                    .unwrap_or_else(|| "default".into())
+            })
+    }
+
+    pub fn set_collaboration_mode(
+        &self,
+        thread_id: &str,
+        mode: &str,
+        state: &AppState,
+        app: &AppHandle,
+    ) -> Result<String, String> {
+        if !matches!(mode, "default" | "plan") {
+            return Err("Unsupported Codex collaboration mode".into());
+        }
+        self.ensure_server()?;
+        update_thread_collaboration_mode(thread_id, mode, state, app)?;
+        self.collaboration_modes
+            .lock()
+            .map_err(|_| "Could not save the Codex collaboration mode".to_string())?
+            .insert(thread_id.to_string(), mode.to_string());
+        Ok(mode.to_string())
     }
 
     pub fn submit_prompt(
@@ -535,6 +569,102 @@ fn prompt_input(prompt: &str, attachment_paths: &[String]) -> Vec<Value> {
             .map(|path| json!({ "type": "localImage", "path": path })),
     );
     input
+}
+
+fn update_thread_collaboration_mode(
+    thread_id: &str,
+    mode: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+    let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
+
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }
+        }),
+    )?;
+    wait_for_response(&mut server, 1, state, app, &profiles)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+    send_json(
+        &mut server,
+        json!({ "method": "thread/resume", "id": 2, "params": { "threadId": thread_id } }),
+    )?;
+    let resumed = wait_for_value_response(&mut server, 2, state, app, &profiles)?;
+    send_json(
+        &mut server,
+        json!({ "method": "collaborationMode/list", "id": 3, "params": {} }),
+    )?;
+    let presets = wait_for_value_response(&mut server, 3, state, app, &profiles)?;
+    let collaboration_mode = collaboration_mode_from_responses(mode, &resumed, &presets)?;
+    send_json(
+        &mut server,
+        json!({
+            "method": "thread/settings/update",
+            "id": 4,
+            "params": {
+                "threadId": thread_id,
+                "collaborationMode": collaboration_mode
+            }
+        }),
+    )?;
+    wait_for_response(&mut server, 4, state, app, &profiles)
+}
+
+fn collaboration_mode_from_responses(
+    mode: &str,
+    resumed: &Value,
+    presets: &Value,
+) -> Result<Value, String> {
+    let preset = presets
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .and_then(|presets| {
+            presets.iter().find(|preset| {
+                text_at(preset, "mode") == Some(mode)
+                    || text_at(preset, "name").is_some_and(|name| name.eq_ignore_ascii_case(mode))
+            })
+        });
+    let model = preset
+        .and_then(|preset| text_at(preset, "model"))
+        .or_else(|| {
+            resumed
+                .pointer("/result")
+                .and_then(|result| text_at(result, "model"))
+        })
+        .ok_or_else(|| "Codex did not provide a model for this collaboration mode".to_string())?;
+    let effort = preset
+        .and_then(|preset| preset.get("reasoning_effort"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| {
+            resumed
+                .pointer("/result/effort")
+                .filter(|value| !value.is_null())
+                .cloned()
+        });
+    let mut settings = json!({
+        "model": model,
+        "developer_instructions": Value::Null
+    });
+    if let Some(effort) = effort {
+        settings["reasoning_effort"] = effort;
+    }
+    Ok(json!({
+        "mode": mode,
+        "settings": settings
+    }))
 }
 
 fn active_turn_connection(
@@ -1764,6 +1894,7 @@ mod tests {
         let bridge = CodexBridge {
             process: Arc::new(Mutex::new(None)),
             queued_prompts: Arc::new(Mutex::new(HashMap::new())),
+            collaboration_modes: Arc::new(Mutex::new(HashMap::new())),
         };
         bridge
             .queue_prompt(
@@ -1910,6 +2041,58 @@ mod tests {
                 { "type": "text", "text": "Analise esta tela" },
                 { "type": "localImage", "path": "/tmp/screenshot.png" }
             ])
+        );
+    }
+
+    #[test]
+    fn collaboration_mode_uses_the_server_preset_and_current_model_fallback() {
+        let resumed = json!({
+            "result": {
+                "model": "gpt-test-default",
+                "effort": "medium"
+            }
+        });
+        let presets = json!({
+            "result": {
+                "data": [
+                    {
+                        "name": "Default",
+                        "mode": "default",
+                        "model": null,
+                        "reasoning_effort": null
+                    },
+                    {
+                        "name": "Plan",
+                        "mode": "plan",
+                        "model": "gpt-test-plan",
+                        "reasoning_effort": "high"
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            collaboration_mode_from_responses("plan", &resumed, &presets).expect("plan preset"),
+            json!({
+                "mode": "plan",
+                "settings": {
+                    "model": "gpt-test-plan",
+                    "developer_instructions": null,
+                    "reasoning_effort": "high"
+                }
+            })
+        );
+        assert_eq!(
+            collaboration_mode_from_responses("default", &resumed, &presets)
+                .expect("default preset"),
+            json!({
+                "mode": "default",
+                "settings": {
+                    "model": "gpt-test-default",
+                    "developer_instructions": null,
+                    "reasoning_effort": "medium"
+                }
+            })
         );
     }
 

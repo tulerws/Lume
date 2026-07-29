@@ -278,6 +278,50 @@ pub fn interrupt_prompt(
     Ok(())
 }
 
+pub fn session_collaboration_mode(
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+) -> Result<String, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if session.agent != AgentKind::Codex {
+        return Err("Collaboration modes are only available for Codex sessions".into());
+    }
+    let thread_id = session
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+    bridge.collaboration_mode(thread_id)
+}
+
+pub fn set_session_collaboration_mode(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+    mode: &str,
+) -> Result<String, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if session.agent != AgentKind::Codex {
+        return Err("Collaboration modes are only available for Codex sessions".into());
+    }
+    let thread_id = session
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+    let mode = bridge.set_collaboration_mode(thread_id, mode, state, app)?;
+    protocol::emit_sessions_changed(app);
+    Ok(mode)
+}
+
 pub fn steer_queued_prompt(
     app: &AppHandle,
     state: &AppState,
