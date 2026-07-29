@@ -20,6 +20,7 @@ pub struct DiscoveredProcess {
     pub agent: AgentKind,
     pub agent_label: String,
     pub process_id: u32,
+    pub native_session_ids: Vec<String>,
     pub working_directory: Option<String>,
     pub source: SessionSource,
 }
@@ -171,6 +172,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 agent,
                 agent_label,
                 process_id: pid.as_u32(),
+                native_session_ids: native_session_ids_for_process_tree(&system, pid),
                 working_directory,
                 source: source_for(&system, pid),
             })
@@ -184,7 +186,57 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
 }
 
 fn is_lume_codex_infrastructure_process(command: &str) -> bool {
-    command.contains("127.0.0.1:43130")
+    let normalized = command.replace('\\', "/");
+    normalized.contains("127.0.0.1:43130")
+        || (normalized.contains("app-server")
+            && normalized.contains(".vscode/extensions")
+            && normalized.contains("openai.chatgpt"))
+}
+
+#[cfg(target_os = "linux")]
+fn native_session_ids_for_process_tree(system: &System, root: sysinfo::Pid) -> Vec<String> {
+    let mut ids = system
+        .processes()
+        .keys()
+        .filter(|pid| **pid == root || process_descends_from(system, **pid, root))
+        .flat_map(|pid| native_session_ids_for_pid(*pid))
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[cfg(target_os = "linux")]
+fn native_session_ids_for_pid(pid: sysinfo::Pid) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", pid.as_u32())) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+            let id = stem.get(stem.len().checked_sub(36)?..)?;
+            is_codex_session_id(id).then(|| id.to_string())
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_session_ids_for_process_tree(_system: &System, _pid: sysinfo::Pid) -> Vec<String> {
+    Vec::new()
+}
+
+fn is_codex_session_id(value: &str) -> bool {
+    value.len() == 36
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit(),
+            })
 }
 
 fn command_working_directory(command: &[std::ffi::OsString]) -> Option<String> {
@@ -422,10 +474,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vscode_codex_app_server_is_not_ignored() {
-        assert!(!is_lume_codex_infrastructure_process(
+    fn vscode_codex_app_server_is_ignored_until_a_real_chat_emits_events() {
+        assert!(is_lume_codex_infrastructure_process(
             "/home/user/.vscode/extensions/openai.chatgpt/bin/codex app-server"
         ));
+        assert!(is_lume_codex_infrastructure_process(
+            r"C:\Users\user\.vscode\extensions\openai.chatgpt\bin\codex.exe app-server"
+        ));
+    }
+
+    #[test]
+    fn recognizes_rollout_session_ids_without_accepting_arbitrary_names() {
+        assert!(is_codex_session_id("019f8061-7032-7521-b333-84f84c744fa8"));
+        assert!(!is_codex_session_id("rollout-memory-maintenance"));
     }
 
     #[test]

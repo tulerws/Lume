@@ -1303,6 +1303,51 @@ impl AppState {
         }
 
         for process in discovered {
+            let exact_native_chat_ids = sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|native_id| process.native_session_ids.contains(native_id))
+                })
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>();
+            if !exact_native_chat_ids.is_empty() {
+                let provisional_ids = sessions
+                    .iter()
+                    .filter(|session| {
+                        is_provisional_process(session)
+                            && session.process_id == Some(process.process_id)
+                    })
+                    .map(|session| session.id.clone())
+                    .collect::<Vec<_>>();
+                if !provisional_ids.is_empty() {
+                    sessions.retain(|session| !provisional_ids.contains(&session.id));
+                    removed_sessions.extend(provisional_ids);
+                    changed = true;
+                }
+                for session in sessions
+                    .iter_mut()
+                    .filter(|session| exact_native_chat_ids.contains(&session.id))
+                {
+                    let mut refreshed = false;
+                    if session.process_id != Some(process.process_id) {
+                        session.process_id = Some(process.process_id);
+                        refreshed = true;
+                    }
+                    if session.source != process.source {
+                        session.source = process.source.clone();
+                        refreshed = true;
+                    }
+                    if refreshed {
+                        session.updated_at = now;
+                        snapshots.push(session.clone());
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             let has_recent_native_vscode_chat = process.source == SessionSource::Vscode
                 && sessions.iter().any(|session| {
                     !is_provisional_process(session)
@@ -1500,22 +1545,29 @@ impl AppState {
             changed = true;
         }
 
-        for session in sessions.iter().filter(|session| {
-            session
-                .process_id
-                .is_some_and(|pid| live_pids.contains(&pid))
-        }) {
+        let process_is_present = |session: &AgentSession| {
+            session.process_id.is_some_and(|pid| {
+                if is_provisional_process(session) && session.source == SessionSource::Vscode {
+                    active_pids.contains(&pid)
+                } else {
+                    live_pids.contains(&pid)
+                }
+            })
+        };
+        for session in sessions
+            .iter()
+            .filter(|session| process_is_present(session))
+        {
             missing_process_scans.remove(&session.id);
         }
         missing_process_scans
             .retain(|session_id, _| sessions.iter().any(|session| &session.id == session_id));
 
         let mut closed_session_ids = Vec::new();
-        for session in sessions.iter().filter(|session| {
-            session
-                .process_id
-                .is_some_and(|pid| !live_pids.contains(&pid))
-        }) {
+        for session in sessions
+            .iter()
+            .filter(|session| session.process_id.is_some() && !process_is_present(session))
+        {
             let missing_scans = missing_process_scans
                 .entry(session.id.clone())
                 .and_modify(|count| *count = count.saturating_add(1))
@@ -2326,6 +2378,7 @@ mod tests {
             agent: AgentKind::Claude,
             agent_label: "Claude".into(),
             process_id,
+            native_session_ids: Vec::new(),
             working_directory: Some("/work/lume".into()),
             source: SessionSource::Cli,
         }
@@ -2842,6 +2895,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 agent_label: "Codex".into(),
                 process_id: 4242,
+                native_session_ids: Vec::new(),
                 working_directory: Some("/work/lume".into()),
                 source: SessionSource::Cli,
             }])
@@ -2866,6 +2920,34 @@ mod tests {
         assert_eq!(sessions[0].process_id, Some(4242));
         assert_eq!(sessions[0].status, SessionStatus::Completed);
         assert_eq!(sessions[0].last_response.as_deref(), Some("Tudo pronto"));
+    }
+
+    #[test]
+    fn active_rollout_file_binds_the_exact_cli_process() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex-app-server:thread-1", 0);
+        event.agent = AgentKind::Codex;
+        event.source = Some(SessionSource::Vscode);
+        event.process_id = None;
+        event.native_session_id = Some("thread-1".into());
+        event.working_directory = Some("/home/user".into());
+        state.ingest(event).expect("chat nativo");
+
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
+                process_id: 4242,
+                native_session_ids: vec!["thread-1".into()],
+                working_directory: Some("/home/user".into()),
+                source: SessionSource::Cli,
+            }])
+            .expect("processo exato");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].process_id, Some(4242));
+        assert_eq!(sessions[0].source, SessionSource::Cli);
     }
 
     #[test]
@@ -3114,6 +3196,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 agent_label: "Codex".into(),
                 process_id: 5252,
+                native_session_ids: Vec::new(),
                 working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
                 source: SessionSource::Vscode,
             }])
@@ -3150,6 +3233,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 agent_label: "Codex".into(),
                 process_id: 5252,
+                native_session_ids: Vec::new(),
                 working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
                 source: SessionSource::Vscode,
             }])
@@ -3170,6 +3254,29 @@ mod tests {
             .load_sessions()
             .expect("persistência")
             .is_empty());
+    }
+
+    #[test]
+    fn vscode_host_without_a_chat_is_removed_even_while_the_host_is_alive() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .reconcile_processes(vec![DiscoveredProcess {
+                agent: AgentKind::Codex,
+                agent_label: "Codex".into(),
+                process_id: 5252,
+                native_session_ids: Vec::new(),
+                working_directory: Some("/home/user/.vscode/extensions/openai.chatgpt".into()),
+                source: SessionSource::Vscode,
+            }])
+            .expect("host inicialmente detectado");
+
+        for _ in 0..PROCESS_MISSING_SCAN_LIMIT {
+            state
+                .reconcile_process_snapshot(Vec::new(), HashSet::from([5252]))
+                .expect("host filtrado");
+        }
+
+        assert!(state.sessions().expect("sessões").is_empty());
     }
 
     #[test]
@@ -3239,6 +3346,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 agent_label: "Codex".into(),
                 process_id: 4242,
+                native_session_ids: Vec::new(),
                 working_directory: Some(home.to_string_lossy().into_owned()),
                 source: SessionSource::Cli,
             }])

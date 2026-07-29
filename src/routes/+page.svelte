@@ -2814,9 +2814,58 @@
               {#each recentResults as item (item.result.id)}
                 {@const capabilities = sessionCapabilities(item.session)}
                 <article class="result-card">
-                  <div class="result-heading">
-                    <span class="agent-avatar agent-{item.session.agent}"><BrandIcon name={item.session.agent} size={15} /></span>
-                    <span><strong>{sessionDisplayName(item.session)}</strong><small>{item.session.agentLabel} · {item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
+                  <div class="result-card-top">
+                    <div class="result-heading">
+                      <span class="agent-avatar agent-{item.session.agent}"><BrandIcon name={item.session.agent} size={15} /></span>
+                      <span><strong>{sessionDisplayName(item.session)}</strong><small>{item.session.agentLabel} · {item.session.project} · {relativeTime(item.result.createdAt)}</small></span>
+                    </div>
+                    <div class="result-actions" aria-label={tr("Result actions", "Ações do resultado")}>
+                      <button
+                        class="result-action-button"
+                        type="button"
+                        data-label={copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
+                        aria-label={copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
+                        onclick={() => copyResult(item.result.id, item.result.response)}
+                      >
+                        {#if copiedResultId === item.result.id}
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7" /></svg>
+                        {:else}
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="7" y="6" width="8" height="9" rx="1.5" /><path d="M12 6V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13H7" /></svg>
+                        {/if}
+                      </button>
+                      <button
+                        class="result-action-button"
+                        disabled={savingNoteId === item.result.id}
+                        type="button"
+                        data-label={savingNoteId === item.result.id ? tr("Saving…", "Salvando…") : tr("Save note", "Salvar nota")}
+                        aria-label={savingNoteId === item.result.id ? tr("Saving…", "Salvando…") : tr("Save note", "Salvar nota")}
+                        onclick={() => keepResultAsNote(item.session, item.result.id)}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5h10v13l-5-3-5 3v-13Z" /></svg>
+                      </button>
+                      {#if capabilities.canPrompt && canContinueSession(item.session)}
+                        <button
+                          class="result-action-button"
+                          type="button"
+                          data-label={tr("Continue", "Continuar")}
+                          aria-label={tr("Continue", "Continuar")}
+                          onclick={() => continueFromResult(item.session)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
+                        </button>
+                      {/if}
+                      {#if capabilities.canOpenSource}
+                        <button
+                          class="result-action-button"
+                          type="button"
+                          data-label={tr("Open source", "Abrir origem")}
+                          aria-label={tr("Open source", "Abrir origem")}
+                          onclick={() => openSessionSource(item.session.id)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5h8v8M14.5 5.5 6 14" /><path d="M13 15H5V7" /></svg>
+                        </button>
+                      {/if}
+                    </div>
                   </div>
                   <p>{item.result.response}</p>
                   {#if item.result.files?.length || item.result.tests?.length}
@@ -2829,16 +2878,6 @@
                       {/if}
                     </div>
                   {/if}
-                  <div class="result-actions">
-                    <button type="button" onclick={() => copyResult(item.result.id, item.result.response)}>{copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}</button>
-                    <button disabled={savingNoteId === item.result.id} type="button" onclick={() => keepResultAsNote(item.session, item.result.id)}>{savingNoteId === item.result.id ? "…" : tr("Save note", "Salvar nota")}</button>
-                    {#if capabilities.canPrompt && canContinueSession(item.session)}
-                      <button type="button" onclick={() => continueFromResult(item.session)}>{tr("Continue", "Continuar")}</button>
-                    {/if}
-                    {#if capabilities.canOpenSource}
-                      <button type="button" onclick={() => openSessionSource(item.session.id)}>{tr("Open source", "Abrir origem")}</button>
-                    {/if}
-                  </div>
                 </article>
               {/each}
             </div>
@@ -3906,7 +3945,8 @@
   .results-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; }
   .results-list { display: grid; gap: 8px; padding: 10px 0 3px; }
   .result-card { padding: 9px 10px; border: 1px solid rgba(91, 115, 104, 0.1); border-radius: 11px; background: rgba(75, 105, 91, 0.03); }
-  .result-heading { display: flex; align-items: center; gap: 7px; }
+  .result-card-top { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .result-heading { min-width: 0; display: flex; align-items: center; gap: 7px; }
   .result-heading .agent-avatar { width: 25px; height: 25px; border-radius: 8px; }
   .result-heading > span:last-child { min-width: 0; display: grid; gap: 1px; }
   .result-heading strong { color: #34443d; font-size: 9px; }
@@ -3915,9 +3955,17 @@
   .result-artifacts { margin: 0 0 8px; display: grid; gap: 4px; }
   .result-artifacts span { overflow: hidden; color: #78867f; font-size: 8px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .result-artifacts strong { margin-right: 5px; color: #60766c; font-size: 7px; text-transform: uppercase; }
-  .result-actions { display: flex; align-items: center; gap: 5px; }
-  .result-actions button { height: 24px; padding: 0 7px; border: 1px solid rgba(84, 109, 98, 0.12); border-radius: 7px; color: #5e756b; background: rgba(255, 255, 255, 0.36); font-size: 8px; font-weight: 700; cursor: pointer; }
-  .result-actions button:hover { background: rgba(255, 255, 255, 0.72); }
+  .result-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+  .result-action-button { position: relative; width: 25px; height: 25px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(84, 109, 98, 0.12); border-radius: 7px; color: #5e756b; background: rgba(255, 255, 255, 0.36); cursor: pointer; transition: color 130ms ease, background 130ms ease, transform 130ms ease; }
+  .result-action-button:hover:not(:disabled) { color: #3f745d; background: rgba(255, 255, 255, 0.72); transform: translateY(-1px); }
+  .result-action-button:disabled { opacity: 0.42; cursor: default; }
+  .result-action-button svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+  .result-action-button::after { position: absolute; z-index: 25; top: calc(100% + 5px); left: 50%; max-width: 120px; padding: 4px 6px; content: attr(data-label); opacity: 0; pointer-events: none; border: 1px solid rgba(74, 96, 86, 0.12); border-radius: 6px; color: #52635b; background: rgba(249, 251, 250, 0.98); box-shadow: 0 5px 15px rgba(43, 58, 51, 0.12); font-size: 7px; font-weight: 700; line-height: 1.2; text-align: center; white-space: nowrap; transform: translate(-50%, -3px); transition: opacity 110ms ease, transform 110ms ease; }
+  .result-action-button:hover::after,
+  .result-action-button:focus-visible::after { opacity: 1; transform: translate(-50%, 0); }
+  .result-action-button:last-child::after { right: 0; left: auto; transform: translateY(-3px); }
+  .result-action-button:last-child:hover::after,
+  .result-action-button:last-child:focus-visible::after { transform: translateY(0); }
   .results-empty { margin: 8px 2px 4px; color: #89938f; font-size: 9px; }
   .saved-notes { display: grid; gap: 6px; }
   .saved-note { position: relative; padding: 9px 34px 9px 10px; border: 1px solid rgba(83, 112, 99, 0.12); border-radius: 10px; background: rgba(244, 239, 198, 0.16); }
@@ -4220,7 +4268,9 @@
   .overlay-shell.dark .result-heading small,
   .overlay-shell.dark .results-intro p,
   .overlay-shell.dark .result-card > p { color: #aebdb5; }
-  .overlay-shell.dark .result-actions button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .result-action-button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .result-action-button:hover:not(:disabled) { color: #9fd0b7; background: rgba(100, 180, 143, 0.09); }
+  .overlay-shell.dark .result-action-button::after { color: #c7d5ce; border-color: rgba(205, 222, 213, 0.11); background: rgba(28, 40, 34, 0.98); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24); }
   .overlay-shell.dark .empty-state strong { color: #c5d0cb; }
   .overlay-shell.dark code,
   .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
