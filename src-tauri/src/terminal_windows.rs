@@ -7,7 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    webview::PageLoadEvent, AppHandle, Emitter, LogicalSize, Manager, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
 };
 
 use crate::{
@@ -326,6 +327,8 @@ impl TerminalWindows {
             .map_err(|_| "Não foi possível guardar o mini terminal".to_string())?
             .insert(label.clone(), placement.clone());
 
+        let ready_registry = self.clone();
+        let ready_label = label.clone();
         let window =
             match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("Lume · {}", session.agent_label))
@@ -341,6 +344,14 @@ impl TerminalWindows {
                 .shadow(false)
                 .resizable(true)
                 .visible(false)
+                .on_page_load(move |window, payload| {
+                    let ready_event = matches!(payload.event(), PageLoadEvent::Finished)
+                        || (cfg!(target_os = "windows")
+                            && matches!(payload.event(), PageLoadEvent::Started));
+                    if ready_event && ready_registry.mark_ready(&ready_label) {
+                        ready_registry.present_if_ready(&window, &ready_label);
+                    }
+                })
                 .build()
             {
                 Ok(window) => window,
