@@ -46,7 +46,6 @@
     PermissionAction,
     Preferences,
     PromptAttachmentInput,
-    PromptDelivery,
     QuestionAnswer,
     ResumableSession,
     ResultNote,
@@ -94,6 +93,7 @@
     saveResultNote,
     restoreTerminalLayout,
     setTerminalWindowsVisible,
+    steerQueuedPrompt,
     submitPrompt,
     takePendingShortcutAction,
     terminateSession,
@@ -184,9 +184,9 @@
   let composerSessionId = $state<string | null>(null);
   let composerPrompt = $state("");
   let composerAttachments = $state<PromptAttachmentInput[]>([]);
-  let composerDelivery = $state<PromptDelivery>("new_turn");
   let composerMessage = $state<string | null>(null);
   let composerSending = $state(false);
+  let steeringQueuedActivityId = $state<string | null>(null);
   let terminateConfirmId = $state<string | null>(null);
   let terminatingSessionId = $state<string | null>(null);
   let interruptingSessionId = $state<string | null>(null);
@@ -1068,11 +1068,18 @@
     );
   }
 
+  function pendingQueuedPrompts(session: AgentSession) {
+    return session.activities
+      .filter((activity) =>
+        activity.kind === "queued_prompt" && activity.status === "waiting"
+      )
+      .sort((left, right) => left.createdAt - right.createdAt);
+  }
+
   function toggleSessionComposer(session: AgentSession) {
     composerSessionId = composerSessionId === session.id ? null : session.id;
     composerPrompt = "";
     composerAttachments = [];
-    composerDelivery = session.status === "running" ? "queue" : "new_turn";
     composerMessage = null;
   }
 
@@ -1082,26 +1089,62 @@
     composerSending = true;
     composerMessage = null;
     try {
-      const delivery =
-        session.status === "running"
-          ? composerDelivery === "new_turn" ? "queue" : composerDelivery
-          : "new_turn";
+      const delivery = session.status === "running" ? "queue" : "new_turn";
       if (isTauri) {
         await submitPrompt(session.id, prompt, composerAttachments, delivery);
       }
       sessions = sessions.map((item) =>
         item.id === session.id
-          ? { ...item, status: "running", statusLabel: "Prompt enviado pelo Lume", lastResponse: undefined }
+          ? {
+              ...item,
+              status: "running",
+              statusLabel: delivery === "queue" ? "Prompt queued" : "Prompt sent by Lume",
+              lastResponse: delivery === "new_turn" ? undefined : item.lastResponse,
+            }
           : item,
       );
       composerPrompt = "";
       composerAttachments = [];
-      composerSessionId = null;
+      composerSessionId = delivery === "queue" ? session.id : null;
+      if (isTauri) await refreshSessions(false);
     } catch (error) {
       composerMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       composerSending = false;
     }
+  }
+
+  async function steerSessionQueuedPrompt(session: AgentSession) {
+    const queuedPrompt = pendingQueuedPrompts(session)[0];
+    if (!queuedPrompt || steeringQueuedActivityId) return;
+    steeringQueuedActivityId = queuedPrompt.id;
+    composerMessage = null;
+    try {
+      if (isTauri) {
+        await steerQueuedPrompt(session.id, queuedPrompt.id);
+        await refreshSessions(false);
+      }
+      composerMessage = tr(
+        "Queued prompt steered into the current task.",
+        "Prompt da fila enviado para a tarefa atual.",
+      );
+    } catch (error) {
+      composerMessage = String(error).replace(/^Error:\s*/, "");
+      if (isTauri) await refreshSessions(false).catch(() => undefined);
+    } finally {
+      steeringQueuedActivityId = null;
+    }
+  }
+
+  function handleSessionComposerKeydown(event: KeyboardEvent, session: AgentSession) {
+    if (
+      event.key !== "Tab"
+      || event.shiftKey
+      || event.isComposing
+      || pendingQueuedPrompts(session).length === 0
+    ) return;
+    event.preventDefault();
+    void steerSessionQueuedPrompt(session);
   }
 
   async function inlineImagePreview(path: string) {
@@ -2388,7 +2431,7 @@
                         <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
                       {/if}
                     </span>
-                    <span class="project-name">{session.agentLabel} · {session.project}</span>
+                    <span class="project-name">{session.project}</span>
                     <span class="status-line status-{session.status}">
                       {#if session.status === "running"}
                         <span class="running-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -2411,36 +2454,8 @@
 
                 {#if selectedId === session.id}
                   {@const capabilities = sessionCapabilities(session)}
+                  {@const queuedPrompts = pendingQueuedPrompts(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
-                    {#if renamingSessionId === session.id}
-                      <form class="session-name-editor" onsubmit={(event) => { event.preventDefault(); void saveSessionRename(session); }}>
-                        <input
-                          maxlength="80"
-                          bind:value={renameDraft}
-                          aria-label={tr("Session name", "Nome da sessão")}
-                          onkeydown={(event) => {
-                            if (event.key === "Escape") {
-                              event.preventDefault();
-                              cancelSessionRename();
-                            }
-                          }}
-                        />
-                        <button class="primary" disabled={renamingSession} type="submit">{tr("Save", "Salvar")}</button>
-                        <button disabled={renamingSession} type="button" onclick={cancelSessionRename}>{tr("Cancel", "Cancelar")}</button>
-                        {#if renameError}<small>{renameError}</small>{/if}
-                      </form>
-                    {:else}
-                      <button class="rename-session-button" type="button" onclick={() => beginSessionRename(session)}>
-                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
-                        {tr("Rename session", "Renomear sessão")}
-                      </button>
-                    {/if}
-                    {#if capabilities.canOpenSource}
-                      <div class="capability-bar">
-                        <button type="button" onclick={() => openSessionSource(session.id)}>{tr("Open source", "Abrir origem")}</button>
-                      </div>
-                    {/if}
-
                     {#if session.lastResponse}
                       <div class="final-response">
                         <span class="eyebrow">{tr("Final response", "Resposta final")}</span>
@@ -2458,6 +2473,94 @@
                           {/if}
                         </button>
                         <p>{session.lastResponse}</p>
+                      </div>
+                    {/if}
+
+                    <div class="session-action-bar" aria-label={tr("Session actions", "Ações da sessão")}>
+                      <button
+                        class="session-action-button"
+                        type="button"
+                        data-label={tr("Rename session", "Renomear sessão")}
+                        aria-label={tr("Rename session", "Renomear sessão")}
+                        onclick={() => beginSessionRename(session)}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
+                      </button>
+                      {#if capabilities.canOpenSource}
+                        <button
+                          class="session-action-button"
+                          type="button"
+                          data-label={tr("Open source", "Abrir origem")}
+                          aria-label={tr("Open source", "Abrir origem")}
+                          onclick={() => openSessionSource(session.id)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5h8v8M14.5 5.5 6 14"></path><path d="M13 15H5V7"></path></svg>
+                        </button>
+                      {/if}
+                      {#if canContinueSession(session) && canSubmitToSession(session)}
+                        <button
+                          class:active={composerSessionId === session.id}
+                          class="session-action-button"
+                          type="button"
+                          data-label={session.status === "waiting_for_input" ? tr("Send prompt", "Enviar prompt") : tr("Continue", "Continuar")}
+                          aria-label={session.status === "waiting_for_input" ? tr("Send prompt", "Enviar prompt") : tr("Continue", "Continuar")}
+                          onclick={() => toggleSessionComposer(session)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4"></path></svg>
+                        </button>
+                      {/if}
+                      {#if canInterruptSession(session)}
+                        <button
+                          class="session-action-button warning"
+                          disabled={interruptingSessionId === session.id}
+                          type="button"
+                          data-label={interruptingSessionId === session.id ? tr("Interrupting…", "Interrompendo…") : tr("Interrupt prompt", "Interromper prompt")}
+                          aria-label={interruptingSessionId === session.id ? tr("Interrupting…", "Interrompendo…") : tr("Interrupt prompt", "Interromper prompt")}
+                          onclick={() => void interruptSessionPrompt(session)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
+                        </button>
+                      {/if}
+                      {#if canTerminateSession(session)}
+                        <button
+                          class="session-action-button danger"
+                          disabled={terminatingSessionId === session.id}
+                          type="button"
+                          data-label={tr("Stop agent", "Encerrar agente")}
+                          aria-label={tr("Stop agent", "Encerrar agente")}
+                          onclick={() => void terminateAgent(session)}
+                        >
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0"></path></svg>
+                        </button>
+                      {/if}
+                    </div>
+
+                    {#if renamingSessionId === session.id}
+                      <form class="session-name-editor" onsubmit={(event) => { event.preventDefault(); void saveSessionRename(session); }}>
+                        <input
+                          maxlength="80"
+                          bind:value={renameDraft}
+                          aria-label={tr("Session name", "Nome da sessão")}
+                          onkeydown={(event) => {
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              cancelSessionRename();
+                            }
+                          }}
+                        />
+                        <button class="primary" disabled={renamingSession} type="submit">{tr("Save", "Salvar")}</button>
+                        <button disabled={renamingSession} type="button" onclick={cancelSessionRename}>{tr("Cancel", "Cancelar")}</button>
+                        {#if renameError}<small>{renameError}</small>{/if}
+                      </form>
+                    {/if}
+
+                    {#if terminateConfirmId === session.id}
+                      <div class="terminate-agent-control confirming">
+                        <span>{tr("Stop the agent and its running commands?", "Encerrar o agente e os comandos em execução?")}</span>
+                        <button type="button" onclick={() => (terminateConfirmId = null)}>{tr("Cancel", "Cancelar")}</button>
+                        <button class="danger" disabled={terminatingSessionId === session.id} type="button" onclick={() => void terminateAgent(session)}>
+                          {terminatingSessionId === session.id ? tr("Stopping…", "Encerrando…") : tr("Stop", "Encerrar")}
+                        </button>
                       </div>
                     {/if}
 
@@ -2510,17 +2613,7 @@
                       </div>
                     {/if}
 
-                    {#if canContinueSession(session) && canSubmitToSession(session)}
-                      <button
-                        class:active={composerSessionId === session.id}
-                        class="continue-trigger"
-                        type="button"
-                        onclick={() => toggleSessionComposer(session)}
-                      >
-                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
-                        {session.status === "waiting_for_input" ? tr("Send prompt through Lume", "Enviar prompt pelo Lume") : tr("Continue through Lume", "Continuar pelo Lume")}
-                      </button>
-                      {#if composerSessionId === session.id}
+                    {#if canContinueSession(session) && canSubmitToSession(session) && composerSessionId === session.id}
                         <form
                           class="inline-composer"
                           onpaste={(event) => void pasteSessionImages(event, session)}
@@ -2544,15 +2637,29 @@
                               {/each}
                             </div>
                           {/if}
+                          {#if queuedPrompts[0]}
+                            <button
+                              class="inline-queue-tray"
+                              disabled={steeringQueuedActivityId !== null}
+                              type="button"
+                              onclick={() => void steerSessionQueuedPrompt(session)}
+                              aria-label={tr("Steer the next queued prompt now", "Enviar agora o próximo prompt da fila")}
+                            >
+                              <span class="queue-mark" aria-hidden="true">↳</span>
+                              <span class="queue-copy">
+                                <small>{queuedPrompts.length > 1 ? tr(`${queuedPrompts.length} queued prompts`, `${queuedPrompts.length} prompts na fila`) : tr("Queued next", "Próximo na fila")}</small>
+                                <strong>{queuedPrompts[0].detail || tr("Prompt with attached images", "Prompt com imagens anexadas")}</strong>
+                              </span>
+                              <span class="queue-shortcut">
+                                <kbd>Tab</kbd>
+                                <small>{steeringQueuedActivityId === queuedPrompts[0].id ? tr("Steering…", "Enviando…") : tr("Steer now", "Enviar agora")}</small>
+                              </span>
+                            </button>
+                          {/if}
                           <div class="inline-composer-controls">
-                            {#if session.status === "running"}
-                              <select bind:value={composerDelivery} aria-label={tr("Prompt delivery", "Forma de envio")}>
-                                <option value="steer">{tr("Steer now", "Orientar agora")}</option>
-                                <option value="queue">{tr("Queue next", "Colocar na fila")}</option>
-                              </select>
-                            {/if}
                             <textarea
                               bind:value={composerPrompt}
+                              onkeydown={(event) => handleSessionComposerKeydown(event, session)}
                               aria-label={tr(`New prompt for ${sessionDisplayName(session)}`, `Novo prompt para ${sessionDisplayName(session)}`)}
                               placeholder={tr("Paste an image or enter the next prompt…", "Cole uma imagem ou digite o próximo prompt…")}
                               rows="2"
@@ -2566,40 +2673,9 @@
                             </button>
                           </div>
                         </form>
-                        {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
-                      {/if}
+                      {#if composerMessage}<p class="inline-error">{composerMessage}</p>{/if}
                     {/if}
 
-                    {#if canInterruptSession(session)}
-                      <button
-                        class="interrupt-prompt-control"
-                        disabled={interruptingSessionId === session.id}
-                        type="button"
-                        onclick={() => void interruptSessionPrompt(session)}
-                      >
-                        <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
-                        {interruptingSessionId === session.id
-                          ? tr("Interrupting…", "Interrompendo…")
-                          : tr("Interrupt prompt", "Interromper prompt")}
-                      </button>
-                    {/if}
-
-                    {#if canTerminateSession(session)}
-                      <div class:confirming={terminateConfirmId === session.id} class="terminate-agent-control">
-                        {#if terminateConfirmId === session.id}
-                          <span>{tr("Stop the agent and its running commands?", "Encerrar o agente e os comandos em execução?")}</span>
-                          <button type="button" onclick={() => (terminateConfirmId = null)}>{tr("Cancel", "Cancelar")}</button>
-                          <button class="danger" disabled={terminatingSessionId === session.id} type="button" onclick={() => void terminateAgent(session)}>
-                            {terminatingSessionId === session.id ? tr("Stopping…", "Encerrando…") : tr("Stop", "Encerrar")}
-                          </button>
-                        {:else}
-                          <button type="button" onclick={() => void terminateAgent(session)}>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
-                            {tr("Stop agent", "Encerrar agente")}
-                          </button>
-                        {/if}
-                      </div>
-                    {/if}
                     {#if sessionActionMessage && selectedId === session.id}
                       <p class="inline-error">{sessionActionMessage}</p>
                     {/if}
@@ -3666,29 +3742,23 @@
   .selected .chevron { transform: rotate(90deg); }
 
   .session-details { padding: 0 2px 13px 43px; }
-  .rename-session-button {
-    margin: -2px 0 8px;
-    padding: 3px 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    border: 0;
-    color: #728079;
-    background: transparent;
-    font-size: 9px;
-  }
-  .rename-session-button:hover { color: #3f745d; }
-  .rename-session-button svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
-  .session-name-editor { margin: -2px 0 9px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .session-action-bar { position: relative; margin: 0 0 10px; display: flex; align-items: center; gap: 5px; }
+  .session-action-button { position: relative; width: 27px; height: 27px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 8px; color: #65786f; background: rgba(77, 105, 92, 0.035); cursor: pointer; transition: color 130ms ease, background 130ms ease, transform 130ms ease; }
+  .session-action-button:hover:not(:disabled),
+  .session-action-button.active { color: #3f745d; background: rgba(68, 125, 99, 0.09); transform: translateY(-1px); }
+  .session-action-button.warning { color: #a2762f; }
+  .session-action-button.danger { color: #9a5c59; }
+  .session-action-button:disabled { opacity: 0.42; cursor: default; }
+  .session-action-button svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+  .session-action-button::after { position: absolute; z-index: 25; bottom: calc(100% + 5px); left: 50%; max-width: 120px; padding: 4px 6px; content: attr(data-label); opacity: 0; pointer-events: none; border: 1px solid rgba(74, 96, 86, 0.12); border-radius: 6px; color: #52635b; background: rgba(249, 251, 250, 0.98); box-shadow: 0 5px 15px rgba(43, 58, 51, 0.12); font-size: 7px; font-weight: 700; line-height: 1.2; text-align: center; white-space: nowrap; transform: translate(-50%, 3px); transition: opacity 110ms ease, transform 110ms ease; }
+  .session-action-button:hover::after,
+  .session-action-button:focus-visible::after { opacity: 1; transform: translate(-50%, 0); }
+  .session-name-editor { margin: 0 0 9px; display: flex; flex-wrap: wrap; gap: 5px; }
   .session-name-editor input { min-width: 0; flex: 1 1 130px; padding: 6px 8px; border: 1px solid rgba(75, 101, 89, 0.14); border-radius: 7px; color: #314139; background: rgba(255, 255, 255, 0.5); font: inherit; font-size: 10px; outline: none; }
   .session-name-editor input:focus { border-color: rgba(64, 132, 99, 0.42); box-shadow: 0 0 0 2px rgba(64, 132, 99, 0.08); }
   .session-name-editor button { padding: 5px 7px; border: 1px solid rgba(75, 101, 89, 0.12); border-radius: 7px; color: #66746d; background: rgba(75, 101, 89, 0.06); font-size: 9px; }
   .session-name-editor button.primary { color: #fff; background: #3e8e68; }
   .session-name-editor small { flex-basis: 100%; color: #ad5555; font-size: 8px; }
-  .capability-bar { margin: -2px 0 9px; display: flex; align-items: center; gap: 5px; }
-  .capability-bar button { height: 24px; padding: 0 7px; border: 1px solid rgba(83, 108, 97, 0.11); border-radius: 7px; color: #63786e; background: rgba(77, 105, 92, 0.035); font-size: 8px; font-weight: 700; cursor: pointer; }
-  .capability-bar button:hover { background: rgba(77, 105, 92, 0.08); }
-
   .permission-block { padding-left: 11px; border-left: 2px solid #d49350; display: grid; gap: 6px; }
   .permission-block > strong { color: #4d3b2a; font-size: 11px; font-weight: 650; line-height: 1.4; }
   .question-block { padding: 9px; display: grid; gap: 8px; border: 1px solid rgba(48, 133, 176, 0.2); border-radius: 9px; background: rgba(48, 133, 176, 0.055); }
@@ -3728,29 +3798,29 @@
   .final-response-copy:hover { color: #3f6253; background: rgba(72, 99, 87, 0.08); }
   .final-response-copy svg { width: 13px; height: 13px; }
 
-  .continue-trigger { margin-top: 9px; padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #557266; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
-  .continue-trigger svg { width: 13px; height: 13px; transition: transform 150ms ease; }
-  .continue-trigger:hover svg,
-  .continue-trigger.active svg { transform: translateX(2px); }
   .inline-composer { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .inline-queue-tray { min-width: 0; width: 100%; min-height: 36px; padding: 5px 7px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(80, 119, 160, 0.13); border-radius: 9px; color: #4f6d83; background: rgba(74, 119, 157, 0.055); text-align: left; cursor: pointer; }
+  .inline-queue-tray:hover:not(:disabled) { border-color: rgba(67, 119, 164, 0.24); background: rgba(74, 119, 157, 0.09); }
+  .inline-queue-tray:disabled { opacity: 0.58; cursor: default; }
+  .inline-queue-tray .queue-mark { width: 18px; height: 18px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 5px; color: #477fa9; background: rgba(66, 127, 174, 0.1); font: 800 11px Inter, sans-serif; }
+  .inline-queue-tray .queue-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
+  .inline-queue-tray .queue-copy small { color: #7790a1; font-size: 7px; font-weight: 760; letter-spacing: 0.035em; text-transform: uppercase; }
+  .inline-queue-tray .queue-copy strong { overflow: hidden; color: #4c6576; font-size: 9px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+  .inline-queue-tray .queue-shortcut { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; color: #748b9a; }
+  .inline-queue-tray .queue-shortcut kbd { min-width: 24px; padding: 2px 4px; border: 1px solid rgba(75, 106, 127, 0.17); border-bottom-width: 2px; border-radius: 5px; color: #547286; background: rgba(255, 255, 255, 0.48); font: 750 7px Inter, sans-serif; text-align: center; }
+  .inline-queue-tray .queue-shortcut small { font-size: 7px; font-weight: 650; white-space: nowrap; }
   .inline-composer-controls { display: flex; align-items: flex-end; gap: 6px; }
-  .inline-composer-controls select { width: 76px; min-height: 30px; padding: 0 6px; flex: 0 0 auto; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 9px; outline: none; color: #5b6f66; background: rgba(83, 108, 97, 0.055); font: 720 8px Inter, sans-serif; }
   .inline-composer textarea { resize: none; outline: none; font: inherit; }
   .inline-composer textarea { min-width: 0; min-height: 52px; flex: 1; padding: 8px 9px; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 10px; color: #34423c; background: rgba(255, 255, 255, 0.48); font-size: 10px; line-height: 1.4; }
   .inline-composer textarea:focus { border-color: rgba(70, 111, 94, 0.42); box-shadow: 0 0 0 3px rgba(74, 118, 99, 0.06); }
   .inline-composer-controls > button { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 9px; color: white; background: #496f60; cursor: pointer; transition: transform 140ms ease, opacity 140ms ease; }
   .inline-composer-controls > button:hover:not(:disabled) { transform: translateY(-1px); }
   .inline-composer-controls > button:disabled { opacity: 0.35; cursor: default; }
-  .interrupt-prompt-control { min-height: 26px; margin-top: 9px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid rgba(189, 137, 49, 0.16); border-radius: 8px; color: #a2762f; background: rgba(189, 137, 49, 0.055); font-size: 8px; font-weight: 750; cursor: pointer; }
-  .interrupt-prompt-control svg { width: 12px; height: 12px; }
-  .interrupt-prompt-control:disabled { opacity: 0.45; cursor: default; }
   .inline-attachments { min-width: 0; display: flex; gap: 6px; overflow-x: auto; }
   .inline-attachments > span { position: relative; width: 44px; height: 44px; flex: 0 0 auto; overflow: hidden; border: 1px solid rgba(85, 109, 99, 0.14); border-radius: 9px; background: rgba(71, 98, 86, 0.05); }
   .inline-attachments img { width: 100%; height: 100%; display: block; object-fit: cover; }
   .inline-attachments button { position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(255, 255, 255, 0.5); border-radius: 50%; color: white; background: rgba(27, 39, 34, 0.78); font-size: 11px; line-height: 1; cursor: pointer; }
-  .terminate-agent-control { margin-top: 11px; display: flex; align-items: center; gap: 6px; }
-  .terminate-agent-control > button { padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: #9a5c59; background: transparent; font-size: 9px; font-weight: 720; cursor: pointer; }
-  .terminate-agent-control > button svg { width: 13px; height: 13px; }
+  .terminate-agent-control { margin: 0 0 9px; display: flex; align-items: center; gap: 6px; }
   .terminate-agent-control.confirming { padding: 7px 8px; border: 1px solid rgba(166, 77, 77, 0.13); border-radius: 9px; background: rgba(166, 77, 77, 0.035); }
   .terminate-agent-control.confirming span { min-width: 0; flex: 1; color: #755b57; font-size: 9px; line-height: 1.35; }
   .terminate-agent-control.confirming button { min-height: 24px; padding: 0 7px; border: 1px solid rgba(91, 107, 100, 0.13); border-radius: 7px; color: #627068; background: rgba(255, 255, 255, 0.42); font-size: 8px; font-weight: 700; cursor: pointer; }
@@ -4065,8 +4135,12 @@
   .overlay-shell.dark .settings-section[open] > .settings-section-label::after { color: #8eb9a5; }
   .overlay-shell.dark .session-row:hover,
   .overlay-shell.dark .session-row.selected { background: rgba(198, 218, 208, 0.045); }
-  .overlay-shell.dark .rename-session-button { color: #8fa199; }
-  .overlay-shell.dark .rename-session-button:hover { color: #9fd0b7; }
+  .overlay-shell.dark .session-action-button { color: #9caea5; border-color: rgba(207, 223, 215, 0.1); background: rgba(222, 233, 228, 0.035); }
+  .overlay-shell.dark .session-action-button:hover:not(:disabled),
+  .overlay-shell.dark .session-action-button.active { color: #9fd0b7; background: rgba(100, 180, 143, 0.09); }
+  .overlay-shell.dark .session-action-button.warning { color: #d0aa67; }
+  .overlay-shell.dark .session-action-button.danger { color: #d49792; }
+  .overlay-shell.dark .session-action-button::after { color: #c7d5ce; border-color: rgba(205, 222, 213, 0.11); background: rgba(28, 40, 34, 0.98); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24); }
   .overlay-shell.dark .session-name-editor input,
   .overlay-shell.dark .session-name-editor button { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .session-name-editor button.primary { color: #f4faf7; background: #397b5c; }
@@ -4108,8 +4182,7 @@
   .overlay-shell.dark .result-heading small,
   .overlay-shell.dark .results-intro p,
   .overlay-shell.dark .result-card > p { color: #aebdb5; }
-  .overlay-shell.dark .result-actions button,
-  .overlay-shell.dark .capability-bar button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
+  .overlay-shell.dark .result-actions button { color: #b9c8c0; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .empty-state strong { color: #c5d0cb; }
   .overlay-shell.dark code,
   .overlay-shell.dark .segmented { color: #bdc8c3; background: rgba(216, 229, 223, 0.06); }
@@ -4122,7 +4195,13 @@
   .overlay-shell.dark .field-row select,
   .overlay-shell.dark .shortcut-input,
   .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
-  .overlay-shell.dark .inline-composer-controls select { color: #aabbb3; border-color: rgba(207, 223, 215, 0.1); background: #1a2520; }
+  .overlay-shell.dark .inline-queue-tray { color: #a7bdcd; border-color: rgba(125, 166, 199, 0.13); background: rgba(91, 143, 184, 0.065); }
+  .overlay-shell.dark .inline-queue-tray:hover:not(:disabled) { border-color: rgba(128, 177, 216, 0.23); background: rgba(91, 143, 184, 0.1); }
+  .overlay-shell.dark .inline-queue-tray .queue-mark { color: #87b8dc; background: rgba(105, 166, 210, 0.11); }
+  .overlay-shell.dark .inline-queue-tray .queue-copy small,
+  .overlay-shell.dark .inline-queue-tray .queue-shortcut { color: #829daa; }
+  .overlay-shell.dark .inline-queue-tray .queue-copy strong { color: #b1c6d2; }
+  .overlay-shell.dark .inline-queue-tray .queue-shortcut kbd { color: #9bb8c9; border-color: rgba(169, 197, 214, 0.14); background: rgba(220, 235, 243, 0.055); }
   .overlay-shell.dark .inline-attachments > span { border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .final-response,
   .overlay-shell.dark .response-preview { border-color: rgba(203, 221, 212, 0.08); background: rgba(210, 230, 220, 0.035); }

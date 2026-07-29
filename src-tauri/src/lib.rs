@@ -347,6 +347,23 @@ fn interrupt_prompt(
 }
 
 #[tauri::command]
+fn steer_queued_prompt(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+    activity_id: String,
+) -> Result<(), String> {
+    control::steer_queued_prompt(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        &session_id,
+        &activity_id,
+    )
+}
+
+#[tauri::command]
 fn list_history(
     state: State<'_, AppState>,
     limit: Option<usize>,
@@ -975,6 +992,7 @@ pub fn run() {
             set_terminal_file_dialog_active,
             refresh_agent_rate_limits,
             interrupt_prompt,
+            steer_queued_prompt,
             terminate_session,
             list_history,
             list_result_notes,

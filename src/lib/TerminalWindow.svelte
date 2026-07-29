@@ -4,7 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, PromptDelivery, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
@@ -46,6 +46,7 @@
     renameSession,
     resizeTerminalWindow,
     setTerminalFileDialogActive,
+    steerQueuedPrompt,
     submitPrompt,
     syncTerminalWindowPosition,
     terminateSession,
@@ -62,9 +63,9 @@
   let initializationRun = 0;
   let prompt = $state("");
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
-  let promptDelivery = $state<PromptDelivery>("new_turn");
   let message = $state<string | null>(null);
   let sending = $state(false);
+  let steeringQueued = $state(false);
   let questionSelections = $state<Record<string, string>>({});
   let dragging = $state(false);
   let dragMoved = false;
@@ -121,6 +122,8 @@
   let workClock = $state(Date.now());
   const composerMinHeight = 63;
   const composerAttachmentMinHeight = 120;
+  const composerQueueMinHeight = 104;
+  const composerAttachmentQueueMinHeight = 160;
   const textZoomMin = 0.8;
   const textZoomMax = 1.8;
   let composerHeight = $state(composerMinHeight);
@@ -134,9 +137,16 @@
   let textZoomOpen = $state(false);
   const effectiveDark = $derived(darkMode ?? systemDark);
   const displayedComposerHeight = $derived.by(() => {
+    const hasQueuedPrompt = pendingQueuedPrompts(session).length > 0;
     const desired = Math.max(
       composerHeight,
-      promptAttachments.length ? composerAttachmentMinHeight : composerMinHeight,
+      promptAttachments.length && hasQueuedPrompt
+        ? composerAttachmentQueueMinHeight
+        : promptAttachments.length
+          ? composerAttachmentMinHeight
+          : hasQueuedPrompt
+            ? composerQueueMinHeight
+            : composerMinHeight,
     );
     return Math.min(desired, composerHeightLimit());
   });
@@ -150,6 +160,14 @@
 
   function sessionDisplayName(item: AgentSession) {
     return item.sessionName?.trim() || item.project?.trim() || item.agentLabel;
+  }
+
+  function pendingQueuedPrompts(item: AgentSession | null) {
+    return (item?.activities ?? [])
+      .filter((activity) =>
+        activity.kind === "queued_prompt" && activity.status === "waiting"
+      )
+      .sort((left, right) => left.createdAt - right.createdAt);
   }
 
   function terminalStorageKey(setting: string) {
@@ -235,6 +253,8 @@
       && capabilities?.promptDeliveries.includes("steer"),
     ),
   );
+  const queuedPrompts = $derived(pendingQueuedPrompts(session));
+  const nextQueuedPrompt = $derived(queuedPrompts[0] ?? null);
   const readyForPrompt = $derived(
     Boolean(
       session
@@ -244,13 +264,6 @@
       ),
     ),
   );
-  $effect(() => {
-    if (canSendWhileRunning && promptDelivery === "new_turn") {
-      promptDelivery = "queue";
-    } else if (!canSendWhileRunning && promptDelivery !== "new_turn") {
-      promptDelivery = "new_turn";
-    }
-  });
   const activeRateLimit = $derived.by(() => {
     const limits = (session?.rateLimits ?? [])
       .filter((limit) => Number.isFinite(Number(limit.usedPercent)));
@@ -396,6 +409,7 @@
     };
     const entries: ChatEntry[] = [];
     for (const activity of activities) {
+      if (activity.kind === "queued_prompt") continue;
       const files = activityChanges(activity);
       const matchingMessage = activity.kind === "message"
         ? [...entries].reverse().find((entry) =>
@@ -507,11 +521,7 @@
       }
     }
     return entries.sort((left, right) => {
-      const queuedOrder =
-        Number(left.activity.kind === "queued_prompt") -
-        Number(right.activity.kind === "queued_prompt");
-      return queuedOrder ||
-        left.activity.createdAt - right.activity.createdAt ||
+      return left.activity.createdAt - right.activity.createdAt ||
         left.sequence - right.sequence;
     });
   });
@@ -1143,10 +1153,7 @@
     sending = true;
     message = null;
     try {
-      const delivery =
-        session.status === "running"
-          ? promptDelivery === "new_turn" ? "queue" : promptDelivery
-          : "new_turn";
+      const delivery = session.status === "running" ? "queue" : "new_turn";
       await submitPrompt(session.id, prompt.trim(), promptAttachments, delivery);
       prompt = "";
       promptAttachments = [];
@@ -1156,15 +1163,30 @@
         statusLabel:
           delivery === "queue"
             ? tr("Prompt queued", "Prompt na fila")
-            : delivery === "steer"
-              ? tr("Context added to this run", "Contexto adicionado à execução")
-              : "Prompt sent by Lume",
+            : "Prompt sent by Lume",
         lastResponse: delivery === "new_turn" ? undefined : session.lastResponse,
       };
+      await refresh();
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
     } finally {
       sending = false;
+    }
+  }
+
+  async function steerNextQueuedPrompt() {
+    if (!session || !nextQueuedPrompt || !canSendWhileRunning || steeringQueued) return;
+    steeringQueued = true;
+    message = null;
+    try {
+      await steerQueuedPrompt(session.id, nextQueuedPrompt.id);
+      message = tr("Queued prompt steered into the current task.", "Prompt da fila enviado para a tarefa atual.");
+      await refresh();
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+      await refresh().catch(() => undefined);
+    } finally {
+      steeringQueued = false;
     }
   }
 
@@ -1253,6 +1275,17 @@
   }
 
   function sendPromptOnEnter(event: KeyboardEvent) {
+    if (
+      event.key === "Tab"
+      && !event.shiftKey
+      && !event.isComposing
+      && nextQueuedPrompt
+      && canSendWhileRunning
+    ) {
+      event.preventDefault();
+      void steerNextQueuedPrompt();
+      return;
+    }
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
     event.preventDefault();
     void sendPrompt();
@@ -1374,7 +1407,7 @@
         {:else}
           <div class="identity">
             <strong>{sessionDisplayName(session)}</strong>
-            <small>{session.agentLabel} · {session.project}</small>
+            <small>{session.project}</small>
           </div>
           <button class="rename-button" type="button" onclick={beginSessionRename} aria-label={tr("Rename session", "Renomear sessão")} title={tr("Rename session", "Renomear sessão")}>
             <svg viewBox="0 0 20 20"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
@@ -1563,13 +1596,10 @@
           <div class="chat-feed">
             {#each chatEntries as entry (entry.id)}
               {@const item = entry.activity}
-              {#if (item.kind === "prompt" || item.kind === "queued_prompt") && (item.detail || item.attachments?.length)}
-                <div class:queued-message={item.kind === "queued_prompt"} class="chat-message user-message">
+              {#if item.kind === "prompt" && (item.detail || item.attachments?.length)}
+                <div class="chat-message user-message">
                   <header>
                     <strong>{tr("You", "Você")}</strong>
-                    {#if item.kind === "queued_prompt"}
-                      <span class="queued-badge">{tr("Queued", "Na fila")}</span>
-                    {/if}
                     <time>{activityTime(item.createdAt)}</time>
                   </header>
                   {#if item.detail}<pre>{item.detail}</pre>{/if}
@@ -1695,13 +1725,23 @@
             {/each}
           </div>
         {/if}
+        {#if nextQueuedPrompt}
+          <button
+            class="queued-prompt-tray"
+            disabled={steeringQueued || !canSendWhileRunning}
+            type="button"
+            onclick={() => void steerNextQueuedPrompt()}
+            aria-label={tr("Steer the next queued prompt now", "Enviar agora o próximo prompt da fila")}
+          >
+            <span class="queue-mark" aria-hidden="true">↳</span>
+            <span class="queue-copy">
+              <small>{queuedPrompts.length > 1 ? tr(`${queuedPrompts.length} queued prompts`, `${queuedPrompts.length} prompts na fila`) : tr("Queued next", "Próximo na fila")}</small>
+              <strong>{nextQueuedPrompt.detail || tr("Prompt with attached images", "Prompt com imagens anexadas")}</strong>
+            </span>
+            <span class="queue-shortcut"><kbd>Tab</kbd><small>{steeringQueued ? tr("Steering…", "Enviando…") : tr("Steer now", "Enviar agora")}</small></span>
+          </button>
+        {/if}
         <div class="composer-controls">
-          {#if canSendWhileRunning}
-            <select class="delivery-select" bind:value={promptDelivery} aria-label={tr("Prompt delivery", "Forma de envio")}>
-              <option value="steer">{tr("Steer now", "Orientar agora")}</option>
-              <option value="queue">{tr("Queue next", "Colocar na fila")}</option>
-            </select>
-          {/if}
           {#if canSubmit && capabilities?.canAttachImages}
             <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
               <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
@@ -1713,7 +1753,7 @@
             onkeydown={sendPromptOnEnter}
             rows="2"
             aria-label={tr(`Prompt for ${sessionDisplayName(session)}`, `Prompt para ${sessionDisplayName(session)}`)}
-            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Add context now or queue the next prompt…", "Adicione contexto agora ou coloque o próximo prompt na fila…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
+            placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Write the next prompt…", "Escreva o próximo prompt…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
           ></textarea>
           {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
           {#if canSubmit}
@@ -1865,12 +1905,10 @@
   .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 7px; overflow-x: hidden; }
   .chat-message { width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: hidden; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
-  .chat-message.user-message.queued-message { border-style: dashed; border-color: rgba(176, 129, 45, 0.3); background: rgba(176, 129, 45, 0.07); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
   .chat-message header { display: flex; align-items: center; gap: 6px; }
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
   .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
-  .queued-badge { padding: 2px 5px; border-radius: 999px; color: #987021; background: rgba(176, 129, 45, 0.12); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; }
   .chat-message.user-message > pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
   .markdown-content { min-width: 0; max-width: 100%; margin-top: 5px; overflow: hidden; color: #4b5c54; font: var(--chat-font-size)/1.55 Inter, sans-serif; overflow-wrap: anywhere; word-break: break-word; }
   .markdown-content :global(> :first-child) { margin-top: 0; }
@@ -1957,7 +1995,6 @@
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
-  .delivery-select { width: 72px; min-height: 29px; padding: 0 5px; flex: 0 0 auto; border: 1px solid rgba(82, 106, 95, 0.12); border-radius: 8px; outline: none; color: #53675e; background: rgba(80, 105, 94, 0.055); font: 720 var(--chat-tiny-font-size) Inter, sans-serif; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
   .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
@@ -1968,6 +2005,15 @@
   .composer-controls textarea:disabled { opacity: 0.58; }
   .send-status { padding-bottom: 9px; color: #70827a; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
+  .terminal-composer .queued-prompt-tray { width: 100%; height: 35px; padding: 0 7px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(80, 119, 160, 0.13); border-radius: 9px; color: #4f6d83; background: rgba(74, 119, 157, 0.055); text-align: left; }
+  .queued-prompt-tray:hover:not(:disabled) { border-color: rgba(67, 119, 164, 0.24); background: rgba(74, 119, 157, 0.09); }
+  .queue-mark { width: 17px; height: 17px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 5px; color: #477fa9; background: rgba(66, 127, 174, 0.1); font: 800 11px Inter, sans-serif; }
+  .queue-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
+  .queue-copy small { color: #7790a1; font: 760 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.035em; text-transform: uppercase; }
+  .queue-copy strong { overflow: hidden; color: #4c6576; font: 620 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .queue-shortcut { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; color: #748b9a; }
+  .queue-shortcut kbd { min-width: 23px; padding: 2px 4px; border: 1px solid rgba(75, 106, 127, 0.17); border-bottom-width: 2px; border-radius: 5px; color: #547286; background: rgba(255, 255, 255, 0.48); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-align: center; }
+  .queue-shortcut small { font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .terminal-composer.sending button:disabled { opacity: 0.82; }
@@ -2023,6 +2069,13 @@
   .terminal-window.dark .pending-images-label { color: #8f9f97; }
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
   .terminal-window.dark .pending-images { background: rgba(83, 174, 129, 0.055); }
+  .terminal-window.dark .terminal-composer .queued-prompt-tray { color: #a7bdcd; border-color: rgba(125, 166, 199, 0.13); background: rgba(91, 143, 184, 0.065); }
+  .terminal-window.dark .terminal-composer .queued-prompt-tray:hover:not(:disabled) { border-color: rgba(128, 177, 216, 0.23); background: rgba(91, 143, 184, 0.1); }
+  .terminal-window.dark .queue-mark { color: #87b8dc; background: rgba(105, 166, 210, 0.11); }
+  .terminal-window.dark .queue-copy small,
+  .terminal-window.dark .queue-shortcut { color: #829daa; }
+  .terminal-window.dark .queue-copy strong { color: #b1c6d2; }
+  .terminal-window.dark .queue-shortcut kbd { color: #9bb8c9; border-color: rgba(169, 197, 214, 0.14); background: rgba(220, 235, 243, 0.055); }
   .terminal-window.dark .work-tray { border-color: rgba(190, 209, 200, 0.07); background: rgba(202, 222, 212, 0.018); }
   .terminal-window.dark .work-tray-toggle { color: #99aea4; }
   .terminal-window.dark .work-tray-toggle:hover { background: rgba(205, 225, 215, 0.025); }
@@ -2063,7 +2116,6 @@
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
   .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
-  .terminal-window.dark .delivery-select { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: #1a2520; }
   .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
   .terminal-window.dark .terminal-composer .composer-resize-handle:hover,
   .terminal-window.dark .terminal-composer .composer-resize-handle:focus-visible { background: rgba(205, 225, 215, 0.045); }

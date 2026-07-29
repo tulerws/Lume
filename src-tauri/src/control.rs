@@ -278,6 +278,30 @@ pub fn interrupt_prompt(
     Ok(())
 }
 
+pub fn steer_queued_prompt(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+    activity_id: &str,
+) -> Result<(), String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if session.status != SessionStatus::Running || session.agent != AgentKind::Codex {
+        return Err("This session cannot steer a queued prompt right now".into());
+    }
+    let thread_id = session
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+    bridge.steer_queued_prompt(session_id, activity_id, thread_id, state, app)?;
+    protocol::emit_sessions_changed(app);
+    Ok(())
+}
+
 fn question_answers_from_prompt(
     request: &PendingQuestion,
     prompt: &str,

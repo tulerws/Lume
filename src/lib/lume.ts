@@ -178,6 +178,13 @@ export async function interruptPrompt(sessionId: string): Promise<void> {
   await invoke("interrupt_prompt", { sessionId });
 }
 
+export async function steerQueuedPrompt(
+  sessionId: string,
+  activityId: string,
+): Promise<void> {
+  await invoke("steer_queued_prompt", { sessionId, activityId });
+}
+
 export async function openTerminalWindow(sessionId: string): Promise<string> {
   return invoke<string>("open_terminal_window", { sessionId });
 }

@@ -151,6 +151,51 @@ impl CodexBridge {
         Ok(())
     }
 
+    pub fn steer_queued_prompt(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+        thread_id: &str,
+        state: &AppState,
+        app: &AppHandle,
+    ) -> Result<(), String> {
+        let (queued, queue_index) = {
+            let mut queues = self
+                .queued_prompts
+                .lock()
+                .map_err(|_| "Could not access the Codex prompt queue".to_string())?;
+            let queue = queues
+                .get_mut(thread_id)
+                .ok_or_else(|| "Queued prompt not found".to_string())?;
+            let queue_index = queue
+                .iter()
+                .position(|queued| {
+                    queued.session_id == session_id && queued.activity_id == activity_id
+                })
+                .ok_or_else(|| "Queued prompt not found".to_string())?;
+            let queued = queue
+                .remove(queue_index)
+                .ok_or_else(|| "Queued prompt not found".to_string())?;
+            (queued, queue_index)
+        };
+
+        if let Err(error) = self.steer_prompt(
+            thread_id,
+            &queued.prompt,
+            &queued.attachment_paths,
+            state,
+            app,
+        ) {
+            if let Ok(mut queues) = self.queued_prompts.lock() {
+                let queue = queues.entry(thread_id.to_string()).or_default();
+                queue.insert(queue_index.min(queue.len()), queued);
+            }
+            return Err(error);
+        }
+
+        state.promote_queued_prompt_activity(session_id, activity_id)
+    }
+
     pub fn interrupt_prompt(
         &self,
         thread_id: &str,
