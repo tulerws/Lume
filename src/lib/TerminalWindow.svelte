@@ -605,6 +605,12 @@
       .replace(/[ \t]+$/gm, "")
       .trim();
   }
+  function fileChangesKey(files: FileChangeSummary[]): string {
+    return files
+      .map((file) => `${file.path}\u0000${file.added}\u0000${file.removed}`)
+      .sort()
+      .join("\u0001");
+  }
   const chatEntries = $derived.by<ChatEntry[]>(() => {
     let sequence = 0;
     const promptTimes = activities
@@ -647,6 +653,18 @@
         }
         mergeFileChanges(matchingMessage.files, files);
         continue;
+      }
+      if (activity.kind === "file" && files.length) {
+        const signature = fileChangesKey(files);
+        const duplicateFileEntry = [...entries].reverse().find((entry) =>
+          entry.activity.kind === "file" &&
+          promptSegment(entry.activity.createdAt) === promptSegment(activity.createdAt) &&
+          fileChangesKey(entry.files) === signature
+        );
+        if (duplicateFileEntry) {
+          mergeFileChanges(duplicateFileEntry.files, files);
+          continue;
+        }
       }
       entries.push({
         id: `activity:${activity.id}`,

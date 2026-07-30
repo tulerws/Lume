@@ -603,10 +603,13 @@
     if (updateState === "checking" || updateState === "downloading" || updateState === "ready") {
       return;
     }
-    const nextUpdate = await checkForUpdates();
-    if (nextUpdate && updateState === "available") {
-      await installAvailableUpdate();
-    }
+    await checkForUpdates();
+  }
+
+  async function handleInstallUpdate() {
+    if (updateState !== "available") return;
+    const latestUpdate = await checkForUpdates();
+    if (latestUpdate && updateState === "available") await installAvailableUpdate();
   }
 
   async function handleCompanionUpdateRequest(payload: CompanionUpdateEvent) {
@@ -2795,14 +2798,44 @@
                   <option value={layout.id}>{layout.name}</option>
                 {/each}
               </select>
-              <input bind:value={layoutName} maxlength="48" placeholder={tr("Layout name", "Nome do layout")} />
-              <button type="button" onclick={saveCurrentLayout}>{tr("Save", "Salvar")}</button>
+              {#if !selectedLayoutId}
+                <input bind:value={layoutName} maxlength="48" placeholder={tr("Layout name", "Nome do layout")} />
+              {/if}
+              <button
+                class="layout-action"
+                type="button"
+                title={selectedLayoutId ? tr("Update layout", "Atualizar layout") : tr("Save new layout", "Salvar novo layout")}
+                aria-label={selectedLayoutId ? tr("Update layout", "Atualizar layout") : tr("Save new layout", "Salvar novo layout")}
+                onclick={saveCurrentLayout}
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 3.5h10l2 2v11H4v-13Z" /><path d="M7 3.5v5h6v-5M7 16.5v-5h6v5" /></svg>
+              </button>
               {#if selectedLayoutId}
                 {@const selectedLayout = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)}
-                <button disabled={!selectedLayout || restoringLayout} type="button" onclick={() => selectedLayout && restoreSavedLayout(selectedLayout)}>
-                  {restoringLayout ? "…" : tr("Restore", "Restaurar")}
+                <button
+                  class:loading={restoringLayout}
+                  class="layout-action"
+                  disabled={!selectedLayout || restoringLayout}
+                  type="button"
+                  title={tr("Restore layout", "Restaurar layout")}
+                  aria-label={tr("Restore layout", "Restaurar layout")}
+                  onclick={() => selectedLayout && restoreSavedLayout(selectedLayout)}
+                >
+                  {#if restoringLayout}
+                    <span class="layout-spinner" aria-hidden="true"></span>
+                  {:else}
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 6.5H2.8V3.8" /><path d="M3.2 6.2A7 7 0 1 1 3 13" /></svg>
+                  {/if}
                 </button>
-                <button class="layout-delete" type="button" aria-label={tr("Delete layout", "Excluir layout")} onclick={() => selectedLayoutId && deleteSavedLayout(selectedLayoutId)}>×</button>
+                <button
+                  class="layout-action layout-delete"
+                  type="button"
+                  title={tr("Delete layout", "Excluir layout")}
+                  aria-label={tr("Delete layout", "Excluir layout")}
+                  onclick={() => selectedLayoutId && deleteSavedLayout(selectedLayoutId)}
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 3.5h4L13 6H7l1-2.5ZM6 6l.7 10h6.6L14 6M8.5 9v4.5M11.5 9v4.5" /></svg>
+                </button>
               {/if}
             </div>
 
@@ -3427,7 +3460,7 @@
                   <span>{tr("Version", "Versão")} {appVersion}</span>
                 </div>
                 {#if updateState === "available"}
-                  <button class="update-available" type="button" onclick={handleUpdateButton}>
+                  <button class="update-available" type="button" onclick={handleInstallUpdate}>
                     {tr("Update to", "Atualizar para")} {availableVersion}
                   </button>
                 {:else}
@@ -3989,9 +4022,14 @@
   .reset-settings-control button:disabled { opacity: 0.45; cursor: default; }
 
   .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
-  .layout-toolbar { padding: 8px 0 4px; display: grid; grid-template-columns: minmax(72px, 1fr) minmax(70px, 1fr) auto auto auto; gap: 4px; }
+  .layout-toolbar { padding: 8px 0 4px; display: flex; align-items: center; gap: 4px; }
   .layout-toolbar select, .layout-toolbar input { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; outline: 0; color: #52625b; background: rgba(255, 255, 255, 0.42); font: inherit; font-size: 8px; }
-  .layout-toolbar button { height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; color: #567165; background: rgba(255, 255, 255, 0.4); font-size: 8px; cursor: pointer; }
+  .layout-toolbar select, .layout-toolbar input { flex: 1 1 auto; }
+  .layout-toolbar button { width: 27px; height: 27px; padding: 5px; flex: 0 0 27px; display: grid; place-items: center; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; color: #567165; background: rgba(255, 255, 255, 0.4); font-size: 8px; cursor: pointer; }
+  .layout-toolbar button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .layout-toolbar button:disabled { opacity: 0.48; cursor: default; }
+  .layout-spinner { width: 12px; height: 12px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: layout-spin 650ms linear infinite; }
+  @keyframes layout-spin { to { transform: rotate(360deg); } }
   .layout-toolbar .layout-delete { color: #a45a58; }
   .terminal-picker { min-height: 0; padding: 9px 0 6px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
   .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
