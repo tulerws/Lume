@@ -3,11 +3,11 @@ use std::{
     env,
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, Seek, SeekFrom},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use notify::{RecursiveMode, Watcher};
@@ -25,6 +25,8 @@ use crate::{
 };
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const BOOTSTRAP_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+const BOOTSTRAP_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct SessionMetadata {
@@ -39,13 +41,17 @@ struct ObservedFile {
     offset: u64,
     session: Option<SessionMetadata>,
     profile: Option<PermissionProfile>,
-    pending_goal_tools: HashMap<String, PendingGoalTool>,
+    pending_tools: HashMap<String, PendingTool>,
 }
 
 #[derive(Debug)]
-struct PendingGoalTool {
+struct PendingTool {
     name: String,
     activity_id: String,
+    kind: String,
+    title: String,
+    detail: Option<String>,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +98,30 @@ struct RecordPayload {
     call_id: Option<String>,
     #[serde(default)]
     output: Option<Value>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default)]
+    summary: Option<Value>,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    command: Option<Value>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    aggregated_output: Option<String>,
+    #[serde(default)]
+    stdout: Option<String>,
+    #[serde(default)]
+    stderr: Option<String>,
+    #[serde(default)]
+    changes: Option<Value>,
+    #[serde(default)]
+    success: Option<bool>,
 }
 
 pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
@@ -106,7 +136,7 @@ fn monitor(state: AppState, app: AppHandle) {
     let Some(root) = sessions_root() else {
         return;
     };
-    let mut observed = initialize(&root);
+    let mut observed = initialize(&root, &state, &app);
     loop {
         if watch_session_files(&root, &state, &app, &mut observed).is_ok() {
             return;
@@ -151,21 +181,86 @@ fn watch_session_files(
     }
 }
 
-fn initialize(root: &Path) -> HashMap<PathBuf, ObservedFile> {
+fn initialize(root: &Path, state: &AppState, app: &AppHandle) -> HashMap<PathBuf, ObservedFile> {
     let mut observed = HashMap::new();
     for path in session_files(root) {
         let Ok(file_metadata) = fs::metadata(&path) else {
             continue;
         };
-        let file = ObservedFile {
+        let mut file = ObservedFile {
             offset: file_metadata.len(),
             session: read_session_metadata(&path),
             profile: None,
-            pending_goal_tools: HashMap::new(),
+            pending_tools: HashMap::new(),
         };
+        if was_modified_recently(&file_metadata) && bootstrap_active_session(&path, &mut file) {
+            if let Some(event) = event_for(&file, HookEventKind::Running, "Rodando", None) {
+                let _ = event_server::publish_event(state, app, event);
+            }
+        }
         observed.insert(path, file);
     }
     observed
+}
+
+fn was_modified_recently(metadata: &fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age <= BOOTSTRAP_LOOKBACK)
+}
+
+fn bootstrap_active_session(path: &Path, file: &mut ObservedFile) -> bool {
+    let Ok(records) = read_tail_records(path, BOOTSTRAP_TAIL_BYTES) else {
+        return false;
+    };
+    let mut running = false;
+    for record in records {
+        if record.kind == "turn_context" {
+            if let Some(session) = file.session.as_mut() {
+                if record.payload.cwd.is_some() {
+                    session.cwd = record.payload.cwd.clone();
+                }
+                file.profile = Some(profile_from_context(&record.payload));
+            }
+            continue;
+        }
+        if record.kind != "event_msg" {
+            continue;
+        }
+        match record.payload.r#type.as_deref() {
+            Some("task_started") => running = true,
+            Some("task_complete" | "turn_aborted" | "stream_error" | "task_failed") => {
+                running = false;
+            }
+            _ => {}
+        }
+    }
+    running
+}
+
+fn read_tail_records(path: &Path, max_bytes: u64) -> Result<Vec<CodexRecord>, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut partial = String::new();
+        reader
+            .read_line(&mut partial)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if let Ok(record) = serde_json::from_str(&line) {
+            records.push(record);
+        }
+    }
+    Ok(records)
 }
 
 fn poll(
@@ -194,7 +289,7 @@ fn poll_path(
             offset: 0,
             session: read_session_metadata(path),
             profile: None,
-            pending_goal_tools: HashMap::new(),
+            pending_tools: HashMap::new(),
         };
         if let Some(event) = session_started_event(&file) {
             let _ = event_server::publish_event(state, app, event);
@@ -211,7 +306,7 @@ fn poll_path(
     if length < file.offset {
         file.offset = 0;
         file.profile = None;
-        file.pending_goal_tools.clear();
+        file.pending_tools.clear();
         file.session = read_session_metadata(path);
         if let Some(event) = session_started_event(file) {
             let _ = event_server::publish_event(state, app, event);
@@ -257,10 +352,27 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
     for record in records {
         if record.kind == "response_item" {
             match record.payload.r#type.as_deref() {
-                Some("function_call") => remember_goal_tool(&record.payload, file),
-                Some("function_call_output") => {
-                    if let Some(event) = goal_tool_output_event(&record.payload, file) {
+                Some("function_call" | "custom_tool_call") => {
+                    if let Some(event) = remember_tool(&record.payload, file) {
                         events.push(event);
+                    }
+                }
+                Some("function_call_output" | "custom_tool_call_output") => {
+                    if let Some(event) = tool_output_event(&record.payload, file) {
+                        events.push(event);
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(detail) = reasoning_summary(&record.payload) {
+                        if let Some(event) = activity_event_for(
+                            file,
+                            "analysis",
+                            "Análise",
+                            &detail,
+                            record.timestamp.as_deref(),
+                        ) {
+                            events.push(event);
+                        }
                     }
                 }
                 _ => {}
@@ -277,6 +389,18 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
             continue;
         }
         if record.kind != "event_msg" {
+            continue;
+        }
+        if record.payload.r#type.as_deref() == Some("exec_command_end") {
+            if let Some(event) = command_finished_event(&record.payload, file) {
+                events.push(event);
+            }
+            continue;
+        }
+        if record.payload.r#type.as_deref() == Some("patch_apply_end") {
+            if let Some(event) = patch_finished_event(&record.payload, file) {
+                events.push(event);
+            }
             continue;
         }
         if matches!(
@@ -310,7 +434,7 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
                 "Tarefa finalizada",
                 record.payload.last_agent_message.as_deref(),
             ),
-            Some("turn_aborted") => (HookEventKind::Completed, "Tarefa interrompida", None),
+            Some("turn_aborted") => (HookEventKind::WaitingForInput, "Tarefa interrompida", None),
             Some("stream_error" | "task_failed") => {
                 (HookEventKind::Failed, "Tarefa encerrada com erro", None)
             }
@@ -323,13 +447,16 @@ fn events_from_records(records: Vec<CodexRecord>, file: &mut ObservedFile) -> Ve
     events
 }
 
-fn remember_goal_tool(payload: &RecordPayload, file: &mut ObservedFile) {
-    let Some(name) = payload.name.as_deref().filter(|name| is_goal_tool(name)) else {
-        return;
-    };
-    let Some(call_id) = payload.call_id.as_ref() else {
-        return;
-    };
+fn remember_tool(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
+    let name = payload.name.as_deref()?;
+    let call_id = payload.call_id.as_ref()?;
+    let kind = tool_kind(name);
+    let title = tool_title(name);
+    let detail = tool_input_text(payload);
+    let files = detail
+        .as_deref()
+        .map(files_from_patch_text)
+        .unwrap_or_default();
     let activity_id = payload
         .id
         .as_ref()
@@ -338,34 +465,244 @@ fn remember_goal_tool(payload: &RecordPayload, file: &mut ObservedFile) {
                 .as_ref()
                 .map(|session| format!("codex:{}:{id}", session.id))
         })
-        .unwrap_or_else(|| format!("codex-rollout-goal:{call_id}"));
-    file.pending_goal_tools.insert(
+        .unwrap_or_else(|| format!("codex-rollout-tool:{call_id}"));
+    file.pending_tools.insert(
         call_id.clone(),
-        PendingGoalTool {
+        PendingTool {
             name: name.into(),
-            activity_id,
+            activity_id: activity_id.clone(),
+            kind: kind.into(),
+            title: title.clone(),
+            detail: detail.clone(),
+            files: files.clone(),
         },
     );
-}
-
-fn goal_tool_output_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
-    let tool = file
-        .pending_goal_tools
-        .remove(payload.call_id.as_deref()?)?;
-    let detail = payload.output.as_ref().and_then(record_value_text)?;
-    let mut event = event_for(file, HookEventKind::Activity, "GOAL atualizada", None)?;
+    if is_goal_tool(name) {
+        return None;
+    }
+    let mut event = event_for(file, HookEventKind::Activity, &title, None)?;
     event.activity = Some(SessionActivity {
-        id: tool.activity_id,
-        kind: "tool".into(),
-        title: format!("functions · {}", tool.name),
-        detail: Some(detail),
-        status: "completed".into(),
+        id: activity_id,
+        kind: kind.into(),
+        title,
+        detail,
+        status: "running".into(),
         created_at: now_millis(),
-        files: Vec::new(),
+        files,
         attachments: Vec::new(),
         append_detail: false,
     });
     Some(event)
+}
+
+fn tool_output_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
+    let tool = file.pending_tools.remove(payload.call_id.as_deref()?)?;
+    let output = payload.output.as_ref().and_then(record_value_text);
+    let detail = combine_activity_detail(tool.detail.as_deref(), output.as_deref());
+    let label = if is_goal_tool(&tool.name) {
+        "GOAL atualizada"
+    } else {
+        &tool.title
+    };
+    let mut event = event_for(file, HookEventKind::Activity, label, None)?;
+    event.activity = Some(SessionActivity {
+        id: tool.activity_id,
+        kind: tool.kind,
+        title: if is_goal_tool(&tool.name) {
+            format!("functions · {}", tool.name)
+        } else {
+            tool.title
+        },
+        detail,
+        status: "completed".into(),
+        created_at: now_millis(),
+        files: tool.files,
+        attachments: Vec::new(),
+        append_detail: false,
+    });
+    Some(event)
+}
+
+fn command_finished_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
+    let call_id = payload.call_id.as_deref()?;
+    let tool = file.pending_tools.remove(call_id)?;
+    let command = payload
+        .command
+        .as_ref()
+        .and_then(command_value_text)
+        .or(tool.detail);
+    let output = payload
+        .aggregated_output
+        .as_deref()
+        .and_then(response_text)
+        .or_else(|| command_output_text(payload));
+    let detail = combine_activity_detail(command.as_deref(), output.as_deref());
+    let failed = payload.status.as_deref() == Some("failed")
+        || payload.exit_code.is_some_and(|exit_code| exit_code != 0);
+    let mut event = event_for(file, HookEventKind::Activity, "Comando", None)?;
+    event.activity = Some(SessionActivity {
+        id: tool.activity_id,
+        kind: "command".into(),
+        title: "Comando".into(),
+        detail,
+        status: if failed { "failed" } else { "completed" }.into(),
+        created_at: now_millis(),
+        files: tool.files,
+        attachments: Vec::new(),
+        append_detail: false,
+    });
+    Some(event)
+}
+
+fn patch_finished_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option<HookEvent> {
+    let changes = payload.changes.as_ref()?.as_object()?;
+    if changes.is_empty() {
+        return None;
+    }
+    let files = changes.keys().cloned().collect::<Vec<_>>();
+    let mut diffs = Vec::new();
+    for (path, change) in changes {
+        if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
+            diffs.push(format!("*** Update File: {path}\n{diff}"));
+        }
+    }
+    let detail = (!diffs.is_empty()).then(|| diffs.join("\n"));
+    let session_id = file.session.as_ref()?.id.clone();
+    let call_id = payload.call_id.as_deref().unwrap_or("patch");
+    let pending = file.pending_tools.remove(call_id);
+    let activity_id = pending
+        .map(|tool| tool.activity_id)
+        .unwrap_or_else(|| format!("codex:{session_id}:patch:{call_id}"));
+    let failed = payload.success == Some(false) || payload.status.as_deref() == Some("failed");
+    let mut event = event_for(file, HookEventKind::Activity, "Arquivos alterados", None)?;
+    event.activity = Some(SessionActivity {
+        id: activity_id,
+        kind: "file".into(),
+        title: "Arquivos alterados".into(),
+        detail,
+        status: if failed { "failed" } else { "completed" }.into(),
+        created_at: now_millis(),
+        files,
+        attachments: Vec::new(),
+        append_detail: false,
+    });
+    Some(event)
+}
+
+fn tool_kind(name: &str) -> &'static str {
+    if name == "exec_command" {
+        "command"
+    } else if name == "apply_patch" {
+        "file"
+    } else {
+        "tool"
+    }
+}
+
+fn tool_title(name: &str) -> String {
+    match name {
+        "exec_command" => "Comando".into(),
+        "apply_patch" => "Alteração de arquivo".into(),
+        name => format!("functions · {name}"),
+    }
+}
+
+fn tool_input_text(payload: &RecordPayload) -> Option<String> {
+    payload
+        .arguments
+        .as_deref()
+        .and_then(|arguments| {
+            serde_json::from_str::<Value>(arguments)
+                .ok()
+                .as_ref()
+                .and_then(tool_input_value_text)
+                .or_else(|| response_text(arguments))
+        })
+        .or_else(|| payload.input.as_ref().and_then(tool_input_value_text))
+}
+
+fn tool_input_value_text(value: &Value) -> Option<String> {
+    value
+        .get("cmd")
+        .and_then(Value::as_str)
+        .and_then(response_text)
+        .or_else(|| value.as_str().and_then(response_text))
+        .or_else(|| record_value_text(value))
+}
+
+fn command_value_text(value: &Value) -> Option<String> {
+    if let Some(parts) = value.as_array() {
+        let command = parts
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return response_text(&command);
+    }
+    record_value_text(value)
+}
+
+fn command_output_text(payload: &RecordPayload) -> Option<String> {
+    let output = [payload.stdout.as_deref(), payload.stderr.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    response_text(&output)
+}
+
+fn combine_activity_detail(input: Option<&str>, output: Option<&str>) -> Option<String> {
+    match (input, output) {
+        (Some(input), Some(output)) if input.trim() != output.trim() => {
+            response_text(&format!("{input}\n\n{output}"))
+        }
+        (Some(input), _) => response_text(input),
+        (_, Some(output)) => response_text(output),
+        _ => None,
+    }
+}
+
+fn reasoning_summary(payload: &RecordPayload) -> Option<String> {
+    payload
+        .summary
+        .as_ref()
+        .and_then(value_text)
+        .or_else(|| payload.content.as_ref().and_then(value_text))
+}
+
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => response_text(value),
+        Value::Array(values) => {
+            let text = values
+                .iter()
+                .filter_map(value_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            response_text(&text)
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(value_text)
+            .or_else(|| object.get("summary_text").and_then(value_text)),
+        _ => None,
+    }
+}
+
+fn files_from_patch_text(value: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in value.lines() {
+        let path = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix));
+        if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+            if !files.iter().any(|existing| existing == path) {
+                files.push(path.into());
+            }
+        }
+    }
+    files
 }
 
 fn is_goal_tool(name: &str) -> bool {
@@ -593,6 +930,28 @@ mod tests {
         serde_json::from_str(value).expect("registro")
     }
 
+    fn observed_file(source: SessionSource) -> ObservedFile {
+        ObservedFile {
+            offset: 0,
+            session: Some(SessionMetadata {
+                id: "chat-1".into(),
+                cwd: Some("/work/lume".into()),
+                started_at: None,
+                source,
+            }),
+            profile: None,
+            pending_tools: HashMap::new(),
+        }
+    }
+
+    fn temporary_rollout(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lume-codex-session-{name}-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ))
+    }
+
     #[test]
     fn identifies_root_codex_sessions_without_creating_subagent_duplicates() {
         let vscode = record(
@@ -618,17 +977,7 @@ mod tests {
 
     #[test]
     fn lifecycle_records_become_realtime_vscode_events() {
-        let mut file = ObservedFile {
-            offset: 0,
-            session: Some(SessionMetadata {
-                id: "chat-1".into(),
-                cwd: Some("/work/lume".into()),
-                started_at: None,
-                source: SessionSource::Vscode,
-            }),
-            profile: None,
-            pending_goal_tools: HashMap::new(),
-        };
+        let mut file = observed_file(SessionSource::Vscode);
         let records = vec![
             record(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#),
             record(
@@ -647,18 +996,26 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_turn_returns_to_waiting_instead_of_completing() {
+        let mut file = observed_file(SessionSource::Vscode);
+        let events = events_from_records(
+            vec![record(
+                r#"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+            )],
+            &mut file,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, HookEventKind::WaitingForInput));
+        assert_eq!(
+            events[0].status_label.as_deref(),
+            Some("Tarefa interrompida")
+        );
+    }
+
+    #[test]
     fn rollout_messages_become_chat_entries() {
-        let mut file = ObservedFile {
-            offset: 0,
-            session: Some(SessionMetadata {
-                id: "chat-1".into(),
-                cwd: Some("/work/lume".into()),
-                started_at: None,
-                source: SessionSource::Vscode,
-            }),
-            profile: None,
-            pending_goal_tools: HashMap::new(),
-        };
+        let mut file = observed_file(SessionSource::Vscode);
         let records = vec![
             record(
                 r#"{"timestamp":"2026-07-24T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Mostre os arquivos"}}"#,
@@ -696,17 +1053,7 @@ mod tests {
 
     #[test]
     fn goal_tool_output_becomes_realtime_work_activity() {
-        let mut file = ObservedFile {
-            offset: 0,
-            session: Some(SessionMetadata {
-                id: "chat-1".into(),
-                cwd: Some("/work/lume".into()),
-                started_at: None,
-                source: SessionSource::Cli,
-            }),
-            profile: None,
-            pending_goal_tools: HashMap::new(),
-        };
+        let mut file = observed_file(SessionSource::Cli);
         let records = vec![
             record(
                 r#"{"type":"response_item","payload":{"type":"function_call","id":"fc-goal","name":"get_goal","arguments":"{}","call_id":"call-goal"}}"#,
@@ -727,6 +1074,142 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains("\"objective\":\"Test goal\"")));
+    }
+
+    #[test]
+    fn command_and_patch_records_become_detailed_activities() {
+        let mut file = observed_file(SessionSource::Vscode);
+        let records = vec![
+            record(
+                r#"{"type":"response_item","payload":{"type":"function_call","id":"fc-command","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call-command"}}"#,
+            ),
+            record(
+                r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-command","command":["/bin/bash","-lc","cargo test"],"status":"completed","exit_code":0,"aggregated_output":"4 tests passed"}}"#,
+            ),
+            record(
+                r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call-patch","input":"*** Begin Patch\n*** Update File: /work/lume/src/main.rs\n@@\n-old\n+new\n*** End Patch"}}"#,
+            ),
+            record(
+                r#"{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-patch","status":"completed","success":true,"changes":{"/work/lume/src/main.rs":{"type":"update","unified_diff":"@@ -1 +1 @@\n-old\n+new\n"}}}}"#,
+            ),
+        ];
+
+        let events = events_from_records(records, &mut file);
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.kind.as_str()),
+            Some("command")
+        );
+        assert_eq!(
+            events[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.status.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            events[1]
+                .activity
+                .as_ref()
+                .map(|activity| activity.status.as_str()),
+            Some("completed")
+        );
+        assert_eq!(
+            events[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.id.as_str()),
+            events[1]
+                .activity
+                .as_ref()
+                .map(|activity| activity.id.as_str())
+        );
+        let patch_start = events[2].activity.as_ref().expect("patch start activity");
+        let patch = events[3].activity.as_ref().expect("patch activity");
+        assert_eq!(patch.kind, "file");
+        assert_eq!(patch_start.id, patch.id);
+        assert_eq!(patch.files, vec!["/work/lume/src/main.rs"]);
+        assert!(patch
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("+new")));
+    }
+
+    #[test]
+    fn reasoning_summaries_are_visible_without_encrypted_reasoning() {
+        let mut file = observed_file(SessionSource::Vscode);
+        let events = events_from_records(
+            vec![record(
+                r#"{"timestamp":"2026-07-29T10:00:00Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Vou validar os eventos."}],"encrypted_content":"nao exibir"}}"#,
+            )],
+            &mut file,
+        );
+
+        assert_eq!(events.len(), 1);
+        let activity = events[0].activity.as_ref().expect("analysis activity");
+        assert_eq!(activity.kind, "analysis");
+        assert_eq!(activity.detail.as_deref(), Some("Vou validar os eventos."));
+    }
+
+    #[test]
+    fn startup_only_restores_a_rollout_with_an_active_turn() {
+        let path = temporary_rollout("bootstrap");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"chat-1\",\"originator\":\"codex_vscode\",\"source\":\"vscode\",\"cwd\":\"/work/lume\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/work/lume\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{\"type\":\"workspace-write\"}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+            ),
+        )
+        .expect("write active rollout");
+        let mut file = observed_file(SessionSource::Vscode);
+        assert!(bootstrap_active_session(&path, &mut file));
+        assert_eq!(
+            file.profile.as_ref().map(|profile| &profile.mode),
+            Some(&AccessMode::WorkspaceWrite)
+        );
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"chat-1\",\"originator\":\"codex_vscode\",\"source\":\"vscode\",\"cwd\":\"/work/lume\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+            ),
+        )
+        .expect("write completed rollout");
+        assert!(!bootstrap_active_session(&path, &mut file));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn incremental_reader_retries_a_partial_json_record() {
+        let path = temporary_rollout("partial");
+        let complete = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
+        let partial = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"";
+        fs::write(&path, format!("{complete}{partial}")).expect("write partial rollout");
+
+        let (records, offset) = read_records(&path, 0).expect("first read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(offset, complete.len() as u64);
+
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open rollout");
+        file.write_all(b"}}\n").expect("finish record");
+
+        let (records, final_offset) = read_records(&path, offset).expect("second read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload.r#type.as_deref(), Some("task_complete"));
+        assert_eq!(final_offset, fs::metadata(&path).expect("metadata").len());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

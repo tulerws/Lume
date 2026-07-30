@@ -9,7 +9,9 @@
 
   type Brand =
     | "codex"
+    | "chatgpt"
     | "claude"
+    | "claude_code"
     | "gemini"
     | "vscode"
     | "chrome"
@@ -23,9 +25,9 @@
 </script>
 
 <span class="brand-icon" class:browsers={name === "browsers"} style:--brand-size={`${size}px`}>
-  {#if name === "codex"}
+  {#if name === "codex" || name === "chatgpt"}
     <OfflineIcon icon={openai} />
-  {:else if name === "claude"}
+  {:else if name === "claude" || name === "claude_code"}
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d={siClaude.path} fill="#d97757" />
     </svg>

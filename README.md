@@ -127,7 +127,7 @@ To install the browser Companion:
 3. Enable developer mode.
 4. Load the Companion folder as an unpacked extension.
 
-The Companion sends only the agent type, state, sanitized title, source, and a local hash of the path. Prompts submitted through Lume travel only over the local connection to the selected tab and are not stored in Lume history.
+The Companion distinguishes ChatGPT, Claude, and Gemini. It sends the agent type, state, sanitized title, source, a local tab identifier, and the final response displayed by the selected chat. Prompts submitted through Lume travel only over the local connection to the selected tab, and conversation content is not persisted in Lume history.
 
 ## Linux display support
 

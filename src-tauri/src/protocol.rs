@@ -44,6 +44,7 @@ pub enum PromptUnavailableReason {
     UnsupportedAgent,
     SessionNotConnected,
     WorkingDirectoryMissing,
+    AgentBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -63,7 +64,13 @@ pub struct SessionCapabilities {
 
 impl SessionCapabilities {
     pub fn for_session(session: &AgentSession) -> Self {
-        let prompt_unavailable_reason = if session.source == SessionSource::Web {
+        let prompt_unavailable_reason = if session.source == SessionSource::Web
+            && matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::PermissionRequired
+            ) {
+            Some(PromptUnavailableReason::AgentBusy)
+        } else if session.source == SessionSource::Web {
             None
         } else if session.agent == AgentKind::Unknown {
             Some(PromptUnavailableReason::UnsupportedAgent)
@@ -89,7 +96,9 @@ impl SessionCapabilities {
                 session.status,
                 SessionStatus::Running | SessionStatus::PermissionRequired
             ) && can_interrupt_session(session),
-            prompt_deliveries: if session.agent == AgentKind::Codex {
+            prompt_deliveries: if session.agent == AgentKind::Codex
+                && session.source != SessionSource::Web
+            {
                 vec![
                     PromptDelivery::NewTurn,
                     PromptDelivery::Steer,
@@ -103,7 +112,10 @@ impl SessionCapabilities {
 }
 
 fn can_interrupt_session(session: &AgentSession) -> bool {
-    if session.agent == AgentKind::Codex && session.native_session_id.is_some() {
+    if session.source != SessionSource::Web
+        && session.agent == AgentKind::Codex
+        && session.native_session_id.is_some()
+    {
         return true;
     }
     #[cfg(not(target_os = "windows"))]
@@ -931,6 +943,64 @@ mod tests {
         let json = serde_json::to_value(snapshot).expect("snapshot");
         assert_eq!(json["sessions"][0]["nativeSessionId"], "thread-1");
         assert_eq!(json["sessions"][0]["capabilities"]["canPrompt"], true);
+    }
+
+    #[test]
+    fn web_chatgpt_does_not_inherit_codex_runtime_capabilities() {
+        let mut web = session();
+        web.id = "web:chatgpt:tab-1".into();
+        web.agent = AgentKind::ChatGpt;
+        web.agent_label = "ChatGPT".into();
+        web.source = SessionSource::Web;
+        web.status = SessionStatus::Running;
+        web.process_id = None;
+        web.native_session_id = Some("tab-1".into());
+        web.working_directory = None;
+
+        let capabilities = SessionCapabilities::for_session(&web);
+        assert!(!capabilities.can_prompt);
+        assert_eq!(
+            capabilities.prompt_unavailable_reason,
+            Some(PromptUnavailableReason::AgentBusy)
+        );
+        assert!(!capabilities.can_interrupt);
+        assert_eq!(
+            capabilities.prompt_deliveries,
+            vec![PromptDelivery::NewTurn]
+        );
+    }
+
+    #[test]
+    fn web_claude_is_not_treated_as_claude_code() {
+        let mut web = session();
+        web.id = "web:claude:tab-2".into();
+        web.agent = AgentKind::Claude;
+        web.agent_label = "Claude".into();
+        web.source = SessionSource::Web;
+        web.process_id = None;
+        web.native_session_id = Some("tab-2".into());
+        web.working_directory = None;
+
+        let capabilities = SessionCapabilities::for_session(&web);
+        assert!(capabilities.can_prompt);
+        assert!(!capabilities.can_interrupt);
+        assert_eq!(
+            capabilities.prompt_deliveries,
+            vec![PromptDelivery::NewTurn]
+        );
+    }
+
+    #[test]
+    fn cli_codex_keeps_queue_and_steer_capabilities() {
+        let capabilities = SessionCapabilities::for_session(&session());
+        assert_eq!(
+            capabilities.prompt_deliveries,
+            vec![
+                PromptDelivery::NewTurn,
+                PromptDelivery::Steer,
+                PromptDelivery::Queue,
+            ]
+        );
     }
 
     #[test]

@@ -336,7 +336,39 @@ impl Store {
                     row.get::<_, String>(0)
                 });
         match result {
-            Ok(payload) => serde_json::from_str(&payload).map_err(|error| error.to_string()),
+            Ok(payload) => {
+                let mut preferences = serde_json::from_str::<Preferences>(&payload)
+                    .map_err(|error| error.to_string())?;
+                for profile in preferences.project_profiles.values_mut() {
+                    for agent in &mut profile.preferred_agents {
+                        if agent == "claude" {
+                            *agent = "claude_code".into();
+                        }
+                    }
+                }
+                let legacy_claude_aliases = preferences
+                    .session_aliases
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("claude:")
+                            .map(|native_id| (format!("claude_code:{native_id}"), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in legacy_claude_aliases {
+                    preferences.session_aliases.entry(key).or_insert(value);
+                }
+                for layout in &mut preferences.whiteboard_layouts {
+                    for terminal in &mut layout.terminals {
+                        if terminal.agent == crate::domain::AgentKind::Claude
+                            && terminal.source != crate::domain::SessionSource::Web
+                        {
+                            terminal.agent = crate::domain::AgentKind::ClaudeCode;
+                            terminal.agent_label = "Claude Code".into();
+                        }
+                    }
+                }
+                Ok(preferences)
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Preferences::default()),
             Err(error) => Err(error.to_string()),
         }
@@ -479,5 +511,48 @@ mod tests {
         assert!(profile.permission_mode.is_none());
         assert!(profile.whiteboard_layout_id.is_none());
         assert!(profile.preferred_agents.is_empty());
+    }
+
+    #[test]
+    fn legacy_claude_cli_preferences_migrate_without_changing_claude_web() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        let payload = r#"{
+            "projectProfiles":{"lume":{"label":"Lume","preferredAgents":["claude"]}},
+            "sessionAliases":{"claude:thread-1":"Review"},
+            "whiteboardLayouts":[{
+                "id":"layout","name":"Layout","terminals":[
+                    {"agent":"claude","agentLabel":"Claude","project":"cli","source":"cli","x":0,"y":0,"width":400,"height":300,"groupId":null},
+                    {"agent":"claude","agentLabel":"Claude","project":"web","source":"web","x":400,"y":0,"width":400,"height":300,"groupId":null}
+                ]
+            }]
+        }"#;
+        store
+            .connection
+            .execute(
+                "INSERT INTO preferences(id, payload) VALUES (1, ?1)",
+                [payload],
+            )
+            .expect("preferências antigas");
+
+        let preferences = store.load_preferences().expect("preferências migradas");
+        assert_eq!(
+            preferences.project_profiles["lume"].preferred_agents,
+            vec!["claude_code"]
+        );
+        assert_eq!(
+            preferences
+                .session_aliases
+                .get("claude_code:thread-1")
+                .map(String::as_str),
+            Some("Review")
+        );
+        assert_eq!(
+            preferences.whiteboard_layouts[0].terminals[0].agent,
+            AgentKind::ClaudeCode
+        );
+        assert_eq!(
+            preferences.whiteboard_layouts[0].terminals[1].agent,
+            AgentKind::Claude
+        );
     }
 }

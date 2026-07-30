@@ -19,7 +19,7 @@ use crate::{
 };
 
 const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
-const WEB_SESSION_STALE_MS: i64 = 12_000;
+const WEB_SESSION_STALE_MS: i64 = 90_000;
 const RECENT_NATIVE_SESSION_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
@@ -834,6 +834,9 @@ impl AppState {
                 session.status_label = event.status_label.unwrap_or_else(|| "Finalizado".into());
                 session.pending_permission = None;
                 session.pending_question = None;
+                if session.last_response.is_some() {
+                    remove_superseded_streamed_messages(session);
+                }
                 for activity in session
                     .activities
                     .iter_mut()
@@ -1679,6 +1682,29 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
             return;
         }
     }
+    if let Some(existing) = session
+        .activities
+        .iter_mut()
+        .find(|existing| existing.id == activity.id)
+    {
+        if activity.append_detail {
+            if let Some(delta) = activity.detail.take() {
+                let detail = existing.detail.get_or_insert_with(String::new);
+                detail.push_str(&delta);
+                *detail = detail.chars().take(32 * 1024).collect();
+            }
+            existing.status = activity.status;
+            for file in activity.files {
+                if !existing.files.contains(&file) {
+                    existing.files.push(file);
+                }
+            }
+            return;
+        }
+        activity.created_at = existing.created_at;
+        *existing = activity;
+        return;
+    }
     if activity.kind == "message" {
         let activity_detail = activity.detail.clone();
         let duplicate = session.activities.iter().rposition(|existing| {
@@ -1716,30 +1742,7 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
             return;
         }
     }
-    if let Some(existing) = session
-        .activities
-        .iter_mut()
-        .find(|existing| existing.id == activity.id)
-    {
-        if activity.append_detail {
-            if let Some(delta) = activity.detail.take() {
-                let detail = existing.detail.get_or_insert_with(String::new);
-                detail.push_str(&delta);
-                *detail = detail.chars().take(32 * 1024).collect();
-            }
-            existing.status = activity.status;
-            for file in activity.files {
-                if !existing.files.contains(&file) {
-                    existing.files.push(file);
-                }
-            }
-            return;
-        }
-        activity.created_at = existing.created_at;
-        *existing = activity;
-    } else {
-        session.activities.push(activity);
-    }
+    session.activities.push(activity);
     session
         .activities
         .sort_by_key(|activity| activity.created_at);
@@ -1748,6 +1751,25 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
             .activities
             .drain(..session.activities.len().saturating_sub(160));
     }
+}
+
+fn remove_superseded_streamed_messages(session: &mut AgentSession) {
+    let latest_prompt_at = session
+        .activities
+        .iter()
+        .filter(|activity| activity.kind == "prompt")
+        .map(|activity| activity.created_at)
+        .max()
+        .unwrap_or(i64::MIN);
+    session.activities.retain(|activity| {
+        if activity.kind != "message"
+            || activity.created_at < latest_prompt_at
+            || !activity.id.starts_with("codex:")
+        {
+            return true;
+        }
+        activity.status != "running"
+    });
 }
 
 fn normalized_chat_text(value: &str) -> String {
@@ -2031,8 +2053,14 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(project) = &event.project {
         session.project = project.clone();
     }
-    if let Some(source) = &event.source {
-        session.source = source.clone();
+    let keeps_bound_process_source = session.agent == AgentKind::Codex
+        && session.process_id.is_some()
+        && event.process_id.is_none()
+        && event.native_session_id.is_some();
+    if !keeps_bound_process_source {
+        if let Some(source) = &event.source {
+            session.source = source.clone();
+        }
     }
     if let Some(source_app) = &event.source_app {
         session.source_app = Some(source_app.clone());
@@ -2063,7 +2091,7 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
 
 fn default_profile(agent: &AgentKind) -> PermissionProfile {
     match agent {
-        AgentKind::Claude => PermissionProfile {
+        AgentKind::ClaudeCode => PermissionProfile {
             mode: AccessMode::Custom,
             label: "Permissões da sessão".into(),
             approval_policy: "Ações disponíveis conforme o hook".into(),
@@ -2284,7 +2312,9 @@ fn status_priority(status: &SessionStatus) -> u8 {
 fn agent_label(agent: &AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "Codex",
+        AgentKind::ChatGpt => "ChatGPT",
         AgentKind::Claude => "Claude",
+        AgentKind::ClaudeCode => "Claude Code",
         AgentKind::Gemini => "Gemini",
         AgentKind::Unknown => "Agente",
     }
@@ -2320,7 +2350,9 @@ fn persistent_session_alias_key(session: &AgentSession) -> Option<String> {
     }
     let agent = match session.agent {
         AgentKind::Codex => "codex".to_string(),
+        AgentKind::ChatGpt => "chatgpt".to_string(),
         AgentKind::Claude => "claude".to_string(),
+        AgentKind::ClaudeCode => "claude_code".to_string(),
         AgentKind::Gemini => "gemini".to_string(),
         AgentKind::Unknown => format!("unknown:{}", session.agent_label.to_lowercase()),
     };
@@ -2375,8 +2407,8 @@ mod tests {
 
     fn discovered(process_id: u32) -> DiscoveredProcess {
         DiscoveredProcess {
-            agent: AgentKind::Claude,
-            agent_label: "Claude".into(),
+            agent: AgentKind::ClaudeCode,
+            agent_label: "Claude Code".into(),
             process_id,
             native_session_ids: Vec::new(),
             working_directory: Some("/work/lume".into()),
@@ -2388,7 +2420,7 @@ mod tests {
         HookEvent {
             event: HookEventKind::SessionStarted,
             session_id: session_id.into(),
-            agent: AgentKind::Claude,
+            agent: AgentKind::ClaudeCode,
             agent_label: None,
             session_name: None,
             project: Some("lume".into()),
@@ -2437,7 +2469,7 @@ mod tests {
         let session = state.sessions().expect("sessões").remove(0);
         assert_eq!(session.session_name, "Review authentication");
         assert_eq!(session.project, "lume");
-        assert_eq!(session.agent_label, "Claude");
+        assert_eq!(session.agent_label, "Claude Code");
     }
 
     #[test]
@@ -2466,7 +2498,7 @@ mod tests {
                 .preferences()
                 .expect("preferências")
                 .session_aliases
-                .get("claude:native-session-2")
+                .get("claude_code:native-session-2")
                 .map(String::as_str),
             Some("release review (2)")
         );
@@ -2679,6 +2711,119 @@ mod tests {
     }
 
     #[test]
+    fn streamed_message_deltas_update_their_item_before_content_deduplication() {
+        let event = started_event("codex:stream-order", 4242);
+        let mut session = session_from_event(&event, 1_000);
+        remember_activity(
+            &mut session,
+            SessionActivity {
+                id: "other-message".into(),
+                kind: "message".into(),
+                title: "Resposta do agente".into(),
+                detail: Some(" world".into()),
+                status: "completed".into(),
+                created_at: 9_000,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+        );
+        remember_activity(
+            &mut session,
+            SessionActivity {
+                id: "codex:thread:item-1".into(),
+                kind: "message".into(),
+                title: "Resposta do agente".into(),
+                detail: Some("Hello".into()),
+                status: "running".into(),
+                created_at: 10_000,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+        );
+        remember_activity(
+            &mut session,
+            SessionActivity {
+                id: "codex:thread:item-1".into(),
+                kind: "message".into(),
+                title: "Resposta do agente".into(),
+                detail: Some(" world".into()),
+                status: "running".into(),
+                created_at: 11_000,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: true,
+            },
+        );
+
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .find(|activity| activity.id == "codex:thread:item-1")
+                .and_then(|activity| activity.detail.as_deref()),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn final_response_removes_the_corrupted_stream_from_the_same_turn() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut started = started_event("codex:final-stream", 4242);
+        started.agent = AgentKind::Codex;
+        started.agent_label = Some("Codex".into());
+        state.ingest(started).expect("sessão");
+
+        for (id, kind, detail, status, created_at) in [
+            ("prompt-1", "prompt", "Apply the fix", "completed", 10_000),
+            (
+                "codex:thread:item-1",
+                "message",
+                "Browser tabs identity corrections ChatGPT separated from Codex. Prompts acknowledged after delivery. Claude Code browser tabs keep their identity. Implemented corrections Claude web separated from Claude. Tests passed successfully. Prompts delivery.",
+                "running",
+                11_000,
+            ),
+        ] {
+            let mut activity = started_event("codex:final-stream", 4242);
+            activity.agent = AgentKind::Codex;
+            activity.agent_label = Some("Codex".into());
+            activity.event = HookEventKind::Activity;
+            activity.activity = Some(SessionActivity {
+                id: id.into(),
+                kind: kind.into(),
+                title: "Chat".into(),
+                detail: Some(detail.into()),
+                status: status.into(),
+                created_at,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            });
+            state.ingest(activity).expect("atividade");
+        }
+
+        let final_response = "Implemented the corrections. ChatGPT is now separated from Codex. Claude web is separated from Claude Code. Browser tabs keep their own identity. Prompts are acknowledged after delivery. Tests passed successfully.";
+        let mut completed = started_event("codex:final-stream", 4242);
+        completed.agent = AgentKind::Codex;
+        completed.agent_label = Some("Codex".into());
+        completed.event = HookEventKind::Completed;
+        completed.last_response = Some(final_response.into());
+        state.ingest(completed).expect("resposta final");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert!(!session.activities.iter().any(|activity| {
+            activity.kind == "message"
+                && activity
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("Browser tabs identity"))
+        }));
+        assert_eq!(session.results.len(), 1);
+        assert_eq!(session.results[0].response, final_response);
+    }
+
+    #[test]
     fn identical_agent_messages_after_a_new_prompt_are_kept() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -2888,7 +3033,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_completion_reuses_a_process_misclassified_as_cli() {
+    fn resumed_vscode_thread_keeps_its_active_cli_process() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
             .reconcile_processes(vec![DiscoveredProcess {
@@ -2916,7 +3061,7 @@ mod tests {
         let sessions = state.sessions().expect("sessões");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "codex-app-server:chat-1");
-        assert_eq!(sessions[0].source, SessionSource::Vscode);
+        assert_eq!(sessions[0].source, SessionSource::Cli);
         assert_eq!(sessions[0].process_id, Some(4242));
         assert_eq!(sessions[0].status, SessionStatus::Completed);
         assert_eq!(sessions[0].last_response.as_deref(), Some("Tudo pronto"));
@@ -2944,10 +3089,22 @@ mod tests {
             }])
             .expect("processo exato");
 
+        let mut running = started_event("codex-app-server:thread-1", 0);
+        running.agent = AgentKind::Codex;
+        running.source = Some(SessionSource::Vscode);
+        running.process_id = None;
+        running.native_session_id = Some("thread-1".into());
+        running.working_directory = Some("/home/user".into());
+        running.event = HookEventKind::Running;
+        state
+            .ingest(running)
+            .expect("evento passivo do rollout retomado");
+
         let sessions = state.sessions().expect("sessões");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].process_id, Some(4242));
         assert_eq!(sessions[0].source, SessionSource::Cli);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
     }
 
     #[test]
@@ -3398,7 +3555,8 @@ mod tests {
     #[test]
     fn stale_browser_heartbeat_removes_the_web_agent() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
-        let mut event = started_event("web:codex:chat", 4343);
+        let mut event = started_event("web:chatgpt:chat", 4343);
+        event.agent = AgentKind::ChatGpt;
         event.source = Some(SessionSource::Web);
         event.process_id = None;
         state.ingest(event).expect("evento web");

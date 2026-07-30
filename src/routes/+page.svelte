@@ -2170,6 +2170,10 @@
     });
   }
 
+  function integrationAgentKind(kind: IntegrationStatus["kind"]): AgentKind {
+    return kind === "claude" ? "claude_code" : kind;
+  }
+
   async function applySelectedProjectProfile() {
     const profile = selectedProjectProfile;
     if (!profile) return;
@@ -2199,8 +2203,8 @@
       .filter((integration) => integration.installed)
       .slice()
       .sort((left, right) => {
-        const leftIndex = preferred.indexOf(left.kind);
-        const rightIndex = preferred.indexOf(right.kind);
+        const leftIndex = preferred.indexOf(integrationAgentKind(left.kind));
+        const rightIndex = preferred.indexOf(integrationAgentKind(right.kind));
         if (leftIndex === rightIndex) return left.label.localeCompare(right.label);
         if (leftIndex < 0) return 1;
         if (rightIndex < 0) return -1;
@@ -3212,8 +3216,8 @@
                 <span><strong>{tr("Preferred agents", "Agentes preferidos")}</strong><small>{tr("Shown first in the launcher.", "Aparecem primeiro no iniciador.")}</small></span>
                 <div class="agent-preferences">
                   {#each integrations as integration (integration.kind)}
-                    <button class:active={(selectedProjectProfile?.preferredAgents ?? []).includes(integration.kind)} type="button" onclick={() => togglePreferredAgent(integration.kind)}>
-                      <BrandIcon name={integration.kind} size={14} />{integration.label}
+                    <button class:active={(selectedProjectProfile?.preferredAgents ?? []).includes(integrationAgentKind(integration.kind))} type="button" onclick={() => togglePreferredAgent(integrationAgentKind(integration.kind))}>
+                      <BrandIcon name={integrationAgentKind(integration.kind)} size={14} />{integration.label}
                     </button>
                   {/each}
                 </div>
@@ -3776,8 +3780,10 @@
   }
 
   .session-summary:hover .agent-avatar { transform: scale(1.04); }
-  .agent-codex { color: #202523; background: #edf0ee; }
-  .agent-claude { color: #d97757; background: #f7ece6; }
+  .agent-codex,
+  .agent-chatgpt { color: #202523; background: #edf0ee; }
+  .agent-claude,
+  .agent-claude_code { color: #d97757; background: #f7ece6; }
   .agent-gemini { color: #6e73ca; background: #eef0fb; }
   .agent-vscode { color: #287aa9; background: #edf6fb; }
   .agent-browser { color: #52615a; background: #f1f3f2; }

@@ -136,6 +136,7 @@
   let workTrayExpanded = $state(true);
   let rateLimitRefreshRequested = false;
   let outputElement = $state<HTMLDivElement | null>(null);
+  let outputFollowingTail = true;
   let language = $state<Language>("en");
   let darkMode = $state<boolean | undefined>(undefined);
   let systemDark = $state(false);
@@ -390,7 +391,7 @@
     const catalog =
       session?.agent === "codex"
         ? codexSlashCommands
-        : session?.agent === "claude"
+        : session?.agent === "claude_code"
           ? claudeSlashCommands
           : session?.agent === "gemini"
             ? geminiSlashCommands
@@ -534,6 +535,12 @@
       return tr(
         "The project folder is unavailable for resuming this session",
         "A pasta do projeto está indisponível para retomar esta sessão",
+      );
+    }
+    if (capabilities?.promptUnavailableReason === "agent_busy") {
+      return tr(
+        "Wait for the web agent to finish before sending another prompt",
+        "Aguarde o agente web terminar antes de enviar outro prompt",
       );
     }
     return tr(
@@ -931,13 +938,29 @@
   }
 
   async function refresh() {
-    const shouldFollow = !outputElement ||
-      outputElement.scrollHeight - outputElement.scrollTop - outputElement.clientHeight < 32;
     const snapshot = await loadHubSnapshot();
+    const shouldFollow = outputFollowingTail;
     session = windowState ? resolveTerminalSession(windowState, snapshot.sessions) ?? null : null;
-    if (shouldFollow) {
+    if (shouldFollow && outputFollowingTail) {
       await tick();
-      outputElement?.scrollTo({ top: outputElement.scrollHeight });
+      if (outputFollowingTail) {
+        outputElement?.scrollTo({ top: outputElement.scrollHeight });
+      }
+    }
+  }
+
+  function outputDistanceFromTail() {
+    if (!outputElement) return 0;
+    return outputElement.scrollHeight - outputElement.scrollTop - outputElement.clientHeight;
+  }
+
+  function handleOutputScroll() {
+    outputFollowingTail = outputDistanceFromTail() <= 24;
+  }
+
+  function handleOutputWheel(event: WheelEvent) {
+    if (event.deltaY < 0) {
+      outputFollowingTail = false;
     }
   }
 
@@ -1970,7 +1993,12 @@
         </button>
       </nav>
 
-      <div class="terminal-output" bind:this={outputElement}>
+      <div
+        class="terminal-output"
+        bind:this={outputElement}
+        onscroll={handleOutputScroll}
+        onwheel={handleOutputWheel}
+      >
         <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
         <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
         {#if session.pendingQuestion}

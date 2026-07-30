@@ -528,8 +528,10 @@ body.install-modal-open { overflow: hidden; }
 }
 
 .agent-icon svg { width: 22px; height: 22px; display: block; fill: currentColor; stroke: none; }
-.agent-icon.agent-codex { color: #17201c; background: #f3f6f4; }
-.agent-icon.agent-claude { color: #e8bd9f; background: rgba(192, 106, 65, 0.13); }
+.agent-icon.agent-codex,
+.agent-icon.agent-chatgpt { color: #17201c; background: #f3f6f4; }
+.agent-icon.agent-claude,
+.agent-icon.agent-claude_code { color: #e8bd9f; background: rgba(192, 106, 65, 0.13); }
 .agent-icon.agent-gemini { color: #b5c5fa; background: rgba(92, 116, 199, 0.14); }
 
 .session-heading { min-width: 0; display: grid; gap: 2px; }

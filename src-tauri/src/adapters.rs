@@ -58,7 +58,7 @@ pub fn run_hook(provider: &str) -> i32 {
 fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
     let agent = match provider {
         "codex" => AgentKind::Codex,
-        "claude" => AgentKind::Claude,
+        "claude" => AgentKind::ClaudeCode,
         "gemini" => AgentKind::Gemini,
         _ => return None,
     };

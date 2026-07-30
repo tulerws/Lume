@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -40,15 +43,33 @@ struct BrowserEvent {
     title: String,
     origin: String,
     browser: Option<String>,
+    #[serde(default)]
+    protocol_version: u8,
     state: BrowserState,
     #[serde(default)]
     last_response: Option<String>,
 }
 
+#[derive(Clone)]
+struct BrowserPromptRequest {
+    id: String,
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPromptAck {
+    provider: String,
+    session_id: String,
+    prompt_id: String,
+    submitted: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct BrowserControl {
     focus_requests: Arc<Mutex<HashSet<String>>>,
-    prompt_requests: Arc<Mutex<HashMap<String, String>>>,
+    prompt_requests: Arc<Mutex<HashMap<String, BrowserPromptRequest>>>,
+    prompt_sequence: Arc<AtomicU64>,
 }
 
 impl BrowserControl {
@@ -61,10 +82,18 @@ impl BrowserControl {
     }
 
     pub fn request_prompt(&self, session_id: String, prompt: String) -> Result<(), String> {
+        let request = BrowserPromptRequest {
+            id: format!(
+                "{}-{}",
+                now_millis(),
+                self.prompt_sequence.fetch_add(1, Ordering::Relaxed)
+            ),
+            prompt,
+        };
         self.prompt_requests
             .lock()
             .map_err(|_| "Não foi possível acessar o conector web".to_string())?
-            .insert(session_id, prompt);
+            .insert(session_id, request);
         Ok(())
     }
 
@@ -75,11 +104,40 @@ impl BrowserControl {
             .unwrap_or(false)
     }
 
-    fn take_prompt(&self, session_id: &str) -> Option<String> {
+    fn pending_prompt(&self, session_id: &str) -> Option<BrowserPromptRequest> {
+        self.prompt_requests
+            .lock()
+            .ok()
+            .and_then(|requests| requests.get(session_id).cloned())
+    }
+
+    fn take_prompt(&self, session_id: &str) -> Option<BrowserPromptRequest> {
         self.prompt_requests
             .lock()
             .ok()
             .and_then(|mut requests| requests.remove(session_id))
+    }
+
+    fn acknowledge_prompt(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        submitted: bool,
+    ) -> Result<(), String> {
+        if !submitted {
+            return Ok(());
+        }
+        let mut requests = self
+            .prompt_requests
+            .lock()
+            .map_err(|_| "Não foi possível acessar o conector web".to_string())?;
+        if requests
+            .get(session_id)
+            .is_some_and(|request| request.id == prompt_id)
+        {
+            requests.remove(session_id);
+        }
+        Ok(())
     }
 }
 
@@ -123,17 +181,20 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
             match serde_json::from_slice::<BrowserEvent>(&request.body)
                 .map_err(|error| error.to_string())
                 .and_then(|browser_event| {
-                    let session_id = format!(
-                        "web:{}:{}",
-                        browser_event.provider, browser_event.session_id
-                    );
+                    let provider = canonical_provider(&browser_event.provider)?;
+                    let session_id = format!("web:{}:{}", provider, browser_event.session_id);
+                    let supports_prompt_ack = browser_event.protocol_version >= 2;
                     let previous_status = state
                         .sessions()?
                         .into_iter()
                         .find(|session| session.id == session_id)
                         .map(|session| session.status);
                     let focus = control.take_focus(&session_id);
-                    let prompt = control.take_prompt(&session_id);
+                    let prompt_request = if supports_prompt_ack {
+                        control.pending_prompt(&session_id)
+                    } else {
+                        control.take_prompt(&session_id)
+                    };
                     let event = map_event(browser_event)?;
                     let notification =
                         crate::domain::should_notify(&event.event, previous_status.as_ref());
@@ -155,14 +216,47 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                             .body(format!("{label} · {project}"))
                             .show();
                     }
-                    Ok((focus, prompt))
+                    Ok((focus, prompt_request))
                 }) {
-                Ok((focus, prompt)) => (
-                    "202 Accepted",
-                    serde_json::json!({ "ok": true, "focus": focus, "prompt": prompt }).to_string(),
-                    request.origin,
-                ),
+                Ok((focus, prompt_request)) => {
+                    let prompt = prompt_request
+                        .as_ref()
+                        .map(|request| request.prompt.as_str());
+                    let prompt_id = prompt_request.as_ref().map(|request| request.id.as_str());
+                    (
+                        "202 Accepted",
+                        serde_json::json!({
+                            "ok": true,
+                            "focus": focus,
+                            "prompt": prompt,
+                            "promptId": prompt_id,
+                        })
+                        .to_string(),
+                        request.origin,
+                    )
+                }
                 Err(_) => ("400 Bad Request", "{\"ok\":false}".into(), request.origin),
+            }
+        }
+        Ok(request)
+            if request.method == "POST"
+                && request.path == "/prompt-ack"
+                && allowed_origin(&request.origin) =>
+        {
+            let acknowledged = serde_json::from_slice::<BrowserPromptAck>(&request.body)
+                .map_err(|error| error.to_string())
+                .and_then(|ack| {
+                    let provider = canonical_provider(&ack.provider)?;
+                    control.acknowledge_prompt(
+                        &format!("web:{provider}:{}", ack.session_id),
+                        &ack.prompt_id,
+                        ack.submitted,
+                    )
+                });
+            if acknowledged.is_ok() {
+                ("200 OK", "{\"ok\":true}".into(), request.origin)
+            } else {
+                ("400 Bad Request", "{\"ok\":false}".into(), request.origin)
             }
         }
         Ok(request) => ("403 Forbidden", "{\"ok\":false}".into(), request.origin),
@@ -232,15 +326,25 @@ fn allowed_origin(origin: &str) -> bool {
     origin.starts_with("chrome-extension://") || origin.starts_with("extension://")
 }
 
+fn canonical_provider(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "codex" | "chatgpt" => Ok("chatgpt"),
+        "claude" => Ok("claude"),
+        "gemini" => Ok("gemini"),
+        _ => Err("Agente web desconhecido".into()),
+    }
+}
+
 fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
     if event.session_id.len() > 180 || event.origin.len() > 180 {
         return Err("Evento web inválido".into());
     }
-    let (agent, label) = match event.provider.as_str() {
-        "codex" => (AgentKind::Codex, "Codex"),
+    let provider = canonical_provider(&event.provider)?;
+    let (agent, label) = match provider {
+        "chatgpt" => (AgentKind::ChatGpt, "ChatGPT"),
         "claude" => (AgentKind::Claude, "Claude"),
         "gemini" => (AgentKind::Gemini, "Gemini"),
-        _ => return Err("Agente web desconhecido".into()),
+        _ => unreachable!(),
     };
     let now = now_millis();
     let source_app = match event.browser.as_deref() {
@@ -272,7 +376,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
     };
     Ok(HookEvent {
         event: kind,
-        session_id: format!("web:{}:{}", event.provider, event.session_id),
+        session_id: format!("web:{provider}:{}", event.session_id),
         agent,
         agent_label: Some(label.into()),
         session_name: Some(truncate(&event.title, 100)),
@@ -325,16 +429,19 @@ mod tests {
     #[test]
     fn browser_event_keeps_only_origin_and_hashed_session() {
         let event = map_event(BrowserEvent {
-            provider: "codex".into(),
+            provider: "chatgpt".into(),
             session_id: "hash-only".into(),
             title: "Projeto".into(),
             origin: "https://chatgpt.com".into(),
             browser: Some("brave".into()),
+            protocol_version: 2,
             state: BrowserState::PermissionRequired,
             last_response: None,
         })
         .expect("evento web");
-        assert_eq!(event.session_id, "web:codex:hash-only");
+        assert_eq!(event.session_id, "web:chatgpt:hash-only");
+        assert_eq!(event.agent, AgentKind::ChatGpt);
+        assert_eq!(event.agent_label.as_deref(), Some("ChatGPT"));
         assert_eq!(event.source_app.as_deref(), Some("brave"));
         assert_eq!(
             event.permission.expect("permissão").resource,
@@ -343,26 +450,90 @@ mod tests {
     }
 
     #[test]
-    fn browser_prompt_is_kept_only_until_the_next_extension_poll() {
+    fn legacy_codex_browser_provider_is_canonicalized_as_chatgpt() {
+        let event = map_event(BrowserEvent {
+            provider: "codex".into(),
+            session_id: "legacy-extension".into(),
+            title: "Legacy ChatGPT tab".into(),
+            origin: "https://chatgpt.com".into(),
+            browser: Some("chrome".into()),
+            protocol_version: 0,
+            state: BrowserState::WaitingForInput,
+            last_response: None,
+        })
+        .expect("legacy browser event");
+
+        assert_eq!(event.session_id, "web:chatgpt:legacy-extension");
+        assert_eq!(event.agent, AgentKind::ChatGpt);
+        assert_eq!(event.agent_label.as_deref(), Some("ChatGPT"));
+    }
+
+    #[test]
+    fn claude_web_is_not_claude_code() {
+        let event = map_event(BrowserEvent {
+            provider: "claude".into(),
+            session_id: "claude-tab".into(),
+            title: "Claude".into(),
+            origin: "https://claude.ai".into(),
+            browser: Some("edge".into()),
+            protocol_version: 2,
+            state: BrowserState::Running,
+            last_response: None,
+        })
+        .expect("claude browser event");
+
+        assert_eq!(event.agent, AgentKind::Claude);
+        assert_eq!(event.agent_label.as_deref(), Some("Claude"));
+    }
+
+    #[test]
+    fn browser_prompt_waits_for_a_successful_extension_acknowledgement() {
         let control = BrowserControl::default();
         control
-            .request_prompt("web:codex:hash-only".into(), "Continue".into())
+            .request_prompt("web:chatgpt:hash-only".into(), "Continue".into())
             .expect("fila local");
+        let request = control
+            .pending_prompt("web:chatgpt:hash-only")
+            .expect("prompt pendente");
+        assert_eq!(request.prompt, "Continue");
+
+        control
+            .acknowledge_prompt("web:chatgpt:hash-only", &request.id, false)
+            .expect("falha mantida");
+        assert!(control.pending_prompt("web:chatgpt:hash-only").is_some());
+
+        control
+            .acknowledge_prompt("web:chatgpt:hash-only", &request.id, true)
+            .expect("entrega confirmada");
+        assert!(control.pending_prompt("web:chatgpt:hash-only").is_none());
+    }
+
+    #[test]
+    fn legacy_browser_prompt_is_consumed_once() {
+        let control = BrowserControl::default();
+        control
+            .request_prompt("web:chatgpt:legacy".into(), "Continue".into())
+            .expect("legacy prompt");
+
         assert_eq!(
-            control.take_prompt("web:codex:hash-only").as_deref(),
-            Some("Continue")
+            control
+                .take_prompt("web:chatgpt:legacy")
+                .expect("first delivery")
+                .prompt,
+            "Continue"
         );
-        assert!(control.take_prompt("web:codex:hash-only").is_none());
+        assert!(control.take_prompt("web:chatgpt:legacy").is_none());
     }
 
     #[test]
     fn closed_browser_tab_becomes_a_session_end_event() {
         let event = map_event(BrowserEvent {
-            provider: "codex".into(),
+            provider: "chatgpt".into(),
             session_id: "closed-tab".into(),
             title: "Projeto".into(),
             origin: "https://chatgpt.com".into(),
             browser: Some("chrome".into()),
+            protocol_version: 2,
             state: BrowserState::Closed,
             last_response: None,
         })

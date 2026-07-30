@@ -135,7 +135,9 @@ fn notification_for(
         .clone()
         .unwrap_or_else(|| match event.agent {
             crate::domain::AgentKind::Codex => "Codex".into(),
+            crate::domain::AgentKind::ChatGpt => "ChatGPT".into(),
             crate::domain::AgentKind::Claude => "Claude".into(),
+            crate::domain::AgentKind::ClaudeCode => "Claude Code".into(),
             crate::domain::AgentKind::Gemini => "Gemini".into(),
             crate::domain::AgentKind::Unknown => "Agente".into(),
         });

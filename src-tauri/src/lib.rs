@@ -778,7 +778,7 @@ fn diagnose_integration(
             matches!(
                 (&kind, &session.agent),
                 (IntegrationKind::Codex, domain::AgentKind::Codex)
-                    | (IntegrationKind::Claude, domain::AgentKind::Claude)
+                    | (IntegrationKind::Claude, domain::AgentKind::ClaudeCode)
                     | (IntegrationKind::Gemini, domain::AgentKind::Gemini)
             )
         })

@@ -23,8 +23,8 @@ export const demoSessions: AgentSession[] = [
   },
   {
     id: "claude-api",
-    agent: "claude",
-    agentLabel: "Claude",
+    agent: "claude_code",
+    agentLabel: "Claude Code",
     project: "Orbit API",
     source: "cli",
     status: "waiting_for_input",

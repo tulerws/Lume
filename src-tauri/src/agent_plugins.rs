@@ -85,7 +85,7 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
         }),
         Box::new(BuiltInAgentPlugin {
             kind: IntegrationKind::Claude,
-            label: "Claude",
+            label: "Claude Code",
             executable: "claude",
             direct_permissions: true,
             hook_events: &[

@@ -1,13 +1,11 @@
 (() => {
   const host = location.hostname;
-  const provider = host.includes("claude")
-    ? "claude"
-    : host.includes("gemini")
-      ? "gemini"
-      : "codex";
+  const provider = globalThis.LumeWebShared?.providerForHost(host);
+  if (!provider) return;
   let lastState = "";
   let lastPath = "";
   let lastResponseSignature = "";
+  let submittingPromptId = "";
   let timer;
 
   const visible = (element) => {
@@ -22,7 +20,7 @@
       .slice(-80)
       .map((button) => `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""}`.trim().toLowerCase());
 
-  const detectState = () => {
+  const detectState = (previousState = lastState) => {
     const buttons = buttonText();
     const permissionDialog = [...document.querySelectorAll('[role="dialog"], [data-state="open"]')]
       .filter(visible)
@@ -61,8 +59,8 @@
       .map((alert) => alert.textContent?.toLowerCase() ?? "")
       .join(" ");
     if (/failed|something went wrong|erro|falhou/.test(alerts)) return "failed";
-    if (lastState === "running" || lastState === "completed") return "completed";
-    if (lastState === "failed") return "failed";
+    if (previousState === "running" || previousState === "completed") return "completed";
+    if (previousState === "failed") return "failed";
     return "waiting_for_input";
   };
 
@@ -82,7 +80,7 @@
       .slice(0, 100) || "Sessão web";
 
   const finalResponse = () => {
-    const selectors = provider === "codex"
+    const selectors = provider === "chatgpt"
       ? ['[data-message-author-role="assistant"]']
       : provider === "claude"
         ? ['[data-testid="assistant-message"]', '.font-claude-response']
@@ -142,8 +140,8 @@
   };
 
   const report = (force = false) => {
-    const state = detectState();
     const path = location.pathname;
+    const state = detectState(path === lastPath ? lastState : "");
     const lastResponse = state === "completed" ? finalResponse() : undefined;
     const responseSignature = lastResponse ? hash(lastResponse) : "";
     if (!force && state === lastState && path === lastPath && responseSignature === lastResponseSignature) return;
@@ -154,14 +152,25 @@
       type: "lume:event",
       event: {
         provider,
+        protocolVersion: 2,
         sessionId: hash(`${provider}:${path}`),
         title: cleanTitle(),
         origin: location.origin,
         state,
         lastResponse,
       },
-    }).then((response) => {
-      if (response?.prompt) void submitPrompt(response.prompt);
+    }).then(async (response) => {
+      if (!response?.prompt || response.promptId === submittingPromptId) return;
+      submittingPromptId = response.promptId || "";
+      const submitted = await submitPrompt(response.prompt);
+      if (response.promptId) {
+        await chrome.runtime.sendMessage({
+          type: "lume:prompt-ack",
+          promptId: response.promptId,
+          submitted,
+        }).catch(() => {});
+      }
+      submittingPromptId = "";
     }).catch(() => {});
   };
 
@@ -176,6 +185,9 @@
     attributeFilter: ["aria-label", "data-state", "disabled"],
   });
   window.addEventListener("popstate", schedule);
-  setInterval(() => report(true), 4000);
+  window.addEventListener("focus", () => report(true));
+  window.addEventListener("pageshow", () => report(true));
+  document.addEventListener("visibilitychange", () => report(true));
+  setInterval(() => report(true), 15_000);
   schedule();
 })();

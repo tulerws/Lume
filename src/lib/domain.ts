@@ -1,4 +1,10 @@
-export type AgentKind = "codex" | "claude" | "gemini" | "unknown";
+export type AgentKind =
+  | "codex"
+  | "chatgpt"
+  | "claude"
+  | "claude_code"
+  | "gemini"
+  | "unknown";
 
 export type SessionStatus =
   | "running"

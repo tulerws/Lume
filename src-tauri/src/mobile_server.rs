@@ -57,6 +57,7 @@ const MDNS_SERVICE_TYPE: &str = "_lume._tcp.local.";
 const MOBILE_INDEX: &str = include_str!("../../mobile-pwa/index.html");
 const MOBILE_APP: &str = include_str!("../../mobile-pwa/app.js");
 const MOBILE_MARKDOWN: &str = include_str!("../../src/lib/markdown.js");
+const MOBILE_RESPONSE_DEDUP: &str = include_str!("../../src/lib/responseDedup.js");
 const MOBILE_STYLES: &str = include_str!("../../mobile-pwa/styles.css");
 const MOBILE_MANIFEST: &str = include_str!("../../mobile-pwa/manifest.webmanifest");
 const MOBILE_SERVICE_WORKER: &str = include_str!("../../mobile-pwa/sw.js");
@@ -1038,6 +1039,7 @@ fn route_core(
             "/" | "/pair" => Some(("text/html; charset=utf-8", MOBILE_INDEX)),
             "/app.js" => Some(("text/javascript; charset=utf-8", MOBILE_APP)),
             "/markdown.js" => Some(("text/javascript; charset=utf-8", MOBILE_MARKDOWN)),
+            "/responseDedup.js" => Some(("text/javascript; charset=utf-8", MOBILE_RESPONSE_DEDUP)),
             "/styles.css" => Some(("text/css; charset=utf-8", MOBILE_STYLES)),
             "/manifest.webmanifest" => {
                 Some(("application/manifest+json; charset=utf-8", MOBILE_MANIFEST))
@@ -1773,6 +1775,14 @@ mod tests {
         );
         assert!(markdown.starts_with("HTTP/1.1 200"));
         assert!(markdown.contains("renderSafeMarkdown"));
+
+        let response_dedup = route(
+            request("GET", "/responseDedup.js", None, serde_json::Value::Null),
+            &state,
+            &gateway,
+        );
+        assert!(response_dedup.starts_with("HTTP/1.1 200"));
+        assert!(response_dedup.contains("sameResponseText"));
     }
 
     #[test]

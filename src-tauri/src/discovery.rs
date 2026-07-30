@@ -108,7 +108,9 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 .map(|agent| {
                     let label = match agent {
                         AgentKind::Codex => "Codex",
+                        AgentKind::ChatGpt => "ChatGPT",
                         AgentKind::Claude => "Claude",
+                        AgentKind::ClaudeCode => "Claude Code",
                         AgentKind::Gemini => "Gemini",
                         AgentKind::Unknown => "Agent",
                     };
@@ -335,7 +337,7 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
             .first()
             .is_some_and(|executable| is_versioned_claude_executable(executable))
     {
-        Some(AgentKind::Claude)
+        Some(AgentKind::ClaudeCode)
     } else if name == "gemini" || tokens.iter().any(|token| token == &"gemini") {
         Some(AgentKind::Gemini)
     } else {
@@ -566,7 +568,7 @@ mod tests {
                 "2.1.220",
                 "/home/user/.local/share/claude/versions/2.1.220 --session-id 9b7acb3c --fork-session"
             ),
-            Some(AgentKind::Claude)
+            Some(AgentKind::ClaudeCode)
         );
     }
 
@@ -607,11 +609,11 @@ mod tests {
         assert_eq!(detect_agent("bash", "gemini chat"), Some(AgentKind::Gemini));
         assert_eq!(
             detect_agent("claude", "/usr/bin/claude"),
-            Some(AgentKind::Claude)
+            Some(AgentKind::ClaudeCode)
         );
         assert_eq!(
             detect_agent("bash", "claude --resume abc"),
-            Some(AgentKind::Claude)
+            Some(AgentKind::ClaudeCode)
         );
     }
 

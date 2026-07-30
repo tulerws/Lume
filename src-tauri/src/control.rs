@@ -193,10 +193,10 @@ pub fn submit_prompt(
         )
     } else {
         let agent = match session.agent {
-            AgentKind::Claude => IntegrationKind::Claude,
+            AgentKind::ClaudeCode => IntegrationKind::Claude,
             AgentKind::Gemini => IntegrationKind::Gemini,
             AgentKind::Codex => unreachable!(),
-            AgentKind::Unknown => {
+            AgentKind::ChatGpt | AgentKind::Claude | AgentKind::Unknown => {
                 return Err("Este agente não oferece retomada direta pelo Lume".into());
             }
         };

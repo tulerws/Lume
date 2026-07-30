@@ -3,7 +3,8 @@ import type { AgentSession, PromptDelivery } from "$lib/domain";
 export type PromptUnavailableReason =
   | "unsupported_agent"
   | "session_not_connected"
-  | "working_directory_missing";
+  | "working_directory_missing"
+  | "agent_busy";
 
 export interface SessionCapabilities {
   canPrompt: boolean;
@@ -20,7 +21,12 @@ export interface SessionCapabilities {
 
 export function sessionCapabilities(session: AgentSession): SessionCapabilities {
   let promptUnavailableReason: PromptUnavailableReason | undefined;
-  if (session.source !== "web") {
+  if (
+    session.source === "web"
+    && ["running", "permission_required"].includes(session.status)
+  ) {
+    promptUnavailableReason = "agent_busy";
+  } else if (session.source !== "web") {
     if (session.agent === "unknown") {
       promptUnavailableReason = "unsupported_agent";
     } else if (!session.nativeSessionId) {
@@ -43,10 +49,11 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
     canAttachImages: session.source !== "web" && session.agent !== "unknown",
     canInterrupt:
       ["running", "permission_required"].includes(session.status)
+      && session.source !== "web"
       && session.agent === "codex"
       && Boolean(session.nativeSessionId),
     promptDeliveries:
-      session.agent === "codex"
+      session.agent === "codex" && session.source !== "web"
         ? ["new_turn", "steer", "queue"]
         : ["new_turn"],
   };
