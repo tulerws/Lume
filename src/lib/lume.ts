@@ -231,6 +231,10 @@ export async function loadTerminalWindowState(label: string): Promise<TerminalWi
   return invoke<TerminalWindowState>("get_terminal_window_state", { label });
 }
 
+export async function minimizeTerminalWindow(label: string): Promise<void> {
+  await invoke("minimize_terminal_window", { label });
+}
+
 export async function closeTerminalWindow(label: string): Promise<void> {
   await invoke("close_terminal_window", { label });
 }

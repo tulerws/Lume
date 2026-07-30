@@ -11,15 +11,21 @@
   import LumeMascot from "$lib/LumeMascot.svelte";
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
+    clipboardHasFile,
     clipboardHasImage,
     clipboardMayContainImage,
+    collectClipboardFiles,
     collectClipboardImages,
     createImagePreview,
+    isImageAttachmentFile,
+    isImageAttachmentPath,
+    prepareClipboardFile,
     prepareClipboardImage,
   } from "$lib/imageAttachments";
   import { renderSafeMarkdown } from "$lib/markdown.js";
   import { latestResponseText, sameResponseText } from "$lib/responseDedup.js";
   import {
+    displayFileChangePath,
     mergeFileChanges,
     summarizeFileChanges,
     type FileChangeSummary,
@@ -41,6 +47,7 @@
     loadHubSnapshot,
     loadTerminalWindowState,
     markTerminalFrontendReady,
+    minimizeTerminalWindow,
     moveTerminalWindow,
     openSessionSource,
     readLocalImageDataUrl,
@@ -86,6 +93,9 @@
   let steeringQueued = $state(false);
   let collaborationMode = $state<CollaborationMode>("default");
   let collaborationModeChanging = $state(false);
+  let collaborationModeTarget = $state<CollaborationMode | null>(null);
+  let collaborationModeNotice = $state<string | null>(null);
+  let collaborationModeNoticeTimer: ReturnType<typeof setTimeout> | undefined;
   let questionSelections = $state<Record<string, string>>({});
   let dragging = $state(false);
   let dragMoved = false;
@@ -897,6 +907,7 @@
       window.removeEventListener("keydown", interruptOnEscape);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
+      if (collaborationModeNoticeTimer) clearTimeout(collaborationModeNoticeTimer);
       clearInterval(workClockInterval);
     };
   });
@@ -1366,6 +1377,15 @@
     }
   }
 
+  async function minimizeTerminal() {
+    message = null;
+    try {
+      await minimizeTerminalWindow(label);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
   function beginSessionRename() {
     if (!session) return;
     renameDraft = sessionDisplayName(session);
@@ -1431,15 +1451,26 @@
       || collaborationModeChanging
     ) return false;
     collaborationModeChanging = true;
+    collaborationModeTarget = nextMode;
+    collaborationModeNotice = null;
+    if (collaborationModeNoticeTimer) clearTimeout(collaborationModeNoticeTimer);
     message = null;
     try {
       collaborationMode = await setSessionCollaborationMode(session.id, nextMode);
+      collaborationModeNotice = collaborationMode === "plan"
+        ? tr("Plan mode enabled", "Modo Plan ativado")
+        : tr("Default mode enabled", "Modo Default ativado");
+      collaborationModeNoticeTimer = setTimeout(() => {
+        collaborationModeNotice = null;
+        collaborationModeNoticeTimer = undefined;
+      }, 2_400);
       return true;
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
       return false;
     } finally {
       collaborationModeChanging = false;
+      collaborationModeTarget = null;
     }
   }
 
@@ -1549,7 +1580,7 @@
     }
   }
 
-  async function chooseImages() {
+  async function chooseAttachments() {
     if (!canSubmit || !readyForPrompt || sending) return;
     message = null;
     try {
@@ -1566,7 +1597,6 @@
         selected = await openDialog({
           multiple: true,
           directory: false,
-          filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
         });
       } finally {
         if (terminalLowered) {
@@ -1576,11 +1606,11 @@
       const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
         .filter((path): path is string => typeof path === "string");
       for (const path of paths.slice(0, 4 - promptAttachments.length)) {
-        const previewDataUrl = await imagePreview(path);
+        const previewDataUrl = isImageAttachmentPath(path) ? await imagePreview(path) : "";
         promptAttachments = [
           ...promptAttachments,
           {
-            name: path.split(/[\\/]/).pop() || "image",
+            name: path.split(/[\\/]/).pop() || "file",
             mimeType: "",
             path,
             previewDataUrl,
@@ -1592,7 +1622,7 @@
     }
   }
 
-  function removeImage(index: number) {
+  function removeAttachment(index: number) {
     promptAttachments = promptAttachments.filter((_, current) => current !== index);
   }
 
@@ -1601,30 +1631,37 @@
     return createImagePreview(source, language);
   }
 
-  async function pasteImages(event: ClipboardEvent) {
-    if (!clipboardHasImage(event) && !clipboardMayContainImage(event)) return;
+  async function pasteAttachments(event: ClipboardEvent) {
+    if (!clipboardHasFile(event) && !clipboardHasImage(event) && !clipboardMayContainImage(event)) return;
     event.preventDefault();
     message = null;
     if (!canSubmit || !readyForPrompt || sending || !capabilities?.canAttachImages) {
       message = tr(
-        "Images can only be attached when this session is ready for a prompt.",
-        "Imagens só podem ser anexadas quando esta sessão estiver pronta para um prompt.",
+        "Files can only be attached when this session is ready for a prompt.",
+        "Arquivos só podem ser anexados quando esta sessão estiver pronta para um prompt.",
       );
       return;
     }
     try {
-      const { files, paths } = await collectClipboardImages(event, language);
+      let { files, paths } = collectClipboardFiles(event);
+      if (!files.length && !paths.length) {
+        ({ files, paths } = await collectClipboardImages(event, language));
+      }
       const available = 4 - promptAttachments.length;
       const prepared: PromptAttachmentInput[] = [];
       for (const [index, file] of files.slice(0, available).entries()) {
-        prepared.push(await prepareClipboardImage(file, index, language));
+        prepared.push(
+          isImageAttachmentFile(file)
+            ? await prepareClipboardImage(file, index, language)
+            : await prepareClipboardFile(file, index, language),
+        );
       }
       for (const path of paths.slice(0, available - prepared.length)) {
         prepared.push({
-          name: path.split(/[\\/]/).pop() || "image",
+          name: path.split(/[\\/]/).pop() || "file",
           mimeType: "",
           path,
-          previewDataUrl: await imagePreview(path),
+          previewDataUrl: isImageAttachmentPath(path) ? await imagePreview(path) : "",
         });
       }
       promptAttachments = [...promptAttachments, ...prepared];
@@ -1869,6 +1906,9 @@
               <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
             </button>
           {/if}
+          <button type="button" onclick={minimizeTerminal} aria-label={tr("Minimize terminal", "Minimizar terminal")} title={tr("Minimize", "Minimizar")}>
+            <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
+          </button>
           <button class="close-button" type="button" onclick={closeTerminal} aria-label={tr("Close terminal", "Fechar terminal")}>
             <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
           </button>
@@ -1924,6 +1964,10 @@
                   <span>{tr("Stop agent", "Encerrar agente")}</span>
                 </button>
               {/if}
+              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void minimizeTerminal(); }}>
+                <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
+                <span>{tr("Minimize terminal", "Minimizar terminal")}</span>
+              </button>
               <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void closeTerminal(); }}>
                 <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
                 <span>{tr("Close terminal", "Fechar terminal")}</span>
@@ -2059,7 +2103,14 @@
                   {#if item.attachments?.length}
                     <div class="message-images">
                       {#each item.attachments as attachment}
-                        <img src={attachment.previewDataUrl} alt={attachment.name} />
+                        {#if attachment.previewDataUrl}
+                          <img src={attachment.previewDataUrl} alt={attachment.name} />
+                        {:else}
+                          <span class="message-file" title={attachment.name}>
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4V17H5zM11 3v4h4M7.5 11h5M7.5 14h4" /></svg>
+                            <small>{attachment.name}</small>
+                          </span>
+                        {/if}
                       {/each}
                     </div>
                   {/if}
@@ -2087,7 +2138,7 @@
                   <strong>{tr("Files changed", "Arquivos alterados")}</strong>
                   <div>
                     {#each entry.files as file}
-                      <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                      <code title={file.path}><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
                     {/each}
                   </div>
                 </div>
@@ -2120,7 +2171,7 @@
             {#if changedFiles.length}
               <div class="change-list">
                 {#each changedFiles as file}
-                  <code><span class="file-path">{file.path}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                  <code title={file.path}><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
                 {/each}
               </div>
             {:else}
@@ -2146,7 +2197,7 @@
         class:has-attachments={promptAttachments.length > 0}
         aria-busy={sending}
         style:height={`${displayedComposerHeight}px`}
-        onpaste={(event) => void pasteImages(event)}
+        onpaste={(event) => void pasteAttachments(event)}
         onsubmit={(event) => {
           event.preventDefault();
           void sendPrompt();
@@ -2187,13 +2238,18 @@
           <div class="pending-images">
             <small class="pending-images-label">
               {promptAttachments.length === 1
-                ? tr("Photo attached", "Foto anexada")
-                : tr(`${promptAttachments.length} photos attached`, `${promptAttachments.length} fotos anexadas`)}
+                ? tr("File attached", "Arquivo anexado")
+                : tr(`${promptAttachments.length} files attached`, `${promptAttachments.length} arquivos anexados`)}
             </small>
             {#each promptAttachments as attachment, index}
-              <span title={attachment.name}>
-                <img src={attachment.previewDataUrl} alt={attachment.name} />
-                <button type="button" onclick={() => removeImage(index)} aria-label={tr("Remove image", "Remover imagem")}>×</button>
+              <span class:file-attachment={!attachment.previewDataUrl} title={attachment.name}>
+                {#if attachment.previewDataUrl}
+                  <img src={attachment.previewDataUrl} alt={attachment.name} />
+                {:else}
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4V17H5zM11 3v4h4M7.5 11h5M7.5 14h4" /></svg>
+                  <small>{attachment.name}</small>
+                {/if}
+                <button type="button" onclick={() => removeAttachment(index)} aria-label={tr("Remove file", "Remover arquivo")}>×</button>
               </span>
             {/each}
           </div>
@@ -2209,7 +2265,7 @@
             <span class="queue-mark" aria-hidden="true">↳</span>
             <span class="queue-copy">
               <small>{queuedPrompts.length > 1 ? tr(`${queuedPrompts.length} queued prompts`, `${queuedPrompts.length} prompts na fila`) : tr("Queued next", "Próximo na fila")}</small>
-              <strong>{nextQueuedPrompt.detail || tr("Prompt with attached images", "Prompt com imagens anexadas")}</strong>
+              <strong>{nextQueuedPrompt.detail || tr("Prompt with attached files", "Prompt com arquivos anexados")}</strong>
             </span>
             <span class="queue-shortcut"><kbd>Tab</kbd><small>{steeringQueued ? tr("Steering…", "Enviando…") : tr("Steer now", "Enviar agora")}</small></span>
           </button>
@@ -2228,7 +2284,7 @@
                   title={promptIsRunning ? tr("Mode can be changed after the current prompt", "O modo pode ser alterado após o prompt atual") : collaborationMode === "plan" ? tr("Plan mode — switch to Default", "Modo Plan — mudar para Default") : tr("Default mode — switch to Plan", "Modo Default — mudar para Plan")}
                 >
                   {#if collaborationModeChanging}
-                    <span class="send-spinner" aria-hidden="true"></span>
+                    <span class="mode-spinner" aria-hidden="true"></span>
                   {:else if collaborationMode === "plan"}
                     <svg aria-hidden="true" viewBox="0 0 20 20">
                       <path d="m4.8 5.8 1.3 1.3 2-2.2M10 6h5M4.8 10 6.1 11.3l2-2.2M10 10.2h5M4.8 14.2l1.3 1.3 2-2.2M10 14.4h5" />
@@ -2239,9 +2295,18 @@
                     </svg>
                   {/if}
                 </button>
+                {#if collaborationModeChanging && collaborationModeTarget}
+                  <span class="mode-feedback" aria-live="polite">
+                    {collaborationModeTarget === "plan"
+                      ? tr("Switching to Plan…", "Mudando para Plan…")
+                      : tr("Switching to Default…", "Mudando para Default…")}
+                  </span>
+                {:else if collaborationModeNotice}
+                  <span class="mode-feedback success" aria-live="polite">{collaborationModeNotice}</span>
+                {/if}
               {/if}
               {#if canSubmit && capabilities?.canAttachImages}
-                <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseImages()} aria-label={tr("Attach image", "Anexar imagem")} title={tr("Attach image", "Anexar imagem")}>
+                <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseAttachments()} aria-label={tr("Attach file", "Anexar arquivo")} title={tr("Attach file", "Anexar arquivo")}>
                   <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
                 </button>
               {/if}
@@ -2473,6 +2538,9 @@
   .markdown-content :global(hr) { height: 1px; margin: 8px 0; border: 0; background: rgba(77, 104, 91, 0.12); }
   .message-images { margin-top: 7px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
   .message-images img { width: 100%; max-height: 150px; display: block; border-radius: 7px; object-fit: cover; }
+  .message-file { min-width: 0; min-height: 38px; padding: 7px 8px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 7px; color: #52665d; background: rgba(52, 145, 99, 0.045); }
+  .message-file svg { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+  .message-file small { min-width: 0; overflow: hidden; color: inherit; font: 650 var(--chat-tiny-font-size)/1.2 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
   .agent-typing span { width: 4px; height: 4px; border-radius: 50%; background: #4e7faf; animation: agent-typing-dot 850ms ease-in-out infinite; }
   .agent-typing span:nth-child(2) { animation-delay: 130ms; }
@@ -2531,11 +2599,14 @@
   .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
-  .composer-leading-actions { display: flex; flex: 0 0 auto; flex-direction: column; justify-content: flex-end; gap: 4px; }
+  .composer-leading-actions { position: relative; display: flex; flex: 0 0 auto; flex-direction: column; justify-content: flex-end; gap: 4px; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
   .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
   .pending-images img { width: 100%; height: 100%; display: block; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 8px; object-fit: cover; }
+  .pending-images > span.file-attachment { width: 116px; padding: 5px 7px; display: flex; align-items: center; gap: 5px; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 8px; color: #52665d; background: rgba(255, 255, 255, 0.5); }
+  .pending-images .file-attachment > svg { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+  .pending-images .file-attachment > small { min-width: 0; overflow: hidden; font: 650 var(--chat-tiny-font-size)/1.2 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .pending-images button { position: absolute; top: -4px; right: -4px; width: 15px; height: 15px; border: 1px solid rgba(82, 106, 95, 0.18); border-radius: 50%; color: #65766e; background: #eef3f0; font-size: 10px; line-height: 1; }
   .composer-controls textarea { min-width: 0; min-height: 46px; height: 100%; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
   .composer-controls textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
@@ -2567,6 +2638,9 @@
   .terminal-composer .mode-button,
   .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
   .terminal-composer .mode-button.plan { color: #527aa0; border-color: rgba(79, 123, 164, 0.2); background: rgba(75, 124, 169, 0.1); }
+  .mode-spinner { width: 12px; height: 12px; border: 2px solid color-mix(in srgb, currentColor 24%, transparent); border-top-color: currentColor; border-radius: 50%; animation: send-spin 650ms linear infinite; }
+  .mode-feedback { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; padding: 4px 6px; border: 1px solid rgba(74, 106, 91, 0.12); border-radius: 6px; color: #687b72; background: rgba(249, 252, 250, 0.97); box-shadow: 0 5px 14px rgba(35, 54, 45, 0.1); font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; pointer-events: none; }
+  .mode-feedback.success { color: #377a59; }
   .terminal-composer button:disabled { opacity: 0.35; cursor: default; }
   .terminal-composer.sending button:disabled { opacity: 0.82; }
   .terminal-composer .composer-resize-handle { position: absolute; z-index: 18; top: -6px; left: 50%; width: 54px; height: 12px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 999px; color: #7c8d85; background: transparent; cursor: ns-resize; touch-action: none; transform: translateX(-50%); }
@@ -2629,6 +2703,8 @@
   .terminal-window.dark .pending-images-label { color: #8f9f97; }
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
   .terminal-window.dark .pending-images { background: rgba(83, 174, 129, 0.055); }
+  .terminal-window.dark .message-file,
+  .terminal-window.dark .pending-images > span.file-attachment { color: #b2c2ba; border-color: rgba(205, 222, 213, 0.12); background: rgba(255, 255, 255, 0.035); }
   .terminal-window.dark .slash-command-menu { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: #18231e; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.34); }
   .terminal-window.dark .slash-command-heading { border-color: rgba(205, 222, 213, 0.08); }
   .terminal-window.dark .slash-command-heading strong,
@@ -2688,6 +2764,8 @@
   .terminal-window.dark .terminal-composer .mode-button,
   .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
   .terminal-window.dark .terminal-composer .mode-button.plan { color: #9abddd; border-color: rgba(138, 183, 220, 0.18); background: rgba(91, 143, 184, 0.1); }
+  .terminal-window.dark .mode-feedback { color: #a6b8af; border-color: rgba(205, 222, 213, 0.1); background: rgba(29, 41, 35, 0.98); box-shadow: 0 5px 14px rgba(0, 0, 0, 0.22); }
+  .terminal-window.dark .mode-feedback.success { color: #84c9a7; }
   .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
   .terminal-window.dark .terminal-composer .composer-resize-handle:hover,
   .terminal-window.dark .terminal-composer .composer-resize-handle:focus-visible { background: rgba(205, 225, 215, 0.045); }
@@ -2704,6 +2782,7 @@
     .terminal-card { transition-duration: 0.01ms; }
     .dock-silhouette { animation: none; }
     .agent-typing span { animation: none; opacity: 0.7; }
-    .send-spinner { animation: none; border-color: rgba(255, 255, 255, 0.72); }
+    .send-spinner,
+    .mode-spinner { animation: none; }
   }
 </style>

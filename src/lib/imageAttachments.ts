@@ -1,6 +1,7 @@
 import type { PromptAttachmentInput } from "$lib/domain";
 
 const MAX_PASTED_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_PASTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_DATA_URL_LENGTH = 6_900_000;
 
 function message(language: "en" | "pt-BR", english: string, portuguese: string) {
@@ -43,13 +44,13 @@ function readFileDataUrl(
         ? resolve(reader.result)
         : reject(new Error(message(
             language,
-            "Could not read this image",
-            "Não foi possível ler esta imagem",
+            "Could not read this file",
+            "Não foi possível ler este arquivo",
           )));
     reader.onerror = () => reject(new Error(message(
       language,
-      "Could not read this image",
-      "Não foi possível ler esta imagem",
+      "Could not read this file",
+      "Não foi possível ler este arquivo",
     )));
     reader.readAsDataURL(file);
   });
@@ -131,6 +132,16 @@ function directImageFiles(event: ClipboardEvent) {
     .filter((file) => !file.type || file.type.startsWith("image/"));
 }
 
+function directClipboardFiles(event: ClipboardEvent) {
+  const itemFiles = [...(event.clipboardData?.items ?? [])]
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  return itemFiles.length
+    ? itemFiles
+    : [...(event.clipboardData?.files ?? [])];
+}
+
 function dataUrlImageFiles(event: ClipboardEvent) {
   const html = event.clipboardData?.getData("text/html") ?? "";
   const matches = [...html.matchAll(/<img[^>]+src=["'](data:image\/[^"']+)["']/gi)];
@@ -167,7 +178,7 @@ function fileUriPath(uri: string) {
   }
 }
 
-function clipboardImagePaths(event: ClipboardEvent) {
+function clipboardFilePaths(event: ClipboardEvent) {
   const uriList = event.clipboardData?.getData("text/uri-list") ||
     event.clipboardData?.getData("text/plain") ||
     "";
@@ -176,8 +187,12 @@ function clipboardImagePaths(event: ClipboardEvent) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
     .map(fileUriPath)
-    .filter((path): path is string => Boolean(path))
-    .filter((path) => /\.(gif|jpe?g|png|webp)$/i.test(path));
+    .filter((path): path is string => Boolean(path));
+}
+
+function clipboardImagePaths(event: ClipboardEvent) {
+  return clipboardFilePaths(event)
+    .filter((path) => isImageAttachmentPath(path));
 }
 
 async function asynchronousClipboardImages() {
@@ -235,6 +250,45 @@ export function clipboardHasImage(event: ClipboardEvent) {
   const types = [...(event.clipboardData?.types ?? [])];
   if (types.some((type) => type === "Files" || type.startsWith("image/"))) return true;
   return /<img[^>]+src=/i.test(event.clipboardData?.getData("text/html") ?? "");
+}
+
+export function clipboardHasFile(event: ClipboardEvent) {
+  return directClipboardFiles(event).length > 0 || clipboardFilePaths(event).length > 0;
+}
+
+export function isImageAttachmentPath(path: string) {
+  return /\.(gif|jpe?g|png|webp)$/i.test(path);
+}
+
+export function isImageAttachmentFile(file: File) {
+  return file.type.startsWith("image/") || isImageAttachmentPath(file.name);
+}
+
+export async function prepareClipboardFile(
+  file: File,
+  index: number,
+  language: "en" | "pt-BR",
+): Promise<PromptAttachmentInput> {
+  if (file.size > MAX_PASTED_FILE_BYTES) {
+    throw new Error(message(
+      language,
+      "The pasted file exceeds the 25 MB limit",
+      "O arquivo colado excede o limite de 25 MB",
+    ));
+  }
+  const dataUrl = await readFileDataUrl(file, language);
+  return {
+    name: file.name || `clipboard-file-${index + 1}`,
+    mimeType: file.type || "application/octet-stream",
+    dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
+    previewDataUrl: "",
+  };
+}
+
+export function collectClipboardFiles(event: ClipboardEvent) {
+  const files = directClipboardFiles(event);
+  const paths = clipboardFilePaths(event);
+  return { files, paths: files.length ? [] : paths };
 }
 
 export function clipboardMayContainImage(event: ClipboardEvent) {

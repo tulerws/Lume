@@ -566,9 +566,7 @@ fn resize_overlay_surface(app: AppHandle, width: i32, height: i32) -> Result<(),
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-// Keep this command synchronous: terminal creation configures GTK and must run on its main thread.
-fn open_terminal_window(
+fn open_terminal_window_impl(
     app: AppHandle,
     state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
@@ -588,6 +586,31 @@ fn open_terminal_window(
         preferences.overlay_y.unwrap_or(44),
         preferences.show_over_fullscreen,
     )
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+// GTK window creation must stay on the command's main-thread path on Linux.
+fn open_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    session_id: String,
+) -> Result<String, String> {
+    open_terminal_window_impl(app, state, terminals, session_id)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+async fn open_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    session_id: String,
+) -> Result<String, String> {
+    // Keeping the command asynchronous prevents WebView2 creation from blocking
+    // the overlay command dispatcher on Windows.
+    open_terminal_window_impl(app, state, terminals, session_id)
 }
 
 #[tauri::command]
@@ -650,6 +673,15 @@ fn close_terminal_window(
     terminals.close(&app, &label)?;
     let _ = app.emit("lume://terminal-windows-changed", ());
     Ok(())
+}
+
+#[tauri::command]
+fn minimize_terminal_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<(), String> {
+    terminals.hide(&app, &label)
 }
 
 #[tauri::command]
@@ -1201,6 +1233,7 @@ pub fn run() {
             list_terminal_windows,
             set_terminal_windows_visible,
             get_terminal_window_state,
+            minimize_terminal_window,
             close_terminal_window,
             move_terminal_window,
             cancel_terminal_window_move,

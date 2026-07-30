@@ -18,18 +18,20 @@ use crate::{
 };
 
 const MAX_PROMPT_ATTACHMENTS: usize = 4;
-const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_FILE_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_PREVIEW_LENGTH: usize = 384 * 1024;
 
 struct PreparedPromptAttachment {
     path: String,
+    is_image: bool,
     display: PromptAttachment,
 }
 
 pub fn local_image_data_url(path: &str) -> Result<String, String> {
     let path = fs::canonicalize(path).map_err(|_| "A imagem selecionada não existe".to_string())?;
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_ATTACHMENT_BYTES {
+    if bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
         return Err("A imagem excede o limite de 5 MB".into());
     }
     let mime = detected_image_mime(&bytes)
@@ -94,7 +96,7 @@ pub fn submit_prompt(
 ) -> Result<(), String> {
     let prompt = prompt.trim();
     if prompt.is_empty() && attachments.is_empty() {
-        return Err("Digite um prompt ou anexe uma imagem antes de enviar".into());
+        return Err("Digite um prompt ou anexe um arquivo antes de enviar".into());
     }
     if prompt.len() > 16 * 1024 {
         return Err("O prompt excede o limite local de 16 KB".into());
@@ -106,7 +108,7 @@ pub fn submit_prompt(
         .ok_or_else(|| "Sessão não encontrada".to_string())?;
     if let Some(question) = session.pending_question.as_ref() {
         if !attachments.is_empty() {
-            return Err("Responda à pergunta antes de anexar uma imagem".into());
+            return Err("Responda à pergunta antes de anexar um arquivo".into());
         }
         let answers = question_answers_from_prompt(question, prompt)?;
         state.resolve_question(session_id, &question.id, answers)?;
@@ -118,10 +120,17 @@ pub fn submit_prompt(
         SessionStatus::Running | SessionStatus::PermissionRequired
     );
     let attachments = prepare_prompt_attachments(app, attachments, allow_local_paths)?;
-    let attachment_paths = attachments
+    let image_paths = attachments
         .iter()
+        .filter(|attachment| attachment.is_image)
         .map(|attachment| attachment.path.clone())
         .collect::<Vec<_>>();
+    let file_paths = attachments
+        .iter()
+        .filter(|attachment| !attachment.is_image)
+        .map(|attachment| attachment.path.clone())
+        .collect::<Vec<_>>();
+    let codex_prompt = prompt_with_attachment_paths(prompt, &file_paths);
     let display_attachments = attachments
         .iter()
         .map(|attachment| attachment.display.clone())
@@ -139,7 +148,7 @@ pub fn submit_prompt(
             .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
         match delivery {
             PromptDelivery::Steer => {
-                bridge.steer_prompt(&thread_id, prompt, &attachment_paths, state, app)
+                bridge.steer_prompt(&thread_id, &codex_prompt, &image_paths, state, app)
             }
             PromptDelivery::Queue => {
                 let mut profile = session.permission_profile.clone();
@@ -150,8 +159,8 @@ pub fn submit_prompt(
                     &session.id,
                     &activity_id,
                     &thread_id,
-                    prompt,
-                    &attachment_paths,
+                    &codex_prompt,
+                    &image_paths,
                     profile,
                 )?;
                 state.record_queued_prompt_activity(
@@ -167,7 +176,7 @@ pub fn submit_prompt(
         }
     } else if session.source == SessionSource::Web {
         if !attachments.is_empty() {
-            return Err("Esta origem web ainda não aceita imagens pelo Lume".into());
+            return Err("Esta origem web ainda não aceita arquivos pelo Lume".into());
         }
         browser.request_prompt(session.id.clone(), prompt.to_string())?;
         browser.request_focus(session.id.clone())
@@ -185,8 +194,8 @@ pub fn submit_prompt(
             .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
         bridge.submit_prompt(
             &thread_id,
-            prompt,
-            &attachment_paths,
+            &codex_prompt,
+            &image_paths,
             profile,
             state.clone(),
             app.clone(),
@@ -219,6 +228,10 @@ pub fn submit_prompt(
             .path()
             .app_data_dir()
             .map_err(|error| error.to_string())?;
+        let attachment_paths = attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect::<Vec<_>>();
         let prompt = prompt_with_attachment_paths(prompt, &attachment_paths);
         launcher::launch(
             LaunchRequest {
@@ -402,7 +415,7 @@ fn prepare_prompt_attachments(
 ) -> Result<Vec<PreparedPromptAttachment>, String> {
     if attachments.len() > MAX_PROMPT_ATTACHMENTS {
         return Err(format!(
-            "Envie no máximo {MAX_PROMPT_ATTACHMENTS} imagens por prompt"
+            "Envie no máximo {MAX_PROMPT_ATTACHMENTS} arquivos por prompt"
         ));
     }
     let mut prepared = Vec::with_capacity(attachments.len());
@@ -413,55 +426,80 @@ fn prepare_prompt_attachments(
         {
             return Err("A prévia da imagem é inválida ou muito grande".into());
         }
-        let (path, detected_mime) = if let Some(path) = attachment.path {
+        let (path, detected_mime, is_image) = if let Some(path) = attachment.path {
             if !allow_local_paths {
                 return Err("O celular não pode indicar caminhos locais do computador".into());
             }
             let path = fs::canonicalize(path)
-                .map_err(|_| "A imagem selecionada não existe".to_string())?;
+                .map_err(|_| "O arquivo selecionado não existe".to_string())?;
             let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-            if bytes.len() > MAX_ATTACHMENT_BYTES {
+            if bytes.len() > MAX_FILE_ATTACHMENT_BYTES {
+                return Err("O arquivo excede o limite de 25 MB".into());
+            }
+            let image_mime = detected_image_mime(&bytes);
+            if image_mime.is_some() && bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
                 return Err("A imagem excede o limite de 5 MB".into());
             }
-            let mime = detected_image_mime(&bytes)
-                .ok_or_else(|| "O arquivo selecionado não é uma imagem compatível".to_string())?;
-            (path.to_string_lossy().to_string(), mime)
+            (
+                path.to_string_lossy().to_string(),
+                image_mime
+                    .or_else(|| {
+                        (!attachment.mime_type.is_empty()).then_some(attachment.mime_type.as_str())
+                    })
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                image_mime.is_some(),
+            )
         } else if let Some(data) = attachment.data_base64 {
             let bytes = STANDARD
                 .decode(data)
-                .map_err(|_| "Não foi possível decodificar a imagem".to_string())?;
-            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                .map_err(|_| "Não foi possível decodificar o arquivo".to_string())?;
+            if bytes.len() > MAX_FILE_ATTACHMENT_BYTES {
+                return Err("O arquivo excede o limite de 25 MB".into());
+            }
+            let image_mime = detected_image_mime(&bytes);
+            if image_mime.is_some() && bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
                 return Err("A imagem excede o limite de 5 MB".into());
             }
-            let mime = detected_image_mime(&bytes)
-                .ok_or_else(|| "O anexo não é uma imagem compatível".to_string())?;
+            let mime = image_mime
+                .or_else(|| {
+                    (!attachment.mime_type.is_empty()).then_some(attachment.mime_type.as_str())
+                })
+                .unwrap_or("application/octet-stream")
+                .to_string();
             let directory = app
                 .path()
                 .app_cache_dir()
                 .map_err(|error| error.to_string())?
                 .join("prompt-attachments");
             fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-            let extension = extension_for_mime(mime);
+            let name = safe_attachment_name(&attachment.name, index, &mime);
             let path = directory.join(format!(
-                "{}-{index}.{extension}",
-                crate::state::now_millis()
+                "{}-{index}-{}",
+                crate::state::now_millis(),
+                cache_attachment_name(&name)
             ));
             fs::write(&path, bytes).map_err(|error| error.to_string())?;
-            (path.to_string_lossy().to_string(), mime)
+            (
+                path.to_string_lossy().to_string(),
+                mime,
+                image_mime.is_some(),
+            )
         } else {
-            return Err("O anexo não contém uma imagem".into());
+            return Err("O anexo não contém um arquivo".into());
         };
-        if !attachment.mime_type.is_empty() && attachment.mime_type != detected_mime {
+        if is_image && !attachment.mime_type.is_empty() && attachment.mime_type != detected_mime {
             return Err("O tipo informado não corresponde ao conteúdo da imagem".into());
         }
-        let name = safe_attachment_name(&attachment.name, index, detected_mime);
+        let name = safe_attachment_name(&attachment.name, index, &detected_mime);
         prepared.push(PreparedPromptAttachment {
             path,
+            is_image,
             display: PromptAttachment {
                 id: format!("attachment:{}:{index}", crate::state::now_millis()),
                 name,
-                mime_type: detected_mime.into(),
-                preview_data_url: preview,
+                mime_type: detected_mime,
+                preview_data_url: if is_image { preview } else { String::new() },
             },
         });
     }
@@ -476,11 +514,9 @@ fn prompt_with_attachment_paths(prompt: &str, paths: &[String]) -> String {
     if !value.is_empty() {
         value.push_str("\n\n");
     }
-    value.push_str("Images attached through Lume. Inspect these local files:\n");
+    value.push_str("Files attached through Lume. Inspect these local paths:\n");
     for path in paths {
-        value.push_str("- ");
-        value.push_str(path);
-        value.push('\n');
+        value.push_str(&format!("- {path:?}\n"));
     }
     value
 }
@@ -514,7 +550,31 @@ fn safe_attachment_name(name: &str, index: usize, mime: &str) -> String {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(str::to_string);
-    name.unwrap_or_else(|| format!("image-{}.{}", index + 1, extension_for_mime(mime)))
+    name.unwrap_or_else(|| {
+        if mime.starts_with("image/") {
+            format!("image-{}.{}", index + 1, extension_for_mime(mime))
+        } else {
+            format!("file-{}", index + 1)
+        }
+    })
+}
+
+fn cache_attachment_name(name: &str) -> String {
+    let value = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if value.is_empty() {
+        "attachment".into()
+    } else {
+        value
+    }
 }
 
 pub fn terminate_session(
@@ -635,6 +695,25 @@ mod tests {
 
         assert!(preview.starts_with("data:image/png;base64,"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_attachments_are_added_as_quoted_local_paths() {
+        let prompt = prompt_with_attachment_paths(
+            "Inspect this workbook",
+            &["/tmp/report \"final\".xlsx".into()],
+        );
+
+        assert!(prompt.starts_with("Inspect this workbook\n\nFiles attached through Lume."));
+        assert!(prompt.contains(r#""/tmp/report \"final\".xlsx""#));
+    }
+
+    #[test]
+    fn cached_attachment_names_cannot_create_nested_paths() {
+        assert_eq!(
+            cache_attachment_name("../monthly report.xlsx"),
+            ".._monthly_report.xlsx"
+        );
     }
 
     #[test]

@@ -475,6 +475,17 @@ impl TerminalWindows {
         Ok(())
     }
 
+    pub fn hide(&self, app: &AppHandle, label: &str) -> Result<(), String> {
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
+        self.restore_fullscreen_group_for_member(app, label);
+        emit_dock_preview(app, label, None);
+        window.hide().map_err(|error| error.to_string())?;
+        emit_windows_changed(app);
+        Ok(())
+    }
+
     pub fn close(&self, app: &AppHandle, label: &str) -> Result<(), String> {
         let window = app
             .get_webview_window(label)
@@ -576,7 +587,7 @@ impl TerminalWindows {
                             y,
                             false,
                             &monitors,
-                            true,
+                            false,
                         );
                     }
                     last_position = Some((x, y));
@@ -590,7 +601,7 @@ impl TerminalWindows {
                                 y,
                                 true,
                                 &monitors,
-                                true,
+                                false,
                             );
                         }
                         break;
@@ -615,6 +626,12 @@ impl TerminalWindows {
                 }
                 error.to_string()
             })?;
+        window.start_dragging().map_err(|error| {
+            if let Ok(mut active) = self.native_drags.lock() {
+                active.remove(&label);
+            }
+            error.to_string()
+        })?;
         Ok(())
     }
 

@@ -4,6 +4,14 @@ export interface FileChangeSummary {
   removed: number;
 }
 
+export function displayFileChangePath(path: string): string {
+  const normalized = path.trim();
+  const isExternal =
+    /^(?:[a-z]:[\\/]|[\\/]{1,2}|\.\.[\\/])/i.test(normalized);
+  if (isExternal) return normalized;
+  return normalized.split(/[\\/]/).pop() || normalized;
+}
+
 function cleanPath(value: string, workingDirectory?: string): string | null {
   let path = value.trim().replace(/^["']|["']$/g, "");
   const patchPath = path.match(
