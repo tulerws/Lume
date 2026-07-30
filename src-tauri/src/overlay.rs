@@ -115,63 +115,6 @@ mod linux {
         .as_ref()
     }
 
-    fn move_xwayland_frame(surface: &gtk::gdk::Window, x: i32, y: i32) -> bool {
-        let Some(api) = x11_api() else {
-            return false;
-        };
-        let Ok(api) = api.lock() else {
-            return false;
-        };
-
-        unsafe {
-            let surface_pointer: *mut gtk::gdk::ffi::GdkWindow = surface.to_glib_none().0;
-            let client = gdkx11::ffi::gdk_x11_window_get_xid(surface_pointer.cast());
-            let mut root = 0;
-            let mut parent = 0;
-            let mut children = std::ptr::null_mut();
-            let mut child_count = 0;
-            if client == 0
-                || (api.functions.XQueryTree)(
-                    api.display,
-                    client,
-                    &mut root,
-                    &mut parent,
-                    &mut children,
-                    &mut child_count,
-                ) == 0
-            {
-                return false;
-            }
-            if !children.is_null() {
-                (api.functions.XFree)(children.cast());
-            }
-
-            let frame = if parent != 0 && parent != root {
-                parent
-            } else {
-                client
-            };
-            let mut attributes: xlib::XSetWindowAttributes = std::mem::zeroed();
-            attributes.override_redirect = xlib::True;
-            (api.functions.XChangeWindowAttributes)(
-                api.display,
-                frame,
-                xlib::CWOverrideRedirect,
-                &mut attributes,
-            );
-            (api.functions.XMoveWindow)(api.display, frame, x, y);
-            attributes.override_redirect = xlib::False;
-            (api.functions.XChangeWindowAttributes)(
-                api.display,
-                frame,
-                xlib::CWOverrideRedirect,
-                &mut attributes,
-            );
-            (api.functions.XSync)(api.display, xlib::False);
-        }
-        true
-    }
-
     pub fn xwayland_drag_target(window: &WebviewWindow) -> Option<super::XwaylandDragTarget> {
         if std::env::var("LUME_LINUX_BACKEND").ok().as_deref() != Some("xwayland-fallback") {
             return None;
@@ -644,17 +587,7 @@ mod linux {
             };
             let target_x = monitor.position().x + x;
             let target_y = monitor.position().y + y;
-            if window.label().starts_with("terminal-") {
-                if let Some(surface) = gtk_window.window() {
-                    if !move_xwayland_frame(&surface, target_x, target_y) {
-                        surface.move_(target_x, target_y);
-                    }
-                } else {
-                    gtk_window.move_(target_x, target_y);
-                }
-            } else {
-                gtk_window.move_(target_x, target_y);
-            }
+            gtk_window.move_(target_x, target_y);
             return true;
         }
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {

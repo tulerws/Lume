@@ -34,7 +34,6 @@
   import { resolveTerminalSession } from "$lib/sessionIdentity";
   import {
     beginLayeredTerminalResize,
-    beginTerminalNativeDrag,
     answerQuestion as answerInteractiveQuestion,
     cancelTerminalWindowMove,
     closeTerminalWindow,
@@ -1074,20 +1073,6 @@
     if ((event.target as HTMLElement).closest("button, input, textarea, form")) return;
     if (displayBackend === "gnome-wayland-limited") {
       message = "Window dragging requires XWayland in GNOME.";
-      return;
-    }
-    if (displayBackend === "xwayland-fallback") {
-      event.preventDefault();
-      dragging = true;
-      nativeDragActive = true;
-      dockMovingLabel = null;
-      dockPreview = null;
-      void beginTerminalNativeDrag(label)
-        .catch((error) => {
-          nativeDragActive = false;
-          dragging = false;
-          message = String(error).replace(/^Error:\s*/, "");
-        });
       return;
     }
     if (isWindows || displayBackend === "native-gnome") {
