@@ -164,9 +164,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
             let working_directory = explicit_working_directory
                 .or_else(|| process.cwd().map(|path| path.to_string_lossy().to_string()));
             if agent == AgentKind::Codex
-                && working_directory
-                    .as_deref()
-                    .is_some_and(is_codex_internal_workspace)
+                && is_codex_internal_process(&system, pid, working_directory.as_deref())
             {
                 return None;
             }
@@ -254,9 +252,53 @@ fn command_working_directory(command: &[std::ffi::OsString]) -> Option<String> {
     None
 }
 
-fn is_codex_internal_workspace(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_lowercase();
-    normalized.contains("/.codex/memories")
+fn is_codex_internal_process(
+    system: &System,
+    mut pid: sysinfo::Pid,
+    working_directory: Option<&str>,
+) -> bool {
+    if working_directory.is_some_and(crate::session_filters::is_codex_internal_workspace) {
+        return true;
+    }
+    for _ in 0..12 {
+        let Some(process) = system.process(pid) else {
+            break;
+        };
+        if process.cwd().is_some_and(|path| {
+            crate::session_filters::is_codex_internal_workspace(&path.to_string_lossy())
+        }) || command_has_codex_internal_workspace(process.cmd())
+        {
+            return true;
+        }
+        let Some(parent) = process.parent() else {
+            break;
+        };
+        pid = parent;
+    }
+    false
+}
+
+fn command_has_codex_internal_workspace(command: &[std::ffi::OsString]) -> bool {
+    let mut parts = command.iter().map(|part| part.to_string_lossy());
+    while let Some(part) = parts.next() {
+        if matches!(part.as_ref(), "--command-cwd" | "--sandbox-policy-cwd") {
+            if parts
+                .next()
+                .is_some_and(|path| crate::session_filters::is_codex_internal_workspace(&path))
+            {
+                return true;
+            }
+            continue;
+        }
+        if ["--command-cwd=", "--sandbox-policy-cwd="]
+            .iter()
+            .find_map(|prefix| part.strip_prefix(prefix))
+            .is_some_and(crate::session_filters::is_codex_internal_workspace)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Subcomandos do Claude Code que são infraestrutura, não conversas.
@@ -537,13 +579,21 @@ mod tests {
 
     #[test]
     fn codex_memory_maintenance_is_not_a_user_session() {
-        assert!(is_codex_internal_workspace("/home/user/.codex/memories"));
-        assert!(is_codex_internal_workspace(
-            "C:\\Users\\user\\.codex\\memories\\2026"
-        ));
-        assert!(!is_codex_internal_workspace(
-            "/home/user/Documents/memories"
-        ));
+        let command = [
+            "codex-linux-sandbox",
+            "--sandbox-policy-cwd",
+            "/home/user/.codex/memories",
+            "codex",
+        ]
+        .map(std::ffi::OsString::from);
+        assert!(command_has_codex_internal_workspace(&command));
+        let regular = [
+            "codex-linux-sandbox",
+            "--command-cwd=/home/user/Documents/memories",
+            "codex",
+        ]
+        .map(std::ffi::OsString::from);
+        assert!(!command_has_codex_internal_workspace(&regular));
     }
 
     #[test]

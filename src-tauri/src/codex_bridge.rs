@@ -58,6 +58,12 @@ struct ActiveProxyConnection {
 
 type ActiveProxyThreads = Arc<Mutex<HashMap<String, ActiveProxyConnection>>>;
 
+#[derive(Clone, Debug)]
+pub struct PreparedThread {
+    pub thread_id: String,
+    pub permission_profile: PermissionProfile,
+}
+
 pub struct CodexBridge {
     process: Arc<Mutex<Option<Child>>>,
     queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
@@ -105,6 +111,22 @@ impl CodexBridge {
 
     pub fn ensure_server(&self) -> Result<(), String> {
         ensure_server_process(&self.process)
+    }
+
+    pub fn prepare_thread(
+        &self,
+        working_directory: &str,
+        resume_id: Option<&str>,
+        permission_mode: Option<&AccessMode>,
+        approval_policy: Option<&str>,
+    ) -> Result<PreparedThread, String> {
+        self.ensure_server()?;
+        prepare_thread_connection(
+            working_directory,
+            resume_id,
+            permission_mode,
+            approval_policy,
+        )
     }
 
     pub fn collaboration_mode(&self, thread_id: &str) -> Result<String, String> {
@@ -728,6 +750,87 @@ fn prompt_connection(
     Ok(server)
 }
 
+fn prepare_thread_connection(
+    working_directory: &str,
+    resume_id: Option<&str>,
+    permission_mode: Option<&AccessMode>,
+    approval_policy: Option<&str>,
+) -> Result<PreparedThread, String> {
+    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }
+        }),
+    )?;
+    wait_for_plain_value_response(&mut server, 1)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+
+    let (method, params) = prepare_thread_request_params(
+        working_directory,
+        resume_id,
+        permission_mode,
+        approval_policy,
+    );
+    let permission_profile = profile_from_params(&params, direct_profile());
+    send_json(
+        &mut server,
+        json!({ "method": method, "id": 2, "params": params }),
+    )?;
+    let response = wait_for_plain_value_response(&mut server, 2)?;
+    let thread_id = response
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "The Codex App Server did not return the thread id".to_string())?
+        .to_string();
+
+    Ok(PreparedThread {
+        thread_id,
+        permission_profile,
+    })
+}
+
+fn prepare_thread_request_params(
+    working_directory: &str,
+    resume_id: Option<&str>,
+    permission_mode: Option<&AccessMode>,
+    approval_policy: Option<&str>,
+) -> (&'static str, Value) {
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), json!(working_directory));
+    let method = if let Some(thread_id) = resume_id {
+        params.insert("threadId".into(), json!(thread_id));
+        "thread/resume"
+    } else {
+        params.insert("serviceName".into(), json!("lume"));
+        "thread/start"
+    };
+    if let Some(sandbox) = permission_mode.and_then(|mode| match mode {
+        AccessMode::ReadOnly | AccessMode::Plan => Some("readOnly"),
+        AccessMode::WorkspaceWrite => Some("workspaceWrite"),
+        AccessMode::FullAccess => Some("dangerFullAccess"),
+        AccessMode::Custom => None,
+    }) {
+        params.insert("sandbox".into(), json!(sandbox));
+    }
+    if approval_policy.is_some_and(|policy| matches!(policy, "untrusted" | "on-request" | "never"))
+    {
+        params.insert("approvalPolicy".into(), json!(approval_policy));
+    }
+    (method, Value::Object(params))
+}
+
 fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String]) -> Value {
     prompt_turn_request_with_id(thread_id, prompt, attachment_paths, json!(3))
 }
@@ -981,6 +1084,30 @@ fn wait_for_response(
         {
             socket.send(response).map_err(|error| error.to_string())?;
         }
+    }
+}
+
+fn wait_for_plain_value_response(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    expected_id: i64,
+) -> Result<Value, String> {
+    loop {
+        let message = socket.read().map_err(|error| error.to_string())?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value = serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+        if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex refused the request")
+                .to_string());
+        }
+        return Ok(value);
     }
 }
 
@@ -2538,5 +2665,33 @@ mod tests {
         .activity
         .expect("atividade de diff");
         assert_eq!(diff.files, vec!["src/old.rs", "src/new.rs"]);
+    }
+
+    #[test]
+    fn new_threads_are_created_with_the_selected_project_profile() {
+        let (method, params) = prepare_thread_request_params(
+            "/work/lume",
+            None,
+            Some(&AccessMode::WorkspaceWrite),
+            Some("on-request"),
+        );
+
+        assert_eq!(method, "thread/start");
+        assert_eq!(text_at(&params, "cwd"), Some("/work/lume"));
+        assert_eq!(text_at(&params, "serviceName"), Some("lume"));
+        assert_eq!(text_at(&params, "sandbox"), Some("workspaceWrite"));
+        assert_eq!(text_at(&params, "approvalPolicy"), Some("on-request"));
+        assert!(params.get("threadId").is_none());
+    }
+
+    #[test]
+    fn resumed_threads_keep_the_known_id_before_the_first_prompt() {
+        let (method, params) =
+            prepare_thread_request_params("/work/lume", Some("thread-1"), None, None);
+
+        assert_eq!(method, "thread/resume");
+        assert_eq!(text_at(&params, "threadId"), Some("thread-1"));
+        assert_eq!(text_at(&params, "cwd"), Some("/work/lume"));
+        assert!(params.get("serviceName").is_none());
     }
 }

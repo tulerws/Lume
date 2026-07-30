@@ -34,6 +34,7 @@ export const defaultPreferences: Preferences = {
   language: "en",
   darkMode: undefined,
   soundEnabled: true,
+  soundVolume: 55,
   autostart: true,
   overlayX: undefined,
   overlayY: undefined,

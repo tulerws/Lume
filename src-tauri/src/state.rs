@@ -822,11 +822,14 @@ impl AppState {
             }
             HookEventKind::WaitingForInput => {
                 session.status = SessionStatus::WaitingForInput;
-                session.status_label = event
-                    .status_label
-                    .unwrap_or_else(|| "Aguardando sua resposta".into());
+                session.status_label = if session.pending_question.is_some() {
+                    "Aguardando sua resposta".into()
+                } else {
+                    event
+                        .status_label
+                        .unwrap_or_else(|| "Aguardando sua resposta".into())
+                };
                 session.pending_permission = None;
-                session.pending_question = None;
                 None
             }
             HookEventKind::Completed | HookEventKind::SessionEnded => {
@@ -3640,6 +3643,47 @@ mod tests {
             .expect("entrega")
             .expect("resposta presente");
         assert_eq!(answers[0].answers, vec!["Safe"]);
+    }
+
+    #[test]
+    fn claude_input_notification_does_not_hide_an_interactive_question() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut question = started_event("claude:chat-1", 4242);
+        question.agent = AgentKind::ClaudeCode;
+        question.event = HookEventKind::QuestionRequest;
+        question.question = Some(crate::domain::PendingQuestion {
+            id: "question-request".into(),
+            questions: vec![crate::domain::InteractiveQuestion {
+                id: "approach".into(),
+                header: "Approach".into(),
+                question: "Which approach?".into(),
+                is_other: true,
+                is_secret: false,
+                options: vec![crate::domain::QuestionOption {
+                    label: "Safe".into(),
+                    description: String::new(),
+                }],
+            }],
+            requested_at: "1".into(),
+        });
+        state.ingest(question).expect("pergunta");
+
+        let mut waiting = started_event("claude:chat-1", 4242);
+        waiting.agent = AgentKind::ClaudeCode;
+        waiting.event = HookEventKind::WaitingForInput;
+        waiting.status_label = Some("Esperando ação".into());
+        state.ingest(waiting).expect("notificação");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::WaitingForInput);
+        assert_eq!(session.status_label, "Aguardando sua resposta");
+        assert_eq!(
+            session
+                .pending_question
+                .as_ref()
+                .map(|question| question.id.as_str()),
+            Some("question-request")
+        );
     }
 
     #[test]

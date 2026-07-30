@@ -14,8 +14,7 @@ export function terminalMatchesSession(
   if (terminal.sessionNativeId) {
     return (
       terminal.sessionNativeId === session.nativeSessionId &&
-      terminal.sessionAgent === session.agent &&
-      terminal.sessionSource === session.source
+      terminal.sessionAgent === session.agent
     );
   }
   return Boolean(
@@ -23,8 +22,11 @@ export function terminalMatchesSession(
     session.processId &&
     terminal.sessionProcessId === session.processId &&
     terminal.sessionAgent === session.agent &&
-    terminal.sessionSource === session.source &&
-    !session.nativeSessionId
+    (
+      !terminal.sessionWorkingDirectory ||
+      normalizedDirectory(terminal.sessionWorkingDirectory) ===
+        normalizedDirectory(session.workingDirectory)
+    )
   );
 }
 
@@ -38,8 +40,7 @@ export function resolveTerminalSession<T extends AgentSession>(
   if (terminal.sessionNativeId) {
     return sessions.find((session) =>
       terminal.sessionNativeId === session.nativeSessionId &&
-      terminal.sessionAgent === session.agent &&
-      terminal.sessionSource === session.source
+      terminal.sessionAgent === session.agent
     );
   }
 
@@ -47,8 +48,7 @@ export function resolveTerminalSession<T extends AgentSession>(
   if (terminal.sessionProcessId) {
     const processMatches = sessions.filter((session) =>
       terminal.sessionProcessId === session.processId &&
-      terminal.sessionAgent === session.agent &&
-      terminal.sessionSource === session.source
+      terminal.sessionAgent === session.agent
     );
     const contextualProcessMatches = expectedDirectory
       ? processMatches.filter((session) =>

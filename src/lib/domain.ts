@@ -162,6 +162,7 @@ export interface Preferences {
   language: "en" | "pt-BR";
   darkMode?: boolean;
   soundEnabled: boolean;
+  soundVolume: number;
   autostart: boolean;
   monitorId?: string;
   overlayX?: number;

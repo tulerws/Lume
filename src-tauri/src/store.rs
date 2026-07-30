@@ -471,6 +471,7 @@ mod tests {
         assert!(preferences.overlay_y.is_none());
         assert!(preferences.dark_mode.is_none());
         assert_eq!(preferences.language, "en");
+        assert_eq!(preferences.sound_volume, 55);
         assert!(preferences.project_profiles.is_empty());
         assert!(preferences.session_aliases.is_empty());
         assert!(preferences.whiteboard_layouts.is_empty());

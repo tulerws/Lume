@@ -185,7 +185,9 @@ mod linux {
         })
     }
 
-    pub fn drag_snapshot_target(target: super::XwaylandDragTarget) -> Option<(bool, i32, i32)> {
+    pub fn xwayland_pointer_snapshot_target(
+        target: super::XwaylandDragTarget,
+    ) -> Option<(bool, i32, i32, i32, i32)> {
         let api = x11_api()?;
         let api = api.lock().ok()?;
         unsafe {
@@ -251,8 +253,19 @@ mod linux {
             {
                 return None;
             }
-            Some((mask & xlib::Button1Mask != 0, frame_x, frame_y))
+            Some((
+                mask & xlib::Button1Mask != 0,
+                root_x,
+                root_y,
+                frame_x,
+                frame_y,
+            ))
         }
+    }
+
+    pub fn drag_snapshot_target(target: super::XwaylandDragTarget) -> Option<(bool, i32, i32)> {
+        let (pressed, _, _, frame_x, frame_y) = xwayland_pointer_snapshot_target(target)?;
+        Some((pressed, frame_x, frame_y))
     }
 
     pub fn drag_snapshot(window: &WebviewWindow) -> Option<(bool, i32, i32)> {
@@ -730,10 +743,12 @@ pub fn xwayland_drag_target(window: &tauri::WebviewWindow) -> Option<XwaylandDra
     }
 }
 
-pub fn drag_snapshot_target(target: XwaylandDragTarget) -> Option<(bool, i32, i32)> {
+pub fn xwayland_pointer_snapshot_target(
+    target: XwaylandDragTarget,
+) -> Option<(bool, i32, i32, i32, i32)> {
     #[cfg(target_os = "linux")]
     {
-        linux::drag_snapshot_target(target)
+        linux::xwayland_pointer_snapshot_target(target)
     }
     #[cfg(not(target_os = "linux"))]
     {

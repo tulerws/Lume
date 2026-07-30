@@ -519,10 +519,11 @@ impl TerminalWindows {
             "XWayland window is not ready for dragging. Try again in a moment.".to_string()
         })?;
         let monitors = monitor_bounds(&window)?;
-        let initial_position = window
-            .outer_position()
-            .ok()
-            .map(|position| (position.x, position.y));
+        let (_, pointer_x, pointer_y, frame_x, frame_y) =
+            overlay::xwayland_pointer_snapshot_target(target)
+                .ok_or_else(|| "Could not read the XWayland pointer position".to_string())?;
+        let grab_offset_x = pointer_x - frame_x;
+        let grab_offset_y = pointer_y - frame_y;
 
         {
             let mut active = self
@@ -542,7 +543,7 @@ impl TerminalWindows {
             .name("lume-xwayland-drag".into())
             .spawn(move || {
                 let started = Instant::now();
-                let mut last_position = initial_position;
+                let mut last_position = Some((frame_x, frame_y));
                 let mut saw_pressed = false;
                 let mut saw_movement = false;
                 let mut failed_reads = 0;
@@ -551,7 +552,9 @@ impl TerminalWindows {
                     if started.elapsed() > Duration::from_secs(120) {
                         break;
                     }
-                    let Some((pressed, x, y)) = overlay::drag_snapshot_target(target) else {
+                    let Some((pressed, pointer_x, pointer_y, _, _)) =
+                        overlay::xwayland_pointer_snapshot_target(target)
+                    else {
                         failed_reads += 1;
                         if failed_reads >= 8 {
                             break;
@@ -561,8 +564,10 @@ impl TerminalWindows {
                     };
                     failed_reads = 0;
                     saw_pressed |= pressed;
+                    let x = pointer_x - grab_offset_x;
+                    let y = pointer_y - grab_offset_y;
                     let moved = last_position.is_some_and(|position| position != (x, y));
-                    if moved {
+                    if moved && (pressed || saw_pressed) {
                         saw_movement = true;
                         let _ = registry.sync_native_position_on_monitors(
                             &app,
@@ -571,6 +576,7 @@ impl TerminalWindows {
                             y,
                             false,
                             &monitors,
+                            true,
                         );
                     }
                     last_position = Some((x, y));
@@ -584,6 +590,7 @@ impl TerminalWindows {
                                 y,
                                 true,
                                 &monitors,
+                                true,
                             );
                         }
                         break;
@@ -608,12 +615,6 @@ impl TerminalWindows {
                 }
                 error.to_string()
             })?;
-        window.start_dragging().map_err(|error| {
-            if let Ok(mut active) = self.native_drags.lock() {
-                active.remove(&label);
-            }
-            error.to_string()
-        })?;
         Ok(())
     }
 
@@ -696,7 +697,7 @@ impl TerminalWindows {
             .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
         let monitors = monitor_bounds(&window)?;
         self.sync_native_position_on_monitors(
-            app, label, physical_x, physical_y, finalize, &monitors,
+            app, label, physical_x, physical_y, finalize, &monitors, false,
         )
     }
 
@@ -708,6 +709,7 @@ impl TerminalWindows {
         physical_y: i32,
         finalize: bool,
         monitors: &[MonitorBounds],
+        move_current_window: bool,
     ) -> Result<TerminalWindowState, String> {
         if self.is_settling(label) {
             return self.state(label);
@@ -812,7 +814,7 @@ impl TerminalWindows {
             let states = self
                 .states_for_labels(&update.moving_labels)?
                 .into_iter()
-                .filter(|state| state.label != label)
+                .filter(|state| move_current_window || state.label != label)
                 .collect::<Vec<_>>();
             move_native_windows(app, &states, false);
             if finalize {
@@ -894,15 +896,16 @@ impl TerminalWindows {
         label: &str,
     ) -> Result<Option<bool>, String> {
         let current = self.state(label)?;
-        let Some(group_id) = current.group_id.clone() else {
-            return Ok(None);
-        };
+        let fullscreen_id = current
+            .group_id
+            .clone()
+            .unwrap_or_else(|| format!("window:{label}"));
 
         if let Some(saved) = self
             .fullscreen_groups
             .lock()
             .map_err(|_| "Não foi possível acessar o fullscreen do grupo".to_string())?
-            .remove(&group_id)
+            .remove(&fullscreen_id)
         {
             let transitions = {
                 let mut placements = self
@@ -948,12 +951,20 @@ impl TerminalWindows {
                 .placements
                 .lock()
                 .map_err(|_| "Não foi possível expandir o grupo".to_string())?;
-            let group = placements
-                .values()
-                .filter(|entry| entry.group.as_deref() == Some(&group_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if group.len() < 2 {
+            let group = if let Some(group_id) = current.group_id.as_deref() {
+                placements
+                    .values()
+                    .filter(|entry| entry.group.as_deref() == Some(group_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                placements
+                    .get(label)
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            if group.is_empty() {
                 return Ok(None);
             }
 
@@ -1031,24 +1042,21 @@ impl TerminalWindows {
         self.fullscreen_groups
             .lock()
             .map_err(|_| "Não foi possível guardar o fullscreen do grupo".to_string())?
-            .insert(group_id, saved);
+            .insert(fullscreen_id, saved);
         self.animate_native_windows(app, transitions);
         emit_windows_changed(app);
         Ok(Some(true))
     }
 
     pub fn group_fullscreen_active(&self, label: &str) -> bool {
-        let group = self
-            .placements
+        self.fullscreen_groups
             .lock()
-            .ok()
-            .and_then(|placements| placements.get(label).and_then(|entry| entry.group.clone()));
-        group.is_some_and(|group| {
-            self.fullscreen_groups
-                .lock()
-                .map(|groups| groups.contains_key(&group))
-                .unwrap_or(false)
-        })
+            .map(|groups| {
+                groups
+                    .values()
+                    .any(|entries| entries.iter().any(|entry| entry.label == label))
+            })
+            .unwrap_or(false)
     }
 
     fn restore_fullscreen_group_for_member(&self, app: &AppHandle, label: &str) {

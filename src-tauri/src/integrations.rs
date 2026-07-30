@@ -161,6 +161,9 @@ fn codex_resume_metadata(value: &Value, updated_at: i64) -> Option<ResumableSess
     }
     let id = payload.get("id")?.as_str()?.to_string();
     let working_directory = payload.get("cwd")?.as_str()?.to_string();
+    if crate::session_filters::is_codex_internal_workspace(&working_directory) {
+        return None;
+    }
     let source = match (
         payload.get("originator").and_then(Value::as_str),
         payload.get("source").and_then(Value::as_str),
@@ -796,6 +799,19 @@ mod tests {
                 }
             }),
             43,
+        )
+        .is_none());
+        assert!(codex_resume_metadata(
+            &json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "memory-thread",
+                    "cwd": "/home/user/.codex/memories",
+                    "originator": "codex-tui",
+                    "source": "cli"
+                }
+            }),
+            44,
         )
         .is_none());
     }

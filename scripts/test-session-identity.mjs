@@ -72,6 +72,18 @@ assert.equal(
   promoted.id,
   "a provisional process terminal may follow one unambiguous promoted session",
 );
+assert.equal(
+  resolveTerminalSession(
+    provisionalTerminal,
+    [session("codex:promoted-source", {
+      nativeSessionId: "thread-promoted-source",
+      processId: 4242,
+      source: "vscode",
+    })],
+  )?.id,
+  "codex:promoted-source",
+  "a terminal must survive a temporary source correction while its process is promoted",
+);
 
 const contextualTerminal = terminal({ sessionProcessId: 43130 });
 assert.equal(

@@ -807,7 +807,7 @@
         if (session && windowState) {
           await refresh();
           if (!session && windowState.sessionSource === "cli") {
-            await closeTerminal();
+            await initializeTerminal();
           }
         } else {
           await initializeTerminal();
@@ -1054,7 +1054,7 @@
 
   function beginDrag(event: PointerEvent) {
     if (event.button !== 0 || !windowState) return;
-    if (fullscreen && windowState.docked) return;
+    if (fullscreen) return;
     if ((event.target as HTMLElement).closest("button, input, textarea, form")) return;
     if (displayBackend === "gnome-wayland-limited") {
       message = "Window dragging requires XWayland in GNOME.";
@@ -1212,7 +1212,11 @@
 
   async function toggleFullscreen() {
     try {
-      if (windowState?.docked) {
+      if (
+        windowState?.docked ||
+        windowState?.layered ||
+        displayBackend === "xwayland-fallback"
+      ) {
         const groupFullscreen = await toggleTerminalGroupFullscreen(label);
         if (groupFullscreen !== null) {
           fullscreen = groupFullscreen;
@@ -1232,7 +1236,7 @@
   async function beginResize(event: PointerEvent, direction: ResizeDirection) {
     const state = windowState;
     if (event.button !== 0 || !state) return;
-    if (fullscreen && state.docked) return;
+    if (fullscreen) return;
     event.preventDefault();
     event.stopPropagation();
     dragging = false;

@@ -814,6 +814,11 @@ fn session_metadata(record: &CodexRecord) -> Option<SessionMetadata> {
         || record.payload.thread_source.as_deref() == Some("subagent")
         || record
             .payload
+            .cwd
+            .as_deref()
+            .is_some_and(crate::session_filters::is_codex_internal_workspace)
+        || record
+            .payload
             .source
             .as_ref()
             .and_then(|source| source.get("subagent"))
@@ -963,6 +968,9 @@ mod tests {
         let subagent = record(
             r#"{"type":"session_meta","payload":{"id":"chat-3","originator":"codex-tui","source":{"subagent":{"other":"guardian"}},"parent_thread_id":"chat-2","thread_source":"subagent","cwd":"/work/lume"}}"#,
         );
+        let memories = record(
+            r#"{"type":"session_meta","payload":{"id":"chat-4","originator":"codex-tui","source":"cli","cwd":"/home/user/.codex/memories"}}"#,
+        );
 
         assert_eq!(
             session_metadata(&vscode).expect("VS Code").source,
@@ -973,6 +981,7 @@ mod tests {
             SessionSource::Cli
         );
         assert!(session_metadata(&subagent).is_none());
+        assert!(session_metadata(&memories).is_none());
     }
 
     #[test]

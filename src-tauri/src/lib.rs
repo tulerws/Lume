@@ -15,6 +15,7 @@ mod mobile_gateway;
 mod mobile_server;
 mod overlay;
 mod protocol;
+mod session_filters;
 mod state;
 mod store;
 mod terminal_windows;
@@ -22,8 +23,8 @@ mod terminal_windows;
 use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
-    AgentKind, AgentSession, HistoryEntry, PermissionAction, Preferences, PromptAttachmentInput,
-    PromptDelivery, QuestionAnswer, ResultNote,
+    AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PermissionAction, Preferences,
+    PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionSource,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -874,21 +875,77 @@ fn reveal_plugin_directory(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 fn launch_session(
     app: AppHandle,
+    state: State<'_, AppState>,
     bridge: State<'_, codex_bridge::CodexBridge>,
-    request: LaunchRequest,
+    mut request: LaunchRequest,
 ) -> Result<(), String> {
+    if request.target == "vscode" && !integrations::vscode_status().configured {
+        return Err("Conecte o Lume Companion ao VS Code nos Ajustes".into());
+    }
     let executable = integrations::lume_executable()?;
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
+    let prepared_event = if request.agent == IntegrationKind::Codex {
+        let prepared = bridge.prepare_thread(
+            &request.working_directory,
+            request.resume_id.as_deref().filter(|_| request.resume),
+            request.permission_mode.as_ref(),
+            request.approval_policy.as_deref(),
+        )?;
+        request.resume = true;
+        request.resume_id = Some(prepared.thread_id.clone());
+        Some(prepared_codex_session_event(&request, prepared))
+    } else {
+        None
+    };
     let codex_remote = if request.agent == IntegrationKind::Codex {
-        bridge.ensure_server()?;
         Some(codex_bridge::PROXY_URL)
     } else {
         None
     };
-    launcher::launch(request, &executable, &app_data_dir, codex_remote)
+    launcher::launch(request, &executable, &app_data_dir, codex_remote)?;
+    if let Some(event) = prepared_event {
+        event_server::publish_event(&state, &app, event)?;
+    }
+    Ok(())
+}
+
+fn prepared_codex_session_event(
+    request: &LaunchRequest,
+    prepared: codex_bridge::PreparedThread,
+) -> HookEvent {
+    let project = std::path::Path::new(&request.working_directory)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    HookEvent {
+        event: HookEventKind::SessionStarted,
+        session_id: format!("codex-app-server:{}", prepared.thread_id),
+        agent: AgentKind::Codex,
+        agent_label: Some("Codex".into()),
+        session_name: None,
+        project,
+        source: Some(if request.target == "vscode" {
+            SessionSource::Vscode
+        } else {
+            SessionSource::Cli
+        }),
+        source_app: None,
+        status_label: Some("Esperando ação".into()),
+        started_at: None,
+        process_id: None,
+        native_session_id: Some(prepared.thread_id),
+        working_directory: Some(request.working_directory.clone()),
+        permission_profile: Some(prepared.permission_profile),
+        permission: None,
+        question: None,
+        last_response: None,
+        activity: None,
+        activities: Vec::new(),
+        wait_for_decision: false,
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1156,5 +1213,40 @@ mod tests {
         let args = vec!["lume".into(), "shortcut".into(), "palette".into()];
 
         assert_eq!(shortcut_action_from_args(&args), Some("palette"));
+    }
+
+    #[test]
+    fn prepared_codex_launch_is_visible_before_its_first_prompt() {
+        let request = LaunchRequest {
+            agent: IntegrationKind::Codex,
+            working_directory: "/work/lume".into(),
+            resume: true,
+            resume_id: Some("thread-1".into()),
+            target: "terminal".into(),
+            initial_prompt: None,
+            permission_mode: None,
+            approval_policy: None,
+        };
+        let event = prepared_codex_session_event(
+            &request,
+            codex_bridge::PreparedThread {
+                thread_id: "thread-1".into(),
+                permission_profile: domain::PermissionProfile {
+                    mode: domain::AccessMode::WorkspaceWrite,
+                    label: "Acesso ao projeto".into(),
+                    approval_policy: "on-request".into(),
+                    approvals_reviewer: None,
+                    can_respond_from_lume: true,
+                    available_actions: vec![PermissionAction::AllowOnce],
+                },
+            },
+        );
+
+        assert_eq!(event.native_session_id.as_deref(), Some("thread-1"));
+        assert_eq!(event.working_directory.as_deref(), Some("/work/lume"));
+        assert_eq!(event.source, Some(SessionSource::Cli));
+        assert!(event
+            .permission_profile
+            .is_some_and(|profile| profile.can_respond_from_lume));
     }
 }

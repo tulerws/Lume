@@ -2217,8 +2217,12 @@
       const AudioContextClass = window.AudioContext;
       const context = new AudioContextClass();
       const gain = context.createGain();
+      const peakVolume = 0.09 * Math.max(0, Math.min(100, preferences.soundVolume)) / 100;
       gain.gain.setValueAtTime(0.0001, context.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.045, context.currentTime + 0.015);
+      gain.gain.exponentialRampToValueAtTime(
+        Math.max(0.0001, peakVolume),
+        context.currentTime + 0.015,
+      );
       gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.42);
       gain.connect(context.destination);
 
@@ -3051,6 +3055,23 @@
                     updatePreference("soundEnabled", event.currentTarget.checked)}
                 />
                 <span></span>
+              </label>
+            </div>
+            <div class:disabled={!preferences.soundEnabled} class="setting-row sound-volume-row">
+              <div><strong>{tr("Sound volume", "Volume dos sons")}</strong><span>{tr("Adjust notification tones.", "Ajuste o volume dos alertas.")}</span></div>
+              <label class="volume-control">
+                <input
+                  aria-label={tr("Sound volume", "Volume dos sons")}
+                  disabled={!preferences.soundEnabled}
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={preferences.soundVolume}
+                  oninput={(event) =>
+                    updatePreference("soundVolume", Number(event.currentTarget.value))}
+                />
+                <output>{preferences.soundVolume}%</output>
               </label>
             </div>
             <div class="setting-row">
@@ -4072,6 +4093,11 @@
   .switch input:checked + span { background: #527c6c; }
   .switch input:checked + span::after { transform: translateX(14px); }
   .switch input:focus-visible + span { outline: 2px solid #83958d; outline-offset: 2px; }
+  .sound-volume-row.disabled { opacity: 0.52; }
+  .volume-control { width: 116px; display: flex; align-items: center; gap: 7px; }
+  .volume-control input { width: 82px; height: 16px; accent-color: #527c6c; cursor: pointer; }
+  .volume-control input:disabled { cursor: default; }
+  .volume-control output { width: 27px; color: #718078; font-size: 8px; font-variant-numeric: tabular-nums; text-align: right; }
 
   .field-row select { max-width: 120px; padding: 6px 23px 6px 8px; border: 1px solid rgba(92, 111, 103, 0.16); border-radius: 8px; color: #4b5a54; background: rgba(255, 255, 255, 0.52); font-size: 10px; }
   .launch-setting { padding: 14px 0 10px; display: grid; gap: 11px; }
