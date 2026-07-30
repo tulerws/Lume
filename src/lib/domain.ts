@@ -223,6 +223,7 @@ export interface IntegrationStatus {
 export interface ResumableSession {
   id: string;
   agent: IntegrationStatus["kind"];
+  name: string;
   project: string;
   workingDirectory: string;
   source: string;

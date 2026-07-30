@@ -285,32 +285,41 @@
     return session.sessionName?.trim() || session.project?.trim() || session.agentLabel;
   }
 
+  function sessionDirectoryName(session: AgentSession) {
+    const directory = session.workingDirectory?.trim().replace(/[\\/]+$/, "");
+    return directory?.split(/[\\/]/).pop() || session.project?.trim() || session.agentLabel;
+  }
+
   function currentExpandedSize() {
     return { width: expandedWidth, height: expandedHeight };
+  }
+
+  function applyExpandedHeight(nextHeight: number, resizeWindow: boolean) {
+    const clampedHeight = Math.min(
+      expandedMaxHeight,
+      Math.max(compactSize.height, Math.ceil(nextHeight)),
+    );
+    if (clampedHeight === expandedHeight) return;
+    const previousSize = currentExpandedSize();
+    const anchor = compactAnchorPosition ?? compactPositionFromExpanded(overlayPosition, previousSize);
+    expandedHeight = clampedHeight;
+    if (resizeWindow && isTauri && expanded && !morphing) {
+      compactAnchorPosition = anchor;
+      const target = currentExpandedSize();
+      const position = expandedPositionFromCompact(anchor, target);
+      overlayPosition = position;
+      void Promise.all([
+        setOverlaySurfaceSize(target.width, target.height),
+        moveOverlay(position.x, position.y, false, preferences.monitorId),
+      ]).catch(() => undefined);
+    }
   }
 
   function observePanelSize(node: HTMLElement) {
     let resizeFrame: number | null = null;
 
     const syncHeight = (resizeWindow: boolean) => {
-      const nextHeight = Math.min(
-        expandedMaxHeight,
-        Math.max(compactSize.height, Math.ceil(node.offsetHeight)),
-      );
-      if (nextHeight === expandedHeight) return;
-      const previousSize = currentExpandedSize();
-      const anchor = compactAnchorPosition ?? compactPositionFromExpanded(overlayPosition, previousSize);
-      expandedHeight = nextHeight;
-      if (resizeWindow && isTauri && expanded && !morphing) {
-        compactAnchorPosition = anchor;
-        const target = currentExpandedSize();
-        const position = expandedPositionFromCompact(anchor, target);
-        overlayPosition = position;
-        void Promise.all([
-          setOverlaySurfaceSize(target.width, target.height),
-          moveOverlay(position.x, position.y, false, preferences.monitorId),
-        ]).catch(() => undefined);
-      }
+      applyExpandedHeight(node.offsetHeight, resizeWindow);
     };
 
     const observer = new ResizeObserver(() => {
@@ -332,6 +341,21 @@
       },
     };
   }
+
+  let launcherSurfaceSync = 0;
+  async function syncLauncherSurface(open: boolean) {
+    const sync = ++launcherSurfaceSync;
+    await tick();
+    if (sync !== launcherSurfaceSync || !expanded || morphing) return;
+    const panel = document.querySelector<HTMLElement>(".panel");
+    if (!panel) return;
+    applyExpandedHeight(open ? expandedMaxHeight : panel.offsetHeight, true);
+  }
+
+  $effect(() => {
+    const open = launcherOpen;
+    if (expanded && !morphing) void syncLauncherSurface(open);
+  });
 
   const effectiveDark = $derived(preferences.darkMode ?? systemDark);
   $effect(() => {
@@ -532,20 +556,25 @@
     await checkForUpdates();
   }
 
-  async function checkForUpdates() {
+  async function checkForUpdates(): Promise<Update | null> {
     if (
       !isTauri ||
       updateState === "checking" ||
-      updateState === "available" ||
       updateState === "downloading" ||
       updateState === "ready"
-    ) return;
+    ) return pendingUpdate;
     updateState = "checking";
     updateDetail = tr("Checking for a new version…", "Procurando uma nova versão…");
     updateProgress = null;
 
     try {
-      const nextUpdate = await check({ timeout: 15_000 });
+      const nextUpdate = await check({
+        timeout: 15_000,
+        headers: {
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+      });
       if (pendingUpdate && pendingUpdate !== nextUpdate) await pendingUpdate.close();
       pendingUpdate = nextUpdate;
       availableVersion = nextUpdate?.version ?? null;
@@ -559,12 +588,24 @@
         updateState = "up_to_date";
         updateDetail = tr("You are using the latest version.", "Você está usando a versão mais recente.");
       }
+      return nextUpdate;
     } catch {
       updateState = "error";
       updateDetail = tr(
         "Could not check for updates right now. Try again shortly.",
         "Não foi possível verificar agora. Tente novamente em instantes.",
       );
+      return null;
+    }
+  }
+
+  async function handleUpdateButton() {
+    if (updateState === "checking" || updateState === "downloading" || updateState === "ready") {
+      return;
+    }
+    const nextUpdate = await checkForUpdates();
+    if (nextUpdate && updateState === "available") {
+      await installAvailableUpdate();
     }
   }
 
@@ -572,7 +613,7 @@
     for (let attempt = 0; updateState === "checking" && attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    if (!["available", "downloading", "ready"].includes(updateState)) {
+    if (!["downloading", "ready"].includes(updateState)) {
       await checkForUpdates();
     }
     if (!["available", "downloading", "ready"].includes(updateState)) return;
@@ -2402,7 +2443,7 @@
                       onclick={() => resumeStoredSession(stored)}
                     >
                       <span>
-                        <strong>{stored.project}</strong>
+                        <strong>{stored.name}</strong>
                         <small>{stored.source} · {relativeTime(stored.updatedAt)}</small>
                       </span>
                       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h8v8M13.5 5.5 5 14" /></svg>
@@ -2477,7 +2518,9 @@
                         <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
                       {/if}
                     </span>
-                    <span class="project-name">{session.project}</span>
+                    <span class="project-name" title={session.workingDirectory}>
+                      {sessionDirectoryName(session)}
+                    </span>
                     <span class="status-line status-{session.status}">
                       {#if session.status === "running"}
                         <span class="running-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -3384,14 +3427,14 @@
                   <span>{tr("Version", "Versão")} {appVersion}</span>
                 </div>
                 {#if updateState === "available"}
-                  <button class="update-available" type="button" onclick={installAvailableUpdate}>
+                  <button class="update-available" type="button" onclick={handleUpdateButton}>
                     {tr("Update to", "Atualizar para")} {availableVersion}
                   </button>
                 {:else}
                   <button
                     type="button"
                     disabled={updateState === "checking" || updateState === "downloading" || updateState === "ready"}
-                    onclick={checkForUpdates}
+                    onclick={handleUpdateButton}
                   >
                     {updateState === "checking"
                       ? tr("Checking…", "Verificando…")
@@ -3581,6 +3624,10 @@
     min-height: 390px;
   }
 
+  .panel.launcher-open {
+    overflow: visible;
+  }
+
   .panel.morphing:not(.measuring) {
     width: var(--morph-width);
     height: var(--morph-height);
@@ -3707,7 +3754,7 @@
   }
 
   .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
-  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; bottom: 12px; width: 320px; max-height: calc(100% - 65px); padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
+  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: calc(100vh - 65px); padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
   .launcher-row .agent-avatar { width: 25px; height: 25px; border-radius: 8px; font-size: 9px; }
@@ -3716,7 +3763,7 @@
   .launcher-row button:hover { background: rgba(78, 105, 93, 0.1); }
   .launcher-row button.active { color: #327a58; background: rgba(57, 139, 96, 0.1); }
   .launcher-row button:disabled { opacity: 0.45; }
-  .resume-session-list { max-height: 238px; padding: 2px 0 7px 32px; display: grid; gap: 3px; overflow-x: hidden; overflow-y: auto; }
+  .resume-session-list { padding: 2px 0 7px 32px; display: grid; gap: 3px; overflow: visible; }
   .resume-session-list > p { margin: 8px 2px; color: #89938f; font-size: 9px; }
   .resume-session { width: 100%; min-height: 39px; padding: 5px 7px 5px 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; border: 0; border-radius: 9px; color: #51665c; background: rgba(76, 104, 91, 0.045); text-align: left; cursor: pointer; }
   .resume-session:hover { background: rgba(61, 132, 96, 0.09); }

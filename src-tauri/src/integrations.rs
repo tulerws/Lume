@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -37,9 +37,16 @@ pub struct IntegrationStatus {
 pub struct ResumableSession {
     pub id: String,
     pub agent: IntegrationKind,
+    pub name: String,
     pub project: String,
     pub working_directory: String,
     pub source: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumePreview {
+    pub response: String,
     pub updated_at: i64,
 }
 
@@ -134,16 +141,76 @@ pub fn resumable_sessions(kind: &IntegrationKind) -> Result<Vec<ResumableSession
     Ok(sessions)
 }
 
+pub fn resume_preview(kind: &IntegrationKind, session_id: &str) -> Option<ResumePreview> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let filename_suffix = format!("-{session_id}");
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let root = match kind {
+        IntegrationKind::Codex => env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("sessions"),
+        IntegrationKind::Claude => home.join(".claude/projects"),
+        IntegrationKind::Gemini => return None,
+    };
+    let path = resume_files(&root).into_iter().find(|path| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|stem| stem == session_id || stem.ends_with(&filename_suffix))
+    })?;
+    let file = fs::File::open(&path).ok()?;
+    let response = match kind {
+        IntegrationKind::Codex => codex_last_response(BufReader::new(file)),
+        IntegrationKind::Claude => claude_last_response(BufReader::new(file)),
+        IntegrationKind::Gemini => None,
+    }?;
+    Some(ResumePreview {
+        response,
+        updated_at: file_updated_at(&path),
+    })
+}
+
 fn codex_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
+    let names = codex_session_names(root);
     resume_files(root)
         .into_iter()
         .filter_map(|path| {
             let file = fs::File::open(&path).ok()?;
             let first_line = BufReader::new(file).lines().next()?.ok()?;
             let value = serde_json::from_str::<Value>(&first_line).ok()?;
-            codex_resume_metadata(&value, file_updated_at(&path))
+            let mut session = codex_resume_metadata(&value, file_updated_at(&path))?;
+            if let Some(name) = names.get(&session.id) {
+                session.name = name.clone();
+            }
+            Some(session)
         })
         .collect()
+}
+
+fn codex_session_names(root: &Path) -> HashMap<String, String> {
+    let Some(index_path) = root.parent().map(|home| home.join("session_index.jsonl")) else {
+        return HashMap::new();
+    };
+    let Ok(file) = fs::File::open(index_path) else {
+        return HashMap::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter_map(|value| codex_session_name_entry(&value))
+        .collect()
+}
+
+fn codex_session_name_entry(value: &Value) -> Option<(String, String)> {
+    let id = value.get("id")?.as_str()?.trim();
+    let name = value.get("thread_name")?.as_str()?.trim();
+    (!id.is_empty() && !name.is_empty()).then(|| (id.to_string(), name.to_string()))
 }
 
 fn codex_resume_metadata(value: &Value, updated_at: i64) -> Option<ResumableSession> {
@@ -172,10 +239,12 @@ fn codex_resume_metadata(value: &Value, updated_at: i64) -> Option<ResumableSess
         _ => "CLI",
     }
     .to_string();
+    let project = resume_project_name(&working_directory);
     Some(ResumableSession {
         id,
         agent: IntegrationKind::Codex,
-        project: resume_project_name(&working_directory),
+        name: project.clone(),
+        project,
         working_directory,
         source,
         updated_at,
@@ -189,6 +258,8 @@ fn claude_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
         .filter_map(|path| {
             let file = fs::File::open(&path).ok()?;
             let mut bytes_read = 0usize;
+            let mut identity: Option<(String, String)> = None;
+            let mut name = None;
             for line in BufReader::new(file).lines().take(128) {
                 let line = line.ok()?;
                 bytes_read = bytes_read.saturating_add(line.len());
@@ -199,27 +270,142 @@ fn claude_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
                 if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
-                let Some(id) = value.get("sessionId").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(working_directory) = value.get("cwd").and_then(Value::as_str) else {
-                    continue;
-                };
-                if !seen.insert(id.to_string()) {
-                    return None;
+                if identity.is_none() {
+                    if let (Some(id), Some(working_directory)) = (
+                        value.get("sessionId").and_then(Value::as_str),
+                        value.get("cwd").and_then(Value::as_str),
+                    ) {
+                        identity = Some((id.to_string(), working_directory.to_string()));
+                    }
                 }
-                return Some(ResumableSession {
-                    id: id.to_string(),
-                    agent: IntegrationKind::Claude,
-                    project: resume_project_name(working_directory),
-                    working_directory: working_directory.to_string(),
-                    source: "CLI".into(),
-                    updated_at: file_updated_at(&path),
-                });
+                name = name.or_else(|| claude_session_name(&value));
+                if identity.is_some() && name.is_some() {
+                    break;
+                }
             }
-            None
+            let (id, working_directory) = identity?;
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let project = resume_project_name(&working_directory);
+            Some(ResumableSession {
+                id,
+                agent: IntegrationKind::Claude,
+                name: name.unwrap_or_else(|| project.clone()),
+                project,
+                working_directory,
+                source: "CLI".into(),
+                updated_at: file_updated_at(&path),
+            })
         })
         .collect()
+}
+
+fn claude_session_name(value: &Value) -> Option<String> {
+    let content = value.pointer("/message/content")?.as_str()?.trim();
+    if content.is_empty() || content.starts_with('/') || content.starts_with("<command-") {
+        return None;
+    }
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let name = chars.by_ref().take(72).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{name}…")
+    } else {
+        name
+    })
+}
+
+fn codex_last_response(reader: impl BufRead) -> Option<String> {
+    let mut last_message = None;
+    let mut last_final = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some((message, is_final)) = codex_agent_message(&value) else {
+            continue;
+        };
+        last_message = Some(message.clone());
+        if is_final {
+            last_final = Some(message);
+        }
+    }
+    last_final.or(last_message)
+}
+
+fn codex_agent_message(value: &Value) -> Option<(String, bool)> {
+    let payload = value.get("payload")?;
+    let phase = payload.get("phase").and_then(Value::as_str);
+    let is_final = matches!(phase, Some("final" | "final_answer"));
+    let message = match (
+        value.get("type").and_then(Value::as_str),
+        payload.get("type").and_then(Value::as_str),
+    ) {
+        (Some("event_msg"), Some("agent_message")) => {
+            payload.get("message").and_then(Value::as_str)?.to_string()
+        }
+        (Some("response_item"), Some("message"))
+            if payload.get("role").and_then(Value::as_str) == Some("assistant") =>
+        {
+            content_text(payload.get("content")?, "output_text")?
+        }
+        _ => return None,
+    };
+    non_empty_response(message).map(|message| (message, is_final))
+}
+
+fn claude_last_response(reader: impl BufRead) -> Option<String> {
+    let mut last_message = None;
+    let mut last_final = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("result") {
+            if let Some(message) = value
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .and_then(non_empty_response)
+            {
+                last_final = Some(message);
+            }
+            continue;
+        }
+        if value.get("type").and_then(Value::as_str) != Some("assistant")
+            || value.pointer("/message/role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+        if let Some(message) = value
+            .pointer("/message/content")
+            .and_then(|content| content_text(content, "text"))
+            .and_then(non_empty_response)
+        {
+            last_message = Some(message);
+        }
+    }
+    last_final.or(last_message)
+}
+
+fn content_text(content: &Value, block_type: &str) -> Option<String> {
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some(block_type))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    non_empty_response(text)
+}
+
+fn non_empty_response(response: String) -> Option<String> {
+    let response = response.trim().to_string();
+    (!response.is_empty()).then_some(response)
 }
 
 fn resume_files(root: &Path) -> Vec<PathBuf> {
@@ -785,6 +971,7 @@ mod tests {
             42,
         )
         .expect("sessão retomável");
+        assert_eq!(session.name, "lume");
         assert_eq!(session.project, "lume");
         assert_eq!(session.source, "VS Code");
         assert_eq!(session.updated_at, 42);
@@ -814,6 +1001,59 @@ mod tests {
             44,
         )
         .is_none());
+    }
+
+    #[test]
+    fn codex_session_index_exposes_the_saved_thread_name() {
+        let entry = codex_session_name_entry(&json!({
+            "id": "thread-1",
+            "thread_name": "Lume principal"
+        }))
+        .expect("nome salvo");
+
+        assert_eq!(entry, ("thread-1".into(), "Lume principal".into()));
+    }
+
+    #[test]
+    fn claude_resume_name_uses_the_first_meaningful_prompt() {
+        assert!(claude_session_name(&json!({
+            "message": { "content": "/plan" }
+        }))
+        .is_none());
+        assert_eq!(
+            claude_session_name(&json!({
+                "message": { "content": "  Revise   o fluxo de autenticação  " }
+            }))
+            .as_deref(),
+            Some("Revise o fluxo de autenticação")
+        );
+    }
+
+    #[test]
+    fn codex_resume_preview_prefers_the_latest_final_answer() {
+        let transcript = concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"phase\":\"commentary\",\"message\":\"Analisando\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"Tudo pronto.\"}]}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"phase\":\"commentary\",\"message\":\"Novo trabalho iniciado\"}}\n",
+        );
+
+        assert_eq!(
+            codex_last_response(std::io::Cursor::new(transcript)).as_deref(),
+            Some("Tudo pronto.")
+        );
+    }
+
+    #[test]
+    fn claude_resume_preview_reads_the_last_agent_text() {
+        let transcript = concat!(
+            "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"internal\"}]}}\n",
+            "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Resposta anterior do Claude.\"}]}}\n",
+        );
+
+        assert_eq!(
+            claude_last_response(std::io::Cursor::new(transcript)).as_deref(),
+            Some("Resposta anterior do Claude.")
+        );
     }
 
     #[test]

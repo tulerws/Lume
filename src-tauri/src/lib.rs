@@ -24,7 +24,8 @@ use std::{collections::HashSet, io::Read, sync::Mutex};
 
 use domain::{
     AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PermissionAction, Preferences,
-    PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionSource,
+    PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionActivity,
+    SessionSource,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -151,9 +152,18 @@ fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String
 fn rename_session(
     app: AppHandle,
     state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
     session_id: String,
     name: String,
 ) -> Result<String, String> {
+    let (session, name) = state.session_rename_plan(&session_id, &name)?;
+    if session.agent == AgentKind::Codex {
+        let thread_id = session
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| "Esta sessão do Codex ainda não informou o ID da thread".to_string())?;
+        bridge.set_thread_name(thread_id, &name)?;
+    }
     let name = state.rename_session(&session_id, &name)?;
     protocol::emit_sessions_changed(&app);
     Ok(name)
@@ -887,6 +897,11 @@ fn launch_session(
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
+    let resume_preview = request
+        .resume
+        .then(|| request.resume_id.as_deref())
+        .flatten()
+        .and_then(|session_id| integrations::resume_preview(&request.agent, session_id));
     let prepared_event = if request.agent == IntegrationKind::Codex {
         let prepared = bridge.prepare_thread(
             &request.working_directory,
@@ -896,9 +911,15 @@ fn launch_session(
         )?;
         request.resume = true;
         request.resume_id = Some(prepared.thread_id.clone());
-        Some(prepared_codex_session_event(&request, prepared))
+        Some(prepared_codex_session_event(
+            &request,
+            prepared,
+            resume_preview.as_ref(),
+        ))
     } else {
-        None
+        resume_preview
+            .as_ref()
+            .and_then(|preview| prepared_resume_preview_event(&request, preview))
     };
     let codex_remote = if request.agent == IntegrationKind::Codex {
         Some(codex_bridge::PROXY_URL)
@@ -915,6 +936,7 @@ fn launch_session(
 fn prepared_codex_session_event(
     request: &LaunchRequest,
     prepared: codex_bridge::PreparedThread,
+    preview: Option<&integrations::ResumePreview>,
 ) -> HookEvent {
     let project = std::path::Path::new(&request.working_directory)
         .file_name()
@@ -925,6 +947,50 @@ fn prepared_codex_session_event(
         session_id: format!("codex-app-server:{}", prepared.thread_id),
         agent: AgentKind::Codex,
         agent_label: Some("Codex".into()),
+        session_name: prepared.thread_name.clone(),
+        project,
+        source: Some(if request.target == "vscode" {
+            SessionSource::Vscode
+        } else {
+            SessionSource::Cli
+        }),
+        source_app: None,
+        status_label: Some("Esperando ação".into()),
+        started_at: None,
+        process_id: None,
+        native_session_id: Some(prepared.thread_id.clone()),
+        working_directory: Some(request.working_directory.clone()),
+        permission_profile: Some(prepared.permission_profile),
+        permission: None,
+        question: None,
+        last_response: preview.map(|preview| preview.response.clone()),
+        activity: None,
+        activities: preview
+            .map(|preview| vec![resume_preview_activity(&prepared.thread_id, preview)])
+            .unwrap_or_default(),
+        wait_for_decision: false,
+    }
+}
+
+fn prepared_resume_preview_event(
+    request: &LaunchRequest,
+    preview: &integrations::ResumePreview,
+) -> Option<HookEvent> {
+    let (agent, agent_label, prefix) = match request.agent {
+        IntegrationKind::Claude => (AgentKind::ClaudeCode, "Claude Code", "claude"),
+        IntegrationKind::Codex => (AgentKind::Codex, "Codex", "codex"),
+        IntegrationKind::Gemini => return None,
+    };
+    let native_session_id = request.resume_id.clone()?;
+    let project = std::path::Path::new(&request.working_directory)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    Some(HookEvent {
+        event: HookEventKind::Activity,
+        session_id: format!("{prefix}-resume:{native_session_id}"),
+        agent,
+        agent_label: Some(agent_label.into()),
         session_name: None,
         project,
         source: Some(if request.target == "vscode" {
@@ -936,15 +1002,32 @@ fn prepared_codex_session_event(
         status_label: Some("Esperando ação".into()),
         started_at: None,
         process_id: None,
-        native_session_id: Some(prepared.thread_id),
+        native_session_id: Some(native_session_id.clone()),
         working_directory: Some(request.working_directory.clone()),
-        permission_profile: Some(prepared.permission_profile),
+        permission_profile: None,
         permission: None,
         question: None,
-        last_response: None,
+        last_response: Some(preview.response.clone()),
         activity: None,
-        activities: Vec::new(),
+        activities: vec![resume_preview_activity(&native_session_id, preview)],
         wait_for_decision: false,
+    })
+}
+
+fn resume_preview_activity(
+    native_session_id: &str,
+    preview: &integrations::ResumePreview,
+) -> SessionActivity {
+    SessionActivity {
+        id: format!("resume-preview:{native_session_id}"),
+        kind: "message".into(),
+        title: "Resposta anterior".into(),
+        detail: Some(preview.response.clone()),
+        status: "completed".into(),
+        created_at: preview.updated_at,
+        files: Vec::new(),
+        attachments: Vec::new(),
+        append_detail: false,
     }
 }
 
@@ -1231,6 +1314,7 @@ mod tests {
             &request,
             codex_bridge::PreparedThread {
                 thread_id: "thread-1".into(),
+                thread_name: Some("Lume principal".into()),
                 permission_profile: domain::PermissionProfile {
                     mode: domain::AccessMode::WorkspaceWrite,
                     label: "Acesso ao projeto".into(),
@@ -1240,13 +1324,46 @@ mod tests {
                     available_actions: vec![PermissionAction::AllowOnce],
                 },
             },
+            None,
         );
 
         assert_eq!(event.native_session_id.as_deref(), Some("thread-1"));
+        assert_eq!(event.session_name.as_deref(), Some("Lume principal"));
         assert_eq!(event.working_directory.as_deref(), Some("/work/lume"));
         assert_eq!(event.source, Some(SessionSource::Cli));
         assert!(event
             .permission_profile
             .is_some_and(|profile| profile.can_respond_from_lume));
+    }
+
+    #[test]
+    fn resumed_session_starts_with_its_previous_agent_response() {
+        let request = LaunchRequest {
+            agent: IntegrationKind::Claude,
+            working_directory: "/work/lume".into(),
+            resume: true,
+            resume_id: Some("claude-thread-1".into()),
+            target: "terminal".into(),
+            initial_prompt: None,
+            permission_mode: None,
+            approval_policy: None,
+        };
+        let event = prepared_resume_preview_event(
+            &request,
+            &integrations::ResumePreview {
+                response: "Resposta anterior.".into(),
+                updated_at: 42,
+            },
+        )
+        .expect("prévia retomada");
+
+        assert!(matches!(event.event, HookEventKind::Activity));
+        assert_eq!(event.last_response.as_deref(), Some("Resposta anterior."));
+        assert_eq!(event.activities.len(), 1);
+        assert_eq!(event.activities[0].created_at, 42);
+        assert_eq!(
+            event.activities[0].detail.as_deref(),
+            Some("Resposta anterior.")
+        );
     }
 }

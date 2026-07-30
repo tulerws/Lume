@@ -153,34 +153,20 @@ impl AppState {
     }
 
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<String, String> {
-        let requested = normalized_session_name(name)
-            .ok_or_else(|| "O nome da sessão não pode ficar vazio".to_string())?;
+        let (_, unique_name) = self.session_rename_plan(session_id, name)?;
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| "Não foi possível renomear a sessão".to_string())?;
-        if !sessions.iter().any(|session| session.id == session_id) {
-            return Err("Sessão não encontrada".into());
-        }
-
         let mut aliases = self
             .session_aliases
             .lock()
             .map_err(|_| "Não foi possível atualizar o nome da sessão".to_string())?;
-        let mut named_sessions = sessions.clone();
-        apply_session_aliases(&mut named_sessions, &aliases);
-        ensure_unique_session_names(&mut named_sessions);
-        let used = named_sessions
-            .iter()
-            .filter(|session| session.id != session_id)
-            .map(|session| session.session_name.to_lowercase())
-            .collect::<HashSet<_>>();
-        let unique_name = unique_session_name(&requested, &used);
         let alias_key = {
             let session = sessions
                 .iter_mut()
                 .find(|session| session.id == session_id)
-                .expect("a sessão foi verificada acima");
+                .ok_or_else(|| "Sessão não encontrada".to_string())?;
             session.session_name.clone_from(&unique_name);
             persistent_session_alias_key(session)
         };
@@ -195,6 +181,38 @@ impl AppState {
             store.save_preferences(&preferences)?;
         }
         Ok(unique_name)
+    }
+
+    pub fn session_rename_plan(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(AgentSession, String), String> {
+        let requested = normalized_session_name(name)
+            .ok_or_else(|| "O nome da sessão não pode ficar vazio".to_string())?;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível renomear a sessão".to_string())?;
+        let session = sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| "Sessão não encontrada".to_string())?;
+        let aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| "Não foi possível atualizar o nome da sessão".to_string())?;
+        let mut named_sessions = sessions.clone();
+        apply_session_aliases(&mut named_sessions, &aliases);
+        ensure_unique_session_names(&mut named_sessions);
+        let used = named_sessions
+            .iter()
+            .filter(|session| session.id != session_id)
+            .map(|session| session.session_name.to_lowercase())
+            .collect::<HashSet<_>>();
+        let unique_name = unique_session_name(&requested, &used);
+        Ok((session, unique_name))
     }
 
     pub fn record_prompt_activity(
@@ -2044,14 +2062,12 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(label) = &event.agent_label {
         session.agent_label = label.clone();
     }
-    if session.session_name.trim().is_empty() {
-        if let Some(name) = event
-            .session_name
-            .as_deref()
-            .and_then(normalized_session_name)
-        {
-            session.session_name = name;
-        }
+    if let Some(name) = event
+        .session_name
+        .as_deref()
+        .and_then(normalized_session_name)
+    {
+        session.session_name = name;
     }
     if let Some(project) = &event.project {
         session.project = project.clone();
@@ -2352,7 +2368,7 @@ fn persistent_session_alias_key(session: &AgentSession) -> Option<String> {
         return None;
     }
     let agent = match session.agent {
-        AgentKind::Codex => "codex".to_string(),
+        AgentKind::Codex => return None,
         AgentKind::ChatGpt => "chatgpt".to_string(),
         AgentKind::Claude => "claude".to_string(),
         AgentKind::ClaudeCode => "claude_code".to_string(),
@@ -2473,6 +2489,24 @@ mod tests {
         assert_eq!(session.session_name, "Review authentication");
         assert_eq!(session.project, "lume");
         assert_eq!(session.agent_label, "Claude Code");
+    }
+
+    #[test]
+    fn provider_thread_name_update_replaces_the_previous_name() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:named", 4151);
+        event.agent = AgentKind::Codex;
+        event.agent_label = Some("Codex".into());
+        event.native_session_id = Some("thread-1".into());
+        event.session_name = Some("Nome anterior".into());
+        state.ingest(event.clone()).expect("sessão");
+
+        event.event = HookEventKind::Activity;
+        event.session_name = Some("Lume principal".into());
+        state.ingest(event).expect("nome atualizado");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.session_name, "Lume principal");
     }
 
     #[test]

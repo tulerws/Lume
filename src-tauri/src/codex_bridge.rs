@@ -61,6 +61,7 @@ type ActiveProxyThreads = Arc<Mutex<HashMap<String, ActiveProxyConnection>>>;
 #[derive(Clone, Debug)]
 pub struct PreparedThread {
     pub thread_id: String,
+    pub thread_name: Option<String>,
     pub permission_profile: PermissionProfile,
 }
 
@@ -139,6 +140,11 @@ impl CodexBridge {
                     .cloned()
                     .unwrap_or_else(|| "default".into())
             })
+    }
+
+    pub fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<(), String> {
+        self.ensure_server()?;
+        set_thread_name_connection(thread_id, name)
     }
 
     pub fn set_collaboration_mode(
@@ -794,11 +800,42 @@ fn prepare_thread_connection(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "The Codex App Server did not return the thread id".to_string())?
         .to_string();
+    let thread_name = response
+        .pointer("/result/thread/name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     Ok(PreparedThread {
         thread_id,
+        thread_name,
         permission_profile,
     })
+}
+
+fn set_thread_name_connection(thread_id: &str, name: &str) -> Result<(), String> {
+    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }
+        }),
+    )?;
+    wait_for_plain_value_response(&mut server, 1)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+    send_json(&mut server, thread_name_request(thread_id, name))?;
+    wait_for_plain_value_response(&mut server, 2)?;
+    Ok(())
 }
 
 fn prepare_thread_request_params(
@@ -829,6 +866,17 @@ fn prepare_thread_request_params(
         params.insert("approvalPolicy".into(), json!(approval_policy));
     }
     (method, Value::Object(params))
+}
+
+fn thread_name_request(thread_id: &str, name: &str) -> Value {
+    json!({
+        "method": "thread/name/set",
+        "id": 2,
+        "params": {
+            "threadId": thread_id,
+            "name": name
+        }
+    })
 }
 
 fn prompt_turn_request(thread_id: &str, prompt: &str, attachment_paths: &[String]) -> Value {
@@ -2019,6 +2067,15 @@ fn notification_event(
                 None,
             )
         }
+        "thread/name/updated" => (
+            HookEventKind::Activity,
+            text_at(params, "threadId")?,
+            "Nome atualizado",
+            None,
+            text_at(params, "threadName"),
+            None,
+            None,
+        ),
         "turn/started" => {
             let thread_id = text_at(params, "threadId")?;
             responses.remove(thread_id);
@@ -2348,6 +2405,21 @@ mod tests {
     }
 
     #[test]
+    fn rename_uses_the_documented_thread_name_shape() {
+        assert_eq!(
+            thread_name_request("thread-1", "Lume principal"),
+            json!({
+                "method": "thread/name/set",
+                "id": 2,
+                "params": {
+                    "threadId": "thread-1",
+                    "name": "Lume principal"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn active_proxy_prompt_keeps_its_private_request_id() {
         assert_eq!(
             prompt_turn_request_with_id(
@@ -2561,6 +2633,26 @@ mod tests {
 
         assert_eq!(event.session_name.as_deref(), Some("Review authentication"));
         assert_eq!(event.project.as_deref(), Some("lume"));
+    }
+
+    #[test]
+    fn thread_name_updates_are_forwarded_to_the_session() {
+        let event = notification_event(
+            &json!({
+                "method": "thread/name/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "threadName": "Lume principal"
+                }
+            }),
+            "thread/name/updated",
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .expect("evento de nome");
+
+        assert!(matches!(event.event, HookEventKind::Activity));
+        assert_eq!(event.session_name.as_deref(), Some("Lume principal"));
     }
 
     #[test]

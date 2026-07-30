@@ -185,6 +185,11 @@
     return item.sessionName?.trim() || item.project?.trim() || item.agentLabel;
   }
 
+  function sessionDirectoryName(item: AgentSession) {
+    const directory = item.workingDirectory?.trim().replace(/[\\/]+$/, "");
+    return directory?.split(/[\\/]/).pop() || item.project?.trim() || item.agentLabel;
+  }
+
   function pendingQueuedPrompts(item: AgentSession | null) {
     return (item?.activities ?? [])
       .filter((activity) =>
@@ -1788,7 +1793,7 @@
         {:else}
           <div class="identity">
             <strong>{sessionDisplayName(session)}</strong>
-            <small>{session.project}</small>
+            <small title={session.workingDirectory}>{sessionDirectoryName(session)}</small>
           </div>
           <button class="rename-button" type="button" onclick={beginSessionRename} aria-label={tr("Rename session", "Renomear sessão")} title={tr("Rename session", "Renomear sessão")}>
             <svg viewBox="0 0 20 20"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
