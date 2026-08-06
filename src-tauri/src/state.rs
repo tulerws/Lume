@@ -3948,13 +3948,13 @@ mod tests {
     #[test]
     fn final_response_extracts_markdown_link_targets_without_markdown_fragments() {
         let (files, _) = extract_result_artifacts(
-            "- [source.txt](/tmp/lume-phase5-test/source.txt): atualizado\n\
-             - [result.txt](/tmp/lume-phase5-test/result.txt): criado\n\
-             - [.env](/tmp/lume-phase5-test/.env): omitido\n\
-             - [test_phase5.py](/tmp/lume-phase5-test/test_phase5.py): criado",
+            "- [source.txt](/workspace/sample-project/source.txt): atualizado\n\
+             - [result.txt](/workspace/sample-project/result.txt): criado\n\
+             - [.env](/workspace/sample-project/.env): omitido\n\
+             - [test_content.py](/workspace/sample-project/test_content.py): criado",
         );
 
-        assert_eq!(files, vec!["source.txt", "result.txt", "test_phase5.py"]);
+        assert_eq!(files, vec!["source.txt", "result.txt", "test_content.py"]);
         assert!(files.iter().all(|file| !file.contains("](")));
     }
 

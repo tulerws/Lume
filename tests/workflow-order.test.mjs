@@ -56,4 +56,4 @@ assert.equal(
   "the direction marker should resolve the terminal on the connected side",
 );
 
-console.log("workflow order regression tests passed");
+console.log("workflow order test suite passed");

@@ -110,4 +110,4 @@ assert.equal(
   "Linux directory matching must remain case-sensitive",
 );
 
-console.log("session identity regression tests passed");
+console.log("session identity test suite passed");

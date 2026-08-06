@@ -20,4 +20,4 @@ assert.equal(
   '<p>Arquivo: <a href="https://example.com/README.md" target="_blank" rel="noopener noreferrer">README</a></p>',
 );
 
-console.log("markdown tests passed");
+console.log("markdown test suite passed");

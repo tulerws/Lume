@@ -8,7 +8,7 @@ on:
       - "src/lib/markdown.js"
       - "src/lib/responseDedup.js"
       - "scripts/validate-mobile-assets.mjs"
-      - "scripts/test-response-dedup.mjs"
+      - "tests/response-dedup.test.mjs"
       - "package.json"
       - ".github/workflows/mobile-pages.yml"
   workflow_dispatch:

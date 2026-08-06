@@ -97,4 +97,4 @@ assert.deepEqual(
   }],
 );
 
-console.log("chat attachment tests passed");
+console.log("chat attachment test suite passed");

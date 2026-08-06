@@ -47,4 +47,4 @@ assert.equal(
   "the newest matching response should win",
 );
 
-console.log("Response deduplication checks passed.");
+console.log("response deduplication test suite passed");

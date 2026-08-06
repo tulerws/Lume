@@ -37,4 +37,4 @@ assert.equal(
 
 assert.equal(parseHandoffPrompt("A regular user prompt"), null);
 
-console.log("handoff tests passed");
+console.log("handoff test suite passed");

@@ -45,9 +45,16 @@ assert.equal(needsUserAuthorization("¿Me autorizas a eliminar este archivo?"), 
 assert.equal(needsUserAuthorization("Est-ce que vous m’autorisez à continuer ?"), true);
 assert.equal(needsUserAuthorization("Erlauben Sie mir, diesen Befehl auszuführen?"), true);
 assert.equal(needsUserAuthorization("Mi autorizzi a procedere?"), true);
+assert.equal(needsUserAuthorization(
+  "O reinício não foi executado porque a autorização do Docker expirou nas duas tentativas. As APIs permanecem no estado anterior.\n\nAutorize novamente o acesso ao daemon Docker para eu concluir o reinício.",
+), true);
+assert.equal(needsUserAuthorization("Please authorize access to the Docker daemon again so I can finish the restart."), true);
+assert.equal(needsUserAuthorization("Autoriza de nuevo el acceso al daemon para que pueda completar el reinicio."), true);
 assert.equal(needsUserAuthorization("A documentação usa a frase 'você autoriza' como exemplo."), false);
 assert.equal(needsUserAuthorization("The documentation explains what 'do you authorize' means."), false);
 assert.equal(needsUserAuthorization("Você autoriza esta alteração."), false);
 assert.equal(needsUserAuthorization("A autorização foi concluída."), false);
+assert.equal(needsUserAuthorization("A autorização expirou, mas nenhuma nova tentativa é necessária."), false);
+assert.equal(needsUserAuthorization("O guia explica como autorizar novamente o Docker para desenvolvimento."), false);
 
-console.log("activity presentation tests passed");
+console.log("activity presentation test suite passed");

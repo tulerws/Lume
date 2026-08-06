@@ -52,6 +52,7 @@ export function needsUserAuthorization(text?: string): boolean {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+  const compact = normalized.replace(/\s+/g, " ").trim();
   const directAuthorizationQuestions = [
     /\bvoce\s+(?:me\s+)?autoriza\b[^?\n]{0,240}\?/,
     /\bdo\s+you\s+(?:authorize|allow|approve|permit)\b[^?\n]{0,240}\?/,
@@ -64,7 +65,16 @@ export function needsUserAuthorization(text?: string): boolean {
     /\bmi\s+autorizzi\b[^?\n]{0,240}\?/,
     /\bposso\s+(?:procedere|continuare|eseguire|modificare|eliminare|accedere|aprire|inviare|installare)\b[^?\n]{0,240}\?/,
   ];
-  return directAuthorizationQuestions.some((pattern) => pattern.test(normalized));
+  const explicitAuthorizationRetries = [
+    /(?:^|[.!?]\s+)(?:por favor[,\s]+)?autorize\s+(?:novamente|de novo)\b.{0,240}\b(?:para|pra)\b/,
+    /(?:^|[.!?]\s+)(?:please\s+)?(?:authorize|approve|allow|grant)\b.{0,160}\b(?:again|once more)\b/,
+    /(?:^|[.!?]\s+)(?:por favor[,\s]+)?(?:autoriza\s+de\s+nuevo|vuelve\s+a\s+autorizar)\b.{0,240}\bpara\b/,
+    /(?:^|[.!?]\s+)(?:veuillez\s+)?autorisez\b.{0,120}\b(?:a\s+nouveau|de\s+nouveau)\b/,
+    /(?:^|[.!?]\s+)(?:bitte\s+)?(?:autorisieren|genehmigen)\b.{0,120}\berneut\b/,
+    /(?:^|[.!?]\s+)(?:per\s+favore[,\s]+)?autorizza\s+(?:nuovamente|di\s+nuovo)\b/,
+  ];
+  return directAuthorizationQuestions.some((pattern) => pattern.test(normalized))
+    || explicitAuthorizationRetries.some((pattern) => pattern.test(compact));
 }
 
 export function activityPreview(activity: SessionActivity): string {

@@ -1152,12 +1152,12 @@ mod tests {
         let package = build_context_package(
             &group(WorkflowContextPolicy::Standard),
             "edge-1",
-            "Ship phase five",
+            "Ship the requested change",
             None,
             &[session()],
         )
         .expect("context");
-        assert!(package.markdown.contains("Ship phase five"));
+        assert!(package.markdown.contains("Ship the requested change"));
         assert!(package.markdown.contains("src/lib.rs"));
         assert!(!package.markdown.contains("super-secret"));
         assert!(!package.markdown.contains(".env"));
@@ -1170,17 +1170,17 @@ mod tests {
     fn standard_context_rejects_patch_paths_and_counts_each_file_section() {
         let patch = concat!(
             "*** Begin Patch\n",
-            "*** Update File: /tmp/lume-phase5-test/source.txt\n",
+            "*** Update File: /workspace/sample-project/source.txt\n",
             "@@\n",
             " Initial content\n",
             "+Alpha\n",
             "+Beta\n",
             "+Gamma\n",
-            "*** Add File: /tmp/lume-phase5-test/result.txt\n",
+            "*** Add File: /workspace/sample-project/result.txt\n",
             "+Added Alpha, Beta, and Gamma to source.txt.\n",
-            "*** Add File: /tmp/lume-phase5-test/.env\n",
-            "+LUME_FAKE_TOKEN=phase5-test-only\n",
-            "*** Add File: /tmp/lume-phase5-test/test_phase5.py\n",
+            "*** Add File: /workspace/sample-project/.env\n",
+            "+LUME_FAKE_TOKEN=example-token-value\n",
+            "*** Add File: /workspace/sample-project/test_content.py\n",
             "+from pathlib import Path\n",
             "+\n",
             "+\n",
@@ -1191,24 +1191,24 @@ mod tests {
             "*** End Patch",
         );
         let mut source = session();
-        source.working_directory = Some("/tmp/lume-phase5-test".into());
+        source.working_directory = Some("/workspace/sample-project".into());
         source.results[0].response = concat!(
-            "- [source.txt](/tmp/lume-phase5-test/source.txt): updated\n",
-            "- [.env](/tmp/lume-phase5-test/.env): configured\n",
-            "api_key=phase5-test-secret\n",
+            "- [source.txt](/workspace/sample-project/source.txt): updated\n",
+            "- [.env](/workspace/sample-project/.env): configured\n",
+            "api_key=example-secret-value\n",
             "{\"access_token\":\"json-secret\"}",
         )
         .into();
         source.results[0].files = vec![
             patch.into(),
-            "source.txt](/tmp/lume-phase5-test/source.txt".into(),
+            "source.txt](/workspace/sample-project/source.txt".into(),
         ];
         source.activities[2].detail = Some(patch.into());
         source.activities[2].files = vec![
-            "/tmp/lume-phase5-test/source.txt".into(),
-            "/tmp/lume-phase5-test/result.txt".into(),
-            "/tmp/lume-phase5-test/.env".into(),
-            "/tmp/lume-phase5-test/test_phase5.py".into(),
+            "/workspace/sample-project/source.txt".into(),
+            "/workspace/sample-project/result.txt".into(),
+            "/workspace/sample-project/.env".into(),
+            "/workspace/sample-project/test_content.py".into(),
         ];
 
         let package = build_context_package(
@@ -1220,11 +1220,13 @@ mod tests {
         )
         .expect("context");
 
-        assert!(!package.markdown.contains("phase5-test-secret"));
+        assert!(!package.markdown.contains("example-secret-value"));
         assert!(!package.markdown.contains("json-secret"));
         assert!(!package.markdown.contains("LUME_FAKE_TOKEN"));
         assert!(!package.markdown.contains("*** Begin Patch"));
-        assert!(!package.markdown.contains("](/tmp/lume-phase5-test/.env)"));
+        assert!(!package
+            .markdown
+            .contains("](/workspace/sample-project/.env)"));
         assert!(package
             .redactions
             .iter()
@@ -1247,7 +1249,10 @@ mod tests {
             (1, 0)
         );
         assert_eq!(
-            (file("test_phase5.py").added, file("test_phase5.py").removed),
+            (
+                file("test_content.py").added,
+                file("test_content.py").removed
+            ),
             (7, 0)
         );
     }
@@ -1339,7 +1344,7 @@ mod tests {
         let package = build_context_package(
             &group(WorkflowContextPolicy::Detailed),
             "edge-1",
-            "Review phase five",
+            "Review the requested change",
             None,
             &[source],
         )
@@ -1378,18 +1383,18 @@ mod tests {
     fn detailed_context_merges_equivalent_paths_and_prefers_unified_diff() {
         let mut source = session();
         source.working_directory = Some("/tmp".into());
-        source.results[0].files = vec!["detailed-test.txt".into()];
+        source.results[0].files = vec!["change-summary.txt".into()];
         source
             .activities
             .retain(|activity| activity.kind == "prompt");
         source.activities.push(SessionActivity {
             id: "json-diff".into(),
             kind: "file".into(),
-            title: "/tmp/lume-phase5-test/detailed-test.txt".into(),
+            title: "/workspace/sample-project/change-summary.txt".into(),
             detail: Some(r#"[{"diff":"One\nTwo\nThree\n","kind":{"type":"add"}}]"#.into()),
             status: "completed".into(),
             created_at: 200,
-            files: vec!["/tmp/lume-phase5-test/detailed-test.txt".into()],
+            files: vec!["/workspace/sample-project/change-summary.txt".into()],
             attachments: Vec::new(),
             append_detail: false,
         });
@@ -1398,15 +1403,15 @@ mod tests {
             kind: "file".into(),
             title: "Changes".into(),
             detail: Some(concat!(
-                "diff --git a/lume-phase5-test/detailed-test.txt b/lume-phase5-test/detailed-test.txt\n",
+                "diff --git a/sample-project/change-summary.txt b/sample-project/change-summary.txt\n",
                 "--- /dev/null\n",
-                "+++ b/lume-phase5-test/detailed-test.txt\n",
+                "+++ b/sample-project/change-summary.txt\n",
                 "@@ -0,0 +1,3 @@\n",
                 "+One\n+Two\n+Three"
             ).into()),
             status: "completed".into(),
             created_at: 210,
-            files: vec!["lume-phase5-test/detailed-test.txt".into()],
+            files: vec!["sample-project/change-summary.txt".into()],
             attachments: Vec::new(),
             append_detail: false,
         });

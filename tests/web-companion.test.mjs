@@ -28,4 +28,4 @@ assert.ok(manifest.content_scripts[0].matches.includes("https://chatgpt.com/*"))
 assert.ok(manifest.content_scripts[0].matches.includes("https://claude.ai/*"));
 assert.ok(manifest.content_scripts[0].matches.includes("https://gemini.google.com/*"));
 
-console.log("web companion regression tests passed");
+console.log("web companion test suite passed");
