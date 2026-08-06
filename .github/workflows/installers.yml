@@ -46,7 +46,7 @@ jobs:
           releaseName: Lume v__VERSION__
           generateReleaseNotes: true
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           args: --bundles ${{ matrix.bundles }}
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true

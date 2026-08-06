@@ -136,6 +136,8 @@ pub struct PromptAttachment {
     pub name: String,
     pub mime_type: String,
     pub preview_data_url: String,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -324,6 +326,206 @@ pub struct WhiteboardLayout {
     pub terminals: Vec<WhiteboardLayoutTerminal>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRole {
+    Planner,
+    Implementer,
+    Reviewer,
+    Tester,
+    Researcher,
+    #[default]
+    Custom,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowRoleContract {
+    pub instruction: String,
+    pub expected_input: String,
+    pub produced_output: String,
+    pub completion_condition: String,
+}
+
+impl WorkflowRole {
+    pub fn default_contract(self) -> WorkflowRoleContract {
+        let fields = match self {
+            Self::Planner => (
+                "Analyze the objective, constraints, dependencies, and risks. Produce a clear, ordered, actionable plan. Resolve important ambiguities before handing work off, and do not implement the solution unless explicitly requested.",
+                "The objective, relevant context, constraints, and any existing decisions.",
+                "An ordered implementation plan with key decisions, dependencies, risks, and validation steps.",
+                "The plan is actionable, covers the full requested scope, and clearly identifies any remaining blocker or decision.",
+            ),
+            Self::Implementer => (
+                "Implement the approved objective while preserving the requested scope and the project's existing conventions. Inspect the relevant code before changing it, keep changes focused, and validate the result.",
+                "An approved plan or a precise objective, plus the relevant project context and constraints.",
+                "Working changes, a concise list of affected files, and the checks or tests performed.",
+                "The requested behavior is implemented, relevant validation passes, and no known blocking issue remains.",
+            ),
+            Self::Reviewer => (
+                "Review the proposed work against its objective. Look for correctness issues, regressions, security or privacy risks, missing edge cases, and maintainability problems. Prioritize concrete findings and do not modify the work unless explicitly requested.",
+                "The objective, implementation result, changed files, and available validation evidence.",
+                "Prioritized findings with evidence and recommended corrections, or an explicit approval when no actionable issue is found.",
+                "Every relevant area has been reviewed and each actionable finding has clear evidence and severity.",
+            ),
+            Self::Tester => (
+                "Validate the requested behavior with focused, reproducible checks. Cover the main path, relevant edge cases, and likely regressions. Report failures precisely and avoid changing product behavior unless explicitly requested.",
+                "The objective, expected behavior, implementation result, and available test environment.",
+                "Executed checks with pass or fail results, reproducible failure details, and remaining coverage gaps.",
+                "All planned checks have run and the final status, failures, and untested risks are clearly documented.",
+            ),
+            Self::Researcher => (
+                "Investigate the question using relevant project evidence and authoritative sources when needed. Compare viable alternatives, separate verified facts from inference, and recommend the best-supported direction.",
+                "The research question, decision context, constraints, and preferred evidence sources.",
+                "Concise findings, compared alternatives, supporting evidence, uncertainties, and a recommendation.",
+                "The research question is answered with sufficient evidence and remaining uncertainty is explicitly stated.",
+            ),
+            Self::Custom => ("", "", "", ""),
+        };
+        WorkflowRoleContract {
+            instruction: fields.0.into(),
+            expected_input: fields.1.into(),
+            produced_output: fields.2.into(),
+            completion_condition: fields.3.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowStepDefinition {
+    pub id: String,
+    pub session_native_id: String,
+    pub role: WorkflowRole,
+    pub custom_role_label: String,
+    pub instruction: String,
+    pub expected_input: String,
+    pub produced_output: String,
+    pub completion_condition: String,
+    pub attempt: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAdvanceMode {
+    #[default]
+    Manual,
+    Automatic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowContextPolicy {
+    Minimal,
+    #[default]
+    Standard,
+    Detailed,
+    Custom,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowContextSelection {
+    pub response: bool,
+    pub files: bool,
+    pub checks: bool,
+    pub plan: bool,
+    pub activity: bool,
+    pub diffs: bool,
+}
+
+impl Default for WorkflowContextSelection {
+    fn default() -> Self {
+        Self {
+            response: true,
+            files: true,
+            checks: true,
+            plan: false,
+            activity: false,
+            diffs: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowConnectionDefinition {
+    pub id: String,
+    pub from_step_id: String,
+    pub to_step_id: String,
+    pub include_response: bool,
+    pub include_files: bool,
+    pub include_tests: bool,
+    pub context_policy: WorkflowContextPolicy,
+    pub context_selection: WorkflowContextSelection,
+    pub additional_instruction: String,
+    pub requires_approval: bool,
+    pub advance_mode: WorkflowAdvanceMode,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowGroupDefinition {
+    pub id: String,
+    pub terminal_group_id: String,
+    pub steps: Vec<WorkflowStepDefinition>,
+    pub connections: Vec<WorkflowConnectionDefinition>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunStatus {
+    #[default]
+    Draft,
+    Ready,
+    Running,
+    WaitingForApproval,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStepRunStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowStepRun {
+    pub step_id: String,
+    pub status: WorkflowStepRunStatus,
+    pub attempt: u16,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub result_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowRun {
+    pub id: String,
+    pub workflow_id: String,
+    pub objective: String,
+    pub status: WorkflowRunStatus,
+    pub current_step_id: Option<String>,
+    pub pending_connection_id: Option<String>,
+    pub handoff_approved: bool,
+    pub recovering: bool,
+    pub steps: Vec<WorkflowStepRun>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
@@ -331,6 +533,7 @@ pub struct Preferences {
     pub dark_mode: Option<bool>,
     pub sound_enabled: bool,
     pub sound_volume: u8,
+    pub popup_notifications_enabled: bool,
     pub autostart: bool,
     pub monitor_id: Option<String>,
     pub overlay_x: Option<i32>,
@@ -341,6 +544,8 @@ pub struct Preferences {
     pub project_profiles: HashMap<String, ProjectProfile>,
     pub session_aliases: HashMap<String, String>,
     pub whiteboard_layouts: Vec<WhiteboardLayout>,
+    pub workflow_enabled: bool,
+    pub workflow_groups: Vec<WorkflowGroupDefinition>,
     pub global_shortcut: String,
     pub open_shortcut: String,
     pub new_session_shortcut: String,
@@ -354,6 +559,7 @@ impl Default for Preferences {
             dark_mode: None,
             sound_enabled: true,
             sound_volume: 55,
+            popup_notifications_enabled: true,
             autostart: true,
             monitor_id: None,
             overlay_x: None,
@@ -364,6 +570,8 @@ impl Default for Preferences {
             project_profiles: HashMap::new(),
             session_aliases: HashMap::new(),
             whiteboard_layouts: Vec::new(),
+            workflow_enabled: false,
+            workflow_groups: Vec::new(),
             global_shortcut: "Ctrl+Shift+Space".into(),
             open_shortcut: "Ctrl+Alt+Shift+L".into(),
             new_session_shortcut: "Ctrl+Alt+Shift+N".into(),
@@ -474,6 +682,48 @@ mod tests {
 
         profile.approvals_reviewer = None;
         assert!(!profile.automatically_approves());
+    }
+
+    #[test]
+    fn standard_workflow_roles_have_contracts_but_custom_starts_empty() {
+        for role in [
+            WorkflowRole::Planner,
+            WorkflowRole::Implementer,
+            WorkflowRole::Reviewer,
+            WorkflowRole::Tester,
+            WorkflowRole::Researcher,
+        ] {
+            let contract = role.default_contract();
+            assert!(!contract.instruction.is_empty());
+            assert!(!contract.expected_input.is_empty());
+            assert!(!contract.produced_output.is_empty());
+            assert!(!contract.completion_condition.is_empty());
+        }
+
+        let custom = WorkflowRole::Custom.default_contract();
+        assert!(custom.instruction.is_empty());
+        assert!(custom.expected_input.is_empty());
+        assert!(custom.produced_output.is_empty());
+        assert!(custom.completion_condition.is_empty());
+    }
+
+    #[test]
+    fn legacy_workflow_connections_gain_the_standard_context_policy() {
+        let connection: WorkflowConnectionDefinition = serde_json::from_value(serde_json::json!({
+            "id": "edge-1",
+            "fromStepId": "source",
+            "toStepId": "target",
+            "includeResponse": true,
+            "includeFiles": true,
+            "includeTests": true
+        }))
+        .expect("legacy connection");
+
+        assert_eq!(connection.context_policy, WorkflowContextPolicy::Standard);
+        assert_eq!(
+            connection.context_selection,
+            WorkflowContextSelection::default()
+        );
     }
 }
 

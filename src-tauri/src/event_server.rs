@@ -117,8 +117,10 @@ pub fn publish_event(
     let notification = notification_for(&event, previous_status.as_ref());
     let permission_id = state.ingest(event)?;
     crate::protocol::emit_sessions_changed(app);
-    if let Some((title, body)) = notification {
-        let _ = app.notification().builder().title(title).body(body).show();
+    if state.preferences()?.popup_notifications_enabled {
+        if let Some((title, body)) = notification {
+            let _ = app.notification().builder().title(title).body(body).show();
+        }
     }
     Ok(permission_id)
 }

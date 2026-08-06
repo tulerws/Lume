@@ -100,6 +100,7 @@ export interface PromptAttachment {
   name: string;
   mimeType: string;
   previewDataUrl: string;
+  path?: string;
 }
 
 export interface PromptAttachmentInput {
@@ -120,7 +121,7 @@ export interface AgentRateLimit {
 
 export interface SessionActivity {
   id: string;
-  kind: "prompt" | "queued_prompt" | "message" | "activity" | "analysis" | "plan" | "command" | "file" | "test" | "tool" | "permission" | "question";
+  kind: "prompt" | "queued_prompt" | "message" | "activity" | "analysis" | "plan" | "plan_document" | "command" | "file" | "test" | "tool" | "permission" | "question";
   title: string;
   detail?: string;
   status: "running" | "completed" | "failed" | "waiting" | "interrupted";
@@ -163,6 +164,7 @@ export interface Preferences {
   darkMode?: boolean;
   soundEnabled: boolean;
   soundVolume: number;
+  popupNotificationsEnabled: boolean;
   autostart: boolean;
   monitorId?: string;
   overlayX?: number;
@@ -173,6 +175,8 @@ export interface Preferences {
   projectProfiles: Record<string, ProjectProfile>;
   sessionAliases: Record<string, string>;
   whiteboardLayouts: WhiteboardLayout[];
+  workflowEnabled: boolean;
+  workflowGroups: WorkflowGroupDefinition[];
   globalShortcut: string;
   openShortcut: string;
   newSessionShortcut: string;
@@ -209,6 +213,160 @@ export interface WhiteboardLayout {
   id: string;
   name: string;
   terminals: WhiteboardLayoutTerminal[];
+}
+
+export type WorkflowRole =
+  | "planner"
+  | "implementer"
+  | "reviewer"
+  | "tester"
+  | "researcher"
+  | "custom";
+
+export interface WorkflowRoleContract {
+  instruction: string;
+  expectedInput: string;
+  producedOutput: string;
+  completionCondition: string;
+}
+
+export interface WorkflowStepDefinition {
+  id: string;
+  sessionNativeId: string;
+  role: WorkflowRole;
+  customRoleLabel: string;
+  instruction: string;
+  expectedInput: string;
+  producedOutput: string;
+  completionCondition: string;
+  attempt: number;
+}
+
+export type WorkflowAdvanceMode = "manual" | "automatic";
+
+export type WorkflowContextPolicy =
+  | "minimal"
+  | "standard"
+  | "detailed"
+  | "custom";
+
+export interface WorkflowContextSelection {
+  response: boolean;
+  files: boolean;
+  checks: boolean;
+  plan: boolean;
+  activity: boolean;
+  diffs: boolean;
+}
+
+export interface WorkflowConnectionDefinition {
+  id: string;
+  fromStepId: string;
+  toStepId: string;
+  includeResponse: boolean;
+  includeFiles: boolean;
+  includeTests: boolean;
+  contextPolicy: WorkflowContextPolicy;
+  contextSelection: WorkflowContextSelection;
+  additionalInstruction: string;
+  requiresApproval: boolean;
+  advanceMode: WorkflowAdvanceMode;
+}
+
+export interface WorkflowGroupDefinition {
+  id: string;
+  terminalGroupId: string;
+  steps: WorkflowStepDefinition[];
+  connections: WorkflowConnectionDefinition[];
+}
+
+export type WorkflowRunStatus =
+  | "draft"
+  | "ready"
+  | "running"
+  | "waiting_for_approval"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type WorkflowStepRunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+export interface WorkflowStepRun {
+  stepId: string;
+  status: WorkflowStepRunStatus;
+  attempt: number;
+  startedAt?: number;
+  completedAt?: number;
+  resultId?: string;
+  error?: string;
+}
+
+export interface WorkflowRun {
+  id: string;
+  workflowId: string;
+  objective: string;
+  status: WorkflowRunStatus;
+  currentStepId?: string;
+  pendingConnectionId?: string;
+  handoffApproved: boolean;
+  recovering: boolean;
+  steps: WorkflowStepRun[];
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface WorkflowContextFile {
+  path: string;
+  external: boolean;
+  added: number;
+  removed: number;
+  diff?: string;
+}
+
+export interface WorkflowContextCheck {
+  summary: string;
+}
+
+export interface WorkflowContextActivity {
+  kind: string;
+  title: string;
+  detail?: string;
+  status: string;
+  createdAt: number;
+}
+
+export interface WorkflowContextRedaction {
+  kind: string;
+  summary: string;
+  count: number;
+}
+
+export interface WorkflowContextPackage {
+  version: number;
+  workflowId: string;
+  sourceStepId: string;
+  targetStepId: string;
+  sourceResultId: string;
+  policy: WorkflowContextPolicy;
+  objective: string;
+  sourceRole: string;
+  targetRole: string;
+  result?: string;
+  files: WorkflowContextFile[];
+  checks: WorkflowContextCheck[];
+  plan?: string;
+  relevantActivity: WorkflowContextActivity[];
+  nextInstruction: string;
+  redactions: WorkflowContextRedaction[];
+  estimatedTokens: number;
+  markdown: string;
 }
 
 export interface IntegrationStatus {
@@ -291,6 +449,9 @@ export interface TerminalWindowState {
   docked: boolean;
   groupId?: string;
   connectedSides: Array<"left" | "right" | "top" | "bottom">;
+  bridgeSides: Array<"left" | "right" | "top" | "bottom">;
+  workflowBridgeOpen: boolean;
+  workflowEnabled: boolean;
   monitorId: string;
   layered: boolean;
   scale: number;
@@ -326,5 +487,6 @@ export interface DockPreviewEvent {
     y: number;
     width: number;
     height: number;
+    proximity: number;
   } | null;
 }

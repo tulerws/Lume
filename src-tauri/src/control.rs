@@ -39,6 +39,44 @@ pub fn local_image_data_url(path: &str) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
+pub fn response_file_payload(
+    state: &AppState,
+    session_id: &str,
+    attachment_id: &str,
+) -> Result<serde_json::Value, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    let attachment = session
+        .activities
+        .iter()
+        .filter(|activity| activity.kind == "message")
+        .flat_map(|activity| activity.attachments.iter())
+        .find(|attachment| attachment.id == attachment_id)
+        .ok_or_else(|| "The response file is no longer available".to_string())?;
+    let path = attachment
+        .path
+        .as_deref()
+        .ok_or_else(|| "The response file has no local path".to_string())?;
+    let path =
+        fs::canonicalize(path).map_err(|_| "The response file no longer exists".to_string())?;
+    if !path.is_file() {
+        return Err("The response attachment is not a file".into());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_FILE_ATTACHMENT_BYTES {
+        return Err("The response file exceeds the 25 MB download limit".into());
+    }
+    Ok(serde_json::json!({
+        "attachmentId": attachment.id,
+        "name": attachment.name,
+        "mimeType": attachment.mime_type,
+        "dataBase64": STANDARD.encode(bytes),
+    }))
+}
+
 pub fn resolve_permission(
     state: &AppState,
     session_id: &str,
@@ -192,14 +230,33 @@ pub fn submit_prompt(
             .native_session_id
             .clone()
             .ok_or_else(|| "A sessão do Codex não informou a thread".to_string())?;
-        bridge.submit_prompt(
+        let first_attempt = bridge.submit_prompt(
             &thread_id,
             &codex_prompt,
             &image_paths,
-            profile,
+            profile.clone(),
             state.clone(),
             app.clone(),
-        )
+        );
+        if let Err(error) = first_attempt {
+            if !is_missing_codex_rollout(&error) {
+                return Err(error);
+            }
+            let working_directory = session.working_directory.as_deref().ok_or_else(|| {
+                "The Codex session has no project directory to reconnect".to_string()
+            })?;
+            bridge.recover_thread_and_submit_prompt(
+                &session.id,
+                working_directory,
+                &codex_prompt,
+                &image_paths,
+                profile,
+                state.clone(),
+                app.clone(),
+            )
+        } else {
+            Ok(())
+        }
     } else {
         let agent = match session.agent {
             AgentKind::ClaudeCode => IntegrationKind::Claude,
@@ -257,6 +314,11 @@ pub fn submit_prompt(
     Ok(())
 }
 
+fn is_missing_codex_rollout(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("no rollout found") || normalized.contains("rollout not found")
+}
+
 pub fn interrupt_prompt(
     app: &AppHandle,
     state: &AppState,
@@ -279,7 +341,17 @@ pub fn interrupt_prompt(
             .native_session_id
             .as_deref()
             .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
-        bridge.interrupt_prompt(thread_id, state, app)?;
+        if let Err(error) = bridge.interrupt_prompt(thread_id, state, app) {
+            if !is_no_active_prompt(&error) {
+                return Err(error);
+            }
+        }
+    } else if session.agent == AgentKind::ClaudeCode {
+        let native_session_id = session
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| "The Claude session did not provide its session id".to_string())?;
+        discovery::interrupt_resumed_prompt_process(native_session_id, &session.agent)?;
     } else {
         let process_id = session
             .process_id
@@ -289,6 +361,13 @@ pub fn interrupt_prompt(
     state.mark_prompt_interrupted(session_id)?;
     protocol::emit_sessions_changed(app);
     Ok(())
+}
+
+fn is_no_active_prompt(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("does not have a prompt running")
+        || error.contains("no active turn")
+        || error.contains("turn is not active")
 }
 
 pub fn session_collaboration_mode(
@@ -493,13 +572,14 @@ fn prepare_prompt_attachments(
         }
         let name = safe_attachment_name(&attachment.name, index, &detected_mime);
         prepared.push(PreparedPromptAttachment {
-            path,
+            path: path.clone(),
             is_image,
             display: PromptAttachment {
                 id: format!("attachment:{}:{index}", crate::state::now_millis()),
                 name,
                 mime_type: detected_mime,
                 preview_data_url: if is_image { preview } else { String::new() },
+                path: Some(path),
             },
         });
     }
@@ -593,11 +673,39 @@ pub fn terminate_session(
                 .into(),
         );
     }
-    let process_id = session
-        .process_id
-        .ok_or_else(|| "A sessão não possui um processo associado".to_string())?;
-    discovery::terminate_agent_process(process_id, &session.agent)?;
-    state.mark_process_terminated(process_id)?;
+    let process_ids = state
+        .sessions()?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.source == SessionSource::Cli
+                && candidate.agent == session.agent
+                && match session.native_session_id.as_deref() {
+                    Some(native_id) => candidate.native_session_id.as_deref() == Some(native_id),
+                    None => candidate.id == session.id,
+                }
+        })
+        .filter_map(|candidate| candidate.process_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if process_ids.is_empty() {
+        return Err("A sessão não possui um processo associado".into());
+    }
+    let mut terminated = 0usize;
+    let mut errors = Vec::new();
+    for process_id in process_ids {
+        match discovery::terminate_agent_process(process_id, &session.agent) {
+            Ok(()) => {
+                state.mark_process_terminated(process_id)?;
+                terminated += 1;
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if terminated == 0 {
+        return Err(errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "O sistema recusou o encerramento do agente".into()));
+    }
     protocol::emit_sessions_changed(app);
     Ok(())
 }
@@ -613,7 +721,7 @@ pub fn execute_hub_command(
     if let Err(error) = request.validate() {
         return protocol::HubCommandResponse::failure(request_id, error);
     }
-    let result = match request.command {
+    let result: Result<Option<serde_json::Value>, String> = match request.command {
         protocol::HubCommand::SubmitPrompt {
             session_id,
             prompt,
@@ -629,31 +737,36 @@ pub fn execute_hub_command(
             attachments,
             delivery,
             false,
-        ),
+        )
+        .map(|_| None),
         protocol::HubCommand::ResolvePermission {
             session_id,
             permission_id,
             action,
-        } => resolve_permission(state, &session_id, &permission_id, action),
+        } => resolve_permission(state, &session_id, &permission_id, action).map(|_| None),
         protocol::HubCommand::ResolveQuestion {
             session_id,
             question_id,
             answers,
-        } => resolve_question(state, &session_id, &question_id, answers),
+        } => resolve_question(state, &session_id, &question_id, answers).map(|_| None),
         protocol::HubCommand::TerminateSession { session_id } => {
-            terminate_session(app, state, &session_id)
+            terminate_session(app, state, &session_id).map(|_| None)
         }
         protocol::HubCommand::InterruptPrompt { session_id } => {
-            interrupt_prompt(app, state, bridge, &session_id)
+            interrupt_prompt(app, state, bridge, &session_id).map(|_| None)
         }
+        protocol::HubCommand::DownloadResponseFile {
+            session_id,
+            attachment_id,
+        } => response_file_payload(state, &session_id, &attachment_id).map(Some),
         protocol::HubCommand::OpenSessionSource { session_id } => {
-            open_session_source(state, browser, &session_id)
+            open_session_source(state, browser, &session_id).map(|_| None)
         }
         protocol::HubCommand::RefreshRateLimits { agent } => {
             if agent == AgentKind::Codex {
-                bridge.refresh_rate_limits(state, app)
+                bridge.refresh_rate_limits(state, app).map(|_| None)
             } else {
-                Ok(())
+                Ok(None)
             }
         }
         protocol::HubCommand::ReportMobileVersion { version } => {
@@ -663,14 +776,16 @@ pub fn execute_hub_command(
                     "lume://companion-update-check",
                     serde_json::json!({ "mobileVersion": version }),
                 )
+                .map(|_| None)
                 .map_err(|error| error.to_string())
             } else {
-                Ok(())
+                Ok(None)
             }
         }
     };
     match result {
-        Ok(()) => protocol::HubCommandResponse::success(request_id),
+        Ok(Some(data)) => protocol::HubCommandResponse::success_with_data(request_id, data),
+        Ok(None) => protocol::HubCommandResponse::success(request_id),
         Err(message) => protocol::HubCommandResponse::failure(
             request_id,
             protocol::ProtocolError::from_control(message),
@@ -709,11 +824,88 @@ mod tests {
     }
 
     #[test]
+    fn missing_codex_rollout_errors_are_recoverable() {
+        assert!(is_missing_codex_rollout(
+            "no rollout found for thread id thread-1"
+        ));
+        assert!(is_missing_codex_rollout("Rollout not found"));
+        assert!(!is_missing_codex_rollout("The Codex server is offline"));
+    }
+
+    #[test]
     fn cached_attachment_names_cannot_create_nested_paths() {
         assert_eq!(
             cache_attachment_name("../monthly report.xlsx"),
             ".._monthly_report.xlsx"
         );
+    }
+
+    #[test]
+    fn paired_mobile_can_download_only_a_reported_response_file() {
+        let path = std::env::temp_dir().join(format!(
+            "lume-response-download-{}-{}.pdf",
+            std::process::id(),
+            crate::state::now_millis()
+        ));
+        fs::write(&path, b"response file").expect("arquivo temporário");
+        let canonical = fs::canonicalize(&path)
+            .expect("caminho")
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(crate::domain::HookEvent {
+                event: crate::domain::HookEventKind::Activity,
+                session_id: "codex:response-download".into(),
+                agent: AgentKind::Codex,
+                agent_label: Some("Codex".into()),
+                session_name: None,
+                project: Some("lume".into()),
+                source: Some(SessionSource::Cli),
+                source_app: None,
+                status_label: None,
+                started_at: None,
+                process_id: Some(4242),
+                native_session_id: Some("response-download".into()),
+                working_directory: path
+                    .parent()
+                    .map(|value| value.to_string_lossy().to_string()),
+                permission_profile: None,
+                permission: None,
+                question: None,
+                last_response: None,
+                activity: Some(crate::domain::SessionActivity {
+                    id: "response-message".into(),
+                    kind: "message".into(),
+                    title: "Agent response".into(),
+                    detail: Some(format!("[Download]({canonical})")),
+                    status: "completed".into(),
+                    created_at: crate::state::now_millis(),
+                    files: Vec::new(),
+                    attachments: Vec::new(),
+                    append_detail: false,
+                }),
+                activities: Vec::new(),
+                wait_for_decision: false,
+            })
+            .expect("resposta");
+        let session = state.sessions().expect("sessões").remove(0);
+        let attachment_id = session.activities[0].attachments[0].id.clone();
+
+        let payload = response_file_payload(&state, &session.id, &attachment_id)
+            .expect("arquivo da resposta");
+        assert_eq!(
+            payload["name"],
+            path.file_name().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            STANDARD
+                .decode(payload["dataBase64"].as_str().expect("base64"))
+                .expect("conteúdo"),
+            b"response file"
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -741,5 +933,14 @@ mod tests {
         };
         let answers = question_answers_from_prompt(&request, "2").expect("resposta");
         assert_eq!(answers[0].answers, vec!["Second"]);
+    }
+
+    #[test]
+    fn missing_active_turn_is_an_idempotent_interruption() {
+        assert!(is_no_active_prompt(
+            "This agent does not have a prompt running right now"
+        ));
+        assert!(is_no_active_prompt("No active turn for this thread"));
+        assert!(!is_no_active_prompt("App Server connection failed"));
     }
 }

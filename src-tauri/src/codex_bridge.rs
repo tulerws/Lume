@@ -65,6 +65,7 @@ pub struct PreparedThread {
     pub permission_profile: PermissionProfile,
 }
 
+#[derive(Clone)]
 pub struct CodexBridge {
     process: Arc<Mutex<Option<Child>>>,
     queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
@@ -187,6 +188,71 @@ impl CodexBridge {
             .spawn(move || {
                 if let Err(error) = monitor_prompt(&mut server, &thread_id, &state, &app) {
                     eprintln!("Prompt do Lume encerrado: {error}");
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn recover_thread_and_submit_prompt(
+        &self,
+        session_id: &str,
+        working_directory: &str,
+        prompt: &str,
+        attachment_paths: &[String],
+        profile: PermissionProfile,
+        state: AppState,
+        app: AppHandle,
+    ) -> Result<(), String> {
+        self.ensure_server()?;
+        let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+        set_server_timeout(&mut server, Duration::from_secs(5))?;
+        send_json(
+            &mut server,
+            json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": { "experimentalApi": true }
+                }
+            }),
+        )?;
+        wait_for_plain_value_response(&mut server, 1)?;
+        send_json(
+            &mut server,
+            json!({ "method": "initialized", "params": {} }),
+        )?;
+
+        let (_, params) = prepare_thread_request_params(
+            working_directory,
+            None,
+            Some(&profile.mode),
+            Some(&profile.approval_policy),
+        );
+        send_json(
+            &mut server,
+            json!({ "method": "thread/start", "id": 2, "params": params }),
+        )?;
+        let response = wait_for_plain_value_response(&mut server, 2)?;
+        let thread_id = response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "The Codex App Server did not return the thread id".to_string())?
+            .to_string();
+        state.rebind_codex_thread(session_id, thread_id.clone())?;
+
+        let profiles = HashMap::from([(thread_id.clone(), profile)]);
+        let turn = prompt_turn_request(&thread_id, prompt, attachment_paths);
+        send_json(&mut server, turn)?;
+        wait_for_response(&mut server, 3, &state, &app, &profiles)?;
+        set_server_timeout(&mut server, Duration::from_millis(200))?;
+        thread::Builder::new()
+            .name("lume-codex-recovered-prompt".into())
+            .spawn(move || {
+                if let Err(error) = monitor_prompt(&mut server, &thread_id, &state, &app) {
+                    eprintln!("Recovered Lume prompt ended: {error}");
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -1111,8 +1177,19 @@ fn wait_for_response(
     profiles: &HashMap<String, PermissionProfile>,
 ) -> Result<(), String> {
     let mut responses = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
     loop {
-        let message = socket.read().map_err(|error| error.to_string())?;
+        let message = loop {
+            match socket.read() {
+                Ok(message) => break message,
+                Err(tungstenite::Error::Io(error))
+                    if transient(&error) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
         if let Message::Text(text) = &message {
             if let Ok(value) = serde_json::from_str::<Value>(text) {
                 if value.get("id").and_then(Value::as_i64) == Some(expected_id) {
@@ -1254,10 +1331,45 @@ fn monitor_prompt(
                     return Ok(());
                 }
             }
-            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(tungstenite::Error::ConnectionClosed) => {
+                mark_prompt_monitor_disconnected(thread_id, state, app);
+                return Ok(());
+            }
             Err(tungstenite::Error::Io(error)) if transient(&error) => {}
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                mark_prompt_monitor_disconnected(thread_id, state, app);
+                return Err(error.to_string());
+            }
         }
+    }
+}
+
+fn mark_prompt_monitor_disconnected(thread_id: &str, state: &AppState, app: &AppHandle) {
+    let _ = event_server::publish_event(state, app, prompt_monitor_disconnected_event(thread_id));
+}
+
+fn prompt_monitor_disconnected_event(thread_id: &str) -> HookEvent {
+    HookEvent {
+        event: HookEventKind::WaitingForInput,
+        session_id: session_id(thread_id),
+        agent: AgentKind::Codex,
+        agent_label: Some("Codex".into()),
+        session_name: None,
+        project: None,
+        source: Some(SessionSource::Cli),
+        source_app: None,
+        status_label: Some("Conexão do prompt encerrada".into()),
+        started_at: None,
+        process_id: None,
+        native_session_id: Some(thread_id.into()),
+        working_directory: None,
+        permission_profile: Some(direct_profile()),
+        permission: None,
+        question: None,
+        last_response: None,
+        activity: None,
+        activities: Vec::new(),
+        wait_for_decision: false,
     }
 }
 
@@ -2581,6 +2693,17 @@ mod tests {
         assert_eq!(limits[0].used_percent, 32);
         assert_eq!(limits[0].resets_at, Some(1_800_000_000_000));
         assert_eq!(limits[1].label, "7d");
+    }
+
+    #[test]
+    fn disconnected_prompt_monitor_releases_the_running_state() {
+        let event = prompt_monitor_disconnected_event("thread-1");
+        assert!(matches!(event.event, HookEventKind::WaitingForInput));
+        assert_eq!(event.native_session_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.status_label.as_deref(),
+            Some("Conexão do prompt encerrada")
+        );
     }
 
     #[test]

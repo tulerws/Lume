@@ -63,6 +63,7 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         _ => return None,
     };
     let hook_name = string(raw, "hook_event_name")?;
+    let (process_id, source, headless_resume) = agent_process_context(provider);
     let event = match (provider, hook_name.as_str()) {
         (_, "SessionStart") => HookEventKind::SessionStarted,
         ("codex", "UserPromptSubmit") | ("claude", "UserPromptSubmit") => HookEventKind::Running,
@@ -103,13 +104,14 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
             HookEventKind::Completed
         }
         (_, "StopFailure") => HookEventKind::Failed,
+        ("claude", "SessionEnd") if headless_resume => HookEventKind::Completed,
         (_, "SessionEnd") => HookEventKind::SessionEnded,
         _ => return None,
     };
 
     let session_id = string(raw, "session_id")?;
     let cwd = string(raw, "cwd");
-    let (process_id, source) = agent_process_context(provider);
+    let process_id = (!headless_resume).then_some(process_id).flatten();
     let permission_mode = string(raw, "permission_mode");
     let is_permission = matches!(event, HookEventKind::PermissionRequest);
     let direct_response = provider == "claude"
@@ -698,7 +700,7 @@ fn status_label(hook: &str, event: &HookEventKind) -> Option<&'static str> {
     }
 }
 
-fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
+fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource, bool) {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -708,7 +710,7 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
             .without_tasks(),
     );
     let Some(current_pid) = get_current_pid().ok() else {
-        return (None, SessionSource::Cli);
+        return (None, SessionSource::Cli, false);
     };
     // O processo atual é `lume hook <provider>` e contém o nome do agente nos
     // próprios argumentos. A busca precisa começar no processo pai para não
@@ -717,10 +719,11 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
         .process(current_pid)
         .and_then(|process| process.parent())
     else {
-        return (None, SessionSource::Cli);
+        return (None, SessionSource::Cli, false);
     };
     let mut agent_pid = None;
     let mut source = SessionSource::Cli;
+    let mut headless_resume = false;
     for _ in 0..10 {
         let Some(process) = system.process(pid) else {
             break;
@@ -740,6 +743,12 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
         if command.contains(provider) {
             agent_pid = Some(pid.as_u32());
         }
+        if provider == "claude"
+            && command.split_whitespace().any(|part| part == "--print")
+            && command.split_whitespace().any(|part| part == "--resume")
+        {
+            headless_resume = true;
+        }
         if name == "code"
             || name == "code.exe"
             || command.contains("visual studio code")
@@ -752,7 +761,7 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource) {
         };
         pid = parent;
     }
-    (agent_pid, source)
+    (agent_pid, source, headless_resume)
 }
 
 fn string(value: &Value, key: &str) -> Option<String> {
@@ -768,7 +777,7 @@ fn hook_response(value: &Value) -> Option<String> {
 }
 
 const CLAUDE_TRANSCRIPT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
-const CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT: usize = 160;
+const CLAUDE_TRANSCRIPT_TRANSIENT_LIMIT: usize = 160;
 const CLAUDE_TRANSCRIPT_LINE_LIMIT: usize = 512 * 1024;
 
 fn claude_transcript_activities(raw: &Value, session_id: &str) -> Vec<SessionActivity> {
@@ -782,10 +791,25 @@ fn claude_transcript_activities(raw: &Value, session_id: &str) -> Vec<SessionAct
     activities.sort_by_key(|activity| activity.created_at);
     let mut seen = HashSet::new();
     activities.retain(|activity| seen.insert(activity.id.clone()));
-    if activities.len() > CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT {
-        activities.drain(..activities.len() - CLAUDE_TRANSCRIPT_ACTIVITY_LIMIT);
-    }
+    prune_claude_transcript_activities(&mut activities);
     activities
+}
+
+fn prune_claude_transcript_activities(activities: &mut Vec<SessionActivity>) {
+    let transient_count = activities
+        .iter()
+        .filter(|activity| !matches!(activity.kind.as_str(), "prompt" | "message"))
+        .count();
+    let mut remove = transient_count.saturating_sub(CLAUDE_TRANSCRIPT_TRANSIENT_LIMIT);
+    activities.retain(|activity| {
+        let transient = !matches!(activity.kind.as_str(), "prompt" | "message");
+        if transient && remove > 0 {
+            remove -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn read_claude_transcript(path: &str, session_id: &str, activities: &mut Vec<SessionActivity>) {
@@ -1255,6 +1279,52 @@ mod tests {
             Some("The hook is connected.")
         );
         assert!(event.activities[0].created_at < event.activities[2].created_at);
+    }
+
+    #[test]
+    fn claude_transcript_limit_preserves_conversation() {
+        let mut activities = Vec::new();
+        for index in 0..190 {
+            push_claude_transcript_activity(
+                &mut activities,
+                "long-session",
+                &format!("thinking-{index}"),
+                0,
+                "thinking",
+                "Thinking",
+                "internal activity",
+                index,
+            );
+        }
+        for index in 0..180 {
+            push_claude_transcript_activity(
+                &mut activities,
+                "long-session",
+                &format!("message-{index}"),
+                0,
+                if index % 2 == 0 { "prompt" } else { "message" },
+                "Conversation",
+                "visible message",
+                1_000 + index,
+            );
+        }
+
+        prune_claude_transcript_activities(&mut activities);
+
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| matches!(activity.kind.as_str(), "prompt" | "message"))
+                .count(),
+            180
+        );
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.kind == "thinking")
+                .count(),
+            CLAUDE_TRANSCRIPT_TRANSIENT_LIMIT
+        );
     }
 
     #[test]

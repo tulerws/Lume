@@ -7,6 +7,7 @@ import type {
 import type {
   AgentSession,
   CompanionStatus,
+  DockSide,
   HistoryEntry,
   IntegrationDiagnostic,
   IntegrationStatus,
@@ -25,6 +26,11 @@ import type {
   ExternalAgentPlugin,
   TerminalWindowState,
   WhiteboardLayout,
+  WorkflowContextPackage,
+  WorkflowGroupDefinition,
+  WorkflowRole,
+  WorkflowRoleContract,
+  WorkflowRun,
 } from "$lib/domain";
 import { demoHistory, demoSessions } from "$lib/demo";
 
@@ -35,6 +41,7 @@ export const defaultPreferences: Preferences = {
   darkMode: undefined,
   soundEnabled: true,
   soundVolume: 55,
+  popupNotificationsEnabled: true,
   autostart: true,
   overlayX: undefined,
   overlayY: undefined,
@@ -44,6 +51,8 @@ export const defaultPreferences: Preferences = {
   projectProfiles: {},
   sessionAliases: {},
   whiteboardLayouts: [],
+  workflowEnabled: false,
+  workflowGroups: [],
   globalShortcut: "Ctrl+Shift+Space",
   openShortcut: "Ctrl+Alt+Shift+L",
   newSessionShortcut: "Ctrl+Alt+Shift+N",
@@ -64,6 +73,10 @@ export async function renameSession(sessionId: string, name: string): Promise<st
 
 export async function loadHubSnapshot(): Promise<HubSnapshot> {
   return invoke<HubSnapshot>("get_hub_snapshot");
+}
+
+export async function loadTerminalHubSnapshot(label: string, activityLimit = 60): Promise<HubSnapshot> {
+  return invoke<HubSnapshot>("get_terminal_hub_snapshot", { label, activityLimit });
 }
 
 export async function loadMobileGatewayStatus(): Promise<MobileGatewayStatus> {
@@ -158,6 +171,10 @@ export async function submitPrompt(
 
 export async function readLocalImageDataUrl(path: string): Promise<string> {
   return invoke<string>("read_local_image_data_url", { path });
+}
+
+export async function exportLocalFile(sourcePath: string, destinationPath: string): Promise<void> {
+  await invoke("export_local_file", { sourcePath, destinationPath });
 }
 
 export async function setTerminalFileDialogActive(
@@ -287,6 +304,8 @@ export async function resizeTerminalWindow(
   y: number,
   width: number,
   height: number,
+  fromLeft: boolean,
+  fromTop: boolean,
 ): Promise<TerminalWindowState> {
   return invoke<TerminalWindowState>("resize_terminal_window", {
     label,
@@ -294,6 +313,8 @@ export async function resizeTerminalWindow(
     y: Math.round(y),
     width: Math.round(width),
     height: Math.round(height),
+    fromLeft,
+    fromTop,
   });
 }
 
@@ -305,8 +326,55 @@ export async function finishLayeredTerminalResize(label: string): Promise<Termin
   return invoke<TerminalWindowState>("finish_layered_terminal_resize", { label });
 }
 
+export type WorkflowBridgeContext = {
+  groupId: string;
+  sourceSessionNativeId: string;
+  targetSessionNativeId: string;
+  side: DockSide;
+  nativeConnectors: boolean;
+  height: number;
+};
+
+export async function openWorkflowBridgeWindow(label: string, side: DockSide): Promise<string> {
+  return invoke<string>("open_workflow_bridge_window", { label, side });
+}
+
+export async function setWorkflowConnectionHover(
+  label: string,
+  side: DockSide,
+  hovered: boolean,
+): Promise<void> {
+  await invoke("set_workflow_connection_hover", { label, side, hovered });
+}
+
+export async function prepareWorkflowBridgeWindow(label: string, side: DockSide): Promise<string> {
+  return invoke<string>("prepare_workflow_bridge_window", { label, side });
+}
+
+export async function discardPreparedWorkflowBridgeWindow(label: string): Promise<void> {
+  await invoke("discard_prepared_workflow_bridge_window", { label });
+}
+
+export async function loadWorkflowBridgeContext(label: string): Promise<WorkflowBridgeContext> {
+  return invoke<WorkflowBridgeContext>("get_workflow_bridge_context", { label });
+}
+
+export async function setWorkflowBridgeExpanded(
+  label: string,
+  expanded: boolean,
+  contentHeight?: number,
+): Promise<void> {
+  await invoke("set_workflow_bridge_expanded", { label, expanded, contentHeight });
+}
+
 export async function undockTerminalWindow(label: string): Promise<TerminalWindowState> {
   return invoke<TerminalWindowState>("undock_terminal_window", { label });
+}
+
+export async function setTerminalWorkflowEnabled(
+  enabled: boolean,
+): Promise<TerminalWindowState[]> {
+  return invoke<TerminalWindowState[]>("set_terminal_workflow_enabled", { enabled });
 }
 
 export async function restoreTerminalLayout(
@@ -346,6 +414,65 @@ export async function loadPreferences(): Promise<Preferences> {
   } catch {
     return { ...defaultPreferences };
   }
+}
+
+export async function loadWorkflowRoleContract(
+  role: WorkflowRole,
+): Promise<WorkflowRoleContract> {
+  return invoke<WorkflowRoleContract>("get_workflow_role_contract", { role });
+}
+
+export async function previewWorkflowContext(
+  group: WorkflowGroupDefinition,
+  connectionId: string,
+  objective: string,
+  sourceResultId?: string,
+): Promise<WorkflowContextPackage> {
+  return invoke<WorkflowContextPackage>("preview_workflow_context", {
+    group,
+    connectionId,
+    objective,
+    sourceResultId,
+  });
+}
+
+export async function loadWorkflowRun(workflowId: string): Promise<WorkflowRun | null> {
+  return invoke<WorkflowRun | null>("get_workflow_run", { workflowId });
+}
+
+export async function startWorkflowRun(
+  group: WorkflowGroupDefinition,
+  objective: string,
+): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("start_workflow_run", { group, objective });
+}
+
+export async function approveWorkflowHandoff(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("approve_workflow_handoff", { workflowId });
+}
+
+export async function advanceWorkflowRun(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("advance_workflow_run", { workflowId });
+}
+
+export async function pauseWorkflowRun(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("pause_workflow_run", { workflowId });
+}
+
+export async function resumeWorkflowRun(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("resume_workflow_run", { workflowId });
+}
+
+export async function retryWorkflowStep(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("retry_workflow_step", { workflowId });
+}
+
+export async function skipWorkflowStep(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("skip_workflow_step", { workflowId });
+}
+
+export async function cancelWorkflowRun(workflowId: string): Promise<WorkflowRun> {
+  return invoke<WorkflowRun>("cancel_workflow_run", { workflowId });
 }
 
 export type DisplayBackend =

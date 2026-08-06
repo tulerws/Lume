@@ -6,18 +6,19 @@ import groovy.json.JsonSlurper
 
 def packageMetadata = new JsonSlurper().parse(file('../../package.json'))
 def lumeVersionName = packageMetadata.version.toString()
-def lumeVersionParts = lumeVersionName.split('\\.').collect { part ->
-    def numeric = part.find(/^\d+/)
-    numeric ? numeric.toInteger() : 0
+def lumeVersionMatch = lumeVersionName =~ /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/
+if (!lumeVersionMatch.matches()) {
+    throw new GradleException("Unsupported Lume version: ${lumeVersionName}")
 }
-while (lumeVersionParts.size() < 4) {
-    lumeVersionParts.add(0)
-}
+def lumeVersionParts = (1..3).collect { index -> lumeVersionMatch[0][index].toInteger() }
+def lumeReleaseSequence = lumeVersionMatch[0][4]
+    ? Math.min(lumeVersionMatch[0][4].toInteger(), 998)
+    : 999
 def lumeVersionCode =
     (lumeVersionParts[0] * 100000000) +
     (lumeVersionParts[1] * 1000000) +
     (lumeVersionParts[2] * 1000) +
-    lumeVersionParts[3]
+    lumeReleaseSequence
 def releaseKeystorePath = System.getenv('ANDROID_KEYSTORE_PATH')
 
 android {

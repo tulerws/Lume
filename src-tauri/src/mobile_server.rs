@@ -1121,6 +1121,7 @@ fn route_core(
             protocol::HubCommand::ResolveQuestion { .. } => MobileScope::Prompt,
             protocol::HubCommand::TerminateSession { .. } => MobileScope::Terminate,
             protocol::HubCommand::InterruptPrompt { .. } => MobileScope::Terminate,
+            protocol::HubCommand::DownloadResponseFile { .. } => MobileScope::Monitor,
             protocol::HubCommand::OpenSessionSource { .. } => {
                 return json_error(
                     403,

@@ -3,6 +3,7 @@ mod agent_plugins;
 mod browser_server;
 mod codex_bridge;
 mod codex_sessions;
+mod context_builder;
 mod control;
 mod desktop_shortcuts;
 mod discovery;
@@ -19,13 +20,18 @@ mod session_filters;
 mod state;
 mod store;
 mod terminal_windows;
+mod workflow_runtime;
 
-use std::{collections::HashSet, io::Read, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+    sync::Mutex,
+};
 
 use domain::{
     AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PermissionAction, Preferences,
     PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionActivity,
-    SessionSource,
+    SessionSource, WorkflowRole, WorkflowRoleContract,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -175,6 +181,34 @@ fn get_hub_snapshot(state: State<'_, AppState>) -> Result<protocol::HubSnapshot,
 }
 
 #[tauri::command]
+fn get_terminal_hub_snapshot(
+    state: State<'_, AppState>,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    activity_limit: Option<usize>,
+) -> Result<protocol::HubSnapshot, String> {
+    let terminal = terminals.state(&label)?;
+    let mut sessions = state.sessions()?;
+    sessions.retain(|session| {
+        session.id == terminal.session_id
+            || (terminal.session_native_id.is_some()
+                && terminal.session_native_id == session.native_session_id
+                && terminal.session_agent == session.agent)
+            || (terminal.session_process_id.is_some()
+                && terminal.session_process_id == session.process_id
+                && terminal.session_agent == session.agent)
+            || (terminal.session_agent == session.agent
+                && terminal.session_source == session.source
+                && terminal.session_project == session.project
+                && terminal.session_working_directory == session.working_directory)
+    });
+    Ok(protocol::HubSnapshot::with_activity_limit(
+        sessions,
+        activity_limit.unwrap_or(60),
+    ))
+}
+
+#[tauri::command]
 fn begin_mobile_pairing(
     gateway: State<'_, mobile_gateway::MobileGateway>,
     server: State<'_, mobile_server::MobileServer>,
@@ -309,6 +343,22 @@ fn read_local_image_data_url(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn export_local_file(source_path: String, destination_path: String) -> Result<(), String> {
+    let source = std::fs::canonicalize(source_path)
+        .map_err(|_| "The response file no longer exists".to_string())?;
+    if !source.is_file() {
+        return Err("The response attachment is not a file".into());
+    }
+    let destination = std::path::PathBuf::from(destination_path);
+    if destination.as_os_str().is_empty() || destination.is_dir() {
+        return Err("Choose a valid destination for the file".into());
+    }
+    std::fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| format!("Could not save the response file: {error}"))
+}
+
+#[tauri::command]
 fn set_terminal_file_dialog_active(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -318,10 +368,32 @@ fn set_terminal_file_dialog_active(
     if !label.starts_with("terminal-") {
         return Err("A janela informada não é um terminal do Lume".into());
     }
-    let window = app
-        .get_webview_window(&label)
+    app.get_webview_window(&label)
         .ok_or_else(|| "Mini terminal não encontrado".to_string())?;
-    overlay::set_file_dialog_active(&window, active, state.preferences()?.show_over_fullscreen)
+    let show_over_fullscreen = state.preferences()?.show_over_fullscreen;
+    if active {
+        overlay::set_native_dialog_active(true);
+    }
+    let mut updated = 0usize;
+    let mut first_error = None;
+    for (window_label, window) in app.webview_windows() {
+        if !window_label.starts_with("terminal-") {
+            continue;
+        }
+        match overlay::set_file_dialog_active(&window, active, show_over_fullscreen) {
+            Ok(()) => updated += 1,
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if !active || updated == 0 {
+        overlay::set_native_dialog_active(false);
+    }
+    if updated > 0 {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| "No Lume terminal window was available".into()))
+    }
 }
 
 #[tauri::command]
@@ -431,6 +503,153 @@ fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
 }
 
 #[tauri::command]
+fn get_workflow_role_contract(role: WorkflowRole) -> WorkflowRoleContract {
+    role.default_contract()
+}
+
+#[tauri::command]
+fn preview_workflow_context(
+    state: State<'_, AppState>,
+    group: domain::WorkflowGroupDefinition,
+    connection_id: String,
+    objective: String,
+    source_result_id: Option<String>,
+) -> Result<context_builder::WorkflowContextPackage, String> {
+    let sessions = state.sessions()?;
+    context_builder::build_context_package(
+        &group,
+        &connection_id,
+        &objective,
+        source_result_id.as_deref(),
+        &sessions,
+    )
+}
+
+#[tauri::command]
+fn get_workflow_run(
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<Option<domain::WorkflowRun>, String> {
+    runtime.get(state.inner(), &workflow_id)
+}
+
+#[tauri::command]
+fn start_workflow_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    browser: State<'_, browser_server::BrowserControl>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    group: domain::WorkflowGroupDefinition,
+    objective: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.start(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        browser.inner(),
+        group,
+        &objective,
+    )
+}
+
+#[tauri::command]
+fn approve_workflow_handoff(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.approve(&app, state.inner(), &workflow_id)
+}
+
+#[tauri::command]
+fn advance_workflow_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    browser: State<'_, browser_server::BrowserControl>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.advance(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        browser.inner(),
+        &workflow_id,
+    )
+}
+
+#[tauri::command]
+fn pause_workflow_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.pause(&app, state.inner(), &workflow_id)
+}
+
+#[tauri::command]
+fn resume_workflow_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.resume(&app, state.inner(), &workflow_id)
+}
+
+#[tauri::command]
+fn retry_workflow_step(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    browser: State<'_, browser_server::BrowserControl>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.retry(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        browser.inner(),
+        &workflow_id,
+    )
+}
+
+#[tauri::command]
+fn skip_workflow_step(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    runtime.skip(&app, state.inner(), &workflow_id)
+}
+
+#[tauri::command]
+fn cancel_workflow_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+) -> Result<domain::WorkflowRun, String> {
+    let current_session = runtime
+        .current_session_id(state.inner(), &workflow_id)
+        .ok()
+        .flatten();
+    let run = runtime.cancel(&app, state.inner(), &workflow_id)?;
+    if let Some(session_id) = current_session {
+        let _ = control::interrupt_prompt(&app, state.inner(), bridge.inner(), &session_id);
+    }
+    Ok(run)
+}
+
+#[tauri::command]
 fn display_backend() -> &'static str {
     #[cfg(target_os = "linux")]
     match std::env::var("LUME_LINUX_BACKEND").ok().as_deref() {
@@ -468,12 +687,135 @@ fn get_overlay_position(
     Ok(OverlayPosition { x, y })
 }
 
+fn workflow_has_cycle(group: &domain::WorkflowGroupDefinition) -> bool {
+    fn visit<'a>(
+        step: &'a str,
+        edges: &HashMap<&'a str, Vec<&'a str>>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> bool {
+        if visiting.contains(step) {
+            return true;
+        }
+        if !visited.insert(step) {
+            return false;
+        }
+        visiting.insert(step);
+        let cyclic = edges
+            .get(step)
+            .into_iter()
+            .flatten()
+            .any(|next| visit(next, edges, visiting, visited));
+        visiting.remove(step);
+        cyclic
+    }
+
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for connection in &group.connections {
+        edges
+            .entry(connection.from_step_id.as_str())
+            .or_default()
+            .push(connection.to_step_id.as_str());
+    }
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    group
+        .steps
+        .iter()
+        .any(|step| visit(&step.id, &edges, &mut visiting, &mut visited))
+}
+
+fn validate_workflow_groups(preferences: &Preferences) -> Result<(), String> {
+    let mut group_ids = HashSet::new();
+    for group in &preferences.workflow_groups {
+        if group.id.trim().is_empty() || group.terminal_group_id.trim().is_empty() {
+            return Err("Workflow groups must have stable identifiers".into());
+        }
+        if !group_ids.insert(group.id.as_str()) {
+            return Err("Workflow group identifiers must be unique".into());
+        }
+        let mut step_ids = HashSet::new();
+        let mut sessions = HashSet::new();
+        for step in &group.steps {
+            if step.id.trim().is_empty() || step.session_native_id.trim().is_empty() {
+                return Err("Workflow steps must identify their terminal session".into());
+            }
+            if !step_ids.insert(step.id.as_str())
+                || !sessions.insert(step.session_native_id.as_str())
+            {
+                return Err("A terminal can appear only once in a workflow group".into());
+            }
+            if [
+                &step.custom_role_label,
+                &step.instruction,
+                &step.expected_input,
+                &step.produced_output,
+                &step.completion_condition,
+            ]
+            .iter()
+            .any(|value| value.len() > 4_000)
+            {
+                return Err("Workflow step fields cannot exceed 4000 characters".into());
+            }
+        }
+        let known_steps = group
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut connection_ids = HashSet::new();
+        let mut connection_pairs = HashSet::new();
+        for connection in &group.connections {
+            if connection.id.trim().is_empty()
+                || !known_steps.contains(connection.from_step_id.as_str())
+                || !known_steps.contains(connection.to_step_id.as_str())
+            {
+                return Err("Workflow connections must reference existing steps".into());
+            }
+            if connection.from_step_id == connection.to_step_id {
+                return Err("A workflow step cannot connect to itself".into());
+            }
+            if !connection_ids.insert(connection.id.as_str())
+                || !connection_pairs.insert((
+                    connection.from_step_id.as_str(),
+                    connection.to_step_id.as_str(),
+                ))
+            {
+                return Err("Workflow connections must be unique".into());
+            }
+            if connection.additional_instruction.len() > 4_000 {
+                return Err(
+                    "Workflow connection instructions cannot exceed 4000 characters".into(),
+                );
+            }
+            let context = context_builder::effective_selection(connection);
+            if !context.response
+                && !context.files
+                && !context.checks
+                && !context.plan
+                && !context.activity
+                && connection.additional_instruction.trim().is_empty()
+            {
+                return Err("Workflow connections must transfer some context".into());
+            }
+            if context.diffs && !context.files {
+                return Err("Workflow diffs require changed files to be included".into());
+            }
+        }
+        if workflow_has_cycle(group) {
+            return Err("Circular workflow connections are disabled by default".into());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn set_preferences(
     app: AppHandle,
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<(), String> {
+    validate_workflow_groups(&preferences)?;
     let previous = state.preferences()?;
     let overlay_configuration_changed = previous.monitor_id != preferences.monitor_id
         || previous.show_over_fullscreen != preferences.show_over_fullscreen;
@@ -585,6 +927,7 @@ fn open_terminal_window_impl(
         preferences.overlay_x.unwrap_or(40),
         preferences.overlay_y.unwrap_or(44),
         preferences.show_over_fullscreen,
+        preferences.workflow_enabled,
     )
 }
 
@@ -744,8 +1087,10 @@ fn resize_terminal_window(
     y: i32,
     width: i32,
     height: i32,
+    from_left: bool,
+    from_top: bool,
 ) -> Result<terminal_windows::TerminalWindowState, String> {
-    terminals.resize_window(&app, &label, x, y, width, height)
+    terminals.resize_window(&app, &label, x, y, width, height, from_left, from_top)
 }
 
 #[tauri::command]
@@ -767,6 +1112,65 @@ fn finish_layered_terminal_resize(
 }
 
 #[tauri::command]
+fn open_workflow_bridge_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    side: terminal_windows::DockSide,
+) -> Result<String, String> {
+    terminals.open_workflow_bridge(&app, &label, side)
+}
+
+#[tauri::command]
+fn set_workflow_connection_hover(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    side: terminal_windows::DockSide,
+    hovered: bool,
+) -> Result<(), String> {
+    terminals.set_workflow_connection_hover(&app, &label, side, hovered)
+}
+
+#[tauri::command]
+fn prepare_workflow_bridge_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    side: terminal_windows::DockSide,
+) -> Result<String, String> {
+    terminals.prepare_workflow_bridge(&app, &label, side)
+}
+
+#[tauri::command]
+fn discard_prepared_workflow_bridge_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<(), String> {
+    terminals.discard_prepared_workflow_bridge(&app, &label)
+}
+
+#[tauri::command]
+fn get_workflow_bridge_context(
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+) -> Result<terminal_windows::WorkflowBridgeContext, String> {
+    terminals.workflow_bridge_context(&label)
+}
+
+#[tauri::command]
+fn set_workflow_bridge_expanded(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    expanded: bool,
+    content_height: Option<i32>,
+) -> Result<(), String> {
+    terminals.set_workflow_bridge_expanded(&app, &label, expanded, content_height)
+}
+
+#[tauri::command]
 fn undock_terminal_window(
     app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
@@ -776,14 +1180,28 @@ fn undock_terminal_window(
 }
 
 #[tauri::command]
+fn set_terminal_workflow_enabled(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    enabled: bool,
+) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
+    terminals.set_workflow_enabled(&app, enabled)
+}
+
+#[tauri::command]
 fn restore_terminal_layout(
     app: AppHandle,
     state: State<'_, AppState>,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     entries: Vec<terminal_windows::RestoredTerminalPlacement>,
 ) -> Result<Vec<terminal_windows::TerminalWindowState>, String> {
-    let monitor_id = state.preferences()?.monitor_id;
-    terminals.restore_layout(&app, entries, monitor_id.as_deref())
+    let preferences = state.preferences()?;
+    terminals.restore_layout(
+        &app,
+        entries,
+        preferences.monitor_id.as_deref(),
+        preferences.workflow_enabled,
+    )
 }
 
 #[tauri::command]
@@ -1109,12 +1527,12 @@ pub fn run() {
             app.manage(state.clone());
             let codex_bridge =
                 codex_bridge::CodexBridge::start(state.clone(), app.handle().clone())?;
-            app.manage(codex_bridge);
+            app.manage(codex_bridge.clone());
             codex_sessions::start(state.clone(), app.handle().clone())?;
             event_server::start(state.clone(), app.handle().clone())?;
             let browser_control = browser_server::BrowserControl::default();
             browser_server::start(state.clone(), app.handle().clone(), browser_control.clone())?;
-            app.manage(browser_control);
+            app.manage(browser_control.clone());
             let mobile_gateway = mobile_gateway::MobileGateway::default();
             let mobile_server = mobile_server::MobileServer::start_loopback(
                 state.clone(),
@@ -1129,6 +1547,17 @@ pub fn run() {
             app.manage(mobile_gateway);
             app.manage(mobile_server);
             app.manage(terminal_windows::TerminalWindows::default());
+            let workflow_runtime = workflow_runtime::WorkflowRuntime::default();
+            if let Err(error) = workflow_runtime.restore(&state) {
+                eprintln!("Could not restore workflow runs: {error}");
+            }
+            workflow_runtime.start_monitor(
+                state.clone(),
+                app.handle().clone(),
+                codex_bridge,
+                browser_control,
+            );
+            app.manage(workflow_runtime);
             discovery::start(state.clone(), app.handle().clone())?;
             overlay::start_fullscreen_guard(state.clone(), app.handle().clone())?;
 
@@ -1195,6 +1624,7 @@ pub fn run() {
             list_sessions,
             rename_session,
             get_hub_snapshot,
+            get_terminal_hub_snapshot,
             execute_hub_command,
             begin_mobile_pairing,
             get_mobile_gateway_status,
@@ -1208,6 +1638,7 @@ pub fn run() {
             open_session_source,
             submit_prompt,
             read_local_image_data_url,
+            export_local_file,
             set_terminal_file_dialog_active,
             refresh_agent_rate_limits,
             interrupt_prompt,
@@ -1220,6 +1651,17 @@ pub fn run() {
             save_result_note,
             delete_result_note,
             get_preferences,
+            get_workflow_role_contract,
+            preview_workflow_context,
+            get_workflow_run,
+            start_workflow_run,
+            approve_workflow_handoff,
+            advance_workflow_run,
+            pause_workflow_run,
+            resume_workflow_run,
+            retry_workflow_step,
+            skip_workflow_step,
+            cancel_workflow_run,
             take_pending_shortcut_action,
             display_backend,
             get_overlay_position,
@@ -1243,7 +1685,14 @@ pub fn run() {
             resize_terminal_window,
             begin_layered_terminal_resize,
             finish_layered_terminal_resize,
+            open_workflow_bridge_window,
+            set_workflow_connection_hover,
+            prepare_workflow_bridge_window,
+            discard_prepared_workflow_bridge_window,
+            get_workflow_bridge_context,
+            set_workflow_bridge_expanded,
             undock_terminal_window,
+            set_terminal_workflow_enabled,
             restore_terminal_layout,
             integration_statuses,
             list_resumable_sessions,
@@ -1322,6 +1771,117 @@ mod tests {
         preferences.open_shortcut = preferences.global_shortcut.clone();
 
         assert!(parsed_shortcut_bindings(&preferences).is_err());
+    }
+
+    #[test]
+    fn workflow_roles_and_contracts_are_validated_as_a_group() {
+        let mut preferences = Preferences::default();
+        preferences.workflow_groups = vec![domain::WorkflowGroupDefinition {
+            id: "workflow-group-1".into(),
+            terminal_group_id: "terminal-group-1".into(),
+            steps: vec![domain::WorkflowStepDefinition {
+                id: "step-1".into(),
+                session_native_id: "thread-1".into(),
+                role: domain::WorkflowRole::Planner,
+                instruction: "Create the implementation plan".into(),
+                expected_input: "Objective".into(),
+                produced_output: "Approved plan".into(),
+                completion_condition: "Plan is complete".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        assert!(validate_workflow_groups(&preferences).is_ok());
+    }
+
+    #[test]
+    fn workflow_rejects_the_same_terminal_twice() {
+        let mut preferences = Preferences::default();
+        let step = domain::WorkflowStepDefinition {
+            id: "step-1".into(),
+            session_native_id: "thread-1".into(),
+            role: domain::WorkflowRole::Implementer,
+            ..Default::default()
+        };
+        preferences.workflow_groups = vec![domain::WorkflowGroupDefinition {
+            id: "workflow-group-1".into(),
+            terminal_group_id: "terminal-group-1".into(),
+            steps: vec![
+                step.clone(),
+                domain::WorkflowStepDefinition {
+                    id: "step-2".into(),
+                    ..step
+                },
+            ],
+            ..Default::default()
+        }];
+
+        assert!(validate_workflow_groups(&preferences).is_err());
+    }
+
+    #[test]
+    fn workflow_connections_reference_unique_existing_steps() {
+        let mut preferences = Preferences::default();
+        let steps = ["planner", "implementer"]
+            .into_iter()
+            .map(|id| domain::WorkflowStepDefinition {
+                id: id.into(),
+                session_native_id: format!("thread-{id}"),
+                ..Default::default()
+            })
+            .collect();
+        preferences.workflow_groups = vec![domain::WorkflowGroupDefinition {
+            id: "workflow-group-1".into(),
+            terminal_group_id: "terminal-group-1".into(),
+            steps,
+            connections: vec![domain::WorkflowConnectionDefinition {
+                id: "connection-1".into(),
+                from_step_id: "planner".into(),
+                to_step_id: "implementer".into(),
+                include_response: true,
+                ..Default::default()
+            }],
+        }];
+
+        assert!(validate_workflow_groups(&preferences).is_ok());
+        preferences.workflow_groups[0].connections[0].to_step_id = "missing".into();
+        assert!(validate_workflow_groups(&preferences).is_err());
+    }
+
+    #[test]
+    fn workflow_connections_reject_cycles_by_default() {
+        let mut preferences = Preferences::default();
+        preferences.workflow_groups = vec![domain::WorkflowGroupDefinition {
+            id: "workflow-group-1".into(),
+            terminal_group_id: "terminal-group-1".into(),
+            steps: ["one", "two"]
+                .into_iter()
+                .map(|id| domain::WorkflowStepDefinition {
+                    id: id.into(),
+                    session_native_id: format!("thread-{id}"),
+                    ..Default::default()
+                })
+                .collect(),
+            connections: vec![
+                domain::WorkflowConnectionDefinition {
+                    id: "forward".into(),
+                    from_step_id: "one".into(),
+                    to_step_id: "two".into(),
+                    include_response: true,
+                    ..Default::default()
+                },
+                domain::WorkflowConnectionDefinition {
+                    id: "back".into(),
+                    from_step_id: "two".into(),
+                    to_step_id: "one".into(),
+                    include_response: true,
+                    ..Default::default()
+                },
+            ],
+        }];
+
+        assert!(validate_workflow_groups(&preferences).is_err());
     }
 
     #[test]

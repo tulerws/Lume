@@ -1,14 +1,20 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { fade, slide } from "svelte/transition";
+  import { emit, listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { AgentSession, DockPreviewEvent, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, DockSide, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState, WorkflowGroupDefinition, WorkflowRole, WorkflowRoleContract, WorkflowStepDefinition } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
+  import ActivityTraceGroup from "$lib/ActivityTraceGroup.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
+  import FileTypeIcon from "$lib/FileTypeIcon.svelte";
+  import ResponseAttachments from "$lib/ResponseAttachments.svelte";
+  import { cleanPromptTransport, promptTextKey } from "$lib/chatAttachments";
+  import { isHiddenAgentActivity, isPresentableTraceActivity, needsUserAuthorization } from "$lib/activityPresentation";
   import { displayText, localize, type Language } from "$lib/i18n";
   import {
     clipboardHasFile,
@@ -30,8 +36,18 @@
     summarizeFileChanges,
     type FileChangeSummary,
   } from "$lib/fileChanges";
+  import {
+    buildHandoffBody,
+    buildHandoffPrompt,
+    parseHandoffPrompt,
+  } from "$lib/handoff";
   import { sessionCapabilities } from "$lib/sessionCapabilities";
   import { resolveTerminalSession } from "$lib/sessionIdentity";
+  import {
+    orderTerminalsByPosition,
+    orderWorkflowSteps,
+    terminalWorkflowKey,
+  } from "$lib/workflowOrder";
   import {
     beginLayeredTerminalResize,
     answerQuestion as answerInteractiveQuestion,
@@ -43,16 +59,23 @@
     interruptPrompt,
     loadDisplayBackend,
     loadPreferences,
+    loadTerminalHubSnapshot,
+    loadWorkflowRoleContract,
     loadHubSnapshot,
+    loadTerminalWindows,
     loadTerminalWindowState,
     markTerminalFrontendReady,
     minimizeTerminalWindow,
     moveTerminalWindow,
+    openWorkflowBridgeWindow,
     openSessionSource,
     readLocalImageDataUrl,
+    prepareWorkflowBridgeWindow,
     refreshAgentRateLimits,
     renameSession,
     resizeTerminalWindow,
+    savePreferences,
+    setWorkflowConnectionHover,
     setSessionCollaborationMode,
     setTerminalFileDialogActive,
     steerQueuedPrompt,
@@ -88,6 +111,23 @@
   let fullscreen = $state(false);
   let promptAttachments = $state<PromptAttachmentInput[]>([]);
   let message = $state<string | null>(null);
+  type HandoffTarget = {
+    terminal: TerminalWindowState;
+    session: HubSession;
+  };
+  type HandoffDraft = {
+    text: string;
+    files: FileChangeSummary[];
+    includeText: boolean;
+    includeFiles: boolean;
+    note: string;
+    targetSessionId: string;
+  };
+  let handoffDraft = $state<HandoffDraft | null>(null);
+  let handoffTargets = $state<HandoffTarget[]>([]);
+  let handoffLoading = $state(false);
+  let handoffSending = $state(false);
+  let handoffError = $state<string | null>(null);
   let sending = $state(false);
   let steeringQueued = $state(false);
   let collaborationMode = $state<CollaborationMode>("default");
@@ -130,8 +170,9 @@
     scale: number;
   } | null = null;
   let resizePreparing: Promise<void> | null = null;
-  let pendingResize: { x: number; y: number; width: number; height: number } | null = null;
+  let pendingResize: { x: number; y: number; width: number; height: number; fromLeft: boolean; fromTop: boolean } | null = null;
   let resizeSyncRunning = false;
+  let resizeFrame: number | null = null;
   let settling = $state(false);
   let dockMovingLabel = $state<string | null>(null);
   let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
@@ -141,15 +182,41 @@
   let renamingSession = $state(false);
   let renameDraft = $state("");
   let savingSessionName = $state(false);
-  let activeTab = $state<"chat" | "changes">("chat");
+  type TerminalTab = "chat" | "changes" | "plan";
+  let activeTab = $state<TerminalTab>("chat");
   let workTrayExpanded = $state(true);
   let rateLimitRefreshRequested = false;
   let outputElement = $state<HTMLDivElement | null>(null);
+  let visibleChatItemLimit = $state(60);
   let outputFollowingTail = true;
+  let chatFollowingTail = true;
+  const tabScrollPositions: Partial<Record<TerminalTab, number>> = {};
   let language = $state<Language>("en");
   let darkMode = $state<boolean | undefined>(undefined);
+  let workflowGroups = $state<WorkflowGroupDefinition[]>([]);
+  let workflowTerminals = $state<TerminalWindowState[]>([]);
+  let workflowDraft = $state<WorkflowGroupDefinition | null>(null);
+  let workflowEditingStepId = $state<string | null>(null);
+  let workflowDraftSaving = $state(false);
+  let workflowDraftError = $state<string | null>(null);
+  let workflowRolePickerOpen = $state(false);
+  let workflowRoleConfigured = $state(false);
+  let workflowContractExpanded = $state(false);
+  let workflowDefaultContract = $state<WorkflowRoleContract | null>(null);
+  let workflowPendingRole = $state<WorkflowRole | null>(null);
+  let workflowRoleFabElement = $state<HTMLButtonElement | null>(null);
+  let workflowRolePopoverStyle = $state("");
+  let workflowRolePopoverAbove = $state(false);
+  let workflowRolePopoverConstrained = $state(false);
+  let preparedWorkflowBridgeSide: DockSide | null = null;
+  let workflowBridgePreparation: Promise<void> | null = null;
+  let hoveredWorkflowConnectionSides = $state<DockSide[]>([]);
+  let workflowConnectionLeaveTimer: ReturnType<typeof setTimeout> | undefined;
   let systemDark = $state(false);
   let workClock = $state(Date.now());
+  let workClockTimer: ReturnType<typeof setTimeout> | undefined;
+  const markdownRenderCache = new Map<string, string>();
+  const activityChangeCache = new Map<string, { detail: string; filesKey: string; changes: FileChangeSummary[] }>();
   const composerMinHeight = 63;
   const composerAttachmentMinHeight = 120;
   const composerQueueMinHeight = 104;
@@ -167,6 +234,55 @@
   let textZoomOpen = $state(false);
   let headerActionsOpen = $state(false);
   const effectiveDark = $derived(darkMode ?? systemDark);
+  const workflowGroup = $derived.by(() => {
+    if (!windowState?.groupId) return undefined;
+    return workflowGroups.find((group) => group.terminalGroupId === windowState?.groupId);
+  });
+  const workflowGroupTerminals = $derived.by(() => windowState?.groupId
+    ? orderTerminalsByPosition(
+      workflowTerminals.filter((terminal) => terminal.groupId === windowState?.groupId),
+    )
+    : []);
+  const workflowPhysicalOrder = $derived.by(() => {
+    if (!windowState) return 0;
+    return Math.max(0, workflowGroupTerminals.findIndex((terminal) => terminal.label === windowState?.label) + 1);
+  });
+  const orderedWorkflowSteps = $derived.by(() => workflowGroup
+    ? orderWorkflowSteps(workflowGroup.steps, workflowTerminals, workflowGroup.connections)
+    : []);
+  const workflowStep = $derived.by((): WorkflowStepDefinition | undefined => {
+    const sessionNativeId = windowState?.sessionNativeId?.trim() || windowState?.sessionId;
+    if (!sessionNativeId || !windowState?.groupId) return undefined;
+    return workflowGroup?.steps.find((step) => step.sessionNativeId === sessionNativeId);
+  });
+  const workflowStepOrder = $derived.by(() => {
+    if (!workflowStep || !windowState?.groupId) return 0;
+    const definedSessions = new Set(workflowGroup?.steps.map((step) => step.sessionNativeId));
+    if (workflowGroupTerminals.some((terminal) => !definedSessions.has(terminalWorkflowKey(terminal)))) {
+      return workflowPhysicalOrder;
+    }
+    return Math.max(0, orderedWorkflowSteps.findIndex((step) => step.id === workflowStep.id) + 1);
+  });
+  const workflowStepTotal = $derived(workflowGroupTerminals.length || orderedWorkflowSteps.length);
+  const workflowEditingStep = $derived(
+    workflowDraft?.steps.find((step) => step.id === workflowEditingStepId),
+  );
+  const workflowRoleReady = $derived(workflowStepIsReady(workflowEditingStep));
+  const workflowInstructionsCustomized = $derived.by(() => {
+    if (!workflowEditingStep || !workflowRoleConfigured) return false;
+    if (workflowEditingStep.role === "custom") {
+      return Boolean(
+        workflowEditingStep.customRoleLabel.trim()
+        || workflowEditingStep.instruction.trim()
+        || workflowEditingStep.expectedInput.trim()
+        || workflowEditingStep.producedOutput.trim()
+        || workflowEditingStep.completionCondition.trim(),
+      );
+    }
+    return workflowDefaultContract
+      ? !workflowContractMatches(workflowEditingStep, workflowDefaultContract)
+      : false;
+  });
   const displayedComposerHeight = $derived.by(() => {
     const hasQueuedPrompt = pendingQueuedPrompts(session).length > 0;
     const modeControlHeight = session?.agent === "codex" ? 16 : 0;
@@ -188,6 +304,312 @@
 
   function tr(english: string, portuguese: string) {
     return localize(language, english, portuguese);
+  }
+
+  function workflowStepRoleLabel(step: WorkflowStepDefinition) {
+    if (step.role === "custom") return step.customRoleLabel.trim() || tr("Custom", "Personalizado");
+    return {
+      planner: tr("Planner", "Planejador"),
+      implementer: tr("Implementer", "Implementador"),
+      reviewer: tr("Reviewer", "Revisor"),
+      tester: tr("Tester", "Testador"),
+      researcher: tr("Researcher", "Pesquisador"),
+      custom: tr("Custom", "Personalizado"),
+    }[step.role];
+  }
+
+  const workflowRoles: WorkflowRole[] = [
+    "planner",
+    "implementer",
+    "reviewer",
+    "tester",
+    "researcher",
+    "custom",
+  ];
+
+  function workflowRoleDescription(role: WorkflowRole) {
+    return {
+      planner: tr("Structures the approach and decisions", "Estrutura a abordagem e as decisões"),
+      implementer: tr("Builds the approved solution", "Constrói a solução aprovada"),
+      reviewer: tr("Finds risks and improvement points", "Encontra riscos e pontos de melhoria"),
+      tester: tr("Validates behavior and regressions", "Valida comportamento e regressões"),
+      researcher: tr("Collects evidence and alternatives", "Reúne evidências e alternativas"),
+      custom: tr("Uses your own responsibility", "Usa uma responsabilidade personalizada"),
+    }[role];
+  }
+
+  function workflowStepIsReady(step?: WorkflowStepDefinition) {
+    if (!step) return false;
+    return Boolean(
+      (step.role !== "custom" || step.customRoleLabel.trim())
+      && step.instruction.trim()
+      && step.expectedInput.trim()
+      && step.producedOutput.trim()
+      && step.completionCondition.trim(),
+    );
+  }
+
+  function workflowContractMatches(
+    step: WorkflowStepDefinition,
+    contract: WorkflowRoleContract,
+  ) {
+    return step.instruction.trim() === contract.instruction.trim()
+      && step.expectedInput.trim() === contract.expectedInput.trim()
+      && step.producedOutput.trim() === contract.producedOutput.trim()
+      && step.completionCondition.trim() === contract.completionCondition.trim();
+  }
+
+  function workflowRoleOptionLabel(role: WorkflowRole) {
+    return workflowStepRoleLabel({
+      id: "",
+      sessionNativeId: "",
+      role,
+      customRoleLabel: "",
+      instruction: "",
+      expectedInput: "",
+      producedOutput: "",
+      completionCondition: "",
+      attempt: 0,
+    });
+  }
+
+  function defaultWorkflowRole(index: number): WorkflowRole {
+    return (["planner", "implementer", "reviewer", "tester"] as WorkflowRole[])[index] ?? "custom";
+  }
+
+  function positionWorkflowRolePopover() {
+    if (!workflowRoleFabElement) return;
+    const bounds = workflowRoleFabElement.getBoundingClientRect();
+    const margin = 8;
+    const gap = 9;
+    const below = Math.max(0, window.innerHeight - bounds.bottom - gap - margin);
+    const above = Math.max(0, bounds.top - gap - margin);
+    workflowRolePopoverAbove = below < 230 && above > below;
+    const available = workflowRolePopoverAbove ? above : below;
+    workflowRolePopoverConstrained = available < 330;
+    workflowRolePopoverStyle = workflowRolePopoverAbove
+      ? `top:auto;bottom:${Math.round(window.innerHeight - bounds.top + gap)}px;max-height:${Math.round(available)}px`
+      : `top:${Math.round(bounds.bottom + gap)}px;bottom:auto;max-height:${Math.round(available)}px`;
+  }
+
+  async function openWorkflowRoleEditor() {
+    if (!windowState?.workflowEnabled || !windowState.groupId) return;
+    workflowDraftError = null;
+    workflowRolePickerOpen = false;
+    workflowPendingRole = null;
+    workflowDefaultContract = null;
+    try {
+      const allTerminals = await loadTerminalWindows();
+      workflowTerminals = allTerminals;
+      const terminals = orderTerminalsByPosition(
+        allTerminals.filter((terminal) => terminal.groupId === windowState?.groupId),
+      );
+      const saved = workflowGroups.find((group) => group.terminalGroupId === windowState?.groupId);
+      const activeKeys = new Set(terminals.map(terminalWorkflowKey));
+      const retained = (saved?.steps ?? []).filter((step) => activeKeys.has(step.sessionNativeId));
+      const currentTerminalKey = terminalWorkflowKey(windowState);
+      workflowRoleConfigured = retained.some((step) => step.sessionNativeId === currentTerminalKey);
+      workflowContractExpanded = false;
+      const retainedKeys = new Set(retained.map((step) => step.sessionNativeId));
+      const currentTerminal = terminals.find((terminal) => terminalWorkflowKey(terminal) === currentTerminalKey);
+      const appended = currentTerminal && !retainedKeys.has(currentTerminalKey)
+        ? [await (async (): Promise<WorkflowStepDefinition> => {
+          const sessionNativeId = currentTerminalKey;
+          const role = defaultWorkflowRole(retained.length);
+          const contract = await loadWorkflowRoleContract(role);
+          return {
+            id: `step-${sessionNativeId}`,
+            sessionNativeId,
+            role,
+            customRoleLabel: "",
+            ...contract,
+            attempt: 0,
+          };
+        })()]
+        : [];
+      const draftSteps = [...retained, ...appended];
+      const draftConnections = (saved?.connections ?? []).filter((connection) =>
+        draftSteps.some((step) => step.id === connection.fromStepId)
+        && draftSteps.some((step) => step.id === connection.toStepId));
+      workflowDraft = {
+        id: saved?.id ?? `workflow-${windowState.groupId}`,
+        terminalGroupId: windowState.groupId,
+        steps: orderWorkflowSteps(draftSteps, terminals, draftConnections),
+        connections: draftConnections,
+      };
+      workflowEditingStepId = workflowDraft.steps
+        .find((step) => step.sessionNativeId === terminalWorkflowKey(windowState!))?.id ?? null;
+      const editingStep = workflowDraft.steps.find((step) => step.id === workflowEditingStepId);
+      workflowDefaultContract = editingStep
+        ? await loadWorkflowRoleContract(editingStep.role)
+        : null;
+      workflowRolePickerOpen = !workflowRoleConfigured;
+      await tick();
+      positionWorkflowRolePopover();
+    } catch (error) {
+      workflowDraftError = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function updateWorkflowEditingStep(patch: Partial<WorkflowStepDefinition>) {
+    if (!workflowDraft || !workflowEditingStepId) return;
+    workflowDraft = {
+      ...workflowDraft,
+      steps: workflowDraft.steps.map((step) =>
+        step.id === workflowEditingStepId ? { ...step, ...patch } : step),
+    };
+  }
+
+  async function selectWorkflowRole(role: WorkflowRole) {
+    workflowDraftError = null;
+    if (workflowRoleConfigured && workflowEditingStep?.role === role) {
+      workflowRolePickerOpen = false;
+      return;
+    }
+    if (workflowRoleConfigured && workflowInstructionsCustomized) {
+      workflowPendingRole = role;
+      workflowRolePickerOpen = false;
+      return;
+    }
+    await applyWorkflowRole(role);
+  }
+
+  async function applyWorkflowRole(role: WorkflowRole) {
+    try {
+      const contract = await loadWorkflowRoleContract(role);
+      if (!workflowDraft || !workflowEditingStepId) return;
+      const saveSelectionImmediately = !workflowRoleConfigured;
+      const nextDraft = {
+        ...workflowDraft,
+        steps: workflowDraft.steps.map((step) =>
+          step.id === workflowEditingStepId
+            ? { ...step, role, customRoleLabel: "", ...contract }
+            : step),
+      };
+      workflowDraft = nextDraft;
+      workflowDefaultContract = contract;
+      workflowPendingRole = null;
+      workflowRoleConfigured = true;
+      workflowContractExpanded = role === "custom";
+      workflowRolePickerOpen = false;
+      const nextStep = nextDraft.steps.find((step) => step.id === workflowEditingStepId);
+      if (saveSelectionImmediately && workflowStepIsReady(nextStep)) {
+        await saveWorkflowRole(false, nextDraft);
+      }
+    } catch (error) {
+      workflowDraftError = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function confirmWorkflowRoleChange() {
+    if (!workflowPendingRole) return;
+    const role = workflowPendingRole;
+    workflowPendingRole = null;
+    await applyWorkflowRole(role);
+  }
+
+  async function restoreWorkflowRoleDefaults() {
+    if (!workflowEditingStep || workflowEditingStep.role === "custom") return;
+    workflowDraftError = null;
+    try {
+      const contract = await loadWorkflowRoleContract(workflowEditingStep.role);
+      workflowDefaultContract = contract;
+      updateWorkflowEditingStep(contract);
+    } catch (error) {
+      workflowDraftError = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function openWorkflowBridgeFromConnection(event: MouseEvent, side: DockSide) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!windowState?.groupId) return;
+    workflowDraftError = null;
+    try {
+      if (workflowBridgePreparation) await workflowBridgePreparation;
+      await openWorkflowBridgeWindow(label, side);
+      preparedWorkflowBridgeSide = null;
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  function prepareWorkflowBridge(side: DockSide) {
+    if (!windowState?.groupId || windowState.workflowBridgeOpen) return;
+    if (preparedWorkflowBridgeSide === side || workflowBridgePreparation) return;
+    preparedWorkflowBridgeSide = side;
+    workflowBridgePreparation = prepareWorkflowBridgeWindow(label, side)
+      .then(() => undefined)
+      .catch(() => {
+        preparedWorkflowBridgeSide = null;
+      })
+      .finally(() => {
+        workflowBridgePreparation = null;
+      });
+  }
+
+  function oppositeDockSide(side: DockSide): DockSide {
+    if (side === "left") return "right";
+    if (side === "right") return "left";
+    if (side === "top") return "bottom";
+    return "top";
+  }
+
+  function enterWorkflowConnection(side: DockSide) {
+    if (workflowConnectionLeaveTimer) {
+      clearTimeout(workflowConnectionLeaveTimer);
+      workflowConnectionLeaveTimer = undefined;
+    }
+    void setWorkflowConnectionHover(label, side, true).catch(() => undefined);
+    prepareWorkflowBridge(side);
+  }
+
+  function leaveWorkflowConnection(side: DockSide) {
+    if (workflowConnectionLeaveTimer) clearTimeout(workflowConnectionLeaveTimer);
+    workflowConnectionLeaveTimer = setTimeout(() => {
+      workflowConnectionLeaveTimer = undefined;
+      void setWorkflowConnectionHover(label, side, false).catch(() => undefined);
+    }, 80);
+  }
+
+  async function saveWorkflowRole(closeEditor = true, draftOverride?: WorkflowGroupDefinition) {
+    const draft = draftOverride ?? workflowDraft;
+    if (!draft || workflowDraftSaving || !workflowRoleConfigured) return;
+    const editingStep = draft.steps.find((step) => step.id === workflowEditingStepId);
+    if (!workflowStepIsReady(editingStep)) {
+      workflowDraftError = tr(
+        "Complete all role instructions before saving.",
+        "Preencha todas as instruções do papel antes de salvar.",
+      );
+      workflowContractExpanded = true;
+      return;
+    }
+    workflowDraftSaving = true;
+    workflowDraftError = null;
+    try {
+      const preferences = await loadPreferences();
+      preferences.workflowGroups = preferences.workflowGroups.some((group) => group.id === draft.id)
+        ? preferences.workflowGroups.map((group) => group.id === draft.id ? draft : group)
+        : [...preferences.workflowGroups, draft];
+      await savePreferences(preferences);
+      workflowGroups = preferences.workflowGroups;
+      await emit("lume://preferences-changed", preferences);
+      if (closeEditor) {
+        workflowDraft = null;
+        workflowEditingStepId = null;
+        workflowRolePickerOpen = false;
+        workflowRoleConfigured = false;
+        workflowContractExpanded = false;
+        workflowDefaultContract = null;
+        workflowPendingRole = null;
+      } else {
+        workflowDraft = draft;
+      }
+    } catch (error) {
+      workflowDraftError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      workflowDraftSaving = false;
+    }
   }
 
   function sessionDisplayName(item: AgentSession) {
@@ -482,10 +904,70 @@
       ? Math.max(0, Math.min(100, Math.round(100 - Number(activeRateLimit.usedPercent))))
       : 0,
   );
-  const todo = $derived(session?.workSummary.todo ?? null);
-  const goal = $derived(session?.workSummary.goal ?? null);
+  const todoSource = $derived(session?.workSummary.todo ?? null);
+  const plan = $derived(session?.workSummary.plan ?? null);
+  const goalSource = $derived(session?.workSummary.goal ?? null);
+  const todo = $derived(
+    todoSource
+      && (
+        todoSource.items.some((item) => item.status !== "completed")
+        || workClock - todoSource.updatedAt < 12_000
+      )
+      ? todoSource
+      : null,
+  );
+  const goal = $derived(
+    goalSource
+      && (
+        goalSource.status !== "complete"
+        || workClock - goalSource.updatedAt < 12_000
+      )
+      ? goalSource
+      : null,
+  );
+  $effect(() => {
+    const currentTodo = todoSource;
+    const currentGoal = goalSource;
+    const activeGoal = currentGoal?.status === "active";
+    const now = Date.now();
+    const expiryDelays = [
+      currentTodo && currentTodo.items.every((item) => item.status === "completed")
+        ? currentTodo.updatedAt + 12_000 - now
+        : Number.POSITIVE_INFINITY,
+      currentGoal && currentGoal.status !== "active"
+        ? currentGoal.updatedAt + 12_000 - now
+        : Number.POSITIVE_INFINITY,
+    ];
+    const labelOffset = Array.from(label).reduce(
+      (hash, character) => (hash * 31 + character.charCodeAt(0)) % 8_000,
+      0,
+    );
+    const firstDelay = Math.min(
+      activeGoal ? 60_000 + labelOffset : Number.POSITIVE_INFINITY,
+      ...expiryDelays,
+    );
+    if (!Number.isFinite(firstDelay)) return;
+
+    let cancelled = false;
+    const tickWorkClock = () => {
+      if (cancelled) return;
+      workClock = Date.now();
+      if (activeGoal) {
+        workClockTimer = setTimeout(tickWorkClock, 60_000 + labelOffset);
+      }
+    };
+    workClockTimer = setTimeout(tickWorkClock, Math.max(16, firstDelay));
+    return () => {
+      cancelled = true;
+      if (workClockTimer) clearTimeout(workClockTimer);
+      workClockTimer = undefined;
+    };
+  });
   const completedTodoItems = $derived(
     todo?.items.filter((item) => item.status === "completed").length ?? 0,
+  );
+  const completedPlanItems = $derived(
+    plan?.items.filter((item) => item.status === "completed").length ?? 0,
   );
 
   function rateLimitWindow(minutes?: number) {
@@ -564,6 +1046,10 @@
   }
 
   const activities = $derived(session?.activities ?? []);
+  function isInternalGoalActivity(activity: SessionActivity): boolean {
+    return /^functions\s*[·:]\s*(?:create_goal|get_goal|update_goal)$/i.test(activity.title.trim());
+  }
+  const chatActivities = $derived(activities.filter((activity) => !isInternalGoalActivity(activity)));
   function activityReportedFiles(activity: SessionActivity): string[] {
     const files = [...activity.files];
     const title = activity.title.trim();
@@ -576,11 +1062,36 @@
   }
 
   function activityChanges(activity: SessionActivity): FileChangeSummary[] {
-    return summarizeFileChanges(
-      activity.detail ?? "",
-      activityReportedFiles(activity),
-      session?.workingDirectory,
-    );
+    const detail = activity.detail ?? "";
+    const reportedFiles = activityReportedFiles(activity);
+    const filesKey = reportedFiles.join("\u0000");
+    const cached = activityChangeCache.get(activity.id);
+    if (cached?.detail === detail && cached.filesKey === filesKey) {
+      return cached.changes.map((change) => ({ ...change }));
+    }
+    const changes = summarizeFileChanges(detail, reportedFiles, session?.workingDirectory);
+    activityChangeCache.set(activity.id, {
+      detail,
+      filesKey,
+      changes: changes.map((change) => ({ ...change })),
+    });
+    if (activityChangeCache.size > 600) {
+      const oldest = activityChangeCache.keys().next().value;
+      if (oldest) activityChangeCache.delete(oldest);
+    }
+    return changes;
+  }
+
+  function renderCachedMarkdown(value: string): string {
+    const cached = markdownRenderCache.get(value);
+    if (cached !== undefined) return cached;
+    const rendered = renderSafeMarkdown(value);
+    markdownRenderCache.set(value, rendered);
+    if (markdownRenderCache.size > 240) {
+      const oldest = markdownRenderCache.keys().next().value;
+      if (oldest) markdownRenderCache.delete(oldest);
+    }
+    return rendered;
   }
   const changedFiles = $derived.by(() => {
     const files: FileChangeSummary[] = [];
@@ -611,26 +1122,86 @@
       .sort()
       .join("\u0001");
   }
+  function mergeChatAttachments(target: SessionActivity, source: SessionActivity) {
+    const attachments = [...(target.attachments ?? [])];
+    for (const attachment of source.attachments ?? []) {
+      const duplicate = attachments.some((existing) =>
+        existing.path && attachment.path
+          ? existing.path.replace(/\\/g, "/").toLowerCase() === attachment.path.replace(/\\/g, "/").toLowerCase()
+          : existing.name === attachment.name
+      );
+      if (!duplicate) attachments.push(attachment);
+    }
+    if (attachments.length) target.attachments = attachments;
+  }
   const chatEntries = $derived.by<ChatEntry[]>(() => {
     let sequence = 0;
-    const promptTimes = activities
-      .filter((activity) => activity.kind === "prompt")
-      .map((activity) => activity.createdAt)
-      .sort((left, right) => left - right);
+    const uniquePrompts: SessionActivity[] = [];
+    let messageSinceLastPrompt = false;
+    for (const activity of [...chatActivities].sort((left, right) => left.createdAt - right.createdAt)) {
+      if (activity.kind === "message") messageSinceLastPrompt = true;
+      if (activity.kind !== "prompt") continue;
+      const existing = uniquePrompts.at(-1);
+      const duplicate = existing
+        && !messageSinceLastPrompt
+        && !(existing.id.startsWith("local:") && activity.id.startsWith("local:"))
+        && promptTextKey(existing.detail) === promptTextKey(activity.detail)
+        && Math.abs(existing.createdAt - activity.createdAt) < 60_000;
+      if (!duplicate) uniquePrompts.push(activity);
+      messageSinceLastPrompt = false;
+    }
+    const promptTimes = uniquePrompts.map((activity) => activity.createdAt);
     const promptSegment = (createdAt: number) => {
+      let low = 0;
+      let high = promptTimes.length - 1;
       let segment = Number.NEGATIVE_INFINITY;
-      for (const promptTime of promptTimes) {
-        if (promptTime > createdAt) break;
-        segment = promptTime;
+      while (low <= high) {
+        const middle = (low + high) >> 1;
+        const promptTime = promptTimes[middle];
+        if (promptTime <= createdAt) {
+          segment = promptTime;
+          low = middle + 1;
+        } else {
+          high = middle - 1;
+        }
       }
       return segment;
     };
     const entries: ChatEntry[] = [];
-    for (const activity of activities) {
-      if (activity.kind === "queued_prompt") continue;
+    for (const activity of chatActivities) {
+      if (
+        activity.kind === "queued_prompt"
+        || activity.kind === "plan"
+        || activity.kind === "plan_document"
+      ) continue;
+      if (activity.kind === "prompt") {
+        let duplicateIndex = -1;
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          const existing = entries[index].activity;
+          if (
+            existing.kind === "prompt"
+            && !(existing.id.startsWith("local:") && activity.id.startsWith("local:"))
+            && promptTextKey(existing.detail) === promptTextKey(activity.detail)
+            && Math.abs(existing.createdAt - activity.createdAt) < 60_000
+          ) {
+            duplicateIndex = index;
+            break;
+          }
+        }
+        const duplicatePrompt = duplicateIndex >= 0
+          && !entries.slice(duplicateIndex + 1).some((entry) =>
+            entry.activity.kind === "prompt" || entry.activity.kind === "message"
+          )
+          ? entries[duplicateIndex]
+          : undefined;
+        if (duplicatePrompt) {
+          mergeChatAttachments(duplicatePrompt.activity, activity);
+          continue;
+        }
+      }
       const files = activityChanges(activity);
       const matchingMessage = activity.kind === "message"
-        ? [...entries].reverse().find((entry) =>
+        ? entries.findLast((entry) =>
             entry.activity.kind === "message" &&
             sameResponseText(entry.activity.detail, activity.detail) &&
             promptSegment(entry.activity.createdAt) === promptSegment(activity.createdAt)
@@ -656,7 +1227,7 @@
       }
       if (activity.kind === "file" && files.length) {
         const signature = fileChangesKey(files);
-        const duplicateFileEntry = [...entries].reverse().find((entry) =>
+        const duplicateFileEntry = entries.findLast((entry) =>
           entry.activity.kind === "file" &&
           promptSegment(entry.activity.createdAt) === promptSegment(activity.createdAt) &&
           fileChangesKey(entry.files) === signature
@@ -668,7 +1239,12 @@
       }
       entries.push({
         id: `activity:${activity.id}`,
-        activity: { ...activity },
+        activity: {
+          ...activity,
+          detail: activity.kind === "prompt"
+            ? cleanPromptTransport(activity.detail) || undefined
+            : activity.detail,
+        },
         files,
         sequence: sequence++,
       });
@@ -680,7 +1256,7 @@
         session?.workingDirectory,
       );
       const responseKey = chatTextKey(result.response);
-      const matchingMessage = [...entries].reverse().find((entry) =>
+      const matchingMessage = entries.findLast((entry) =>
         entry.activity.kind === "message" &&
         sameResponseText(entry.activity.detail, responseKey) &&
         promptSegment(entry.activity.createdAt) === promptSegment(result.createdAt)
@@ -697,6 +1273,10 @@
           matchingMessage.activity.status = "completed";
         }
         mergeFileChanges(matchingMessage.files, resultFiles);
+        matchingMessage.activity.files = Array.from(new Set([
+          ...matchingMessage.activity.files,
+          ...result.files,
+        ]));
       } else if (result.response || resultFiles.length) {
         entries.push({
           id: `result:${result.id}`,
@@ -716,11 +1296,9 @@
     }
     if (session?.lastResponse) {
       const responseKey = chatTextKey(session.lastResponse);
-      const segment = promptSegment(session.updatedAt);
       const matchingMessage = entries.find((entry) =>
         entry.activity.kind === "message" &&
-        sameResponseText(entry.activity.detail, responseKey) &&
-        promptSegment(entry.activity.createdAt) === segment
+        sameResponseText(entry.activity.detail, responseKey)
       );
       if (matchingMessage) {
         matchingMessage.activity.detail = latestResponseText(
@@ -755,6 +1333,78 @@
         left.sequence - right.sequence;
     });
   });
+  type ChatFeedItem =
+    | { kind: "entry"; id: string; entry: ChatEntry }
+    | { kind: "trace"; id: string; entries: ChatEntry[]; files: FileChangeSummary[] };
+  const chatFeedItems = $derived.by<ChatFeedItem[]>(() => {
+    const feed: ChatFeedItem[] = [];
+    let trace: Extract<ChatFeedItem, { kind: "trace" }> | null = null;
+    for (const entry of chatEntries) {
+      if (isHiddenAgentActivity(entry.activity)) continue;
+      if (isPresentableTraceActivity(entry.activity)) {
+        const previous = trace?.entries[trace.entries.length - 1];
+        if (!trace || (previous && entry.activity.createdAt - previous.activity.createdAt > 180_000)) {
+          trace = {
+            kind: "trace",
+            id: `trace:${entry.id}`,
+            entries: [],
+            files: [],
+          };
+          feed.push(trace);
+        }
+        trace.entries.push(entry);
+        mergeFileChanges(trace.files, entry.files);
+        continue;
+      }
+      trace = null;
+      feed.push({ kind: "entry", id: entry.id, entry });
+    }
+    return feed;
+  });
+  const unloadedActivityCount = $derived(Math.max(
+    0,
+    (session?.activityTotal ?? activities.length) - activities.length,
+  ));
+  const locallyHiddenChatItemCount = $derived(Math.max(0, chatFeedItems.length - visibleChatItemLimit));
+  const hiddenChatItemCount = $derived(unloadedActivityCount + locallyHiddenChatItemCount);
+  const visibleChatFeedItems = $derived(
+    locallyHiddenChatItemCount > 0 ? chatFeedItems.slice(-visibleChatItemLimit) : chatFeedItems,
+  );
+  const activeTraceId = $derived.by(() => {
+    if (!session || !["running", "permission_required"].includes(session.status)) return null;
+    const latest = chatFeedItems.at(-1);
+    return latest?.kind === "trace" ? latest.id : null;
+  });
+  const authorizationMessageId = $derived.by<string | null>(() => {
+    if (!session) return null;
+    const visibleEntries = chatEntries.filter((entry) => !isHiddenAgentActivity(entry.activity));
+    const latestAgentMessage = visibleEntries.findLast((entry) => entry.activity.kind === "message");
+    if (!latestAgentMessage || !needsUserAuthorization(latestAgentMessage.activity.detail)) return null;
+    if (session.pendingPermission || session.status === "permission_required") return latestAgentMessage.id;
+    return visibleEntries.at(-1)?.id === latestAgentMessage.id ? latestAgentMessage.id : null;
+  });
+
+  async function revealEarlierChatItems() {
+    const previousHeight = outputElement?.scrollHeight ?? 0;
+    const previousTop = outputElement?.scrollTop ?? 0;
+    visibleChatItemLimit += 60;
+    outputFollowingTail = false;
+    chatFollowingTail = false;
+    await refresh();
+    await tick();
+    if (outputElement) {
+      outputElement.scrollTop = previousTop + outputElement.scrollHeight - previousHeight;
+    }
+  }
+
+  function traceHandoffEntry(item: Extract<ChatFeedItem, { kind: "trace" }>): ChatEntry {
+    const source = item.entries[item.entries.length - 1];
+    return {
+      ...source,
+      activity: { ...source.activity, detail: undefined },
+      files: item.files,
+    };
+  }
 
   onMount(() => {
     let disposed = false;
@@ -765,9 +1415,10 @@
     let stopPreferences: (() => void) | undefined;
     let stopDockPreview: (() => void) | undefined;
     let stopNativeDragEnded: (() => void) | undefined;
-    const workClockInterval = setInterval(() => {
-      workClock = Date.now();
-    }, 30_000);
+    let stopWorkflowConnectionHover: (() => void) | undefined;
+    let sessionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let sessionRefreshRunning = false;
+    let sessionRefreshQueued = false;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -785,6 +1436,10 @@
       if (!(event.target instanceof Element)) return;
       if (!event.target.closest(".text-zoom-control")) textZoomOpen = false;
       if (!event.target.closest(".header-overflow")) headerActionsOpen = false;
+      if (!event.target.closest(".workflow-role-control")) {
+        workflowDraft = null;
+        workflowRolePickerOpen = false;
+      }
     };
     const interruptOnEscape = (event: KeyboardEvent) => {
       if (
@@ -820,12 +1475,15 @@
     document.addEventListener("pointerdown", closeHeaderPopovers);
     window.addEventListener("keydown", interruptOnEscape);
     void (async () => {
-      const [nextPreferences, nextDisplayBackend] = await Promise.all([
+      const [nextPreferences, nextDisplayBackend, nextWorkflowTerminals] = await Promise.all([
         loadPreferences(),
         loadDisplayBackend(),
+        loadTerminalWindows().catch(() => []),
       ]);
       language = nextPreferences.language;
       darkMode = nextPreferences.darkMode;
+      workflowGroups = nextPreferences.workflowGroups;
+      workflowTerminals = nextWorkflowTerminals;
       displayBackend = nextDisplayBackend;
       fullscreen = await currentWindow.isFullscreen().catch(() => false);
       if (!fullscreen) fullscreen = await terminalGroupFullscreenActive(label).catch(() => false);
@@ -835,19 +1493,46 @@
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       await markTerminalFrontendReady(label);
       if (disposed) return;
-      stopListening = await listen("lume://sessions-changed", async () => {
-        if (session && windowState) {
-          await refresh();
-          if (!session && windowState.sessionSource === "cli") {
+      const flushSessionRefresh = async () => {
+        if (sessionRefreshRunning || disposed) return;
+        sessionRefreshRunning = true;
+        sessionRefreshQueued = false;
+        try {
+          if (session && windowState) {
+            await refresh();
+            if (!session && windowState.sessionSource === "cli") {
+              await initializeTerminal();
+            }
+          } else {
             await initializeTerminal();
           }
-        } else {
-          await initializeTerminal();
+        } finally {
+          sessionRefreshRunning = false;
+          if (sessionRefreshQueued && !disposed) queueSessionRefresh();
         }
-      });
+      };
+      const queueSessionRefresh = () => {
+        sessionRefreshQueued = true;
+        if (sessionRefreshRunning || sessionRefreshTimer) return;
+        const refreshDelay = resizing || dragging
+          ? 750
+          : session && ["running", "permission_required"].includes(session.status)
+            ? 120
+            : 650;
+        sessionRefreshTimer = setTimeout(() => {
+          sessionRefreshTimer = undefined;
+          void flushSessionRefresh();
+        }, refreshDelay);
+      };
+      stopListening = await listen("lume://sessions-changed", queueSessionRefresh);
       stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
         try {
-          windowState = await loadTerminalWindowState(label);
+          const [nextWindowState, nextWorkflowTerminals] = await Promise.all([
+            loadTerminalWindowState(label),
+            loadTerminalWindows(),
+          ]);
+          windowState = nextWindowState;
+          workflowTerminals = nextWorkflowTerminals;
           fullscreen = await terminalGroupFullscreenActive(label);
         } catch {
           // The window may be closing.
@@ -856,6 +1541,7 @@
       stopPreferences = await listen<Preferences>("lume://preferences-changed", ({ payload }) => {
         language = payload.language;
         darkMode = payload.darkMode;
+        workflowGroups = payload.workflowGroups;
       });
       stopDockPreview = await listen<DockPreviewEvent>("lume://terminal-dock-preview", ({ payload }) => {
         const relevant = payload.preview &&
@@ -883,6 +1569,23 @@
           }
         },
       );
+      stopWorkflowConnectionHover = await listen<{
+        connectionLabel: string;
+        sourceLabel: string;
+        targetLabel: string;
+        side: DockSide;
+        visible: boolean;
+      }>("lume://workflow-connection-hover", ({ payload }) => {
+        const side = payload.sourceLabel === label
+          ? payload.side
+          : payload.targetLabel === label
+            ? oppositeDockSide(payload.side)
+            : null;
+        if (!side) return;
+        hoveredWorkflowConnectionSides = payload.visible
+          ? Array.from(new Set([...hoveredWorkflowConnectionSides, side]))
+          : hoveredWorkflowConnectionSides.filter((entry) => entry !== side);
+      });
       stopMoved = await currentWindow.onMoved(({ payload }) => {
         if ((!isWindows && displayBackend !== "native-gnome") || !nativeDragActive) return;
         nativePosition = { x: payload.x, y: payload.y };
@@ -894,6 +1597,7 @@
         }, isWindows ? 180 : 450);
       });
       stopResized = await currentWindow.onResized(() => {
+        if (workflowDraft) positionWorkflowRolePopover();
         if (settling) return;
         if (resizeDragState) return;
         composerHeight = clampComposerHeight(composerHeight);
@@ -918,14 +1622,18 @@
       stopPreferences?.();
       stopDockPreview?.();
       stopNativeDragEnded?.();
+      stopWorkflowConnectionHover?.();
       colorScheme.removeEventListener("change", syncSystemTheme);
       document.removeEventListener("click", openMarkdownLink);
       document.removeEventListener("pointerdown", closeHeaderPopovers);
       window.removeEventListener("keydown", interruptOnEscape);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
       if (collaborationModeNoticeTimer) clearTimeout(collaborationModeNoticeTimer);
-      clearInterval(workClockInterval);
+      if (workflowConnectionLeaveTimer) clearTimeout(workflowConnectionLeaveTimer);
+      if (workClockTimer) clearTimeout(workClockTimer);
+      if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer);
     };
   });
 
@@ -971,10 +1679,24 @@
   }
 
   async function refresh() {
-    const snapshot = await loadHubSnapshot();
-    const shouldFollow = outputFollowingTail;
-    session = windowState ? resolveTerminalSession(windowState, snapshot.sessions) ?? null : null;
-    if (shouldFollow && outputFollowingTail) {
+    const snapshot = await loadTerminalHubSnapshot(label, visibleChatItemLimit);
+    const shouldFollow = activeTab === "chat" && outputFollowingTail;
+    const nextSession = windowState ? resolveTerminalSession(windowState, snapshot.sessions) ?? null : null;
+    const previousActivity = session?.activities.at(-1);
+    const nextActivity = nextSession?.activities.at(-1);
+    const sessionChanged = !session || !nextSession
+      ? session !== nextSession
+      : session.id !== nextSession.id
+        || session.updatedAt !== nextSession.updatedAt
+        || session.status !== nextSession.status
+        || session.activities.length !== nextSession.activities.length
+        || session.results.length !== nextSession.results.length
+        || session.pendingPermission?.id !== nextSession.pendingPermission?.id
+        || previousActivity?.id !== nextActivity?.id
+        || previousActivity?.status !== nextActivity?.status
+        || previousActivity?.detail?.length !== nextActivity?.detail?.length;
+    if (sessionChanged) session = nextSession;
+    if (sessionChanged && shouldFollow && outputFollowingTail) {
       await tick();
       if (outputFollowingTail) {
         outputElement?.scrollTo({ top: outputElement.scrollHeight });
@@ -988,30 +1710,38 @@
   }
 
   function handleOutputScroll() {
+    if (activeTab !== "chat") return;
     outputFollowingTail = outputDistanceFromTail() <= 24;
+    chatFollowingTail = outputFollowingTail;
   }
 
   function handleOutputWheel(event: WheelEvent) {
-    if (event.deltaY < 0) {
+    if (activeTab === "chat" && event.deltaY < 0) {
       outputFollowingTail = false;
+      chatFollowingTail = false;
     }
   }
 
-  function activityMark(activity: SessionActivity) {
-    return {
-      prompt: "›",
-      queued_prompt: "⌛",
-      message: "◆",
-      activity: "·",
-      analysis: "···",
-      plan: "≡",
-      command: "$",
-      file: "±",
-      test: "✓",
-      tool: "⌁",
-      permission: "!",
-      question: "?",
-    }[activity.kind] ?? "·";
+  async function selectTab(nextTab: TerminalTab) {
+    if (nextTab === activeTab) return;
+    if (outputElement) {
+      tabScrollPositions[activeTab] = outputElement.scrollTop;
+    }
+    if (activeTab === "chat") {
+      chatFollowingTail = outputFollowingTail;
+    }
+    activeTab = nextTab;
+    await tick();
+    if (!outputElement) return;
+    if (nextTab === "chat" && chatFollowingTail) {
+      outputElement.scrollTop = outputElement.scrollHeight;
+    } else {
+      outputElement.scrollTop = tabScrollPositions[nextTab] ?? 0;
+    }
+    if (nextTab === "chat") {
+      outputFollowingTail = outputDistanceFromTail() <= 24;
+      chatFollowingTail = outputFollowingTail;
+    }
   }
 
   function activityTime(createdAt: number) {
@@ -1020,6 +1750,89 @@
       minute: "2-digit",
       second: "2-digit",
     }).format(new Date(createdAt));
+  }
+
+  function handoffTargetCanReceive(target: HandoffTarget): boolean {
+    if (!target.session.capabilities.canPrompt) return false;
+    return target.session.status !== "running"
+      || target.session.capabilities.promptDeliveries.includes("queue");
+  }
+
+  async function openHandoff(entry: ChatEntry) {
+    if (!session || !windowState?.groupId) {
+      message = tr(
+        "Dock this terminal to another one before sharing context.",
+        "Acople este terminal a outro antes de compartilhar contexto.",
+      );
+      return;
+    }
+    handoffLoading = true;
+    handoffError = null;
+    try {
+      const [terminals, snapshot] = await Promise.all([
+        loadTerminalWindows(),
+        loadHubSnapshot(),
+      ]);
+      handoffTargets = terminals.flatMap((terminal) => {
+        if (
+          terminal.label === label
+          || terminal.groupId !== windowState?.groupId
+        ) return [];
+        const targetSession = resolveTerminalSession(terminal, snapshot.sessions);
+        return targetSession ? [{ terminal, session: targetSession }] : [];
+      });
+      if (handoffTargets.length === 0) {
+        message = tr(
+          "No other active terminal is connected to this docked group.",
+          "Nenhum outro terminal ativo está conectado a este grupo.",
+        );
+        return;
+      }
+      handoffDraft = {
+        text: entry.activity.detail?.trim() ?? "",
+        files: entry.files,
+        includeText: Boolean(entry.activity.detail?.trim()),
+        includeFiles: entry.files.length > 0,
+        note: "",
+        targetSessionId:
+          handoffTargets.find(handoffTargetCanReceive)?.session.id
+          ?? handoffTargets[0].session.id,
+      };
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      handoffLoading = false;
+    }
+  }
+
+  function handoffPreview(draft: HandoffDraft): string {
+    return buildHandoffBody(draft);
+  }
+
+  async function sendHandoff() {
+    if (!session || !handoffDraft || handoffSending) return;
+    const target = handoffTargets.find(
+      (candidate) => candidate.session.id === handoffDraft?.targetSessionId,
+    );
+    const body = handoffPreview(handoffDraft);
+    if (!target || !handoffTargetCanReceive(target) || !body) return;
+    handoffSending = true;
+    handoffError = null;
+    try {
+      const sourceName = sessionDisplayName(session);
+      const prompt = buildHandoffPrompt(session.agentLabel, sourceName, body);
+      const delivery = target.session.status === "running" ? "queue" : "new_turn";
+      await submitPrompt(target.session.id, prompt, [], delivery);
+      handoffDraft = null;
+      message = tr(
+        `Context sent to ${sessionDisplayName(target.session)}.`,
+        `Contexto enviado para ${sessionDisplayName(target.session)}.`,
+      );
+    } catch (error) {
+      handoffError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      handoffSending = false;
+    }
   }
 
   function sourceLabel(item: AgentSession) {
@@ -1089,6 +1902,13 @@
     if (event.button !== 0 || !windowState) return;
     if (fullscreen) return;
     if ((event.target as HTMLElement).closest("button, input, textarea, form")) return;
+    if (windowState.workflowBridgeOpen) {
+      message = tr(
+        "Close the workflow connection before moving these terminals.",
+        "Feche a conexão do workflow antes de mover estes terminais.",
+      );
+      return;
+    }
     if (displayBackend === "gnome-wayland-limited") {
       message = "Window dragging requires XWayland in GNOME.";
       return;
@@ -1256,6 +2076,13 @@
     const state = windowState;
     if (event.button !== 0 || !state) return;
     if (fullscreen) return;
+    if (state.workflowBridgeOpen) {
+      message = tr(
+        "Close the workflow connection before resizing these terminals.",
+        "Feche a conexão do workflow antes de redimensionar estes terminais.",
+      );
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     dragging = false;
@@ -1264,7 +2091,11 @@
     dockPreview = null;
     dockMovingLabel = null;
     resizing = true;
-    if (state.layered || displayBackend === "xwayland-fallback") {
+    if (
+      state.layered
+      || displayBackend === "xwayland-fallback"
+      || (state.docked && displayBackend !== "native-gnome")
+    ) {
       const target = event.currentTarget as HTMLElement;
       target.setPointerCapture(event.pointerId);
       resizeDragState = {
@@ -1290,7 +2121,7 @@
         })
         .finally(() => {
           resizePreparing = null;
-          if (pendingResize) void flushResize();
+          if (pendingResize) scheduleResizeFlush();
         });
       return;
     }
@@ -1324,31 +2155,47 @@
         : resizeDragState.originY + Math.round((resizeDragState.originHeight - height) * scale),
       width,
       height,
+      fromLeft: !east,
+      fromTop: !south,
     };
-    void flushResize();
+    scheduleResizeFlush();
   }
 
-  async function flushResize() {
+  function scheduleResizeFlush() {
+    if (
+      resizeFrame !== null
+      || resizeSyncRunning
+      || resizePreparing
+      || !pendingResize
+    ) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = null;
+      void flushResize();
+    });
+  }
+
+  async function flushResize(final = false) {
     if (resizeSyncRunning || resizePreparing) return;
+    const next = pendingResize;
+    if (!next) return;
+    pendingResize = null;
     resizeSyncRunning = true;
     try {
-      while (pendingResize) {
-        const next = pendingResize;
-        pendingResize = null;
-        windowState = await resizeTerminalWindow(
-          label,
-          next.x,
-          next.y,
-          next.width,
-          next.height,
-        );
-      }
+      await resizeTerminalWindow(
+        label,
+        next.x,
+        next.y,
+        next.width,
+        next.height,
+        next.fromLeft,
+        next.fromTop,
+      );
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
       pendingResize = null;
     } finally {
       resizeSyncRunning = false;
-      if (pendingResize) void flushResize();
+      if (!final && resizeDragState && pendingResize) scheduleResizeFlush();
     }
   }
 
@@ -1358,9 +2205,18 @@
     if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
     resizeDragState = null;
     if (resizePreparing) await resizePreparing;
-    while (resizeSyncRunning || pendingResize) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    if (resizeFrame !== null) {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = null;
     }
+    while (resizeSyncRunning) {
+      await new Promise((resolve) => setTimeout(resolve, 4));
+    }
+    if (resizeFrame !== null) {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = null;
+    }
+    if (pendingResize) await flushResize(true);
     try {
       windowState = await finishLayeredTerminalResize(label);
       composerHeight = clampComposerHeight(composerHeight);
@@ -1787,7 +2643,7 @@
   }
 </script>
 
-<main class:dark={effectiveDark} class="terminal-window">
+<main class:dark={effectiveDark} class="terminal-window" onpointerdown={() => void currentWindow.setFocus().catch(() => undefined)}>
   {#if session}
     <section
       class:dragging
@@ -1799,17 +2655,57 @@
       class:dock-right={dockPreview?.side === "right"}
       class:dock-top={dockPreview?.side === "top"}
       class:dock-bottom={dockPreview?.side === "bottom"}
-      class:joined-left={windowState?.connectedSides.includes("left")}
-      class:joined-right={windowState?.connectedSides.includes("right")}
-      class:joined-top={windowState?.connectedSides.includes("top")}
-      class:joined-bottom={windowState?.connectedSides.includes("bottom")}
+      class:workflow-mode={windowState?.workflowEnabled}
+      class:workflow-preview={windowState?.workflowEnabled && Boolean(dockPreview)}
+      class:normal-preview={!windowState?.workflowEnabled && Boolean(dockPreview)}
+      class:bridge-locked={windowState?.workflowBridgeOpen}
+      class:header-menu-open={headerActionsOpen}
+      class:dock-ready={Boolean(dockPreview) && (dockPreview?.proximity ?? 0) >= 0.78}
+      class:joined-left={windowState?.connectedSides.includes("left") || windowState?.bridgeSides?.includes("left")}
+      class:joined-right={windowState?.connectedSides.includes("right") || windowState?.bridgeSides?.includes("right")}
+      class:joined-top={windowState?.connectedSides.includes("top") || windowState?.bridgeSides?.includes("top")}
+      class:joined-bottom={windowState?.connectedSides.includes("bottom") || windowState?.bridgeSides?.includes("bottom")}
       class="terminal-card"
       style:--chat-font-adjust={`${(textZoom - 1) * 9}px`}
       style:--chat-small-font-adjust={`${(textZoom - 1) * 8}px`}
       style:--chat-tiny-font-adjust={`${(textZoom - 1) * 7}px`}
+      style:--dock-pull={`${(dockPreview?.proximity ?? 0) * 14}px`}
+      style:--dock-squeeze={`${(dockPreview?.proximity ?? 0) * 0.018}`}
+      style:--dock-proximity={`${dockPreview?.proximity ?? 0}`}
+      style:--dock-tension={`${1 - Math.pow(1 - (dockPreview?.proximity ?? 0), 2.4)}`}
+      style:--dock-glow={`${0.12 + (dockPreview?.proximity ?? 0) * 0.48}`}
     >
-      {#if dockPreview?.targetLabel === label}
-        <div class="dock-silhouette" aria-hidden="true"><span>{tr("Dock", "Acoplar")}</span></div>
+      {#if dockPreview}
+        <div class="workflow-merge-preview" aria-hidden="true"></div>
+      {/if}
+      {#if windowState?.workflowEnabled}
+        {#each windowState.connectedSides as side}
+          <span class="workflow-connection workflow-{side}" aria-hidden="true"></span>
+          <span
+            class:visible={hoveredWorkflowConnectionSides.includes(side)}
+            class="workflow-connection-control workflow-control-{side}"
+            role="group"
+            aria-label={tr("Workflow connection", "Conexão do workflow")}
+            onpointerenter={() => enterWorkflowConnection(side)}
+            onpointerleave={() => leaveWorkflowConnection(side)}
+          >
+            <button
+              class="workflow-connection-editor workflow-editor-{side}"
+              type="button"
+              aria-label={tr("Edit workflow connection", "Editar conexão do workflow")}
+              title={tr("Edit workflow", "Editar workflow")}
+              onpointerdown={(event) => event.stopPropagation()}
+              onfocus={() => enterWorkflowConnection(side)}
+              onblur={() => leaveWorkflowConnection(side)}
+              onclick={(event) => void openWorkflowBridgeFromConnection(event, side)}
+            >
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.2 12.8 5.5 14.5a3 3 0 0 1-4.2-4.2L4 7.6a3 3 0 0 1 4.2 0" /><path d="m12.8 7.2 1.7-1.7a3 3 0 0 1 4.2 4.2L16 12.4a3 3 0 0 1-4.2 0" /><path d="m7 13 6-6" /></svg>
+            </button>
+          </span>
+        {/each}
+        {#each windowState.bridgeSides ?? [] as side}
+          <span class="workflow-connection workflow-{side} workflow-bridge-link" aria-hidden="true"></span>
+        {/each}
       {/if}
       <header
         role="banner"
@@ -1857,6 +2753,11 @@
           </div>
         {/if}
         <span class="header-actions">
+          {#if session.source === "cli" && session.processId}
+            <button class="terminate-button" type="button" onclick={() => (terminateConfirm = true)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
+              <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+            </button>
+          {/if}
           <span class="text-zoom-control">
             <button
               class:active={textZoomOpen}
@@ -1892,25 +2793,20 @@
               </span>
             {/if}
           </span>
+          {#if windowState?.docked}
+            <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
+              <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
+            </button>
+          {/if}
+          <button type="button" onclick={minimizeTerminal} aria-label={tr("Minimize terminal", "Minimizar terminal")} title={tr("Minimize", "Minimizar")}>
+            <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
+          </button>
           <button class="fullscreen-button" type="button" onclick={toggleFullscreen} aria-label={fullscreen ? tr("Exit full screen", "Sair da tela cheia") : tr("Enter full screen", "Entrar em tela cheia")} title={fullscreen ? tr("Exit full screen", "Sair da tela cheia") : tr("Full screen", "Tela cheia")}>
             {#if fullscreen}
               <svg viewBox="0 0 20 20"><path d="M8 3v5H3M12 3v5h5M8 17v-5H3M12 17v-5h5" /></svg>
             {:else}
               <svg viewBox="0 0 20 20"><path d="M3 8V3h5M12 3h5v5M3 12v5h5M17 12v5h-5" /></svg>
             {/if}
-          </button>
-          {#if windowState?.docked}
-            <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
-              <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
-            </button>
-          {/if}
-          {#if session.source === "cli" && session.processId}
-            <button class="terminate-button" type="button" onclick={() => (terminateConfirm = !terminateConfirm)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
-              <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
-            </button>
-          {/if}
-          <button type="button" onclick={minimizeTerminal} aria-label={tr("Minimize terminal", "Minimizar terminal")} title={tr("Minimize", "Minimizar")}>
-            <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
           </button>
           <button class="close-button" type="button" onclick={closeTerminal} aria-label={tr("Close terminal", "Fechar terminal")}>
             <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
@@ -1946,7 +2842,17 @@
                 <output>{Math.round(textZoom * 100)}%</output>
                 <button disabled={textZoom >= textZoomMax} type="button" aria-label={tr("Increase text size", "Aumentar textos")} onclick={() => setTextZoom(textZoom + 0.1)}>+</button>
               </span>
-              <button type="button" role="menuitem" onclick={() => void toggleFullscreen()}>
+              {#if windowState?.docked}
+                <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
+                  <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
+                  <span>{tr("Undock terminal", "Desacoplar terminal")}</span>
+                </button>
+              {/if}
+              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void minimizeTerminal(); }}>
+                <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
+                <span>{tr("Minimize terminal", "Minimizar terminal")}</span>
+              </button>
+              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void toggleFullscreen(); }}>
                 {#if fullscreen}
                   <svg viewBox="0 0 20 20"><path d="M8 3v5H3M12 3v5h5M8 17v-5H3M12 17v-5h5" /></svg>
                   <span>{tr("Exit full screen", "Sair da tela cheia")}</span>
@@ -1955,33 +2861,23 @@
                   <span>{tr("Enter full screen", "Entrar em tela cheia")}</span>
                 {/if}
               </button>
-              {#if windowState?.docked}
-                <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
-                  <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
-                  <span>{tr("Undock terminal", "Desacoplar terminal")}</span>
-                </button>
-              {/if}
-              {#if session.source === "cli" && session.processId}
-                <button class="danger" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; terminateConfirm = !terminateConfirm; }}>
-                  <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
-                  <span>{tr("Stop agent", "Encerrar agente")}</span>
-                </button>
-              {/if}
-              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void minimizeTerminal(); }}>
-                <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
-                <span>{tr("Minimize terminal", "Minimizar terminal")}</span>
-              </button>
               <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void closeTerminal(); }}>
                 <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
                 <span>{tr("Close terminal", "Fechar terminal")}</span>
               </button>
+              {#if session.source === "cli" && session.processId}
+                <button class="danger terminal-stop-menu" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; terminateConfirm = true; }}>
+                  <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
+                  <span>{tr("Stop agent", "Encerrar agente")}</span>
+                </button>
+              {/if}
             </span>
           {/if}
         </span>
       </header>
 
       {#if todo || goal}
-        <aside class:collapsed={!workTrayExpanded} class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")}>
+        <aside class:collapsed={!workTrayExpanded} class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")} transition:slide={{ duration: 160 }}>
           <button
             class="work-tray-toggle"
             type="button"
@@ -1999,7 +2895,7 @@
           <div class="work-tray-body" aria-hidden={!workTrayExpanded}>
             <div class="work-tray-grid">
               {#if todo}
-                <section class="work-card todo-card">
+                <section class="work-card todo-card" transition:fade={{ duration: 140 }}>
                   <div class="work-card-heading">
                     <strong>TO DO</strong>
                     <span>{completedTodoItems}/{todo.items.length}</span>
@@ -2021,7 +2917,7 @@
                 </section>
               {/if}
               {#if goal}
-                <section class="work-card goal-card">
+                <section class="work-card goal-card" transition:fade={{ duration: 140 }}>
                   <div class="work-card-heading">
                     <strong>GOAL</strong>
                     <span class:complete={goal.status === "complete"} class:blocked={goal.status === "blocked"}>
@@ -2041,15 +2937,148 @@
       {/if}
 
       <nav class="hub-tabs" aria-label={tr("Session details", "Detalhes da sessão")}>
-        <button class:active={activeTab === "chat"} type="button" onclick={() => (activeTab = "chat")}>
+        <button class:active={activeTab === "chat"} type="button" onclick={() => void selectTab("chat")}>
           {tr("Chat", "Chat")} <span>{chatEntries.length}</span>
         </button>
-        <button class:active={activeTab === "changes"} type="button" onclick={() => (activeTab = "changes")}>
+        <button class:active={activeTab === "changes"} type="button" onclick={() => void selectTab("changes")}>
           {tr("Changes", "Alterações")} <span>{changedFiles.length}</span>
         </button>
+        {#if plan}
+          <button class:active={activeTab === "plan"} type="button" onclick={() => void selectTab("plan")}>
+            {tr("Plan", "Plano")} <span>{plan.items.length || 1}</span>
+          </button>
+        {/if}
       </nav>
 
+      {#if activeTab === "chat" && windowState?.workflowEnabled && windowState.docked}
+        <span class="workflow-role-control">
+          <button
+            bind:this={workflowRoleFabElement}
+            class:unconfigured={!workflowStep}
+            class:open={Boolean(workflowDraft)}
+            class="workflow-role-fab"
+            type="button"
+            title={workflowStep?.instruction || tr("Configure this terminal role", "Configurar o papel deste terminal")}
+            aria-label={tr("Configure this terminal role", "Configurar o papel deste terminal")}
+            aria-expanded={Boolean(workflowDraft)}
+            onclick={() => workflowDraft ? (workflowDraft = null) : void openWorkflowRoleEditor()}
+          >
+            {#if workflowStep}
+              <i class="role-symbol role-{workflowStep.role}" aria-hidden="true"><span></span></i>
+            {:else}
+              <i class="role-symbol role-custom" aria-hidden="true"><span></span></i>
+            {/if}
+            {#if workflowStepOrder}<span class="workflow-step-badge" aria-hidden="true">{workflowStepOrder}</span>{/if}
+            <span class="workflow-role-tooltip">
+              <strong>{workflowStep ? workflowStepRoleLabel(workflowStep) : tr("Set role", "Definir papel")}</strong>
+              <small>{workflowStepOrder
+                ? tr(`Step ${workflowStepOrder} of ${workflowStepTotal}`, `Etapa ${workflowStepOrder} de ${workflowStepTotal}`)
+                : tr("Not configured", "Não configurado")}</small>
+            </span>
+          </button>
+
+          {#if workflowDraft && workflowEditingStep}
+            {@const draftIndex = workflowDraft.steps.findIndex((step) => step.id === workflowEditingStep?.id)}
+            <div
+              class:above={workflowRolePopoverAbove}
+              class:constrained={workflowRolePopoverConstrained}
+              class="workflow-role-popover"
+              style={workflowRolePopoverStyle}
+              role="dialog"
+              tabindex="-1"
+              aria-label={tr("Configure workflow role", "Configurar papel do workflow")}
+              onpointerdown={(event) => event.stopPropagation()}
+            >
+              <div class="workflow-popover-bridge" aria-hidden="true"></div>
+              <div class="workflow-popover-heading">
+                <span>
+                  <small>{tr(`Step ${workflowStepOrder || workflowPhysicalOrder || draftIndex + 1} of ${workflowStepTotal || workflowDraft.steps.length}`, `Etapa ${workflowStepOrder || workflowPhysicalOrder || draftIndex + 1} de ${workflowStepTotal || workflowDraft.steps.length}`)}</small>
+                  <strong>{sessionDisplayName(session)}</strong>
+                </span>
+              </div>
+
+              <div class:picker-open={workflowRolePickerOpen} class="workflow-role-fields">
+                <div class="workflow-role-picker">
+                  <span class="workflow-field-label">{tr("Agent role", "Papel do agente")}</span>
+                  <button class:open={workflowRolePickerOpen} class="workflow-role-trigger" type="button" aria-haspopup="listbox" aria-expanded={workflowRolePickerOpen} onclick={() => { workflowPendingRole = null; workflowRolePickerOpen = !workflowRolePickerOpen; }}>
+                    <i class="role-symbol role-{workflowRoleConfigured ? workflowEditingStep.role : 'custom'}" aria-hidden="true"><span></span></i>
+                    <span>
+                      <strong>{workflowRoleConfigured ? workflowStepRoleLabel(workflowEditingStep) : tr("Choose a role", "Escolha um papel")}</strong>
+                      <small>{workflowRoleConfigured ? workflowRoleDescription(workflowEditingStep.role) : tr("Select this agent's responsibility", "Selecione a responsabilidade deste agente")}</small>
+                    </span>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"></path></svg>
+                  </button>
+                  {#if workflowRolePickerOpen}
+                    <div class="workflow-role-menu" role="listbox" aria-label={tr("Agent role", "Papel do agente")}>
+                      {#each workflowRoles as role}
+                        <button class:active={workflowRoleConfigured && workflowEditingStep.role === role} disabled={workflowDraftSaving} type="button" role="option" aria-selected={workflowRoleConfigured && workflowEditingStep.role === role} onclick={() => void selectWorkflowRole(role)}>
+                          <i class="role-symbol role-{role}" aria-hidden="true"><span></span></i>
+                          <span><strong>{workflowRoleOptionLabel(role)}</strong><small>{workflowRoleDescription(role)}</small></span>
+                          {#if workflowRoleConfigured && workflowEditingStep.role === role}<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7"></path></svg>{/if}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+                {#if workflowPendingRole}
+                  <div class="workflow-role-replace-warning" role="alert">
+                    <i class="role-symbol role-{workflowPendingRole}" aria-hidden="true"><span></span></i>
+                    <span>
+                      <strong>{tr("Replace customized instructions?", "Substituir instruções personalizadas?")}</strong>
+                      <small>{tr(`Changing to ${workflowRoleOptionLabel(workflowPendingRole)} restores that role's defaults.`, `Mudar para ${workflowRoleOptionLabel(workflowPendingRole)} restaura os padrões desse papel.`)}</small>
+                    </span>
+                    <div>
+                      <button type="button" onclick={() => (workflowPendingRole = null)}>{tr("Keep", "Manter")}</button>
+                      <button class="confirm" disabled={workflowDraftSaving} type="button" onclick={() => void confirmWorkflowRoleChange()}>{tr("Replace", "Substituir")}</button>
+                    </div>
+                  </div>
+                {/if}
+                {#if workflowRoleConfigured}
+                  <button class:open={workflowContractExpanded} class="workflow-contract-toggle" type="button" aria-expanded={workflowContractExpanded} onclick={() => (workflowContractExpanded = !workflowContractExpanded)}>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5h7l3 3v10H5z"></path><path d="M12 3.5v3h3M8 10h4M8 13h4"></path></svg>
+                    <span><strong>{workflowContractExpanded ? tr("Hide role instructions", "Ocultar instruções do papel") : tr("Show role instructions", "Exibir instruções do papel")}</strong></span>
+                    <svg class="contract-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"></path></svg>
+                  </button>
+                  {#if workflowContractExpanded}
+                    <div class="workflow-contract-body">
+                      <div class="workflow-instruction-meta">
+                        <span class:customized={workflowInstructionsCustomized || workflowEditingStep.role === "custom"} class:ready={workflowRoleReady}>
+                          {workflowEditingStep.role === "custom" ? tr("Custom role", "Papel personalizado") : workflowInstructionsCustomized ? tr("Customized", "Personalizado") : tr("Lume default", "Padrão do Lume")}
+                        </span>
+                        {#if workflowEditingStep.role !== "custom" && workflowInstructionsCustomized}
+                          <button type="button" onclick={() => void restoreWorkflowRoleDefaults()}>{tr("Restore default", "Restaurar padrão")}</button>
+                        {/if}
+                      </div>
+                      {#if workflowEditingStep.role === "custom"}
+                        <label><span>{tr("Custom role name", "Nome do papel personalizado")}</span><input maxlength="80" value={workflowEditingStep.customRoleLabel} oninput={(event) => updateWorkflowEditingStep({ customRoleLabel: event.currentTarget.value })} /></label>
+                      {/if}
+                      <label class="workflow-instruction-field"><span>{tr("Instruction", "Instrução")}</span><textarea maxlength="4000" rows="2" value={workflowEditingStep.instruction} placeholder={tr("What this agent must do", "O que este agente deve fazer")} oninput={(event) => updateWorkflowEditingStep({ instruction: event.currentTarget.value })}></textarea></label>
+                      <div class="workflow-contract-pair">
+                        <label><span>{tr("Expected input", "Entrada esperada")}</span><textarea maxlength="4000" rows="2" value={workflowEditingStep.expectedInput} oninput={(event) => updateWorkflowEditingStep({ expectedInput: event.currentTarget.value })}></textarea></label>
+                        <label><span>{tr("Produced output", "Saída produzida")}</span><textarea maxlength="4000" rows="2" value={workflowEditingStep.producedOutput} oninput={(event) => updateWorkflowEditingStep({ producedOutput: event.currentTarget.value })}></textarea></label>
+                      </div>
+                      <label><span>{tr("Completion condition", "Condição de conclusão")}</span><textarea maxlength="4000" rows="2" value={workflowEditingStep.completionCondition} placeholder={tr("How Lume knows this step is complete", "Como o Lume sabe que esta etapa terminou")} oninput={(event) => updateWorkflowEditingStep({ completionCondition: event.currentTarget.value })}></textarea></label>
+                      {#if !workflowRoleReady}
+                        <p class="workflow-readiness-note">{tr("Complete every field so this step is ready for the workflow.", "Preencha todos os campos para deixar esta etapa pronta para o workflow.")}</p>
+                      {/if}
+                    </div>
+                  {/if}
+                {/if}
+              </div>
+              {#if workflowDraftError}<p class="handoff-error">{workflowDraftError}</p>{/if}
+              {#if workflowRoleConfigured}
+                <div class="workflow-popover-actions">
+                  <button type="button" onclick={() => (workflowDraft = null)}>{tr("Cancel", "Cancelar")}</button>
+                  <button class="primary" disabled={workflowDraftSaving || !workflowRoleReady} type="button" onclick={() => void saveWorkflowRole()}>{workflowDraftSaving ? tr("Saving…", "Salvando…") : tr("Save instructions", "Salvar instruções")}</button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </span>
+      {/if}
+
       <div
+        class:with-workflow-role={activeTab === "chat" && windowState?.workflowEnabled && windowState.docked}
         class="terminal-output"
         bind:this={outputElement}
         onscroll={handleOutputScroll}
@@ -2094,57 +3123,148 @@
 
         {#if activeTab === "chat"}
           <div class="chat-feed">
-            {#each chatEntries as entry (entry.id)}
-              {@const item = entry.activity}
-              {#if item.kind === "prompt" && (item.detail || item.attachments?.length)}
-                <div class="chat-message user-message">
-                  <header>
-                    <strong>{tr("You", "Você")}</strong>
-                    <time>{activityTime(item.createdAt)}</time>
-                  </header>
-                  {#if item.detail}<pre>{item.detail}</pre>{/if}
-                  {#if item.attachments?.length}
-                    <div class="message-images">
-                      {#each item.attachments as attachment}
-                        {#if attachment.previewDataUrl}
-                          <img src={attachment.previewDataUrl} alt={attachment.name} />
-                        {:else}
-                          <span class="message-file" title={attachment.name}>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4V17H5zM11 3v4h4M7.5 11h5M7.5 14h4" /></svg>
-                            <small>{attachment.name}</small>
-                          </span>
-                        {/if}
+            {#if hiddenChatItemCount > 0}
+              <button class="load-earlier-chat" type="button" onclick={() => void revealEarlierChatItems()}>
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 12 4-4 4 4" /></svg>
+                <span>{tr(`Load ${Math.min(60, hiddenChatItemCount)} earlier items`, `Carregar ${Math.min(60, hiddenChatItemCount)} itens anteriores`)}</span>
+                <small>{hiddenChatItemCount}</small>
+              </button>
+            {/if}
+            {#each visibleChatFeedItems as feedItem (feedItem.id)}
+              {#if feedItem.kind === "trace"}
+                <ActivityTraceGroup
+                  activities={feedItem.entries.map((entry) => entry.activity)}
+                  active={feedItem.id === activeTraceId}
+                  {language}
+                />
+                {#if feedItem.files.length}
+                  <div class="turn-files">
+                    <header>
+                      <span class="turn-files-mark"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5h6l4 4v9H5zM11 3.5v4h4M8 11h4M8 14h3" /></svg></span>
+                      <strong>{tr("Files changed", "Arquivos alterados")}</strong>
+                      <small>{feedItem.files.length}</small>
+                      <button
+                        class="handoff-button"
+                        disabled={handoffLoading}
+                        type="button"
+                        title={tr("Send files to a docked agent", "Enviar arquivos para um agente acoplado")}
+                        aria-label={tr("Send these changed files to a docked agent", "Enviar estes arquivos alterados para um agente acoplado")}
+                        onclick={() => void openHandoff(traceHandoffEntry(feedItem))}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M9 3l3 3-3 3M16 14H8M11 11l-3 3 3 3" /></svg>
+                      </button>
+                    </header>
+                    <div>
+                      {#each feedItem.files as file}
+                        <code title={file.path}><FileTypeIcon path={file.path} /><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
                       {/each}
                     </div>
-                  {/if}
-                </div>
-              {:else if item.kind === "message" && item.detail}
-                <div class="chat-message agent-message">
-                  <header>
-                    <strong>{session.agentLabel}</strong>
-                    <time>{activityTime(item.createdAt)}</time>
-                  </header>
-                  <div class="markdown-content">{@html renderSafeMarkdown(item.detail)}</div>
-                </div>
-              {:else if item.kind !== "file"}
-                <details class="turn-trace">
-                  <summary>
-                    <span>{activityMark(item)}</span>
-                    <strong class="trace-title">{displayText(language, item.title)}</strong>
-                    <time>{activityTime(item.createdAt)}</time>
-                  </summary>
-                  {#if item.detail}<pre>{item.detail}</pre>{/if}
-                </details>
-              {/if}
-              {#if entry.files.length}
-                <div class="turn-files">
-                  <strong>{tr("Files changed", "Arquivos alterados")}</strong>
-                  <div>
-                    {#each entry.files as file}
-                      <code title={file.path}><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
-                    {/each}
                   </div>
-                </div>
+                {/if}
+              {:else}
+                {@const entry = feedItem.entry}
+                {@const item = entry.activity}
+                {#if item.kind === "prompt" && (item.detail || item.attachments?.length)}
+                  {@const receivedHandoff = parseHandoffPrompt(item.detail)}
+                  <div class="chat-message user-message">
+                    <header>
+                      <strong>
+                        {receivedHandoff
+                          ? tr(`Context from ${receivedHandoff.source}`, `Contexto de ${receivedHandoff.source}`)
+                          : tr("You", "Você")}
+                      </strong>
+                      <time>{activityTime(item.createdAt)}</time>
+                    </header>
+                    {#if receivedHandoff}
+                      <div class="markdown-content">{@html renderCachedMarkdown(receivedHandoff.body)}</div>
+                    {:else if item.detail}
+                      <pre>{item.detail}</pre>
+                    {/if}
+                    {#if item.attachments?.length}
+                      <div class="message-images">
+                        {#each item.attachments as attachment}
+                          {#if attachment.previewDataUrl}
+                            <img src={attachment.previewDataUrl} alt={attachment.name} />
+                          {:else}
+                            <span class="message-file" title={attachment.name}>
+                              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4V17H5zM11 3v4h4M7.5 11h5M7.5 14h4" /></svg>
+                              <small>{attachment.name}</small>
+                            </span>
+                          {/if}
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {:else if item.kind === "message" && (item.detail || item.attachments?.length)}
+                  {@const authorizationNeeded = authorizationMessageId === entry.id}
+                  <div class:intervention-required={authorizationNeeded} class="chat-message agent-message">
+                    <header>
+                      <strong>{session.agentLabel}</strong>
+                      <button
+                        class="handoff-button"
+                        disabled={handoffLoading}
+                        type="button"
+                        title={tr("Send to a docked agent", "Enviar para um agente acoplado")}
+                        aria-label={tr("Send this response to a docked agent", "Enviar esta resposta para um agente acoplado")}
+                        onclick={() => void openHandoff(entry)}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M9 3l3 3-3 3M16 14H8M11 11l-3 3 3 3" /></svg>
+                      </button>
+                      <time>{activityTime(item.createdAt)}</time>
+                    </header>
+                    {#if authorizationNeeded}
+                      <aside class="intervention-indicator" aria-label={tr("Your intervention is required", "Sua intervenção é necessária")}>
+                        <span aria-hidden="true">
+                          <svg viewBox="0 0 20 20"><path class="indicator-shape" d="M10 2.8 18 16.5H2z"></path><path class="indicator-mark" d="M10 7v4.5M10 14.2v.2"></path></svg>
+                        </span>
+                        <div>
+                          <strong>{tr("Your authorization is needed", "Sua autorização é necessária")}</strong>
+                        </div>
+                      </aside>
+                    {/if}
+                    {#if item.detail}<div class="markdown-content">{@html renderCachedMarkdown(item.detail)}</div>{/if}
+                    <ResponseAttachments
+                      text={item.detail}
+                      attachments={item.attachments ?? []}
+                      workingDirectory={session.workingDirectory}
+                      {language}
+                      onError={(error) => (message = error)}
+                    />
+                  </div>
+                {:else if item.kind === "analysis" && item.detail}
+                  <section class:running={item.status === "running"} class="reasoning-update">
+                    <header>
+                      <span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5 11.4 7 16 8.5 11.4 10 10 14.5 8.6 10 4 8.5 8.6 7ZM15.5 13l.7 2.1 2.1.7-2.1.7-.7 2.1-.7-2.1-2.1-.7 2.1-.7Z" /></svg></span>
+                      <strong>{displayText(language, item.title)}</strong>
+                      <time>{activityTime(item.createdAt)}</time>
+                    </header>
+                    <div class="markdown-content">{@html renderCachedMarkdown(item.detail)}</div>
+                  </section>
+                {/if}
+                {#if entry.files.length}
+                  <div class="turn-files">
+                    <header>
+                      <span class="turn-files-mark"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5h6l4 4v9H5zM11 3.5v4h4M8 11h4M8 14h3" /></svg></span>
+                      <strong>{tr("Files changed", "Arquivos alterados")}</strong>
+                      <small>{entry.files.length}</small>
+                      <button
+                        class="handoff-button"
+                        disabled={handoffLoading}
+                        type="button"
+                        title={tr("Send files to a docked agent", "Enviar arquivos para um agente acoplado")}
+                        aria-label={tr("Send these changed files to a docked agent", "Enviar estes arquivos alterados para um agente acoplado")}
+                        onclick={() => void openHandoff(entry)}
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M9 3l3 3-3 3M16 14H8M11 11l-3 3 3 3" /></svg>
+                      </button>
+                    </header>
+                    <div>
+                      {#each entry.files as file}
+                        <code title={file.path}><FileTypeIcon path={file.path} /><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
               {/if}
             {:else}
               <p class="empty-state">{tr("Messages and agent activity will appear here in real time.", "As mensagens e a atividade do agente aparecerão aqui em tempo real.")}</p>
@@ -2168,31 +3288,135 @@
               </div>
             {/if}
           </div>
-        {:else}
+        {:else if activeTab === "changes"}
           <section class="changes-panel">
             <strong>{tr("All changed files", "Todos os arquivos alterados")}</strong>
             {#if changedFiles.length}
               <div class="change-list">
                 {#each changedFiles as file}
-                  <code title={file.path}><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
+                  <code title={file.path}><FileTypeIcon path={file.path} /><span class="file-path">{displayFileChangePath(file.path)}</span><span class="added">+{file.added}</span><span class="removed">-{file.removed}</span></code>
                 {/each}
               </div>
             {:else}
               <p class="empty-state">{tr("No file changes were reported in this session.", "Nenhuma alteração de arquivo foi informada nesta sessão.")}</p>
             {/if}
           </section>
+        {:else if plan}
+          <section class="plan-panel">
+            <header>
+              <div>
+                <small>{tr("Agent planning", "Planejamento do agente")}</small>
+                <strong>{tr("Current plan", "Plano atual")}</strong>
+              </div>
+              {#if plan.items.length}
+                <span>{completedPlanItems}/{plan.items.length} {tr("completed", "concluídos")}</span>
+              {/if}
+            </header>
+            {#if plan.content}
+              <div class="plan-document markdown-content">{@html renderCachedMarkdown(plan.content)}</div>
+            {:else}
+              {#if plan.explanation}
+                <p class="plan-explanation">{plan.explanation}</p>
+              {/if}
+              {#if plan.items.length}
+                <i class="plan-progress" style={`--plan-progress: ${(completedPlanItems / plan.items.length) * 100}%`}>
+                  <em></em>
+                </i>
+                <ol class="plan-items">
+                  {#each plan.items as item, index}
+                    <li class:active={item.status === "in_progress"} class:done={item.status === "completed"}>
+                      <span>{item.status === "completed" ? "✓" : index + 1}</span>
+                      <div>
+                        <strong>{item.label}</strong>
+                        <small>{workItemLabel(item.status)}</small>
+                      </div>
+                    </li>
+                  {/each}
+                </ol>
+              {/if}
+            {/if}
+          </section>
         {/if}
 
-        {#if terminateConfirm}
-          <div class="terminate-confirm">
-            <span>{tr("Stop this agent and its commands?", "Encerrar este agente e os comandos dele?")}</span>
-            <div>
-              <button type="button" onclick={() => (terminateConfirm = false)}>{tr("Cancel", "Cancelar")}</button>
-              <button class="danger" disabled={terminating} type="button" onclick={() => void terminateAgent()}>{terminating ? tr("Stopping…", "Encerrando…") : tr("Stop", "Encerrar")}</button>
+        {#if handoffDraft}
+          {@const selectedHandoffTarget = handoffTargets.find((target) => target.session.id === handoffDraft?.targetSessionId)}
+          <div class="handoff-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) handoffDraft = null; }}>
+            <div class="handoff-dialog" role="dialog" aria-modal="true" aria-labelledby="handoff-title">
+              <header>
+                <div>
+                  <small>{tr("Context handoff", "Transferência de contexto")}</small>
+                  <strong id="handoff-title">{tr("Send to a docked agent", "Enviar para um agente acoplado")}</strong>
+                </div>
+                <button type="button" aria-label={tr("Close", "Fechar")} onclick={() => (handoffDraft = null)}>×</button>
+              </header>
+
+              <label class="handoff-target">
+                <span>{tr("Destination", "Destino")}</span>
+                <select bind:value={handoffDraft.targetSessionId}>
+                  {#each handoffTargets as target (target.terminal.label)}
+                    <option value={target.session.id} disabled={!handoffTargetCanReceive(target)}>
+                      {sessionDisplayName(target.session)} · {target.session.agentLabel}{handoffTargetCanReceive(target) ? "" : ` · ${tr("Unavailable", "Indisponível")}`}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+
+              <div class="handoff-options">
+                <label class:disabled={!handoffDraft.text}>
+                  <input type="checkbox" bind:checked={handoffDraft.includeText} disabled={!handoffDraft.text} />
+                  <span><strong>{tr("Response", "Resposta")}</strong><small>{tr("Share the selected agent message", "Compartilhar a mensagem selecionada")}</small></span>
+                </label>
+                <label class:disabled={!handoffDraft.files.length}>
+                  <input type="checkbox" bind:checked={handoffDraft.includeFiles} disabled={!handoffDraft.files.length} />
+                  <span><strong>{tr("Changed files", "Arquivos alterados")}</strong><small>{handoffDraft.files.length} {tr("reported files", "arquivos informados")}</small></span>
+                </label>
+              </div>
+
+              <label class="handoff-note">
+                <span>{tr("Instruction for the next agent", "Instrução para o próximo agente")}</span>
+                <textarea bind:value={handoffDraft.note} rows="2" placeholder={tr("Optional: explain what the next agent should do…", "Opcional: explique o que o próximo agente deve fazer…")}></textarea>
+              </label>
+
+              <div class="handoff-preview">
+                <strong>{tr("Preview", "Pré-visualização")}</strong>
+                <pre>{handoffPreview(handoffDraft) || tr("Select content or write an instruction.", "Selecione um conteúdo ou escreva uma instrução.")}</pre>
+              </div>
+
+              {#if handoffError}<p class="handoff-error">{handoffError}</p>{/if}
+              {#if selectedHandoffTarget && !handoffTargetCanReceive(selectedHandoffTarget)}
+                <p class="handoff-error">{tr("This agent cannot receive context while its current task is running.", "Este agente não pode receber contexto enquanto a tarefa atual estiver em execução.")}</p>
+              {/if}
+
+              <footer>
+                <button type="button" onclick={() => (handoffDraft = null)}>{tr("Cancel", "Cancelar")}</button>
+                <button
+                  class="primary"
+                  disabled={handoffSending || !selectedHandoffTarget || !handoffTargetCanReceive(selectedHandoffTarget) || !handoffPreview(handoffDraft)}
+                  type="button"
+                  onclick={() => void sendHandoff()}
+                >
+                  {handoffSending ? tr("Sending…", "Enviando…") : tr("Send context", "Enviar contexto")}
+                </button>
+              </footer>
             </div>
           </div>
         {/if}
       </div>
+
+      {#if terminateConfirm}
+        <div class="terminate-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget && !terminating) terminateConfirm = false; }}>
+          <div class="terminate-dialog" role="alertdialog" aria-modal="true" aria-labelledby="terminate-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+            <div>
+              <strong id="terminate-title">{tr("Stop this agent?", "Encerrar este agente?")}</strong>
+              <p>{tr("This will close the original connection and stop the agent.", "Ao encerrar, a conexão original será fechada e o agente será interrompido.")}</p>
+            </div>
+            <footer>
+              <button disabled={terminating} type="button" onclick={() => (terminateConfirm = false)}>{tr("Cancel", "Cancelar")}</button>
+              <button class="danger" disabled={terminating} type="button" onclick={() => void terminateAgent()}>{terminating ? tr("Stopping…", "Encerrando…") : tr("Stop agent", "Encerrar agente")}</button>
+            </footer>
+          </div>
+        </div>
+      {/if}
 
       <form
         class="terminal-composer"
@@ -2358,10 +3582,12 @@
         </div>
       </form>
       {#if message}<p class="message">{message}</p>{/if}
-      <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
-      <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
-      <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
-      <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+      {#if !windowState?.workflowBridgeOpen}
+        <button class="resize-handle resize-nw" type="button" tabindex="-1" aria-label={tr("Resize from top-left corner", "Redimensionar pelo canto superior esquerdo")} onpointerdown={(event) => void beginResize(event, "NorthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+        <button class="resize-handle resize-ne" type="button" tabindex="-1" aria-label={tr("Resize from top-right corner", "Redimensionar pelo canto superior direito")} onpointerdown={(event) => void beginResize(event, "NorthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+        <button class="resize-handle resize-sw" type="button" tabindex="-1" aria-label={tr("Resize from bottom-left corner", "Redimensionar pelo canto inferior esquerdo")} onpointerdown={(event) => void beginResize(event, "SouthWest")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+        <button class="resize-handle resize-se" type="button" tabindex="-1" aria-label={tr("Resize from bottom-right corner", "Redimensionar pelo canto inferior direito")} onpointerdown={(event) => void beginResize(event, "SouthEast")} onpointermove={moveResize} onpointerup={(event) => void endResize(event)} onpointercancel={(event) => void endResize(event)}></button>
+      {/if}
     </section>
   {:else if initializationError}
     <section class="terminal-card loading">
@@ -2384,14 +3610,22 @@
 </main>
 
 <style>
-  .terminal-window { width: 100%; height: 100%; }
+  .terminal-window { width: 100%; height: 100%; container-type: inline-size; }
   .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; --chat-font-adjust: 0px; --chat-small-font-adjust: 0px; --chat-tiny-font-adjust: 0px; --chat-font-size: calc(9px + var(--chat-font-adjust)); --chat-small-font-size: calc(8px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(7px + var(--chat-tiny-font-adjust)); border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: #f8fbf9; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
-  @supports (width: 1cqw) {
-    .terminal-card { --chat-font-size: clamp(calc(9px + var(--chat-font-adjust)), calc(7px + 0.55cqw + var(--chat-font-adjust)), calc(12px + var(--chat-font-adjust))); --chat-small-font-size: clamp(calc(8px + var(--chat-small-font-adjust)), calc(6.2px + 0.5cqw + var(--chat-small-font-adjust)), calc(10.5px + var(--chat-small-font-adjust))); --chat-tiny-font-size: clamp(calc(7px + var(--chat-tiny-font-adjust)), calc(5.8px + 0.4cqw + var(--chat-tiny-font-adjust)), calc(9px + var(--chat-tiny-font-adjust))); }
+  @container (min-width: 520px) {
+    .terminal-card { --chat-font-size: calc(10px + var(--chat-font-adjust)); --chat-small-font-size: calc(9px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(8px + var(--chat-tiny-font-adjust)); }
+  }
+  @container (min-width: 700px) {
+    .terminal-card { --chat-font-size: calc(11px + var(--chat-font-adjust)); --chat-small-font-size: calc(10px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(8.5px + var(--chat-tiny-font-adjust)); }
+  }
+  @container (min-width: 880px) {
+    .terminal-card { --chat-font-size: calc(12px + var(--chat-font-adjust)); --chat-small-font-size: calc(10.5px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(9px + var(--chat-tiny-font-adjust)); }
   }
   .terminal-card > header { min-height: 48px; padding: 7px 8px 7px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(97, 119, 109, 0.11); cursor: grab; touch-action: none; }
   .terminal-card.dragging > header { cursor: grabbing; }
+  .terminal-card.bridge-locked > header { cursor: default; }
   .terminal-card.resizing { user-select: none; }
+  .terminal-card.header-menu-open .workflow-role-control { opacity: 0; pointer-events: none; }
   .terminal-card.dock-moving { border-color: rgba(72, 142, 111, 0.58); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.12); transform: scale(0.992); }
   .terminal-card.dock-target { border-color: rgba(65, 151, 111, 0.78); box-shadow: inset 0 0 0 3px rgba(75, 157, 120, 0.18); }
   .terminal-card.settling { border-color: rgba(69, 139, 108, 0.48); box-shadow: inset 0 0 0 2px rgba(75, 157, 120, 0.11); }
@@ -2402,6 +3636,77 @@
   .dock-silhouette { position: absolute; z-index: 30; inset: 5px; overflow: hidden; border: 1px solid rgba(71, 155, 117, 0.62); border-radius: 13px; background: rgba(76, 161, 121, 0.075); box-shadow: inset 0 0 0 1px rgba(225, 249, 238, 0.48); pointer-events: none; animation: dock-breathe 900ms ease-in-out infinite alternate; }
   .dock-silhouette::before { position: absolute; border: 1px solid rgba(65, 149, 111, 0.68); border-radius: 9px; content: ""; background: linear-gradient(135deg, rgba(77, 164, 121, 0.32), rgba(77, 164, 121, 0.12)); box-shadow: 0 6px 18px rgba(38, 105, 76, 0.14); }
   .dock-silhouette span { position: absolute; z-index: 1; padding: 3px 6px; border-radius: 999px; color: #39755a; background: rgba(232, 246, 239, 0.9); font-size: 7px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+  .terminal-card.workflow-preview { transition: border-color 90ms ease, transform 110ms cubic-bezier(0.22, 0.8, 0.3, 1); }
+  .terminal-card.workflow-preview.dock-target,
+  .terminal-card.workflow-preview.dock-moving { border-color: rgba(103, 126, 116, 0.2); box-shadow: none; transform: none; }
+  .terminal-card.workflow-preview.dock-target.dock-left { transform: translateX(calc(var(--dock-tension) * -1.1px)) scaleX(calc(1 + var(--dock-tension) * 0.012)) scaleY(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: right center; }
+  .terminal-card.workflow-preview.dock-moving.dock-left { transform: translateX(calc(var(--dock-tension) * 1.1px)) scaleX(calc(1 + var(--dock-tension) * 0.012)) scaleY(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: left center; }
+  .terminal-card.workflow-preview.dock-target.dock-right { transform: translateX(calc(var(--dock-tension) * 1.1px)) scaleX(calc(1 + var(--dock-tension) * 0.012)) scaleY(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: left center; }
+  .terminal-card.workflow-preview.dock-moving.dock-right { transform: translateX(calc(var(--dock-tension) * -1.1px)) scaleX(calc(1 + var(--dock-tension) * 0.012)) scaleY(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: right center; }
+  .terminal-card.workflow-preview.dock-target.dock-top { transform: translateY(calc(var(--dock-tension) * -1.1px)) scaleY(calc(1 + var(--dock-tension) * 0.012)) scaleX(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: center bottom; }
+  .terminal-card.workflow-preview.dock-moving.dock-top { transform: translateY(calc(var(--dock-tension) * 1.1px)) scaleY(calc(1 + var(--dock-tension) * 0.012)) scaleX(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: center top; }
+  .terminal-card.workflow-preview.dock-target.dock-bottom { transform: translateY(calc(var(--dock-tension) * 1.1px)) scaleY(calc(1 + var(--dock-tension) * 0.012)) scaleX(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: center top; }
+  .terminal-card.workflow-preview.dock-moving.dock-bottom { transform: translateY(calc(var(--dock-tension) * -1.1px)) scaleY(calc(1 + var(--dock-tension) * 0.012)) scaleX(calc(1 - var(--dock-tension) * 0.0035)); transform-origin: center bottom; }
+  .terminal-card.workflow-mode.settling { animation: workflow-dock-settle 360ms cubic-bezier(0.2, 0.85, 0.3, 1) 1; }
+  @keyframes workflow-dock-settle {
+    0% { transform: scale(0.996); }
+    42% { transform: scale(1.003); }
+    72% { transform: scale(0.999); }
+    100% { transform: scale(1); }
+  }
+  .terminal-card.normal-preview.dock-target,
+  .terminal-card.normal-preview.dock-moving { border-color: rgba(103, 126, 116, 0.2); box-shadow: none; transform: none; }
+  .terminal-card.normal-preview .workflow-merge-preview { opacity: calc(0.1 + var(--dock-proximity) * 0.5); }
+  .terminal-card.normal-preview .workflow-merge-preview::before { background: radial-gradient(ellipse at center, rgba(116, 151, 134, calc(0.1 + var(--dock-proximity) * 0.24)) 0 28%, rgba(82, 126, 105, calc(0.06 + var(--dock-proximity) * 0.15)) 56%, transparent 82%); filter: saturate(0.45); }
+  .terminal-card.normal-preview .workflow-merge-preview::after { background: rgba(105, 148, 127, calc(0.17 + var(--dock-proximity) * 0.34)); }
+  .terminal-card.normal-preview.dock-ready .workflow-merge-preview::before { filter: saturate(0.5) brightness(1.04); }
+  .terminal-card.normal-preview.dock-ready .workflow-merge-preview::after { background: rgba(124, 166, 145, 0.72); transform: scale(1.05); }
+  .workflow-merge-preview { position: absolute; z-index: 31; pointer-events: none; opacity: calc(0.14 + var(--dock-proximity) * 0.64); transition: width 55ms linear, height 55ms linear, opacity 55ms linear; }
+  .workflow-merge-preview::before,
+  .workflow-merge-preview::after { position: absolute; content: ""; pointer-events: none; }
+  .workflow-merge-preview::before { background: radial-gradient(ellipse at center, rgba(91, 164, 126, calc(0.12 + var(--dock-proximity) * 0.3)) 0 28%, rgba(53, 137, 94, calc(0.08 + var(--dock-proximity) * 0.2)) 56%, transparent 82%); filter: saturate(0.86); transition: background 55ms linear, filter 55ms linear; }
+  .workflow-merge-preview::after { border-radius: 999px; background: rgba(91, 165, 126, calc(0.2 + var(--dock-proximity) * 0.42)); transition: background 55ms linear, transform 55ms linear; }
+  .dock-target.dock-left .workflow-merge-preview,
+  .dock-moving.dock-right .workflow-merge-preview { left: 0; }
+  .dock-target.dock-right .workflow-merge-preview,
+  .dock-moving.dock-left .workflow-merge-preview { right: 0; }
+  .dock-target.dock-left .workflow-merge-preview,
+  .dock-target.dock-right .workflow-merge-preview,
+  .dock-moving.dock-left .workflow-merge-preview,
+  .dock-moving.dock-right .workflow-merge-preview { top: calc(23% - var(--dock-pull) * 0.25); bottom: calc(23% - var(--dock-pull) * 0.25); width: calc(11px + var(--dock-pull) * 1.02); }
+  .dock-target.dock-left .workflow-merge-preview::before,
+  .dock-target.dock-right .workflow-merge-preview::before,
+  .dock-moving.dock-left .workflow-merge-preview::before,
+  .dock-moving.dock-right .workflow-merge-preview::before { inset: 5% -2px; border-radius: 22% 92% 92% 22% / 48% 52% 52% 48%; }
+  .dock-target.dock-right .workflow-merge-preview::before,
+  .dock-moving.dock-left .workflow-merge-preview::before { border-radius: 92% 22% 22% 92% / 52% 48% 48% 52%; }
+  .dock-target.dock-left .workflow-merge-preview::after,
+  .dock-moving.dock-right .workflow-merge-preview::after { top: 29%; bottom: 29%; left: 0; width: 1px; }
+  .dock-target.dock-right .workflow-merge-preview::after,
+  .dock-moving.dock-left .workflow-merge-preview::after { top: 29%; right: 0; bottom: 29%; width: 1px; }
+  .dock-target.dock-top .workflow-merge-preview,
+  .dock-moving.dock-bottom .workflow-merge-preview { top: 0; }
+  .dock-target.dock-bottom .workflow-merge-preview,
+  .dock-moving.dock-top .workflow-merge-preview { bottom: 0; }
+  .dock-target.dock-top .workflow-merge-preview,
+  .dock-target.dock-bottom .workflow-merge-preview,
+  .dock-moving.dock-top .workflow-merge-preview,
+  .dock-moving.dock-bottom .workflow-merge-preview { right: calc(23% - var(--dock-pull) * 0.25); left: calc(23% - var(--dock-pull) * 0.25); height: calc(11px + var(--dock-pull) * 1.02); }
+  .dock-target.dock-top .workflow-merge-preview::before,
+  .dock-target.dock-bottom .workflow-merge-preview::before,
+  .dock-moving.dock-top .workflow-merge-preview::before,
+  .dock-moving.dock-bottom .workflow-merge-preview::before { inset: -2px 5%; border-radius: 48% 48% 52% 52% / 22% 22% 92% 92%; }
+  .dock-target.dock-top .workflow-merge-preview::before,
+  .dock-moving.dock-bottom .workflow-merge-preview::before { border-radius: 48% 48% 52% 52% / 22% 22% 92% 92%; }
+  .dock-target.dock-bottom .workflow-merge-preview::before,
+  .dock-moving.dock-top .workflow-merge-preview::before { border-radius: 52% 52% 48% 48% / 92% 92% 22% 22%; }
+  .dock-target.dock-top .workflow-merge-preview::after,
+  .dock-moving.dock-bottom .workflow-merge-preview::after { top: 0; right: 29%; left: 29%; height: 1px; }
+  .dock-target.dock-bottom .workflow-merge-preview::after,
+  .dock-moving.dock-top .workflow-merge-preview::after { right: 29%; bottom: 0; left: 29%; height: 1px; }
+  .dock-ready .workflow-merge-preview { opacity: 0.92; }
+  .dock-ready .workflow-merge-preview::before { filter: saturate(0.92) brightness(1.08); }
+  .dock-ready .workflow-merge-preview::after { background: rgba(112, 186, 145, 0.84); transform: scale(1.08); }
   .dock-left .dock-silhouette::before, .dock-right .dock-silhouette::before { top: 12%; bottom: 12%; width: 31%; }
   .dock-left .dock-silhouette::before { left: 7px; }
   .dock-right .dock-silhouette::before { right: 7px; }
@@ -2422,6 +3727,35 @@
   .terminal-name-editor input:focus { border-color: rgba(48, 139, 96, 0.5); box-shadow: 0 0 0 2px rgba(48, 139, 96, 0.08); }
   .terminal-name-editor button { width: 22px; height: 22px; }
   .source-badge { padding: 3px 5px; display: inline-flex; align-items: center; gap: 3px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 7px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
+  .workflow-role-control { position: relative; z-index: 82; height: 0; display: flex; flex: 0 0 0; justify-content: center; overflow: visible; transition: opacity 100ms ease; }
+  .workflow-role-fab { position: relative; top: 7px; width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(54, 148, 101, 0.24); border-radius: 50%; color: #47755f; background: radial-gradient(circle at 34% 24%, rgba(255,255,255,.96) 0 13%, rgba(255,255,255,.34) 31%, transparent 52%), linear-gradient(145deg, #fbfdfc 12%, #e5efe9 88%); box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 5px rgba(43,91,67,.1), 0 5px 10px rgba(24,58,41,.18), 0 1px 2px rgba(24,58,41,.14), 0 0 0 3px rgba(59,151,104,.045); cursor: pointer; transition: border-color 150ms ease, box-shadow 170ms ease, transform 170ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-role-fab:hover { border-color: rgba(54, 148, 101, 0.38); box-shadow: inset 0 1px 0 rgba(255,255,255,.98), inset 0 -3px 5px rgba(43,91,67,.11), 0 7px 14px rgba(24,58,41,.2), 0 2px 3px rgba(24,58,41,.14), 0 0 0 4px rgba(59,151,104,.07); transform: translateY(-2px); }
+  .workflow-role-fab:active { box-shadow: inset 0 2px 5px rgba(38,80,59,.14), 0 2px 5px rgba(24,58,41,.16), 0 0 0 3px rgba(59,151,104,.055); transform: translateY(1px) scale(.98); }
+  .workflow-role-fab.open { border-color: rgba(54, 148, 101, 0.48); box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 5px rgba(43,91,67,.1), 0 7px 16px rgba(24,58,41,.19), 0 0 0 4px rgba(59,151,104,.09); }
+  .workflow-role-fab.unconfigured { border-style: dashed; color: #77877f; }
+  .workflow-role-fab > .role-symbol { width: 30px; height: 30px; border: 0; border-radius: 50%; background: transparent; transform: scale(.9); }
+  .workflow-step-badge { position: absolute; top: -3px; right: -4px; min-width: 14px; height: 14px; padding: 0 3px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.86); border-radius: 999px; color: #fff; background: #398b63; box-shadow: 0 2px 5px rgba(29,74,51,.24); font: 800 7px/1 Inter, sans-serif; }
+  .workflow-role-tooltip { position: absolute; top: 39px; left: 50%; min-width: max-content; padding: 5px 8px; display: grid; gap: 1px; border: 1px solid rgba(70, 112, 91, 0.14); border-radius: 8px; color: #50665a; background: rgba(248, 251, 249, 0.98); box-shadow: 0 8px 20px rgba(24, 51, 38, 0.14); opacity: 0; pointer-events: none; transform: translate(-50%, -4px) scale(.96); transition: opacity 130ms ease, transform 150ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-role-tooltip strong { font: 780 8px/1.25 Inter, sans-serif; }
+  .workflow-role-tooltip small { color: #829089; font: 690 7px/1.25 Inter, sans-serif; }
+  .workflow-role-fab:hover:not(.open) .workflow-role-tooltip,
+  .workflow-role-fab:focus-visible:not(.open) .workflow-role-tooltip { opacity: 1; transform: translate(-50%, 0) scale(1); }
+  .workflow-role-popover { position: fixed; z-index: 85; top: 118px; left: 50%; width: min(420px, calc(100vw - 16px)); max-height: calc(100dvh - 126px); padding: 10px; display: flex; flex-direction: column; gap: 8px; overflow: visible; border: 1px solid rgba(70, 112, 91, 0.17); border-radius: 13px; color: #34463d; background: #f8fbf9; box-shadow: 0 18px 42px rgba(20, 39, 29, 0.22); cursor: default; transform: translateX(-50%); }
+  .workflow-popover-bridge { position: absolute; top: -8px; left: calc(50% - 10px); width: 20px; height: 9px; overflow: hidden; }
+  .workflow-popover-bridge::before { position: absolute; right: 4px; bottom: -6px; width: 12px; height: 12px; content: ""; border: 1px solid rgba(70, 112, 91, 0.17); background: #f8fbf9; transform: rotate(45deg); }
+  .workflow-role-popover.above .workflow-popover-bridge { top: auto; bottom: -8px; }
+  .workflow-role-popover.above .workflow-popover-bridge::before { top: -6px; bottom: auto; }
+  .workflow-role-popover.constrained { overflow: hidden; }
+  .workflow-role-popover.constrained .workflow-popover-bridge { display: none; }
+  .workflow-role-popover.constrained .workflow-popover-heading { display: none; }
+  .workflow-popover-heading { min-height: 32px; display: flex; align-items: center; gap: 8px; }
+  .workflow-popover-heading > span { min-width: 0; flex: 1; display: grid; gap: 1px; }
+  .workflow-popover-heading small { color: #71867b; font: 750 7px Inter, sans-serif; letter-spacing: 0.06em; text-transform: uppercase; }
+  .workflow-popover-heading strong { overflow: hidden; color: #31483c; font: 800 11px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .workflow-popover-actions { display: flex; justify-content: flex-end; gap: 5px; }
+  .workflow-popover-actions button { width: auto; min-width: 62px; height: 27px; padding: 0 8px; border: 1px solid rgba(81, 112, 97, 0.14); border-radius: 8px; color: #60736a; background: transparent; font: 750 8px Inter, sans-serif; cursor: pointer; }
+  .workflow-popover-actions button.primary { color: white; border-color: #32895f; background: #32895f; }
+  .workflow-popover-actions button:disabled { opacity: 0.45; cursor: default; }
   .rate-limit-meter { width: clamp(58px, 21cqw, 96px); min-width: 58px; display: grid; flex: 0 1 auto; gap: 3px; color: #438161; pointer-events: none; }
   .rate-limit-meter > span { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; font: 750 7px Inter, sans-serif; white-space: nowrap; }
   .rate-limit-meter b { color: currentColor; font-size: 8px; }
@@ -2436,13 +3770,14 @@
   header .rename-button { width: 21px; height: 21px; }
   .header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
   .header-overflow { position: relative; z-index: 60; display: none; flex: 0 0 auto; }
-  .header-actions-menu { position: absolute; z-index: 70; top: 30px; right: 0; width: 178px; padding: 5px; display: grid; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 10px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 10px 28px rgba(30, 55, 43, 0.17); cursor: default; }
+  .header-actions-menu { position: absolute; z-index: 70; top: 30px; right: 0; width: 190px; padding: 5px; display: grid; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 10px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 10px 28px rgba(30, 55, 43, 0.17); cursor: default; }
   header .header-actions-menu > button { z-index: auto; width: 100%; min-height: 29px; height: auto; padding: 0 8px; display: flex; justify-content: flex-start; gap: 8px; border-radius: 7px; color: #53665d; font: 700 8px Inter, sans-serif; text-align: left; }
   header .header-actions-menu > button:hover { color: #287452; background: rgba(57, 145, 99, 0.08); }
   header .header-actions-menu > button.danger { color: #9d615c; }
+  header .header-actions-menu > button.terminal-stop-menu { margin-top: 3px; box-shadow: 0 -1px rgba(80, 105, 94, 0.11); }
   .header-actions-menu > button svg { width: 13px; height: 13px; flex: 0 0 auto; }
-  .header-menu-zoom { min-height: 29px; padding: 0 4px 0 8px; display: grid; grid-template-columns: minmax(0, 1fr) 23px 35px 23px; align-items: center; gap: 2px; color: #53665d; font: 700 8px Inter, sans-serif; }
-  .header-menu-zoom > span { min-width: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .header-menu-zoom { box-sizing: border-box; width: 100%; min-height: 29px; padding: 0 4px 0 8px; display: grid; grid-template-columns: minmax(0, 1fr) 23px 34px 23px; align-items: center; gap: 2px; color: #53665d; font: 700 8px Inter, sans-serif; }
+  .header-menu-zoom > span { min-width: 0; display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .header-menu-zoom > span svg { width: 13px; height: 13px; flex: 0 0 auto; }
   header .header-menu-zoom > button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 12px/1 Inter, sans-serif; }
   header .header-menu-zoom > button:hover { color: #287452; background: rgba(57, 145, 99, 0.1); }
@@ -2460,6 +3795,32 @@
   .text-zoom-popover button:disabled { opacity: 0.32; cursor: default; }
   .text-zoom-popover output { min-width: 35px; color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
   .dock-button { color: #4a7564; }
+  .workflow-connection { position: absolute; z-index: 25; overflow: hidden; background: linear-gradient(180deg, rgba(62, 162, 111, 0.14), rgba(82, 185, 130, 0.72) 45%, rgba(62, 162, 111, 0.14)); pointer-events: none; opacity: 0.62; animation: workflow-connect-confirm 620ms cubic-bezier(0.22, 1, 0.36, 1) 1; }
+  .workflow-bridge-link { opacity: .92; box-shadow: 0 0 10px rgba(68, 183, 123, .42); animation: workflow-bridge-current 2.2s ease-in-out infinite; }
+  .workflow-left, .workflow-right { top: 18px; bottom: 18px; width: 3px; }
+  .workflow-left { left: 0; border-radius: 0 999px 999px 0; }
+  .workflow-right { right: 0; border-radius: 999px 0 0 999px; }
+  .workflow-top, .workflow-bottom { right: 18px; left: 18px; height: 3px; background: linear-gradient(90deg, rgba(62, 162, 111, 0.18), #52b982 45%, rgba(62, 162, 111, 0.18)); }
+  .workflow-top { top: 0; border-radius: 0 0 999px 999px; }
+  .workflow-bottom { bottom: 0; border-radius: 999px 999px 0 0; }
+  .workflow-connection-control { position: absolute; z-index: 60; display: grid; place-items: center; }
+  .workflow-control-right { top: 50%; right: -21px; width: 42px; height: 88px; transform: translateY(-50%); }
+  .workflow-control-left { top: 50%; left: -21px; width: 42px; height: 88px; transform: translateY(-50%); }
+  .workflow-control-bottom { bottom: -21px; left: 50%; width: 88px; height: 42px; transform: translateX(-50%); }
+  .workflow-control-top { top: -21px; left: 50%; width: 88px; height: 42px; transform: translateX(-50%); }
+  .workflow-connection-editor { position: relative; width: 27px; height: 27px; padding: 6px; display: grid; place-items: center; border: 1px solid rgba(70, 161, 111, .3); border-radius: 50%; color: #36865d; background: radial-gradient(circle at 35% 28%, rgba(255,255,255,.96), rgba(240,249,244,.96) 58%, rgba(213,237,224,.98)); box-shadow: 0 4px 13px rgba(30,70,49,.2), 0 0 0 3px rgba(74,174,121,.055); cursor: pointer; opacity: 0; pointer-events: auto; transform: scale(.82); transform-origin: center; transition: opacity 130ms ease, transform 160ms cubic-bezier(.2,.8,.2,1), filter 150ms ease, box-shadow 150ms ease; }
+  .workflow-connection-editor svg { width: 14px; height: 14px; }
+  .workflow-connection-control.visible .workflow-connection-editor,
+  .workflow-connection-editor:focus-visible { opacity: 1; transform: scale(1); outline: none; filter: brightness(1.05); box-shadow: 0 5px 16px rgba(34,112,70,.26), 0 0 0 3px rgba(74,174,121,.1); }
+  @keyframes workflow-connect-confirm {
+    0% { opacity: 0.18; filter: brightness(0.85); }
+    48% { opacity: 1; filter: brightness(1.55); }
+    100% { opacity: 0.62; filter: brightness(1); }
+  }
+  @keyframes workflow-bridge-current {
+    0%, 100% { opacity: .7; }
+    50% { opacity: 1; }
+  }
   .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
@@ -2498,21 +3859,41 @@
   .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
   .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: var(--chat-tiny-font-size); }
   .terminal-output { min-width: 0; min-height: 0; max-width: 100%; flex: 1; padding: 10px 12px 7px; overflow-x: hidden; overflow-y: auto; color: #55635d; background: linear-gradient(180deg, rgba(61, 87, 75, 0.025), transparent); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: var(--chat-font-size); }
+  .terminal-output.with-workflow-role { padding-top: 49px; }
   .terminal-output p { max-width: 100%; margin: 0 0 6px; overflow-wrap: anywhere; line-height: 1.45; word-break: break-word; }
   .terminal-output p > span { color: #36a269; font-weight: 800; }
   .terminal-output i { color: #8a9690; font-style: normal; }
+  .load-earlier-chat { width: min(240px, 88%); min-height: 29px; margin: 1px auto 8px; padding: 0 8px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid rgba(77, 104, 91, 0.1); border-radius: 8px; color: #6d7e76; background: rgba(69, 99, 84, 0.025); font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
+  .load-earlier-chat:hover { color: #37785a; border-color: rgba(52, 139, 94, 0.18); background: rgba(52, 139, 94, 0.045); }
+  .load-earlier-chat svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+  .load-earlier-chat small { padding: 2px 5px; border-radius: 999px; color: #7e8d86; background: rgba(77, 104, 91, 0.06); }
   .status-running, .status-running span { color: #4e7faf; }
   .status-permission_required, .status-permission_required span { color: #b06b25; }
   .status-waiting_for_input, .status-waiting_for_input span { color: #b0812d; }
   .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
   .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 7px; overflow-x: hidden; }
-  .chat-message { width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: hidden; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
+  .chat-feed > * { min-width: 0; max-width: 100%; content-visibility: auto; contain-intrinsic-block-size: auto 76px; }
+  .terminal-card.resizing .chat-feed > *,
+  .terminal-card.settling .chat-feed > * { content-visibility: visible; }
+  .chat-message { box-sizing: border-box; width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: clip; overflow-clip-margin: 1px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
+  .chat-message.agent-message.intervention-required { width: min(94%, 460px); border-color: rgba(190, 132, 42, 0.18); background: rgba(196, 139, 47, 0.025); }
   .chat-message header { display: flex; align-items: center; gap: 6px; }
   .chat-message header strong { min-width: 0; flex: 1; color: #4f685c; font: 750 var(--chat-small-font-size) Inter, sans-serif; }
-  .chat-message header time { color: #9aa59f; font-size: var(--chat-tiny-font-size); }
+  .chat-message header time { flex: 0 0 auto; color: #9aa59f; font-size: var(--chat-tiny-font-size); }
+  .intervention-indicator { margin: 6px 0 2px; padding: 3px 1px; display: flex; align-items: center; gap: 7px; color: #806128; }
+  .intervention-indicator > span { width: 22px; height: 22px; display: grid; flex: 0 0 auto; place-items: center; color: #a87120; }
+  .intervention-indicator svg { width: 18px; height: 18px; overflow: visible; }
+  .intervention-indicator .indicator-shape { fill: currentColor; stroke: none; }
+  .intervention-indicator .indicator-mark { fill: none; stroke: white; stroke-linecap: round; stroke-width: 1.5; }
+  .intervention-indicator > div { min-width: 0; display: grid; gap: 1px; }
+  .intervention-indicator strong { color: #78591f; font: 800 var(--chat-small-font-size)/1.3 Inter, sans-serif; }
+  .handoff-button { width: 20px; height: 20px; padding: 3px; display: grid; place-items: center; border: 0; border-radius: 5px; color: #668076; background: transparent; cursor: pointer; transition: color 130ms ease, background 130ms ease; }
+  .handoff-button:hover:not(:disabled) { color: #2f8b63; background: rgba(47, 139, 99, 0.09); }
+  .handoff-button:disabled { opacity: 0.4; cursor: default; }
+  .handoff-button svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
   .chat-message.user-message > pre { min-width: 0; max-width: 100%; margin: 5px 0 0; overflow-x: hidden; color: #4b5c54; font: var(--chat-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
   .markdown-content { min-width: 0; max-width: 100%; margin-top: 5px; overflow: hidden; color: #4b5c54; font: var(--chat-font-size)/1.55 Inter, sans-serif; overflow-wrap: anywhere; word-break: break-word; }
   .markdown-content :global(> :first-child) { margin-top: 0; }
@@ -2538,6 +3919,11 @@
   .markdown-content :global(code) { max-width: 100%; padding: 1px 4px; border-radius: 4px; color: #3f6553; background: rgba(53, 116, 84, 0.08); font: 0.92em/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: break-spaces; }
   .markdown-content :global(pre) { max-width: 100%; max-height: 220px; margin: 6px 0; padding: 7px 8px; overflow: auto; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 6px; background: rgba(42, 63, 53, 0.055); }
   .markdown-content :global(pre code) { padding: 0; color: #465a50; background: transparent; font-size: var(--chat-small-font-size); white-space: pre-wrap; word-break: break-word; }
+  .markdown-content :global(table) { box-sizing: border-box; width: 100%; max-width: 100%; display: block; overflow-x: auto; border-collapse: collapse; }
+  .markdown-content :global(th),
+  .markdown-content :global(td) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .markdown-content :global(img),
+  .markdown-content :global(video) { max-width: 100%; height: auto; }
   .markdown-content :global(hr) { height: 1px; margin: 8px 0; border: 0; background: rgba(77, 104, 91, 0.12); }
   .message-images { margin-top: 7px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
   .message-images img { width: 100%; max-height: 150px; display: block; border-radius: 7px; object-fit: cover; }
@@ -2546,27 +3932,49 @@
   .message-file small { min-width: 0; overflow: hidden; color: inherit; font: 650 var(--chat-tiny-font-size)/1.2 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .agent-typing { width: fit-content; min-width: 38px; height: 25px; padding: 0 9px; display: flex; align-items: center; gap: 4px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px 9px 9px 3px; background: rgba(69, 99, 84, 0.035); }
   .agent-typing span { width: 4px; height: 4px; border-radius: 50%; background: #4e7faf; animation: agent-typing-dot 850ms ease-in-out infinite; }
+  .agent-typing span,
+  .reasoning-update.running > header > span,
+  .workflow-bridge-link { will-change: transform, opacity; }
   .agent-typing span:nth-child(2) { animation-delay: 130ms; }
   .agent-typing span:nth-child(3) { animation-delay: 260ms; }
   @keyframes agent-typing-dot {
     0%, 60%, 100% { opacity: 0.35; transform: translateY(1px); }
     30% { opacity: 1; transform: translateY(-3px); }
   }
-  .turn-trace { min-width: 0; max-width: 100%; padding: 4px 6px; overflow: hidden; border-radius: 6px; background: rgba(72, 101, 88, 0.03); }
-  .turn-trace summary { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 5px; color: #71817a; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
-  .turn-trace summary > span { width: 14px; color: #4f806a; text-align: center; }
-  .turn-trace .trace-title { min-width: 0; flex: 1; overflow-wrap: anywhere; font: inherit; word-break: break-word; }
-  .turn-trace summary time { margin-left: auto; flex: 0 0 auto; color: #a0aaa5; font-weight: 500; }
-  .turn-trace pre { min-width: 0; max-width: calc(100% - 19px); max-height: 180px; margin: 5px 0 0 19px; overflow-x: hidden; overflow-y: auto; color: #5c6b64; font: var(--chat-small-font-size)/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
-  .turn-files { padding: 7px 8px; border-left: 2px solid #4b9b73; border-radius: 0 7px 7px 0; background: rgba(55, 142, 98, 0.045); }
-  .turn-files > strong { display: block; margin-bottom: 5px; color: #4f775f; font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-transform: uppercase; }
-  .turn-files > div { display: grid; gap: 3px; }
-  .turn-files code { display: flex; gap: 6px; color: #496258; font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
+  .reasoning-update { min-width: 0; max-width: 94%; padding: 6px 8px 7px; border-left: 2px solid #6d91ae; border-radius: 0 8px 8px 0; background: linear-gradient(90deg, rgba(91, 133, 164, .07), rgba(91, 133, 164, .018)); }
+  .reasoning-update > header { display: flex; align-items: center; gap: 6px; color: #698092; }
+  .reasoning-update > header > span { width: 21px; height: 21px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 6px; background: rgba(91, 133, 164, .09); }
+  .reasoning-update > header svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+  .reasoning-update > header strong { min-width: 0; flex: 1; color: #5c7181; font: 740 var(--chat-small-font-size) Inter, sans-serif; }
+  .reasoning-update > header time { color: #98a4aa; font: 500 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .reasoning-update .markdown-content { margin: 5px 0 0 27px; color: #586961; }
+  .reasoning-update.running > header > span { animation: reasoning-pulse 1.25s ease-in-out infinite; }
+  @keyframes reasoning-pulse { 50% { opacity: .55; transform: scale(.92); } }
+  @container (max-width: 390px) {
+    .terminal-output { padding-right: 8px; padding-left: 8px; }
+    .chat-feed > * { content-visibility: visible; }
+    .chat-message,
+    .reasoning-update,
+    .turn-files { box-sizing: border-box; width: 100%; max-width: 100%; }
+    .reasoning-update .markdown-content { margin-left: 0; }
+    .message-images { grid-template-columns: minmax(0, 1fr); }
+  }
+  .turn-files { padding: 6px; overflow: hidden; border: 1px solid rgba(70, 139, 105, .13); border-radius: 10px; background: linear-gradient(145deg, rgba(66, 143, 104, .055), rgba(66, 143, 104, .018)); }
+  .turn-files > header { min-height: 25px; margin-bottom: 5px; padding: 0 2px; display: flex; align-items: center; gap: 6px; }
+  .turn-files-mark { width: 22px; height: 22px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 6px; color: #448466; background: rgba(55, 142, 98, .085); }
+  .turn-files-mark svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+  .turn-files > header strong { min-width: 0; flex: 1; color: #4f775f; font: 760 var(--chat-small-font-size) Inter, sans-serif; }
+  .turn-files > header small { min-width: 18px; height: 18px; padding: 0 4px; display: grid; place-items: center; border-radius: 9px; color: #688076; background: rgba(76, 105, 91, .07); font: 700 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .turn-files > div { display: grid; gap: 4px; }
+  .turn-files code { min-height: 28px; padding: 5px 3px; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto auto; align-items: center; gap: 5px; overflow: hidden; border-bottom: 1px solid rgba(75, 112, 94, .075); color: #496258; background: transparent; font-size: var(--chat-small-font-size); white-space: normal; }
+  .turn-files code:last-child { border-bottom: 0; }
   .turn-files code .file-path { min-width: 0; flex: 1; color: inherit; overflow-wrap: anywhere; word-break: break-word; }
   .turn-files code .added,
   .change-list code .added { color: #45906a; }
+  .turn-files code .added { padding: 2px 4px; border-radius: 5px; background: rgba(69, 144, 106, .08); }
   .turn-files code .removed,
   .change-list code .removed { color: #b46161; }
+  .turn-files code .removed { padding: 2px 4px; border-radius: 5px; background: rgba(180, 97, 97, .07); }
   .privacy-note { padding-top: 6px; border-top: 1px solid rgba(81, 105, 94, 0.08); color: #9aa49f; font: var(--chat-tiny-font-size)/1.45 Inter, sans-serif; }
   .empty-state { margin: 7px 0 10px !important; color: #909c96; font: var(--chat-small-font-size)/1.5 Inter, sans-serif; }
   .changes-panel { margin-top: 9px; display: grid; gap: 7px; }
@@ -2574,6 +3982,25 @@
   .change-list { display: grid; gap: 4px; }
   .change-list code { padding: 5px 6px; display: flex; align-items: flex-start; gap: 6px; border-radius: 6px; color: #4f6158; background: rgba(70, 101, 86, 0.045); font-size: var(--chat-small-font-size); overflow-wrap: anywhere; white-space: normal; }
   .change-list code .file-path { min-width: 0; flex: 1; color: inherit; overflow-wrap: anywhere; word-break: break-word; }
+  .plan-panel { margin: 9px 0 10px; display: grid; gap: 9px; }
+  .plan-panel > header { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
+  .plan-panel > header > div { min-width: 0; display: grid; gap: 2px; }
+  .plan-panel > header small { color: #8b9791; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
+  .plan-panel > header strong { color: #4d6358; font: 780 var(--chat-font-size) Inter, sans-serif; }
+  .plan-panel > header > span { flex: 0 0 auto; color: #4c8b6c; font: 700 var(--chat-small-font-size) Inter, sans-serif; }
+  .plan-explanation { margin: 0 !important; padding: 7px 8px; border-left: 2px solid #4d98c3; border-radius: 0 7px 7px 0; color: #5d6f67; background: rgba(77, 152, 195, 0.055); font: var(--chat-small-font-size)/1.5 Inter, sans-serif; white-space: pre-wrap; }
+  .plan-document { min-width: 0; padding: 9px 10px; overflow-x: hidden; border: 1px solid rgba(78, 106, 93, 0.09); border-radius: 9px; background: rgba(70, 101, 86, 0.03); overflow-wrap: anywhere; word-break: break-word; }
+  .plan-progress { height: 3px; overflow: hidden; border-radius: 999px; background: rgba(69, 112, 91, 0.1); }
+  .plan-progress em { width: var(--plan-progress); height: 100%; display: block; border-radius: inherit; background: #4d9e76; transition: width 240ms ease; }
+  .plan-items { margin: 0; padding: 0; display: grid; gap: 5px; list-style: none; }
+  .plan-items li { min-width: 0; padding: 7px 8px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid rgba(78, 106, 93, 0.08); border-radius: 8px; background: rgba(70, 101, 86, 0.03); }
+  .plan-items li > span { width: 19px; height: 19px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid rgba(91, 112, 102, 0.18); border-radius: 6px; color: #7c8b84; font: 750 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .plan-items li > div { min-width: 0; display: grid; gap: 2px; }
+  .plan-items strong { color: #576a61; font: 680 var(--chat-small-font-size)/1.4 Inter, sans-serif; overflow-wrap: anywhere; }
+  .plan-items small { color: #929d98; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .plan-items li.active { border-color: rgba(77, 152, 195, 0.17); background: rgba(77, 152, 195, 0.055); }
+  .plan-items li.active > span { border-color: #4d98c3; color: #4d98c3; box-shadow: 0 0 0 2px rgba(77, 152, 195, 0.08); }
+  .plan-items li.done > span { border-color: #55a77b; color: white; background: #55a77b; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
@@ -2595,11 +4022,15 @@
   .agent-question .question-submit { justify-self: end; min-height: 25px; padding: 0 10px; border: 0; border-radius: 7px; color: white; background: #318e62; font: 750 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .hint { color: #89948f; font-size: var(--chat-small-font-size); }
   .hint.docked { color: #4f7566; }
-  .terminate-confirm { margin: 8px 0 2px; padding: 7px 8px; display: flex; align-items: center; gap: 6px; border: 1px solid rgba(166, 77, 77, 0.14); border-radius: 8px; background: rgba(166, 77, 77, 0.04); font: 700 var(--chat-small-font-size)/1.35 Inter, sans-serif; }
-  .terminate-confirm > span { min-width: 0; flex: 1; color: #7d5d58; }
-  .terminate-confirm > div { display: flex; gap: 4px; }
-  .terminate-confirm button { min-height: 22px; padding: 0 6px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 6px; color: #596861; background: rgba(255, 255, 255, 0.48); font: 700 var(--chat-tiny-font-size) Inter, sans-serif; cursor: pointer; }
-  .terminate-confirm button.danger { color: #a54c4c; border-color: rgba(166, 77, 77, 0.2); }
+  .terminate-backdrop { position: absolute; z-index: 80; inset: 49px 0 64px; padding: 12px; display: grid; place-items: center; background: rgba(25, 34, 30, 0.22); backdrop-filter: blur(2px); }
+  .terminate-dialog { box-sizing: border-box; width: min(280px, 100%); padding: 11px; display: grid; gap: 10px; border: 1px solid rgba(166, 77, 77, 0.17); border-radius: 12px; color: #394a42; background: #f8fbf9; box-shadow: 0 12px 34px rgba(26, 38, 32, 0.2); }
+  .terminate-dialog > div { min-width: 0; display: grid; gap: 4px; }
+  .terminate-dialog strong { color: #704a47; font: 800 var(--chat-font-size)/1.3 Inter, sans-serif; }
+  .terminate-dialog p { margin: 0; color: #6c7973; font: 550 var(--chat-small-font-size)/1.45 Inter, sans-serif; overflow-wrap: anywhere; }
+  .terminate-dialog footer { display: flex; justify-content: flex-end; gap: 5px; }
+  .terminate-dialog button { min-height: 26px; padding: 0 8px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 7px; color: #596861; background: transparent; font: 750 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
+  .terminate-dialog button.danger { color: white; border-color: #a85656; background: #a85656; }
+  .terminate-dialog button:disabled { opacity: 0.48; cursor: default; }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
   .composer-leading-actions { position: relative; display: flex; flex: 0 0 auto; flex-direction: column; justify-content: flex-end; gap: 4px; }
@@ -2672,7 +4103,163 @@
   .loading-actions { display: flex; gap: 6px; }
   .loading-actions button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 8px; color: #4d6f61; background: rgba(255, 255, 255, 0.55); font-size: 8px; font-weight: 720; cursor: pointer; }
 
+  .terminal-window:not(.dark) .terminal-card {
+    border-color: rgba(64, 91, 78, 0.32);
+    background: #edf3f0;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.66), 0 8px 24px rgba(31, 56, 44, 0.11);
+  }
+  .terminal-window:not(.dark) .terminal-card > header,
+  .terminal-window:not(.dark) .terminal-composer {
+    border-color: rgba(68, 95, 82, 0.18);
+    background: #f7faf8;
+  }
+  .terminal-window:not(.dark) .terminal-output {
+    color: #43564d;
+    background: linear-gradient(180deg, #e8f0ec 0, #edf3f0 76px);
+  }
+  .terminal-window:not(.dark) .hub-tabs,
+  .terminal-window:not(.dark) .work-tray { border-color: rgba(68, 95, 82, 0.16); }
+  .terminal-window:not(.dark) .work-tray { background: #f2f7f4; }
+  .terminal-window:not(.dark) .work-card,
+  .terminal-window:not(.dark) .plan-items li,
+  .terminal-window:not(.dark) .chat-message {
+    border-color: rgba(66, 94, 81, 0.18);
+    background: #f8faf9;
+    box-shadow: 0 1px 3px rgba(39, 66, 53, 0.04);
+  }
+  .terminal-window:not(.dark) .chat-message.user-message {
+    border-color: rgba(46, 132, 88, 0.2);
+    background: #e2f0e9;
+  }
+  .terminal-window:not(.dark) .reasoning-update {
+    border-color: #668aa6;
+    background: linear-gradient(90deg, rgba(91, 133, 164, 0.12), rgba(91, 133, 164, 0.035));
+  }
+  .terminal-window:not(.dark) .turn-files {
+    border-color: rgba(55, 132, 91, 0.22);
+    background: #e7f2ec;
+  }
+  .terminal-window:not(.dark) .turn-files code { border-color: rgba(65, 103, 84, 0.13); }
+  .terminal-window:not(.dark) .agent-typing,
+  .terminal-window:not(.dark) .load-earlier-chat {
+    border-color: rgba(66, 94, 81, 0.18);
+    background: #f8faf9;
+  }
+  .terminal-window:not(.dark) .slash-command-menu,
+  .terminal-window:not(.dark) .header-actions-menu,
+  .terminal-window:not(.dark) .text-zoom-popover,
+  .terminal-window:not(.dark) .workflow-role-menu,
+  .terminal-window:not(.dark) .workflow-role-popover,
+  .terminal-window:not(.dark) .handoff-dialog {
+    border-color: rgba(64, 91, 78, 0.24);
+    background: #f7faf8;
+    box-shadow: 0 14px 34px rgba(27, 52, 40, 0.18);
+  }
+
   .terminal-window.dark { color-scheme: dark; }
+  .handoff-backdrop { position: absolute; z-index: 60; inset: 0; padding: 14px; display: grid; place-items: center; background: rgba(19, 29, 24, 0.38); backdrop-filter: blur(3px); }
+  .handoff-dialog { width: min(430px, 100%); max-height: 100%; padding: 12px; display: grid; gap: 10px; overflow-y: auto; border: 1px solid rgba(81, 112, 97, 0.18); border-radius: 13px; color: #34463d; background: #f8fbf9; box-shadow: 0 16px 44px rgba(20, 35, 28, 0.2); }
+  .handoff-dialog > header { min-height: auto; padding: 0; display: flex; align-items: flex-start; border: 0; }
+  .handoff-dialog > header div { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .handoff-dialog > header small { color: #6f8178; font: 700 8px Inter, sans-serif; text-transform: uppercase; letter-spacing: 0.07em; }
+  .handoff-dialog > header strong { color: #30453a; font: 800 12px Inter, sans-serif; }
+  .handoff-dialog > header button { width: 25px; height: 25px; padding: 0; border: 0; border-radius: 7px; color: #71827a; background: transparent; font-size: 17px; cursor: pointer; }
+  .handoff-target,
+  .handoff-note { display: grid; gap: 4px; color: #60736a; font: 700 8px Inter, sans-serif; }
+  .handoff-target select,
+  .handoff-note textarea { width: 100%; min-width: 0; border: 1px solid rgba(81, 112, 97, 0.16); border-radius: 8px; outline: 0; color: #364a40; background: rgba(82, 121, 101, 0.045); font: 9px/1.4 Inter, sans-serif; }
+  .handoff-target select { height: 30px; padding: 0 8px; }
+  .handoff-note textarea { min-height: 48px; padding: 7px 8px; resize: vertical; }
+  .handoff-target select:focus,
+  .handoff-note textarea:focus { border-color: rgba(47, 139, 99, 0.48); box-shadow: 0 0 0 2px rgba(47, 139, 99, 0.08); }
+  .handoff-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .handoff-options > label { min-width: 0; padding: 7px; display: flex; align-items: flex-start; gap: 6px; border: 1px solid rgba(81, 112, 97, 0.12); border-radius: 8px; background: rgba(82, 121, 101, 0.035); cursor: pointer; }
+  .handoff-options > label.disabled { opacity: 0.48; cursor: default; }
+  .handoff-options input { margin: 2px 0 0; accent-color: #359268; }
+  .handoff-options span { min-width: 0; display: grid; gap: 2px; }
+  .handoff-options strong { color: #42594e; font: 750 9px Inter, sans-serif; }
+  .handoff-options small { color: #7b8a83; font: 7px/1.35 Inter, sans-serif; }
+  .handoff-preview { min-height: 64px; padding: 7px 8px; display: grid; gap: 5px; border-left: 2px solid #52a37d; border-radius: 0 8px 8px 0; background: rgba(55, 142, 98, 0.045); }
+  .handoff-preview > strong { color: #507463; font: 750 8px Inter, sans-serif; text-transform: uppercase; }
+  .handoff-preview pre { max-height: 120px; margin: 0; overflow: auto; color: #53665c; font: 8px/1.5 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+  .handoff-error { margin: 0; color: #a55451; font: 8px/1.4 Inter, sans-serif; }
+  .handoff-dialog > footer { display: flex; justify-content: flex-end; gap: 6px; }
+  .handoff-dialog > footer button { min-height: 28px; padding: 0 10px; border: 1px solid rgba(81, 112, 97, 0.16); border-radius: 8px; color: #60736a; background: transparent; font: 750 8px Inter, sans-serif; cursor: pointer; }
+  .handoff-dialog > footer button.primary { border-color: #32895f; color: white; background: #32895f; }
+  .handoff-dialog > footer button:disabled { opacity: 0.45; cursor: default; }
+  .workflow-role-fields { min-height: 0; display: grid; flex: 1; align-content: start; gap: 7px; overflow-x: hidden; overflow-y: auto; }
+  .workflow-role-fields.picker-open { overflow: visible; }
+  .workflow-role-popover.constrained .workflow-role-fields.picker-open { overflow-x: hidden; overflow-y: auto; }
+  .workflow-role-fields label { min-width: 0; display: grid; gap: 3px; color: #708079; font: 700 8px Inter, sans-serif; }
+  .workflow-role-fields input,
+  .workflow-role-fields textarea { width: 100%; min-width: 0; padding: 6px 7px; border: 1px solid rgba(76, 105, 91, 0.13); border-radius: 8px; outline: none; color: #3d5047; background: rgba(255, 255, 255, 0.58); font: 9px/1.4 Inter, sans-serif; }
+  .workflow-role-fields textarea { resize: vertical; }
+  .workflow-role-fields input:focus,
+  .workflow-role-fields textarea:focus { border-color: rgba(53, 142, 97, 0.38); }
+  .workflow-role-picker { position: relative; display: grid; gap: 4px; }
+  .workflow-field-label { color: #708079; font: 700 8px Inter, sans-serif; }
+  .workflow-role-trigger { width: 100%; min-height: 47px; padding: 6px 8px; display: flex; align-items: center; gap: 8px; border: 1px solid rgba(65, 135, 101, 0.14); border-radius: 10px; color: #3f554a; background: linear-gradient(135deg, rgba(255, 255, 255, 0.72), rgba(68, 143, 105, 0.035)); cursor: pointer; text-align: left; transition: border-color 130ms ease, background 130ms ease; }
+  .workflow-role-trigger.open { border-color: rgba(47, 142, 94, 0.34); background: rgba(64, 151, 106, 0.06); }
+  .workflow-role-trigger > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .workflow-role-trigger strong { color: #395044; font: 800 9px Inter, sans-serif; }
+  .workflow-role-trigger small { overflow: hidden; color: #7b8d84; font: 7px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .workflow-role-trigger > svg { width: 13px; height: 13px; transition: transform 140ms ease; }
+  .workflow-role-trigger.open > svg { transform: rotate(180deg); }
+  .workflow-role-menu { position: absolute; z-index: 95; top: calc(100% + 5px); right: 0; left: 0; max-height: clamp(56px, calc(100vh - 154px), 218px); padding: 5px; display: grid; gap: 2px; overflow-y: auto; border: 1px solid rgba(73, 108, 90, 0.15); border-radius: 11px; background: #f8fbf9; box-shadow: 0 14px 30px rgba(25, 48, 37, 0.2); }
+  .workflow-role-popover.constrained .workflow-role-menu { position: relative; top: auto; right: auto; left: auto; max-height: none; margin-top: 5px; box-shadow: none; }
+  .workflow-role-menu > button { width: 100%; min-height: 40px; padding: 5px 6px; display: flex; align-items: center; gap: 7px; border: 0; border-radius: 8px; color: #53665d; background: transparent; cursor: pointer; text-align: left; }
+  .workflow-role-menu > button:hover,
+  .workflow-role-menu > button.active { background: rgba(54, 145, 99, 0.065); }
+  .workflow-role-menu > button > span { min-width: 0; flex: 1; display: grid; gap: 1px; }
+  .workflow-role-menu strong { color: #40544a; font: 780 8px Inter, sans-serif; }
+  .workflow-role-menu small { color: #829088; font: 7px Inter, sans-serif; }
+  .workflow-role-menu > button > svg { width: 13px; height: 13px; color: #36855e; }
+  .workflow-role-replace-warning { padding: 7px; display: grid; grid-template-columns: 27px minmax(0, 1fr); align-items: center; gap: 6px 7px; border: 1px solid rgba(178, 126, 50, 0.2); border-radius: 10px; background: rgba(185, 132, 51, 0.065); }
+  .workflow-role-replace-warning > .role-symbol { width: 27px; height: 27px; }
+  .workflow-role-replace-warning > span { min-width: 0; display: grid; gap: 2px; }
+  .workflow-role-replace-warning strong { color: #755d39; font: 800 8px Inter, sans-serif; }
+  .workflow-role-replace-warning small { color: #8c7a5d; font: 7px/1.35 Inter, sans-serif; }
+  .workflow-role-replace-warning > div { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 5px; }
+  .workflow-role-replace-warning button,
+  .workflow-instruction-meta button { min-height: 24px; padding: 0 7px; border: 1px solid rgba(89, 112, 101, 0.15); border-radius: 7px; color: #62736b; background: rgba(255, 255, 255, 0.45); font: 750 7px Inter, sans-serif; cursor: pointer; }
+  .workflow-role-replace-warning button.confirm { color: #fff; border-color: #9b7134; background: #9b7134; }
+  .workflow-contract-toggle { width: 100%; min-height: 42px; padding: 6px 8px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 14px; align-items: center; gap: 7px; border: 1px solid rgba(65, 135, 101, 0.13); border-radius: 10px; color: #4b6256; background: rgba(67, 139, 103, 0.035); cursor: pointer; text-align: left; }
+  .workflow-contract-toggle > svg:first-child { width: 15px; height: 15px; justify-self: center; color: #438763; }
+  .workflow-contract-toggle > span { min-width: 0; display: grid; gap: 1px; }
+  .workflow-contract-toggle strong { color: #40564b; font: 800 8px Inter, sans-serif; }
+  .workflow-contract-toggle small { overflow: hidden; color: #87958e; font: 7px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .workflow-contract-toggle .contract-chevron { width: 13px; height: 13px; transition: transform 150ms ease; }
+  .workflow-contract-toggle.open .contract-chevron { transform: rotate(180deg); }
+  .workflow-contract-body { min-height: 0; display: grid; gap: 7px; }
+  .workflow-instruction-meta { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+  .workflow-instruction-meta > span { padding: 3px 6px; border-radius: 999px; color: #6b7b73; background: rgba(86, 110, 99, 0.07); font: 780 7px Inter, sans-serif; }
+  .workflow-instruction-meta > span.ready { color: #347a59; background: rgba(54, 145, 99, 0.09); }
+  .workflow-instruction-meta > span.customized { color: #8a6836; background: rgba(170, 119, 43, 0.09); }
+  .workflow-readiness-note { margin: 0; color: #a06f45; font: 7px/1.4 Inter, sans-serif; }
+  .role-symbol { position: relative; width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; overflow: hidden; border: 1px solid rgba(73, 121, 98, 0.12); border-radius: 9px; background: rgba(70, 108, 89, 0.055); }
+  .role-symbol::before,
+  .role-symbol::after,
+  .role-symbol span { position: absolute; content: ""; }
+  .role-planner { color: #4e78a0; background: rgba(70, 123, 171, 0.08); }
+  .role-planner::before { width: 12px; height: 9px; border: 1.5px solid currentColor; border-radius: 3px; }
+  .role-planner::after { width: 6px; border-top: 1.5px solid currentColor; box-shadow: 0 4px 0 currentColor; }
+  .role-implementer { color: #438c66; background: rgba(54, 145, 94, 0.08); }
+  .role-implementer::before { width: 11px; height: 11px; border: 1.5px solid currentColor; transform: rotate(45deg); }
+  .role-implementer::after { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .role-reviewer { color: #8a6c46; background: rgba(155, 111, 56, 0.08); }
+  .role-reviewer::before { width: 9px; height: 9px; border: 1.5px solid currentColor; border-radius: 50%; transform: translate(-2px, -2px); }
+  .role-reviewer::after { width: 6px; border-top: 1.5px solid currentColor; transform: translate(5px, 5px) rotate(45deg); }
+  .role-tester { color: #745e9c; background: rgba(111, 82, 158, 0.08); }
+  .role-tester::before { width: 12px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px; }
+  .role-tester::after { width: 6px; height: 3px; border-bottom: 1.5px solid currentColor; border-left: 1.5px solid currentColor; transform: rotate(-45deg); }
+  .role-researcher { color: #4e7f88; background: rgba(63, 128, 138, 0.08); }
+  .role-researcher::before { width: 12px; height: 8px; border: 1.5px solid currentColor; border-radius: 50%; }
+  .role-researcher::after { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+  .role-custom { color: #6d7d75; background: rgba(85, 109, 98, 0.07); }
+  .role-custom::before { width: 3px; height: 3px; border-radius: 50%; background: currentColor; box-shadow: -6px 0 0 currentColor, 6px 0 0 currentColor; }
+  .workflow-instruction-field textarea { min-height: 54px; }
+  .workflow-contract-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+
   .terminal-window.dark .terminal-card { color: #dbe7e1; border-color: rgba(190, 209, 200, 0.13); background: #141d19; }
   .terminal-window.dark .terminal-card.dock-moving,
   .terminal-window.dark .terminal-card.dock-target,
@@ -2680,6 +4267,12 @@
   .terminal-window.dark .dock-silhouette { border-color: rgba(96, 193, 149, 0.5); background: rgba(72, 157, 116, 0.06); box-shadow: inset 0 0 0 1px rgba(154, 220, 188, 0.08); }
   .terminal-window.dark .dock-silhouette::before { border-color: rgba(99, 197, 152, 0.52); background: linear-gradient(135deg, rgba(79, 174, 128, 0.22), rgba(69, 149, 111, 0.08)); }
   .terminal-window.dark .dock-silhouette span { color: #a8d9c2; background: rgba(27, 51, 40, 0.92); }
+  .terminal-window.dark .terminal-card.workflow-preview.dock-target,
+  .terminal-window.dark .terminal-card.workflow-preview.dock-moving { border-color: rgba(190, 209, 200, 0.13); box-shadow: none; }
+  .terminal-window.dark .workflow-merge-preview::before { background: radial-gradient(ellipse at center, rgba(78, 156, 115, calc(0.11 + var(--dock-proximity) * 0.29)) 0 28%, rgba(39, 119, 79, calc(0.07 + var(--dock-proximity) * 0.18)) 56%, transparent 82%); }
+  .terminal-window.dark .workflow-merge-preview::after { background: rgba(68, 157, 109, calc(0.22 + var(--dock-proximity) * 0.5)); }
+  .terminal-window.dark .terminal-card.normal-preview .workflow-merge-preview::before { background: radial-gradient(ellipse at center, rgba(103, 142, 123, calc(0.09 + var(--dock-proximity) * 0.22)) 0 28%, rgba(68, 111, 90, calc(0.05 + var(--dock-proximity) * 0.14)) 56%, transparent 82%); filter: saturate(0.4); }
+  .terminal-window.dark .terminal-card.normal-preview .workflow-merge-preview::after { background: rgba(91, 137, 114, calc(0.15 + var(--dock-proximity) * 0.32)); }
   .terminal-window.dark .terminal-card > header,
   .terminal-window.dark .terminal-composer { border-color: rgba(190, 209, 200, 0.09); }
   .terminal-window.dark .identity strong { color: #e2ebe6; }
@@ -2698,6 +4291,11 @@
   .terminal-window.dark header .header-menu-zoom > button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
   .terminal-window.dark header .header-menu-zoom > button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
   .terminal-window.dark .header-menu-zoom output { color: #a5b6ad; }
+  .terminal-window.dark .terminate-backdrop { background: rgba(4, 9, 7, 0.5); }
+  .terminal-window.dark .terminate-dialog { color: #d5e1db; border-color: rgba(211, 128, 121, 0.2); background: #18221d; box-shadow: 0 14px 38px rgba(0, 0, 0, 0.36); }
+  .terminal-window.dark .terminate-dialog strong { color: #e0a39d; }
+  .terminal-window.dark .terminate-dialog p { color: #a7b7af; }
+  .terminal-window.dark .terminate-dialog button:not(.danger) { color: #afbeb7; border-color: rgba(205, 222, 213, 0.13); }
   .terminal-window.dark .text-zoom-popover { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
   .terminal-window.dark .text-zoom-popover button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
   .terminal-window.dark .text-zoom-popover button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
@@ -2739,14 +4337,43 @@
   .terminal-window.dark .hub-tabs button { color: #84938c; }
   .terminal-window.dark .hub-tabs button.active { color: #83c6a6; border-bottom-color: #59ad84; }
   .terminal-window.dark .hub-tabs span { background: rgba(205, 222, 213, 0.07); }
+  .terminal-window.dark .plan-panel > header strong,
+  .terminal-window.dark .plan-items strong { color: #b8cbc1; }
+  .terminal-window.dark .plan-explanation { color: #a9bbb2; background: rgba(77, 152, 195, 0.07); }
+  .terminal-window.dark .plan-items li { border-color: rgba(205, 222, 213, 0.07); background: rgba(218, 234, 226, 0.025); }
+  .terminal-window.dark .plan-items li.active { border-color: rgba(100, 170, 207, 0.2); background: rgba(77, 152, 195, 0.07); }
   .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
+  .terminal-window.dark .load-earlier-chat { color: #9aaba2; border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.02); }
+  .terminal-window.dark .load-earlier-chat:hover { color: #88c8a8; border-color: rgba(91, 177, 137, 0.17); background: rgba(91, 177, 137, 0.045); }
+  .terminal-window.dark .load-earlier-chat small { color: #8fa198; background: rgba(205, 222, 213, 0.055); }
   .terminal-window.dark .chat-message { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
+  .terminal-window.dark .chat-message.agent-message.intervention-required { border-color: rgba(215, 166, 78, 0.17); background: rgba(202, 149, 55, 0.025); }
+  .terminal-window.dark .intervention-indicator { color: #dfbd79; }
+  .terminal-window.dark .intervention-indicator > span { color: #e1ad51; }
+  .terminal-window.dark .intervention-indicator strong { color: #e3c17c; }
+  .terminal-window.dark .handoff-button { color: #91a79c; }
+  .terminal-window.dark .workflow-connection { background: linear-gradient(180deg, rgba(70, 182, 127, 0.15), #59c58b 45%, rgba(70, 182, 127, 0.15)); box-shadow: 0 0 9px rgba(75, 201, 137, 0.38); }
+  .terminal-window.dark .workflow-connection-editor { color: #7ed4a6; border-color: rgba(101, 210, 153, .22); background: rgba(25, 43, 34, .97); box-shadow: 0 8px 24px rgba(0, 0, 0, .32); }
+  .terminal-window.dark .workflow-role-fab { color: #91cbae; border-color: rgba(86, 184, 134, 0.22); background: radial-gradient(circle at 34% 24%, rgba(129,208,168,.16) 0 12%, rgba(83,153,116,.06) 31%, transparent 52%), linear-gradient(145deg, #24342c 8%, #15201a 90%); box-shadow: inset 0 1px 0 rgba(190,232,209,.12), inset 0 -3px 5px rgba(0,0,0,.24), 0 6px 13px rgba(0,0,0,.36), 0 1px 2px rgba(0,0,0,.5), 0 0 0 3px rgba(74,164,116,.055); }
+  .terminal-window.dark .workflow-role-fab:hover,
+  .terminal-window.dark .workflow-role-fab.open { border-color: rgba(100, 205, 151, 0.4); box-shadow: inset 0 1px 0 rgba(190,232,209,.13), inset 0 -3px 5px rgba(0,0,0,.25), 0 8px 17px rgba(0,0,0,.4), 0 0 0 4px rgba(74,174,122,.08); }
+  .terminal-window.dark .workflow-step-badge { border-color: rgba(24,35,29,.9); background: #4ba978; box-shadow: 0 2px 6px rgba(0,0,0,.34); }
+  .terminal-window.dark .workflow-role-tooltip { color: #c4d5cc; border-color: rgba(200, 219, 210, 0.13); background: rgba(24, 34, 29, 0.98); box-shadow: 0 9px 24px rgba(0, 0, 0, 0.34); }
+  .terminal-window.dark .workflow-role-tooltip small { color: #8fa198; }
+  .terminal-window.dark .workflow-role-popover { color: #d4e1da; border-color: rgba(200, 219, 210, 0.13); background: #18221d; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.36); }
+  .terminal-window.dark .workflow-popover-bridge::before { border-color: rgba(200, 219, 210, 0.13); background: #18221d; }
+  .terminal-window.dark .workflow-popover-heading strong { color: #dce9e2; }
+  .terminal-window.dark .workflow-popover-heading small { color: #93a69c; }
+  .terminal-window.dark .workflow-popover-heading button,
+  .terminal-window.dark .workflow-popover-actions button { color: #aebfb6; border-color: rgba(205, 222, 213, 0.13); background: rgba(220, 235, 227, 0.035); }
+  .terminal-window.dark .workflow-popover-actions button.primary { color: white; border-color: #347c5a; background: #347c5a; }
+  .terminal-window.dark .workflow-top,
+  .terminal-window.dark .workflow-bottom { background: linear-gradient(90deg, rgba(70, 182, 127, 0.15), #59c58b 45%, rgba(70, 182, 127, 0.15)); }
   .terminal-window.dark .agent-typing { border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.035); }
   .terminal-window.dark .chat-message.user-message { background: rgba(76, 169, 124, 0.09); }
   .terminal-window.dark .chat-message header strong,
   .terminal-window.dark .chat-message.user-message > pre,
   .terminal-window.dark .markdown-content,
-  .terminal-window.dark .turn-trace pre,
   .terminal-window.dark .turn-files code { color: #bdcbc4; }
   .terminal-window.dark .markdown-content :global(strong),
   .terminal-window.dark .markdown-content :global(h1),
@@ -2758,9 +4385,58 @@
   .terminal-window.dark .markdown-content :global(code) { color: #b9d9c9; background: rgba(157, 205, 181, 0.075); }
   .terminal-window.dark .markdown-content :global(pre) { border-color: rgba(205, 222, 213, 0.08); background: rgba(7, 16, 12, 0.2); }
   .terminal-window.dark .markdown-content :global(pre code) { color: #bdcbc4; background: transparent; }
-  .terminal-window.dark .turn-trace { background: rgba(218, 234, 226, 0.025); }
-  .terminal-window.dark .turn-files { border-color: #5bad83; background: rgba(91, 177, 137, 0.055); }
-  .terminal-window.dark .turn-files > strong { color: #8bc6a8; }
+  .terminal-window.dark .reasoning-update { border-color: #6c9abc; background: linear-gradient(90deg, rgba(90, 139, 174, .085), rgba(90, 139, 174, .018)); }
+  .terminal-window.dark .reasoning-update > header { color: #92b3ca; }
+  .terminal-window.dark .reasoning-update > header > span { background: rgba(105, 157, 194, .1); }
+  .terminal-window.dark .reasoning-update > header strong { color: #a9c4d6; }
+  .terminal-window.dark .reasoning-update .markdown-content { color: #bccbc4; }
+  .terminal-window.dark .turn-files > header strong { color: #8bc6a8; }
+  .terminal-window.dark .turn-files { border-color: rgba(104, 180, 143, .14); background: linear-gradient(145deg, rgba(91, 177, 137, .065), rgba(91, 177, 137, .018)); }
+  .terminal-window.dark .turn-files-mark { color: #8bc6a8; background: rgba(91, 177, 137, .09); }
+  .terminal-window.dark .turn-files > header small { color: #91a59a; background: rgba(205, 222, 213, .06); }
+  .terminal-window.dark .turn-files code { border-color: rgba(205, 222, 213, .065); background: transparent; }
+  .terminal-window.dark .handoff-backdrop { background: rgba(4, 9, 7, 0.55); }
+  .terminal-window.dark .handoff-dialog { color: #d4e1da; border-color: rgba(200, 219, 210, 0.13); background: #18221d; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.36); }
+  .terminal-window.dark .workflow-role-fields label { color: #98aaa1; }
+  .terminal-window.dark .workflow-role-fields input,
+  .terminal-window.dark .workflow-role-fields textarea { color: #d7e3dc; border-color: rgba(205, 222, 213, 0.11); background: rgba(222, 235, 228, 0.04); }
+  .terminal-window.dark .workflow-role-trigger { color: #d5e2db; border-color: rgba(94, 177, 136, 0.12); background: linear-gradient(135deg, rgba(222, 235, 228, 0.055), rgba(64, 151, 106, 0.035)); }
+  .terminal-window.dark .workflow-role-trigger.open { border-color: rgba(91, 190, 140, 0.28); background: rgba(70, 160, 113, 0.07); }
+  .terminal-window.dark .workflow-role-trigger strong,
+  .terminal-window.dark .workflow-role-menu strong { color: #d6e3dc; }
+  .terminal-window.dark .workflow-role-trigger small,
+  .terminal-window.dark .workflow-role-menu small { color: #91a39a; }
+  .terminal-window.dark .workflow-role-menu { border-color: rgba(205, 222, 213, 0.12); background: #18221d; box-shadow: 0 16px 34px rgba(0, 0, 0, 0.34); }
+  .terminal-window.dark .workflow-role-menu > button { color: #becdc5; }
+  .terminal-window.dark .workflow-role-menu > button:hover,
+  .terminal-window.dark .workflow-role-menu > button.active { background: rgba(76, 171, 122, 0.08); }
+  .terminal-window.dark .workflow-role-replace-warning { border-color: rgba(211, 162, 84, 0.18); background: rgba(190, 132, 48, 0.075); }
+  .terminal-window.dark .workflow-role-replace-warning strong { color: #d6b987; }
+  .terminal-window.dark .workflow-role-replace-warning small { color: #a99779; }
+  .terminal-window.dark .workflow-role-replace-warning button,
+  .terminal-window.dark .workflow-instruction-meta button { color: #b7c7bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(222, 235, 228, 0.035); }
+  .terminal-window.dark .workflow-role-replace-warning button.confirm { color: #fff; border-color: #8c6734; background: #8c6734; }
+  .terminal-window.dark .workflow-contract-toggle { color: #b8c9c0; border-color: rgba(205, 222, 213, 0.11); background: rgba(222, 235, 228, 0.035); }
+  .terminal-window.dark .workflow-contract-toggle strong { color: #d6e3dc; }
+  .terminal-window.dark .workflow-contract-toggle small { color: #91a39a; }
+  .terminal-window.dark .workflow-instruction-meta > span { color: #a2b0a9; background: rgba(218, 234, 226, 0.055); }
+  .terminal-window.dark .workflow-instruction-meta > span.ready { color: #8bc9aa; background: rgba(76, 171, 122, 0.09); }
+  .terminal-window.dark .workflow-instruction-meta > span.customized { color: #d1b27e; background: rgba(190, 132, 48, 0.09); }
+  .terminal-window.dark .workflow-readiness-note { color: #c69c72; }
+  .terminal-window.dark .role-symbol { border-color: rgba(205, 222, 213, 0.1); }
+  .terminal-window.dark .handoff-dialog > header strong,
+  .terminal-window.dark .handoff-options strong { color: #d9e6df; }
+  .terminal-window.dark .handoff-dialog > header small,
+  .terminal-window.dark .handoff-target,
+  .terminal-window.dark .handoff-note,
+  .terminal-window.dark .handoff-options small { color: #94a69d; }
+  .terminal-window.dark .handoff-target select,
+  .terminal-window.dark .handoff-note textarea,
+  .terminal-window.dark .handoff-options > label { color: #d1ded7; border-color: rgba(205, 222, 213, 0.11); background: rgba(218, 234, 226, 0.035); }
+  .terminal-window.dark .handoff-preview { border-color: #5bad83; background: rgba(91, 177, 137, 0.055); }
+  .terminal-window.dark .handoff-preview > strong { color: #8bc6a8; }
+  .terminal-window.dark .handoff-preview pre { color: #b8c8c0; }
+  .terminal-window.dark .handoff-dialog > footer button { color: #aebfb6; border-color: rgba(205, 222, 213, 0.13); }
   .terminal-window.dark .change-list code { color: #bdcbc4; }
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
@@ -2784,8 +4460,11 @@
   @media (prefers-reduced-motion: reduce) {
     .terminal-card { transition-duration: 0.01ms; }
     .dock-silhouette { animation: none; }
+    .workflow-merge-preview::before,
+    .workflow-merge-preview::after { animation: none; }
     .agent-typing span { animation: none; opacity: 0.7; }
     .send-spinner,
     .mode-spinner { animation: none; }
+    .workflow-connection { animation: none; opacity: 0.82; }
   }
 </style>

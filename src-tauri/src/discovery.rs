@@ -4,6 +4,12 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    io::{BufRead, BufReader},
+    path::Path,
+};
+
 use sysinfo::{
     get_current_pid, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind,
 };
@@ -57,7 +63,10 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::Always)
+            // A linha de comando de um PID não muda durante sua vida. Reabrir
+            // /proc/<pid>/cmdline para todos os processos a cada dois segundos
+            // monopolizava um núcleo em máquinas com muitos processos/threads.
+            .with_cmd(UpdateKind::OnlyIfNotSet)
             .without_tasks(),
     );
     let own_pid = get_current_pid().ok();
@@ -96,6 +105,9 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 .to_lowercase();
             let name = process.name().to_string_lossy().to_lowercase();
             if is_lume_codex_infrastructure_process(&command) {
+                return None;
+            }
+            if is_claude_headless_resume(&command) {
                 return None;
             }
             if ignored_codex_pids
@@ -168,11 +180,16 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
             {
                 return None;
             }
+            let native_session_ids = if agent == AgentKind::Codex {
+                native_session_ids_for_process_tree(&system, pid)
+            } else {
+                Vec::new()
+            };
             Some(DiscoveredProcess {
                 agent,
                 agent_label,
                 process_id: pid.as_u32(),
-                native_session_ids: native_session_ids_for_process_tree(&system, pid),
+                native_session_ids,
                 working_directory,
                 source: source_for(&system, pid),
             })
@@ -193,39 +210,115 @@ fn is_lume_codex_infrastructure_process(command: &str) -> bool {
             && normalized.contains("openai.chatgpt"))
 }
 
-#[cfg(target_os = "linux")]
 fn native_session_ids_for_process_tree(system: &System, root: sysinfo::Pid) -> Vec<String> {
-    let mut ids = system
+    let process_tree = system
         .processes()
         .keys()
         .filter(|pid| **pid == root || process_descends_from(system, **pid, root))
-        .flat_map(|pid| native_session_ids_for_pid(*pid))
+        .filter_map(|pid| system.process(*pid))
         .collect::<Vec<_>>();
-    ids.sort();
-    ids.dedup();
-    ids
+    let command_ids = process_tree
+        .iter()
+        .flat_map(|process| native_session_ids_from_command(process.cmd()))
+        .collect::<HashSet<_>>();
+    if command_ids.len() == 1 {
+        return command_ids.into_iter().collect();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // A CLI pode herdar rollouts do agente pai e também abrir rollouts internos
+        // (por exemplo, o guardian). Depois de descartar os internos, o descritor
+        // mais recente representa a conversa visível selecionada nessa CLI.
+        let candidates = system
+            .processes()
+            .keys()
+            .filter(|pid| **pid == root || process_descends_from(system, **pid, root))
+            .flat_map(|pid| native_session_ids_for_pid(*pid))
+            .collect::<Vec<_>>();
+        return select_native_session_id(candidates).into_iter().collect();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
-fn native_session_ids_for_pid(pid: sysinfo::Pid) -> Vec<String> {
+fn select_native_session_id(candidates: Vec<(u64, String)>) -> Option<String> {
+    candidates
+        .into_iter()
+        .max_by_key(|(descriptor, _)| *descriptor)
+        .map(|(_, id)| id)
+}
+
+#[cfg(target_os = "linux")]
+fn native_session_ids_for_pid(pid: sysinfo::Pid) -> Vec<(u64, String)> {
     let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", pid.as_u32())) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-        .filter_map(|path| {
+        .filter_map(|entry| {
+            let descriptor = entry.file_name().to_str()?.parse::<u64>().ok()?;
+            let path = std::fs::read_link(entry.path()).ok()?;
+            if !rollout_is_user_facing(&path) {
+                return None;
+            }
             let name = path.file_name()?.to_str()?;
-            let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-            let id = stem.get(stem.len().checked_sub(36)?..)?;
-            is_codex_session_id(id).then(|| id.to_string())
+            let stem = name.strip_suffix(".jsonl")?;
+            let id = if let Some(rollout) = stem.strip_prefix("rollout-") {
+                rollout.get(rollout.len().checked_sub(36)?..)?
+            } else {
+                stem
+            };
+            is_codex_session_id(id).then(|| (descriptor, id.to_string()))
         })
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn native_session_ids_for_process_tree(_system: &System, _pid: sysinfo::Pid) -> Vec<String> {
-    Vec::new()
+#[cfg(target_os = "linux")]
+fn rollout_is_user_facing(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut first_line = String::new();
+    if BufReader::new(file).read_line(&mut first_line).is_err() {
+        return true;
+    }
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+        return true;
+    };
+    rollout_metadata_is_user_facing(&metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn rollout_metadata_is_user_facing(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("payload")
+        .and_then(|payload| payload.get("source"))
+        .and_then(serde_json::Value::as_object)
+        .is_none_or(|source| !source.contains_key("subagent"))
+}
+
+fn native_session_ids_from_command(command: &[std::ffi::OsString]) -> Vec<String> {
+    let parts = command
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>();
+    let mut ids = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        let candidate = if part == "resume" || part == "--resume" {
+            parts.get(index + 1).map(|value| value.as_ref())
+        } else {
+            part.strip_prefix("--resume=")
+        };
+        if let Some(candidate) = candidate.filter(|value| is_codex_session_id(value)) {
+            if !ids.iter().any(|existing| existing == candidate) {
+                ids.push(candidate.to_string());
+            }
+        }
+    }
+    ids
 }
 
 fn is_codex_session_id(value: &str) -> bool {
@@ -307,6 +400,19 @@ fn is_claude_infrastructure(tokens: &[&str]) -> bool {
     tokens
         .windows(2)
         .any(|pair| pair[0] == "claude" && SUBCOMMANDS.contains(&pair[1]))
+}
+
+fn is_claude_headless_resume(command: &str) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().any(|token| *token == "--print")
+        && tokens.iter().any(|token| *token == "--resume")
+        && tokens.iter().any(|token| {
+            token
+                .trim_matches(['"', '\''])
+                .split(['/', '\\'])
+                .next_back()
+                == Some("claude")
+        })
 }
 
 fn process_descends_from(system: &System, mut child: sysinfo::Pid, ancestor: sysinfo::Pid) -> bool {
@@ -493,6 +599,59 @@ pub fn interrupt_agent_process(process_id: u32, expected_agent: &AgentKind) -> R
     }
 }
 
+pub fn interrupt_resumed_prompt_process(
+    native_session_id: &str,
+    expected_agent: &AgentKind,
+) -> Result<(), String> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let process = system.processes().values().find(|process| {
+        let command = process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>();
+        resumed_prompt_command_matches(&command, native_session_id, expected_agent)
+    });
+    let Some(process) = process else {
+        return Err("The running Claude prompt process could not be found".into());
+    };
+    #[cfg(not(target_os = "windows"))]
+    let interrupted = process.kill_with(Signal::Interrupt).unwrap_or(false);
+    #[cfg(target_os = "windows")]
+    let interrupted = process.kill();
+    if interrupted {
+        Ok(())
+    } else {
+        Err("The operating system could not interrupt this prompt safely".into())
+    }
+}
+
+fn resumed_prompt_command_matches(
+    command: &[std::borrow::Cow<'_, str>],
+    native_session_id: &str,
+    expected_agent: &AgentKind,
+) -> bool {
+    let joined = command.join(" ").to_lowercase();
+    let executable = command
+        .first()
+        .and_then(|part| std::path::Path::new(part.as_ref()).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    detect_agent(&executable, &joined).as_ref() == Some(expected_agent)
+        && command.iter().any(|part| part.as_ref() == "--print")
+        && command
+            .windows(2)
+            .any(|parts| parts[0].as_ref() == "--resume" && parts[1].as_ref() == native_session_id)
+}
+
 #[cfg(target_os = "windows")]
 pub fn interrupt_agent_process(
     _process_id: u32,
@@ -531,6 +690,56 @@ mod tests {
     fn recognizes_rollout_session_ids_without_accepting_arbitrary_names() {
         assert!(is_codex_session_id("019f8061-7032-7521-b333-84f84c744fa8"));
         assert!(!is_codex_session_id("rollout-memory-maintenance"));
+    }
+
+    #[test]
+    fn resumed_thread_id_is_recovered_from_the_process_command() {
+        let command = [
+            "codex",
+            "--remote",
+            "ws://127.0.0.1:43131",
+            "resume",
+            "019f8061-7032-7521-b333-84f84c744fa8",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            native_session_ids_from_command(&command),
+            vec!["019f8061-7032-7521-b333-84f84c744fa8"],
+        );
+    }
+
+    #[test]
+    fn unrelated_uuid_in_a_prompt_is_not_treated_as_a_thread() {
+        let command = ["codex", "explain", "019f8061-7032-7521-b333-84f84c744fa8"]
+            .map(std::ffi::OsString::from);
+        assert!(native_session_ids_from_command(&command).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_rollout_uses_the_session_opened_last() {
+        assert_eq!(
+            select_native_session_id(vec![
+                (32, "019f8061-7032-7521-b333-84f84c744fa8".into()),
+                (54, "019fcdac-85c9-77e2-871a-3583aa965a75".into()),
+            ]),
+            Some("019fcdac-85c9-77e2-871a-3583aa965a75".into()),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn internal_subagent_rollouts_are_not_used_as_visible_session_identity() {
+        let guardian = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "source": { "subagent": { "other": "guardian" } } }
+        });
+        let cli = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "source": "cli" }
+        });
+        assert!(!rollout_metadata_is_user_facing(&guardian));
+        assert!(rollout_metadata_is_user_facing(&cli));
     }
 
     #[test]
@@ -609,6 +818,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn claude_headless_resume_is_not_a_second_process_session() {
+        assert!(is_claude_headless_resume(
+            "/home/user/.local/bin/claude --print --resume session-id prompt"
+        ));
+        assert!(!is_claude_headless_resume(
+            "/home/user/.local/bin/claude --resume session-id"
+        ));
+    }
+
+    #[test]
+    fn interruption_targets_only_the_headless_process_for_the_exact_claude_session() {
+        let command = [
+            std::borrow::Cow::Borrowed("/home/user/.local/bin/claude"),
+            std::borrow::Cow::Borrowed("--print"),
+            std::borrow::Cow::Borrowed("--resume"),
+            std::borrow::Cow::Borrowed("session-id"),
+            std::borrow::Cow::Borrowed("Continue"),
+        ];
+        assert!(resumed_prompt_command_matches(
+            &command,
+            "session-id",
+            &AgentKind::ClaudeCode
+        ));
+        assert!(!resumed_prompt_command_matches(
+            &command,
+            "another-session",
+            &AgentKind::ClaudeCode
+        ));
+        assert!(!resumed_prompt_command_matches(
+            &command,
+            "session-id",
+            &AgentKind::Codex
+        ));
     }
 
     #[test]

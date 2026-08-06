@@ -128,10 +128,16 @@
     display: inline-grid;
     flex: 0 0 auto;
     place-items: center;
+    contain: layout paint style;
     color: #263d35;
   }
 
   svg { width: 100%; height: 100%; overflow: visible; }
+  .dino,
+  .feet,
+  .sleep-pixels,
+  .motion-pixels,
+  .state-pixels { will-change: transform, opacity; }
   .body { fill: var(--mascot-color); transition: fill 280ms ease; }
   .belly { fill: rgba(255, 255, 255, 0.34); transition: fill 280ms ease; }
   .snout { fill: rgba(24, 48, 39, 0.16); }

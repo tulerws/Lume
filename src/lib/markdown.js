@@ -68,12 +68,24 @@ function startsBlock(line) {
 }
 
 /**
+ * Remove provider-internal metadata that must never be presented as chat text.
+ * @param {unknown} value
+ */
+export function stripInternalAgentMetadata(value) {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n*<oai-mem-citation\b[^>]*>[\s\S]*?<\/oai-mem-citation>\n*/gi, "\n")
+    .replace(/\n*<oai-mem-citation\b[^>]*>[\s\S]*$/gi, "")
+    .trim();
+}
+
+/**
  * Render the supported Markdown subset after escaping all source HTML.
  * Only generated markup and explicitly allowed http(s)/mailto links survive.
  * @param {unknown} markdown
  */
 export function renderSafeMarkdown(markdown) {
-  const source = String(markdown ?? "").replace(/\r\n?/g, "\n").trim();
+  const source = stripInternalAgentMetadata(markdown);
   if (!source) return "";
 
   const lines = source.split("\n");

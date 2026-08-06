@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 
 use crate::domain::{
-    AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote,
+    AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote, SessionActivity,
 };
 
 pub struct Store {
@@ -58,6 +58,26 @@ impl Store {
                     created_at INTEGER NOT NULL,
                     last_seen_at INTEGER,
                     scopes TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_plans (
+                    native_session_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    source_activity_id TEXT,
+                    updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS conversation_activities (
+                    thread_key TEXT NOT NULL,
+                    activity_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(thread_key, activity_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_conversation_activities_thread
+                    ON conversation_activities(thread_key, created_at ASC);
+                 CREATE TABLE IF NOT EXISTS workflow_runs (
+                    workflow_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
                  );",
             )
             .map_err(|error| error.to_string())?;
@@ -70,12 +90,149 @@ impl Store {
         Ok(Vec::new())
     }
 
-    pub fn save_session(&self, _session: &AgentSession) -> Result<(), String> {
+    pub fn save_session(&self, session: &AgentSession) -> Result<(), String> {
+        let Some(thread_key) = Self::conversation_key(session) else {
+            return Ok(());
+        };
+        let durable = session
+            .activities
+            .iter()
+            .filter(|activity| Self::is_archivable_conversation_activity(activity))
+            .collect::<Vec<_>>();
+        if durable.is_empty() {
+            return Ok(());
+        }
+        let exists = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_activities WHERE thread_key = ?1)",
+                [&thread_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let start = if exists {
+            durable.len().saturating_sub(6)
+        } else {
+            0
+        };
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for activity in &durable[start..] {
+            let mut archived = (*activity).clone();
+            for attachment in &mut archived.attachments {
+                attachment.preview_data_url.clear();
+            }
+            let payload = serde_json::to_string(&archived).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO conversation_activities(thread_key, activity_id, payload, created_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(thread_key, activity_id) DO UPDATE SET
+                        payload = excluded.payload,
+                        created_at = excluded.created_at",
+                    params![thread_key, archived.id, payload, archived.created_at],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
     pub fn delete_session(&self, _session_id: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    pub fn conversation_key(session: &AgentSession) -> Option<String> {
+        let native_id = session.native_session_id.as_deref()?.trim();
+        if native_id.is_empty() {
+            return None;
+        }
+        let agent = serde_json::to_string(&session.agent).ok()?;
+        Some(format!("{}:{native_id}", agent.trim_matches('"')))
+    }
+
+    pub fn is_archivable_conversation_activity(activity: &SessionActivity) -> bool {
+        matches!(activity.kind.as_str(), "prompt" | "queued_prompt")
+            || (activity.kind == "message" && activity.status != "running")
+    }
+
+    pub fn conversation_activities(
+        &self,
+        session: &AgentSession,
+    ) -> Result<Vec<SessionActivity>, String> {
+        let Some(thread_key) = Self::conversation_key(session) else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload FROM conversation_activities
+                 WHERE thread_key = ?1 ORDER BY created_at ASC, activity_id ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([thread_key], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut activities = Vec::new();
+        for payload in rows {
+            let payload = payload.map_err(|error| error.to_string())?;
+            if let Ok(activity) = serde_json::from_str(&payload) {
+                if Self::is_archivable_conversation_activity(&activity) {
+                    activities.push(activity);
+                }
+            }
+        }
+        Ok(activities)
+    }
+
+    pub fn save_session_plan(
+        &self,
+        native_session_id: &str,
+        content: &str,
+        source_activity_id: Option<&str>,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO session_plans
+                 (native_session_id, content, source_activity_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(native_session_id) DO UPDATE SET
+                    content = excluded.content,
+                    source_activity_id = excluded.source_activity_id,
+                    updated_at = excluded.updated_at
+                 WHERE excluded.updated_at >= session_plans.updated_at",
+                params![native_session_id, content, source_activity_id, updated_at],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn session_plan(
+        &self,
+        native_session_id: &str,
+    ) -> Result<Option<(String, Option<String>, i64)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT content, source_activity_id, updated_at
+                 FROM session_plans
+                 WHERE native_session_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![native_session_id])
+            .map_err(|error| error.to_string())?;
+        let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            row.get(0).map_err(|error| error.to_string())?,
+            row.get(1).map_err(|error| error.to_string())?,
+            row.get(2).map_err(|error| error.to_string())?,
+        )))
     }
 
     pub fn add_history(&self, entry: &HistoryEntry) -> Result<(), String> {
@@ -179,6 +336,37 @@ impl Store {
             .execute("DELETE FROM result_notes WHERE id = ?1", [id])
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn save_workflow_run(
+        &self,
+        workflow_id: &str,
+        payload: &str,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO workflow_runs (workflow_id, payload, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workflow_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at",
+                params![workflow_id, payload, updated_at],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn workflow_runs(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload FROM workflow_runs ORDER BY updated_at DESC")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
     }
 
     pub fn save_mobile_device(
@@ -387,9 +575,20 @@ impl Store {
     }
 
     pub fn purge_history(&self, older_than: i64) -> Result<(), String> {
-        self.connection
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute("DELETE FROM history WHERE created_at < ?1", [older_than])
             .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM conversation_activities WHERE created_at < ?1",
+                [older_than],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -459,6 +658,73 @@ mod tests {
         store.save_session(&session).expect("salva a sessão");
         let loaded = store.load_sessions().expect("carrega as sessões");
         assert!(loaded.is_empty());
+
+        let mut threaded = session.clone();
+        threaded.native_session_id = Some("thread-archive".into());
+        threaded.activities.push(SessionActivity {
+            id: "message-1".into(),
+            kind: "message".into(),
+            title: "Codex".into(),
+            detail: Some("resposta preservada".into()),
+            status: "completed".into(),
+            created_at: 2,
+            files: Vec::new(),
+            attachments: vec![crate::domain::PromptAttachment {
+                id: "image-1".into(),
+                name: "image.png".into(),
+                mime_type: "image/png".into(),
+                preview_data_url: "data:image/png;base64,secret".into(),
+                path: Some("/tmp/image.png".into()),
+            }],
+            append_detail: false,
+        });
+        store.save_session(&threaded).expect("arquiva conversa");
+        let archived = store
+            .conversation_activities(&threaded)
+            .expect("carrega conversa");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].detail.as_deref(), Some("resposta preservada"));
+        assert!(archived[0].attachments[0].preview_data_url.is_empty());
+    }
+
+    #[test]
+    fn session_plan_is_persisted_by_native_session_id() {
+        let store = Store::open(Path::new(":memory:")).expect("banco em memória");
+        store
+            .save_session_plan(
+                "thread-1",
+                "# Plan\n\n## Phase 1\nBuild",
+                Some("message-1"),
+                42,
+            )
+            .expect("salva plano");
+        let plan = store
+            .session_plan("thread-1")
+            .expect("consulta plano")
+            .expect("plano");
+        assert_eq!(plan.0, "# Plan\n\n## Phase 1\nBuild");
+        assert_eq!(plan.1.as_deref(), Some("message-1"));
+        assert_eq!(plan.2, 42);
+    }
+
+    #[test]
+    fn workflow_runs_round_trip_locally() {
+        let store = Store::open(Path::new(":memory:")).expect("in-memory database");
+        store
+            .save_workflow_run("workflow-1", r#"{"status":"running"}"#, 42)
+            .expect("save workflow run");
+        assert_eq!(
+            store.workflow_runs().expect("load workflow runs"),
+            vec![r#"{"status":"running"}"#.to_string()]
+        );
+
+        store
+            .save_workflow_run("workflow-1", r#"{"status":"completed"}"#, 43)
+            .expect("update workflow run");
+        assert_eq!(
+            store.workflow_runs().expect("load updated workflow run"),
+            vec![r#"{"status":"completed"}"#.to_string()]
+        );
     }
 
     #[test]
@@ -536,6 +802,7 @@ mod tests {
             .expect("preferências antigas");
 
         let preferences = store.load_preferences().expect("preferências migradas");
+        assert!(preferences.workflow_groups.is_empty());
         assert_eq!(
             preferences.project_profiles["lume"].preferred_agents,
             vec!["claude_code"]

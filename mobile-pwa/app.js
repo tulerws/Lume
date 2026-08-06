@@ -1,4 +1,4 @@
-import { renderSafeMarkdown } from "./markdown.js";
+import { renderSafeMarkdown, stripInternalAgentMetadata } from "./markdown.js";
 import { latestResponseText, sameResponseText } from "./responseDedup.js";
 
 const tokenKey = "lume-mobile-token-v1";
@@ -84,6 +84,8 @@ const expandedResults = new Set();
 const submittingPromptSessions = new Set();
 const promptDrafts = new Map();
 const promptAttachments = new Map();
+const responseFileCache = new Map();
+const responseFileLoads = new Set();
 const promptDeliveries = new Map();
 const questionSelections = new Map();
 const rateLimitRefreshes = new Map();
@@ -841,6 +843,155 @@ function chatTextKey(value) {
     .trim();
 }
 
+const lumeAttachedFilesMarker = "Files attached through Lume. Inspect these local paths:";
+
+function cleanPromptTransport(value) {
+  const normalized = String(value || "").replace(/\r\n?/g, "\n");
+  const marker = normalized.indexOf(lumeAttachedFilesMarker);
+  return (marker >= 0 ? normalized.slice(0, marker) : normalized).trim();
+}
+
+function promptTextKey(value) {
+  return chatTextKey(cleanPromptTransport(value));
+}
+
+function mergeActivityAttachments(target, source) {
+  const attachments = [...(target.attachments || [])];
+  for (const attachment of source.attachments || []) {
+    const duplicate = attachments.some((existing) =>
+      existing.path && attachment.path
+        ? existing.path.replace(/\\/g, "/").toLowerCase() === attachment.path.replace(/\\/g, "/").toLowerCase()
+        : existing.name === attachment.name
+    );
+    if (!duplicate) attachments.push(attachment);
+  }
+  if (attachments.length) target.attachments = attachments;
+}
+
+function isInternalGoalActivity(activity) {
+  return /^functions\s*[·:]\s*(?:create_goal|get_goal|update_goal)$/i.test(
+    String(activity?.title || "").trim(),
+  );
+}
+
+function mobileActivityCategory(activity) {
+  const title = String(activity?.title || "")
+    .replace(/^functions\s*[·:]\s*/i, "")
+    .replace(/^functions[.:/]/i, "")
+    .trim()
+    .toLowerCase();
+  const detail = String(activity?.detail || "").split("\n", 1)[0].toLowerCase();
+  const searchable = `${title} ${detail}`;
+  if (activity?.kind === "file" || /apply_patch|patch|edit(?:ed)?\s+file/.test(title)) return "edit";
+  if (activity?.kind === "test" || /\b(?:test|check|lint|build|pytest|vitest|jest)\b/.test(searchable)) return "test";
+  if (/web.?search|search_query|\b(?:rg|grep|find|fd)\b|search|searched/.test(searchable)) return "search";
+  if (/view_image|read|inspect|open file/.test(title) || /^\s*(?:cat|sed\s+-n|head|tail|ls|stat)\b/.test(detail)) return "read";
+  if (activity?.kind === "command" || /^(?:exec|exec_command|shell|terminal)$/.test(title)) return "command";
+  return "tool";
+}
+
+function mobileActivityTitle(activity) {
+  const labels = {
+    edit: "Edited files",
+    read: "Inspected context",
+    search: "Searched the project",
+    test: "Ran a check",
+    command: "Ran a command",
+    tool: "Used a tool",
+  };
+  return labels[mobileActivityCategory(activity)] || "Agent activity";
+}
+
+function mobileActivityIcon(category) {
+  const paths = {
+    edit: '<path d="m5 14 1-4 7-7 3 3-7 7zM12 4l3 3" />',
+    read: '<path d="M3.5 5.5h5l1.5 2h6.5v8h-13zM7 11h6M7 14h4" />',
+    search: '<circle cx="8.5" cy="8.5" r="4.5" /><path d="m12 12 4 4" />',
+    test: '<path d="m4 10 3.5 3.5L16 5" />',
+    command: '<path d="m4 6 4 4-4 4M10 14h6" />',
+    tool: '<path d="M10 3v3M10 14v3M3 10h3M14 10h3M5 5l2 2M13 13l2 2M15 5l-2 2M7 13l-2 2" />',
+  };
+  return `<svg viewBox="0 0 20 20" aria-hidden="true">${paths[category] || paths.tool}</svg>`;
+}
+
+function mobileActivityPreview(activity) {
+  const preview = String(activity?.detail || "")
+    .split("\n", 1)[0]
+    .replace(/^\{\s*"cmd"\s*:\s*"/i, "")
+    .replace(/"\s*\}\s*$/, "")
+    .trim();
+  return preview.length > 120 ? `${preview.slice(0, 117)}…` : preview;
+}
+
+function mobileActivitySummary(activities) {
+  const counts = new Map();
+  const files = new Set();
+  for (const activity of activities) {
+    const category = mobileActivityCategory(activity);
+    counts.set(category, (counts.get(category) || 0) + 1);
+    for (const file of activity.files || []) files.add(file);
+  }
+  const phrases = [];
+  if (counts.get("edit")) phrases.push(`${files.size || counts.get("edit")} file${(files.size || counts.get("edit")) === 1 ? " edited" : "s edited"}`);
+  if (counts.get("read")) phrases.push("read context");
+  if (counts.get("search")) phrases.push("searched the project");
+  if (counts.get("test")) phrases.push(`${counts.get("test")} check${counts.get("test") === 1 ? "" : "s"}`);
+  if (counts.get("command")) phrases.push(`${counts.get("command")} command${counts.get("command") === 1 ? "" : "s"}`);
+  if (counts.get("tool")) phrases.push(`${counts.get("tool")} tool${counts.get("tool") === 1 ? "" : "s"}`);
+  const summary = phrases.join(", ") || "Agent activity";
+  return summary.charAt(0).toUpperCase() + summary.slice(1);
+}
+
+function isMobileTraceActivity(activity) {
+  return !["message", "analysis", "prompt", "queued_prompt", "file", "plan", "plan_document"].includes(activity?.kind)
+    && !isInternalGoalActivity(activity);
+}
+
+function groupMobileChatItems(items) {
+  const grouped = [];
+  let trace;
+  for (const item of items || []) {
+    if (isMobileTraceActivity(item)) {
+      const previous = trace?.items?.at(-1);
+      if (!trace || (previous && item.createdAt - previous.createdAt > 180_000)) {
+        trace = { kind: "trace", id: `trace:${item.id}`, items: [] };
+        grouped.push(trace);
+      }
+      trace.items.push(item);
+    } else {
+      trace = undefined;
+      grouped.push({ kind: "item", id: item.id, item });
+    }
+  }
+  return grouped;
+}
+
+function mobileTraceMarkup(trace, active) {
+  return `<details class="mobile-activity-cluster${active ? " active" : ""}" ${active ? "open" : ""}>
+    <summary class="mobile-activity-summary">
+      <span class="mobile-activity-mark">${mobileActivityIcon("tool")}</span>
+      <strong>${escapeHtml(mobileActivitySummary(trace.items))}</strong>
+      <small>${trace.items.length}</small>
+      <svg class="mobile-activity-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
+    </summary>
+    <div class="mobile-activity-list">
+      ${trace.items.map((activity) => {
+        const category = mobileActivityCategory(activity);
+        const preview = mobileActivityPreview(activity);
+        return `<details class="mobile-activity-row ${escapeHtml(activity.status || "completed")}">
+          <summary>
+            <i class="mobile-activity-status"></i>
+            <span class="mobile-activity-icon" data-category="${category}">${mobileActivityIcon(category)}</span>
+            <span class="mobile-activity-copy"><strong>${escapeHtml(mobileActivityTitle(activity))}</strong>${preview ? `<code>${escapeHtml(preview)}</code>` : ""}</span>
+            ${activity.detail ? '<svg class="mobile-row-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>' : ""}
+          </summary>
+          ${activity.detail ? `<pre>${escapeHtml(activity.detail)}</pre>` : ""}
+        </details>`;
+      }).join("")}
+    </div>
+  </details>`;
+}
+
 function buildChatTurns(session) {
   const turns = [];
   const queuedPrompts = [];
@@ -851,13 +1002,27 @@ function buildChatTurns(session) {
   };
   let current;
   for (const activity of session.activities || []) {
+    if (isInternalGoalActivity(activity)) continue;
     if (activity.kind === "queued_prompt") {
       queuedPrompts.push(activity);
       continue;
     }
     if (activity.kind === "prompt") {
+      const previousTurn = turns.at(-1);
+      const duplicateTurn = previousTurn?.prompt
+        && !(previousTurn.items || []).some((item) => item.kind === "message")
+        && !(String(previousTurn.prompt.id).startsWith("local:") && String(activity.id).startsWith("local:"))
+        && promptTextKey(previousTurn.prompt.detail) === promptTextKey(activity.detail)
+        && Math.abs(Number(previousTurn.prompt.createdAt) - Number(activity.createdAt)) < 60_000
+        ? previousTurn
+        : undefined;
+      if (duplicateTurn) {
+        mergeActivityAttachments(duplicateTurn.prompt, activity);
+        current = duplicateTurn;
+        continue;
+      }
       current = ensureTurn(activity.id);
-      current.prompt = activity;
+      current.prompt = { ...activity, detail: cleanPromptTransport(activity.detail) || undefined };
       continue;
     }
     current ||= ensureTurn(`turn:${activity.id}`);
@@ -987,6 +1152,83 @@ function messageImagesMarkup(attachments = []) {
   return `<div class="mobile-message-images">${images.map((attachment) =>
     `<img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" />`
   ).join("")}</div>`;
+}
+
+function responseAttachmentsMarkup(sessionId, attachments = []) {
+  const files = attachments.filter((attachment) => attachment?.id && attachment?.path);
+  if (!files.length) return "";
+  return `<div class="mobile-response-files">${files.map((attachment) => {
+    const preview = responseFileCache.get(attachment.id);
+    const image = String(attachment.mimeType || "").startsWith("image/");
+    return `<article class="${image ? "image" : "file"}">
+      <span class="mobile-response-file-preview">${image && preview
+        ? `<img src="${preview}" alt="${escapeHtml(attachment.name || "Response image")}" />`
+        : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 13h6M9 17h4" /></svg>`}
+      </span>
+      <span><strong>${escapeHtml(attachment.name || "Response file")}</strong><small>${escapeHtml(attachment.mimeType || "File")}</small></span>
+      <button
+        type="button"
+        data-response-file="${escapeHtml(attachment.id)}"
+        data-response-session="${escapeHtml(sessionId)}"
+        aria-label="Download ${escapeHtml(attachment.name || "response file")}"
+      ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v9M6.5 9 10 12.5 13.5 9M4 16h12" /></svg></button>
+    </article>`;
+  }).join("")}</div>`;
+}
+
+async function responseFileData(sessionId, attachmentId) {
+  const response = await executeCommand({
+    type: "download_response_file",
+    sessionId,
+    attachmentId,
+  }, { refresh: false });
+  if (!response.data?.dataBase64) throw new Error("The response file is unavailable");
+  return response.data;
+}
+
+async function loadResponseImagePreviews(session) {
+  const images = (session.activities || [])
+    .filter((activity) => activity.kind === "message")
+    .flatMap((activity) => activity.attachments || [])
+    .filter((attachment) =>
+      attachment?.id
+      && attachment?.path
+      && String(attachment.mimeType || "").startsWith("image/")
+      && !responseFileCache.has(attachment.id)
+      && !responseFileLoads.has(attachment.id)
+    );
+  for (const attachment of images) {
+    responseFileLoads.add(attachment.id);
+    try {
+      const file = await responseFileData(session.id, attachment.id);
+      responseFileCache.set(
+        attachment.id,
+        `data:${file.mimeType || attachment.mimeType};base64,${file.dataBase64}`,
+      );
+      if (activeChatSessionId === session.id && currentSnapshot) {
+        renderChat(currentSnapshot.sessions || []);
+      }
+    } catch {
+      responseFileCache.set(attachment.id, "");
+    } finally {
+      responseFileLoads.delete(attachment.id);
+    }
+  }
+}
+
+async function downloadResponseFile(sessionId, attachmentId) {
+  const file = await responseFileData(sessionId, attachmentId);
+  const binary = atob(file.dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  const url = URL.createObjectURL(new Blob([bytes], { type: file.mimeType || "application/octet-stream" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = file.name || "lume-response-file";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 function renderRateLimit(session) {
@@ -1194,8 +1436,9 @@ function renderChat(sessions) {
       </article>`
     : "";
   const turns = buildChatTurns(session);
-  const conversation = turns.map((turn) => `
-    <article class="mobile-chat-turn">
+  const conversation = turns.map((turn, turnIndex) => {
+    const feed = groupMobileChatItems(turn.items);
+    return `<article class="mobile-chat-turn">
       ${turn.queuedPrompt?.detail || turn.queuedPrompt?.attachments?.length ? `
         <div class="mobile-chat-message user queued">
           <header><strong>You</strong><span class="mobile-queued-badge">Queued</span><time>${activityTime(turn.queuedPrompt.createdAt)}</time></header>
@@ -1208,30 +1451,41 @@ function renderChat(sessions) {
           ${turn.prompt.detail ? `<p>${escapeHtml(turn.prompt.detail)}</p>` : ""}
           ${messageImagesMarkup(turn.prompt.attachments)}
         </div>` : ""}
-      ${(turn.items || []).map((item) => {
-        if (item.kind === "message" && item.detail) {
+      ${feed.map((entry, entryIndex) => {
+        if (entry.kind === "trace") {
+          const active = session.status === "running"
+            && turnIndex === turns.length - 1
+            && entryIndex === feed.length - 1;
+          return mobileTraceMarkup(entry, active);
+        }
+        const item = entry.item;
+        if (item.kind === "message" && (item.detail || item.attachments?.length)) {
           return `<div class="mobile-chat-message agent">
             <header><strong>${escapeHtml(sessionDisplayName(session))}</strong><time>${activityTime(item.createdAt)}</time></header>
-            <div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>
+            ${item.detail ? `<div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>` : ""}
+            ${responseAttachmentsMarkup(session.id, item.attachments)}
           </div>`;
         }
-        if (item.kind === "file") return "";
-        return `<details class="mobile-chat-trace">
-          <summary><i></i><span>${escapeHtml(item.title || "Agent activity")}</span><time>${activityTime(item.createdAt)}</time></summary>
-          ${item.detail ? `<pre>${escapeHtml(item.detail)}</pre>` : ""}
-        </details>`;
+        if (item.kind === "analysis" && item.detail) {
+          return `<section class="mobile-reasoning${item.status === "running" ? " running" : ""}">
+            <header><span>${mobileActivityIcon("tool")}</span><strong>${escapeHtml(item.title || "Agent reasoning")}</strong><time>${activityTime(item.createdAt)}</time></header>
+            <div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>
+          </section>`;
+        }
+        return "";
       }).join("")}
       ${turn.files.length ? `
         <details class="mobile-turn-files">
-          <summary><span>Files changed in this prompt</span><em>${turn.files.length}</em></summary>
+          <summary><span class="mobile-turn-files-mark">${mobileActivityIcon("edit")}</span><strong>Files changed</strong><em>${turn.files.length}</em><svg class="mobile-row-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg></summary>
           <div>${fileChangeRows(turn.files)}</div>
         </details>` : ""}
-    </article>
-  `).join("");
+    </article>`;
+  }).join("");
   const typing = session.status === "running"
     ? `<div class="mobile-agent-typing" aria-label="${escapeHtml(sessionDisplayName(session))} is working"><span></span><span></span><span></span></div>`
     : "";
   chatFeed.innerHTML = permission + questionRequest + (conversation || '<p class="mobile-chat-empty">Messages and live agent activity will appear here.</p>') + typing;
+  void loadResponseImagePreviews(session);
 
   const promptReady = ["completed", "failed", "waiting_for_input"].includes(session.status);
   const agentWorking = session.status === "running";
@@ -1254,10 +1508,14 @@ function renderChat(sessions) {
           ${attachments.map((attachment, index) => `
           <span title="${escapeHtml(attachment.name || "Attached image")}"><img src="${safeImagePreview(attachment.previewDataUrl)}" alt="${escapeHtml(attachment.name || "Attached image")}" /><button type="button" data-remove-image="${index}" aria-label="Remove image" ${promptSubmitting ? "disabled" : ""}>×</button></span>
         `).join("")}</div>` : ""}
-        ${supportsRunningPrompt ? `<select class="mobile-prompt-delivery" aria-label="Prompt delivery">
-          <option value="steer" ${promptDelivery === "steer" ? "selected" : ""}>Steer now</option>
-          <option value="queue" ${promptDelivery === "queue" ? "selected" : ""}>Queue next</option>
-        </select>` : ""}
+        ${supportsRunningPrompt ? `<div class="mobile-prompt-delivery" role="group" aria-label="Prompt delivery">
+          <button class="${promptDelivery === "queue" ? "active" : ""}" type="button" data-prompt-delivery="queue" aria-pressed="${promptDelivery === "queue"}">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5h8M5 10h6M5 15h4M14 12v5M11.5 14.5 14 17l2.5-2.5" /></svg><span><strong>Queue up</strong><small>Runs next</small></span>
+          </button>
+          <button class="${promptDelivery === "steer" ? "active" : ""}" type="button" data-prompt-delivery="steer" aria-pressed="${promptDelivery === "steer"}">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h10M11 6l4 4-4 4M5 5v10" /></svg><span><strong>Steer now</strong><small>Guide this task</small></span>
+          </button>
+        </div>` : ""}
         ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/*" multiple hidden />
           <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
         <textarea maxlength="16384" placeholder="Message ${escapeHtml(sessionDisplayName(session))}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
@@ -1342,8 +1600,9 @@ function renderSessions(snapshot, trackChanges = true) {
   sessionList.innerHTML = visibleSessions.map((session) => {
     const scopes = currentDevice?.scopes || [];
     const expanded = session.status === "permission_required";
-    const response = session.lastResponse
-      ? `<div class="response"><span class="content-label">Final response</span><p>${escapeHtml(session.lastResponse)}</p></div>`
+    const visibleLastResponse = stripInternalAgentMetadata(session.lastResponse);
+    const response = visibleLastResponse
+      ? `<div class="response"><span class="content-label">Final response</span><p>${escapeHtml(visibleLastResponse)}</p></div>`
       : "";
     const permission = session.pendingPermission
       ? `<div class="permission"><span class="content-label">Approval required</span><strong>${escapeHtml(session.pendingPermission.summary)}</strong><code>${escapeHtml(session.pendingPermission.resource)}</code>
@@ -1426,7 +1685,7 @@ function renderResults(sessions) {
           <time>${activityTime(result.createdAt)}</time>
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
         </button>
-        <p class="result-response">${escapeHtml(result.response || "Task completed.")}</p>
+        <p class="result-response">${escapeHtml(stripInternalAgentMetadata(result.response) || "Task completed.")}</p>
         ${files.length ? `
           <details class="result-changes">
             <summary>
@@ -1965,7 +2224,7 @@ async function refreshSnapshot() {
   }
 }
 
-async function executeCommand(command) {
+async function executeCommand(command, { refresh = true } = {}) {
   const requestId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
   const request = { requestId, ...command };
   const realtime = nativeRealtimeConnected ? nativeRealtimePlugin() : null;
@@ -1976,7 +2235,8 @@ async function executeCommand(command) {
         body: JSON.stringify(request),
       });
   if (!response.ok) throw new Error(response.error?.message || "The command failed");
-  await refreshSnapshot();
+  if (refresh) await refreshSnapshot();
+  return response;
 }
 
 async function pollEvents() {
@@ -2289,7 +2549,7 @@ async function submitPromptForm(form) {
   const attachments = promptAttachments.get(sessionId) || [];
   const delivery =
     session?.status === "running"
-      ? form.querySelector(".mobile-prompt-delivery")?.value || "queue"
+      ? form.querySelector("[data-prompt-delivery].active")?.dataset.promptDelivery || "queue"
       : "new_turn";
   if ((!submittedPrompt && !attachments.length) || submittingPromptSessions.has(sessionId)) return;
   submittingPromptSessions.add(sessionId);
@@ -2445,12 +2705,6 @@ chatScreen.addEventListener("submit", async (event) => {
   await submitPromptForm(form);
 });
 chatScreen.addEventListener("input", rememberPromptDraft);
-chatScreen.addEventListener("change", (event) => {
-  const select = event.target.closest?.(".mobile-prompt-delivery");
-  const form = select?.closest(".mobile-chat-form");
-  if (!form?.dataset.session) return;
-  promptDeliveries.set(form.dataset.session, select.value);
-});
 chatScreen.addEventListener("paste", async (event) => {
   const form = event.target.closest?.(".mobile-chat-form");
   const sessionId = form?.dataset.session;
@@ -2492,6 +2746,30 @@ chatScreen.addEventListener("change", async (event) => {
   }
 });
 chatScreen.addEventListener("click", async (event) => {
+  const deliveryButton = event.target.closest("button[data-prompt-delivery]");
+  if (deliveryButton) {
+    const form = deliveryButton.closest(".mobile-chat-form");
+    if (!form?.dataset.session) return;
+    promptDeliveries.set(form.dataset.session, deliveryButton.dataset.promptDelivery);
+    lastChatRenderKey = "";
+    renderChat(currentSnapshot?.sessions || []);
+    return;
+  }
+  const responseFileButton = event.target.closest("button[data-response-file]");
+  if (responseFileButton) {
+    responseFileButton.disabled = true;
+    try {
+      await downloadResponseFile(
+        responseFileButton.dataset.responseSession,
+        responseFileButton.dataset.responseFile,
+      );
+    } catch (error) {
+      showBanner(error?.message || "Could not download the response file.", "error");
+    } finally {
+      responseFileButton.disabled = false;
+    }
+    return;
+  }
   const attachButton = event.target.closest("button[data-attach-image]");
   if (attachButton) {
     attachButton.closest(".mobile-chat-form")?.querySelector(".mobile-image-input")?.click();

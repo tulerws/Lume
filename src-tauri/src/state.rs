@@ -15,12 +15,14 @@ use crate::{
         Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity, SessionResult,
         SessionSource, SessionStatus,
     },
+    integrations::{self, IntegrationKind, ResumableSession},
     store::Store,
 };
 
 const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
 const WEB_SESSION_STALE_MS: i64 = 90_000;
 const RECENT_NATIVE_SESSION_MS: i64 = 10 * 60 * 1_000;
+const LUME_ATTACHED_FILES_MARKER: &str = "Files attached through Lume. Inspect these local paths:";
 
 #[derive(Clone, Debug)]
 struct WorkspaceSnapshot {
@@ -39,6 +41,7 @@ pub struct AppState {
     workspace_snapshots: Arc<Mutex<HashMap<String, WorkspaceSnapshot>>>,
     agent_rate_limits: Arc<Mutex<HashMap<AgentKind, Vec<AgentRateLimit>>>>,
     session_aliases: Arc<Mutex<HashMap<String, String>>>,
+    archived_conversations: Arc<Mutex<HashMap<String, Vec<SessionActivity>>>>,
 }
 
 impl AppState {
@@ -61,6 +64,7 @@ impl AppState {
             workspace_snapshots: Arc::new(Mutex::new(HashMap::new())),
             agent_rate_limits: Arc::new(Mutex::new(HashMap::new())),
             session_aliases: Arc::new(Mutex::new(preferences.session_aliases)),
+            archived_conversations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -71,6 +75,15 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível acessar as sessões".to_string())?
             .clone();
+        self.attach_archived_conversations(&mut sessions)?;
+        self.attach_session_plans(&mut sessions)?;
+        sessions.retain(|session| {
+            !(session.agent == AgentKind::Codex
+                && session
+                    .working_directory
+                    .as_deref()
+                    .is_some_and(crate::session_filters::is_codex_internal_workspace))
+        });
         let aliases = self
             .session_aliases
             .lock()
@@ -150,6 +163,103 @@ impl AppState {
         ensure_unique_session_names(&mut sessions);
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
         Ok(sessions)
+    }
+
+    fn attach_session_plans(&self, sessions: &mut [AgentSession]) -> Result<(), String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Não foi possível acessar os planejamentos".to_string())?;
+        for session in sessions {
+            let Some(native_session_id) = session.native_session_id.as_deref() else {
+                continue;
+            };
+            if let Some(activity) = session.activities.iter().rev().find(|activity| {
+                activity.kind == "message"
+                    && activity
+                        .detail
+                        .as_deref()
+                        .is_some_and(crate::protocol::looks_like_full_plan_document)
+            }) {
+                if let Some(content) = activity.detail.as_deref() {
+                    store.save_session_plan(
+                        native_session_id,
+                        content,
+                        Some(&activity.id),
+                        activity.created_at,
+                    )?;
+                }
+            }
+            let Some((content, _, updated_at)) = store.session_plan(native_session_id)? else {
+                continue;
+            };
+            session
+                .activities
+                .retain(|activity| activity.kind != "plan_document");
+            session.activities.push(SessionActivity {
+                id: format!("plan-document:{native_session_id}"),
+                kind: "plan_document".into(),
+                title: "Plan".into(),
+                detail: Some(content),
+                status: "completed".into(),
+                created_at: updated_at,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            });
+            session
+                .activities
+                .sort_by_key(|activity| activity.created_at);
+        }
+        Ok(())
+    }
+
+    fn attach_archived_conversations(&self, sessions: &mut [AgentSession]) -> Result<(), String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Não foi possível acessar o histórico das conversas".to_string())?;
+        let mut cache = self
+            .archived_conversations
+            .lock()
+            .map_err(|_| "Não foi possível acessar o cache das conversas".to_string())?;
+        for session in sessions {
+            let Some(key) = Store::conversation_key(session) else {
+                continue;
+            };
+            if !cache.contains_key(&key) {
+                cache.insert(key.clone(), store.conversation_activities(session)?);
+            }
+            let archived = cache.entry(key).or_default();
+            for activity in session
+                .activities
+                .iter()
+                .filter(|activity| Store::is_archivable_conversation_activity(activity))
+            {
+                if let Some(existing) = archived.iter_mut().find(|item| item.id == activity.id) {
+                    let existing_length = existing.detail.as_deref().map(str::len).unwrap_or(0);
+                    let incoming_length = activity.detail.as_deref().map(str::len).unwrap_or(0);
+                    if incoming_length >= existing_length {
+                        *existing = activity.clone();
+                    }
+                } else {
+                    archived.push(activity.clone());
+                }
+            }
+            for activity in archived.iter() {
+                if !session
+                    .activities
+                    .iter()
+                    .any(|current| current.id == activity.id)
+                {
+                    session.activities.push(activity.clone());
+                }
+            }
+            session
+                .activities
+                .sort_by_key(|activity| activity.created_at);
+        }
+        Ok(())
     }
 
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<String, String> {
@@ -244,7 +354,30 @@ impl AppState {
                 append_detail: false,
             },
         );
+        session.status = SessionStatus::Running;
+        session.status_label = "Executando".into();
         session.updated_at = now;
+        Ok(())
+    }
+
+    pub fn rebind_codex_thread(
+        &self,
+        session_id: &str,
+        native_session_id: String,
+    ) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not reconnect the Codex session".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        if session.agent != AgentKind::Codex {
+            return Err("Only Codex sessions can be rebound to a thread".into());
+        }
+        session.native_session_id = Some(native_session_id);
+        session.updated_at = now_millis();
         Ok(())
     }
 
@@ -398,6 +531,25 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível acessar as notas".to_string())?
             .result_notes(limit.min(200))
+    }
+
+    pub fn save_workflow_run(
+        &self,
+        workflow_id: &str,
+        payload: &str,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Could not persist the workflow run".to_string())?
+            .save_workflow_run(workflow_id, payload, updated_at)
+    }
+
+    pub fn workflow_runs(&self) -> Result<Vec<String>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Could not restore workflow runs".to_string())?
+            .workflow_runs()
     }
 
     pub fn save_result_note(
@@ -569,6 +721,14 @@ impl AppState {
     pub fn ingest(&self, event: HookEvent) -> Result<Option<String>, String> {
         if event.session_id.trim().is_empty() {
             return Err("O evento não informou uma sessão".into());
+        }
+        if event.agent == AgentKind::Codex
+            && event
+                .working_directory
+                .as_deref()
+                .is_some_and(crate::session_filters::is_codex_internal_workspace)
+        {
+            return Ok(None);
         }
 
         let now = now_millis();
@@ -1287,6 +1447,24 @@ impl AppState {
             .sessions
             .lock()
             .map_err(|_| "Não foi possível atualizar os processos".to_string())?;
+        let recovered_identities = recover_process_identities(&discovered, &sessions);
+        let recovered_work = recovered_identities
+            .iter()
+            .map(|(process_id, (native_id, _))| {
+                let kind = discovered
+                    .iter()
+                    .find(|process| {
+                        process.process_id == *process_id
+                            && process.native_session_ids.contains(native_id)
+                    })
+                    .and_then(|process| integration_kind_for_agent(&process.agent));
+                let activities = kind
+                    .as_ref()
+                    .map(|kind| integrations::resume_work_activities(kind, native_id))
+                    .unwrap_or_default();
+                (*process_id, activities)
+            })
+            .collect::<HashMap<_, _>>();
         let mut missing_process_scans = self
             .missing_process_scans
             .lock()
@@ -1363,6 +1541,14 @@ impl AppState {
                     if session.source != process.source {
                         session.source = process.source.clone();
                         refreshed = true;
+                    }
+                    if session.activities.is_empty() {
+                        if let Some(activities) = recovered_work.get(&process.process_id) {
+                            if !activities.is_empty() {
+                                session.activities.clone_from(activities);
+                                refreshed = true;
+                            }
+                        }
                     }
                     if refreshed {
                         session.updated_at = now;
@@ -1495,6 +1681,21 @@ impl AppState {
                     session.agent_label = process.agent_label.clone();
                     refreshed = true;
                 }
+                if session.session_name.trim().is_empty() {
+                    if let Some((native_id, name)) = recovered_identities.get(&process.process_id) {
+                        session.native_session_id = Some(native_id.clone());
+                        session.session_name = name.clone();
+                        refreshed = true;
+                    }
+                }
+                if session.activities.is_empty() {
+                    if let Some(activities) = recovered_work.get(&process.process_id) {
+                        if !activities.is_empty() {
+                            session.activities.clone_from(activities);
+                            refreshed = true;
+                        }
+                    }
+                }
                 if is_provisional_process(session) && session.status == SessionStatus::Completed {
                     session.status = SessionStatus::WaitingForInput;
                     session.status_label = "Esperando ação".into();
@@ -1522,6 +1723,13 @@ impl AppState {
                     )
             }) {
                 session.process_id = Some(process.process_id);
+                if let Some((native_id, name)) = recovered_identities.get(&process.process_id) {
+                    session.native_session_id = Some(native_id.clone());
+                    session.session_name = name.clone();
+                }
+                if let Some(activities) = recovered_work.get(&process.process_id) {
+                    session.activities.clone_from(activities);
+                }
                 session.status = SessionStatus::WaitingForInput;
                 session.status_label = "Esperando ação".into();
                 session.updated_at = now;
@@ -1537,6 +1745,7 @@ impl AppState {
                 .unwrap_or("Sessão local")
                 .to_string();
             let agent_name = process.agent_label.clone();
+            let recovered_identity = recovered_identities.get(&process.process_id);
             let session = AgentSession {
                 id: format!(
                     "process:{}:{}",
@@ -1545,7 +1754,9 @@ impl AppState {
                 ),
                 agent: process.agent.clone(),
                 agent_label: agent_name,
-                session_name: String::new(),
+                session_name: recovered_identity
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default(),
                 project,
                 source: process.source,
                 source_app: None,
@@ -1554,14 +1765,17 @@ impl AppState {
                 started_at: now.to_string(),
                 updated_at: now,
                 process_id: Some(process.process_id),
-                native_session_id: None,
+                native_session_id: recovered_identity.map(|(id, _)| id.clone()),
                 working_directory: process.working_directory,
                 permission_profile: default_profile(&process.agent),
                 pending_permission: None,
                 pending_question: None,
                 last_response: None,
                 results: Vec::new(),
-                activities: Vec::new(),
+                activities: recovered_work
+                    .get(&process.process_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 rate_limits: Vec::new(),
             };
             snapshots.push(session.clone());
@@ -1694,14 +1908,40 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
 
 fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) {
     if activity.kind == "prompt" {
-        if let Some(existing) = session.activities.iter_mut().rev().find(|existing| {
+        normalize_lume_prompt_activity(&mut activity);
+        let incoming_key = activity
+            .detail
+            .as_deref()
+            .map(normalized_chat_text)
+            .unwrap_or_default();
+        let duplicate = session.activities.iter().rposition(|existing| {
             existing.kind == "prompt"
-                && existing.detail == activity.detail
-                && (existing.created_at - activity.created_at).abs() < 10_000
+                && !(existing.id.starts_with("local:") && activity.id.starts_with("local:"))
+                && existing
+                    .detail
+                    .as_deref()
+                    .map(normalized_chat_text)
+                    .unwrap_or_default()
+                    == incoming_key
+                && (existing.created_at - activity.created_at).abs() < 60_000
+        });
+        if let Some(index) = duplicate.filter(|index| {
+            !session.activities[index.saturating_add(1)..]
+                .iter()
+                .any(|existing| matches!(existing.kind.as_str(), "prompt" | "message"))
         }) {
+            let existing = &mut session.activities[index];
             existing.status = activity.status;
+            merge_attachments(&mut existing.attachments, activity.attachments);
             return;
         }
+    }
+    if activity.kind == "message" {
+        let discovered = response_attachments(
+            activity.detail.as_deref().unwrap_or_default(),
+            session.working_directory.as_deref(),
+        );
+        merge_attachments(&mut activity.attachments, discovered);
     }
     if let Some(existing) = session
         .activities
@@ -1720,6 +1960,7 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
                     existing.files.push(file);
                 }
             }
+            merge_attachments(&mut existing.attachments, activity.attachments);
             return;
         }
         activity.created_at = existing.created_at;
@@ -1760,6 +2001,10 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
                     session.activities[index].files.push(file);
                 }
             }
+            merge_attachments(
+                &mut session.activities[index].attachments,
+                activity.attachments,
+            );
             return;
         }
     }
@@ -1767,10 +2012,289 @@ fn remember_activity(session: &mut AgentSession, mut activity: SessionActivity) 
     session
         .activities
         .sort_by_key(|activity| activity.created_at);
-    if session.activities.len() > 160 {
-        session
-            .activities
-            .drain(..session.activities.len().saturating_sub(160));
+    prune_transient_activities(&mut session.activities, 160);
+}
+
+fn prune_transient_activities(activities: &mut Vec<SessionActivity>, limit: usize) {
+    let transient_count = activities
+        .iter()
+        .filter(|activity| {
+            !matches!(
+                activity.kind.as_str(),
+                "prompt" | "message" | "queued_prompt"
+            )
+        })
+        .count();
+    let mut remove = transient_count.saturating_sub(limit);
+    if remove == 0 {
+        return;
+    }
+    activities.retain(|activity| {
+        let transient = !matches!(
+            activity.kind.as_str(),
+            "prompt" | "message" | "queued_prompt"
+        );
+        if transient && remove > 0 {
+            remove -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn normalize_lume_prompt_activity(activity: &mut SessionActivity) {
+    let Some(detail) = activity.detail.as_deref() else {
+        return;
+    };
+    let normalized = normalized_chat_text(detail);
+    let Some((visible, transport)) = normalized.split_once(LUME_ATTACHED_FILES_MARKER) else {
+        return;
+    };
+    let attachments = transport.lines().filter_map(|line| {
+        let raw_path = line
+            .trim()
+            .strip_prefix("- ")?
+            .trim()
+            .trim_matches(['`', '"', '\'']);
+        response_attachment(raw_path, None)
+    });
+    merge_attachments(&mut activity.attachments, attachments);
+    activity.detail = (!visible.trim().is_empty()).then(|| visible.trim().to_string());
+}
+
+fn merge_attachments(
+    current: &mut Vec<PromptAttachment>,
+    incoming: impl IntoIterator<Item = PromptAttachment>,
+) {
+    for attachment in incoming {
+        let duplicate = current.iter().any(|existing| {
+            existing
+                .path
+                .as_deref()
+                .zip(attachment.path.as_deref())
+                .is_some_and(|(left, right)| same_directory(Some(left), Some(right)))
+                || (existing.path.is_none()
+                    && attachment.path.is_none()
+                    && existing.name == attachment.name)
+        });
+        if !duplicate {
+            current.push(attachment);
+        }
+    }
+}
+
+fn response_attachments(detail: &str, working_directory: Option<&str>) -> Vec<PromptAttachment> {
+    let candidates = explicit_response_targets(detail);
+    let mut attachments = Vec::new();
+    for candidate in candidates {
+        let Some(attachment) = response_attachment(&candidate, working_directory) else {
+            continue;
+        };
+        merge_attachments(&mut attachments, [attachment]);
+        if attachments.len() == 8 {
+            break;
+        }
+    }
+    attachments
+}
+
+fn explicit_response_targets(value: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in value.lines() {
+        let mut remaining = line;
+        while let Some(close) = remaining.find("](") {
+            let before = &remaining[..close];
+            let Some(open) = before.rfind('[') else {
+                break;
+            };
+            let label = &before[open + 1..];
+            let image = open > 0 && before[..open].ends_with('!');
+            let target = &remaining[close + 2..];
+            let Some(end) = target.find(')') else {
+                break;
+            };
+            if image || has_response_delivery_cue(&format!("{} {label}", &before[..open])) {
+                let raw = target[..end].trim();
+                let raw = if let Some(raw) = raw.strip_prefix('<') {
+                    raw.split_once('>').map(|(path, _)| path).unwrap_or(raw)
+                } else {
+                    raw.split_once(" \"")
+                        .or_else(|| raw.split_once(" '"))
+                        .map(|(path, _)| path)
+                        .unwrap_or(raw)
+                };
+                push_response_target(&mut targets, raw);
+            }
+            remaining = &target[end + 1..];
+        }
+        if !has_response_delivery_cue(line) {
+            continue;
+        }
+        let mut code = line;
+        while let Some(start) = code.find('`') {
+            let tail = &code[start + 1..];
+            let Some(end) = tail.find('`') else {
+                break;
+            };
+            push_response_target(&mut targets, &tail[..end]);
+            code = &tail[end + 1..];
+        }
+        if !line.contains("](") {
+            if let Some((_, tail)) = line.split_once(':') {
+                push_response_target(&mut targets, tail);
+            }
+        }
+    }
+    targets
+}
+
+fn has_response_delivery_cue(value: &str) -> bool {
+    let value = value.to_lowercase();
+    [
+        "download",
+        "baixar",
+        "baixe",
+        "arquivo final",
+        "arquivo gerado",
+        "ficheiro final",
+        "final file",
+        "final pdf",
+        "final image",
+        "final document",
+        "generated file",
+        "generated pdf",
+        "generated image",
+        "pdf final",
+        "output file",
+        "deliverable",
+        "attachment",
+        "anexo",
+        "exported",
+        "exportado",
+        "saved at",
+        "saved to",
+        "salvo em",
+        "salva em",
+        "available for download",
+        "disponível para baixar",
+        "resultado final",
+        "entrega final",
+    ]
+    .iter()
+    .any(|cue| value.contains(cue))
+}
+
+fn push_response_target(targets: &mut Vec<String>, raw: &str) {
+    let raw = raw
+        .trim()
+        .trim_matches(['`', '"', '\'', '<', '>', '.', ',', ';'])
+        .replace("%20", " ");
+    if !raw.is_empty() && !targets.iter().any(|target| target == &raw) {
+        targets.push(raw);
+    }
+}
+
+fn response_attachment(
+    raw_path: &str,
+    working_directory: Option<&str>,
+) -> Option<PromptAttachment> {
+    let raw_path = raw_path
+        .trim()
+        .trim_matches(['`', '"', '\'', '<', '>'])
+        .strip_prefix("file://")
+        .unwrap_or(raw_path.trim().trim_matches(['`', '"', '\'', '<', '>']));
+    if raw_path.is_empty()
+        || raw_path.contains(['\n', '\r', '\0'])
+        || raw_path.starts_with("http://")
+        || raw_path.starts_with("https://")
+    {
+        return None;
+    }
+    let raw_path = strip_path_line_number(raw_path);
+    let candidate = Path::new(raw_path);
+    let candidate = if candidate.is_absolute() || looks_like_windows_path(raw_path) {
+        candidate.to_path_buf()
+    } else {
+        Path::new(working_directory?).join(candidate)
+    };
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !canonical.is_file() || sensitive_response_path(&canonical) {
+        return None;
+    }
+    let name = canonical.file_name()?.to_string_lossy().to_string();
+    let path = canonical.to_string_lossy().to_string();
+    let mime_type = response_file_mime(&canonical).to_string();
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    Some(PromptAttachment {
+        id: format!("response-file:{:x}", hasher.finish()),
+        name,
+        mime_type,
+        preview_data_url: String::new(),
+        path: Some(path),
+    })
+}
+
+fn strip_path_line_number(path: &str) -> &str {
+    let Some((candidate, suffix)) = path.rsplit_once(':') else {
+        return path;
+    };
+    if suffix.chars().all(|character| character.is_ascii_digit())
+        && !(candidate.len() == 1 && candidate.as_bytes()[0].is_ascii_alphabetic())
+    {
+        candidate
+    } else {
+        path
+    }
+}
+
+fn looks_like_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn sensitive_response_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        value == ".ssh" || value == ".gnupg" || value == ".aws"
+    }) || path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name == ".env"
+            || name.starts_with(".env.")
+            || matches!(
+                name.as_str(),
+                "id_rsa" | "id_ed25519" | ".netrc" | ".npmrc" | ".pypirc"
+            )
+            || [".pem", ".key", ".p12", ".pfx"]
+                .iter()
+                .any(|extension| name.ends_with(extension))
+    })
+}
+
+fn response_file_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" => "text/html",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1956,12 +2480,12 @@ fn file_fingerprint(path: &Path) -> u64 {
     hasher.finish()
 }
 
-fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
     let mut files = Vec::new();
     let mut tests = Vec::new();
     const FILE_EXTENSIONS: &[&str] = &[
         "rs", "ts", "tsx", "js", "jsx", "svelte", "json", "toml", "yaml", "yml", "md", "css",
-        "scss", "html", "py", "go", "java", "cs", "sh", "sql",
+        "scss", "html", "py", "go", "java", "cs", "sh", "sql", "txt",
     ];
     const TEST_MARKERS: &[&str] = &[
         "cargo test",
@@ -1999,34 +2523,10 @@ fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
         }
 
         for token in line.split_whitespace() {
-            let cleaned = token
-                .trim_matches(|character: char| {
-                    matches!(
-                        character,
-                        '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';'
-                    )
-                })
-                .trim_end_matches(['.', '`']);
-            let candidate = cleaned.split(':').next().unwrap_or_default();
-            let extension = candidate
-                .rsplit_once('.')
-                .map(|(_, extension)| extension.trim_end_matches(['.', ':']))
-                .unwrap_or_default()
-                .to_lowercase();
-            if !FILE_EXTENSIONS.contains(&extension.as_str()) || candidate.starts_with("http") {
-                continue;
-            }
-            let sanitized = if Path::new(candidate).is_absolute() {
-                Path::new(candidate)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(candidate)
-                    .to_string()
-            } else {
-                candidate.trim_start_matches("./").to_string()
-            };
-            if !sanitized.is_empty() && !files.contains(&sanitized) {
-                files.push(sanitized);
+            if let Some(file) = reported_file_candidate(token, FILE_EXTENSIONS) {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
             }
         }
     }
@@ -2035,7 +2535,49 @@ fn extract_result_artifacts(response: &str) -> (Vec<String>, Vec<String>) {
     (files, tests)
 }
 
+fn reported_file_candidate(token: &str, extensions: &[&str]) -> Option<String> {
+    let token =
+        token.trim_matches(|character: char| matches!(character, '`' | '"' | '\'' | ',' | ';'));
+    let candidate = if let Some(link_start) = token.find("](") {
+        let target = &token[link_start + 2..];
+        let target_end = target.find(')')?;
+        &target[..target_end]
+    } else {
+        token
+    };
+    let mut candidate = candidate
+        .trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | '`'))
+        .trim_end_matches(['.', '`']);
+    if candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+        || candidate.contains(['\n', '\r', '\0'])
+        || candidate.contains("***")
+        || candidate.contains("](")
+    {
+        return None;
+    }
+    if let Some((path, suffix)) = candidate.rsplit_once(':') {
+        if !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()) {
+            candidate = path;
+        }
+    }
+    let extension = Path::new(candidate)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    if !extensions.contains(&extension.as_str()) {
+        return None;
+    }
+    let sanitized = if Path::new(candidate).is_absolute() {
+        Path::new(candidate).file_name()?.to_str()?.to_string()
+    } else {
+        candidate.trim_start_matches("./").to_string()
+    };
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 fn merge_results(target: &mut AgentSession, source: &AgentSession) {
+    merge_permission_scope(&mut target.permission_profile, &source.permission_profile);
     for activity in &source.activities {
         remember_activity(target, activity.clone());
     }
@@ -2055,6 +2597,46 @@ fn merge_results(target: &mut AgentSession, source: &AgentSession) {
     target.results.sort_by_key(|result| result.created_at);
     if target.results.len() > 12 {
         target.results.drain(..target.results.len() - 12);
+    }
+}
+
+fn merge_permission_scope(target: &mut PermissionProfile, source: &PermissionProfile) {
+    if permission_scope_is_explicit(source) && !permission_scope_is_explicit(target) {
+        copy_permission_scope(target, source);
+    }
+    if source.can_respond_from_lume && !target.can_respond_from_lume {
+        target.can_respond_from_lume = true;
+        target
+            .available_actions
+            .clone_from(&source.available_actions);
+    }
+}
+
+fn permission_scope_is_explicit(profile: &PermissionProfile) -> bool {
+    profile.mode != AccessMode::Custom
+        || profile.approvals_reviewer.is_some()
+        || matches!(
+            profile.approval_policy.trim().to_ascii_lowercase().as_str(),
+            "never" | "on-request" | "on-failure" | "untrusted" | "unless-trusted"
+        )
+}
+
+fn copy_permission_scope(target: &mut PermissionProfile, source: &PermissionProfile) {
+    target.mode = source.mode.clone();
+    target.label = source.label.clone();
+    target.approval_policy = source.approval_policy.clone();
+    target.approvals_reviewer = source.approvals_reviewer.clone();
+}
+
+fn apply_permission_profile(target: &mut PermissionProfile, source: &PermissionProfile) {
+    if permission_scope_is_explicit(source) || !permission_scope_is_explicit(target) {
+        copy_permission_scope(target, source);
+    }
+    if source.can_respond_from_lume || !target.can_respond_from_lume {
+        target.can_respond_from_lume = source.can_respond_from_lume;
+        target
+            .available_actions
+            .clone_from(&source.available_actions);
     }
 }
 
@@ -2094,14 +2676,7 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
         session.working_directory = Some(working_directory.clone());
     }
     if let Some(profile) = &event.permission_profile {
-        if profile.can_respond_from_lume || !session.permission_profile.can_respond_from_lume {
-            session.permission_profile = profile.clone();
-        } else {
-            session.permission_profile.mode = profile.mode.clone();
-            session.permission_profile.label = profile.label.clone();
-            session.permission_profile.approval_policy = profile.approval_policy.clone();
-            session.permission_profile.approvals_reviewer = profile.approvals_reviewer.clone();
-        }
+        apply_permission_profile(&mut session.permission_profile, profile);
     }
     if let Some(response) = &event.last_response {
         session.last_response = Some(response.clone());
@@ -2154,6 +2729,88 @@ fn history_for_event(
         summary: summary.into(),
         created_at: now,
     })
+}
+
+fn recover_process_identities(
+    discovered: &[DiscoveredProcess],
+    sessions: &[AgentSession],
+) -> HashMap<u32, (String, String)> {
+    let unresolved = discovered
+        .iter()
+        .filter(|process| {
+            sessions
+                .iter()
+                .find(|session| session.process_id == Some(process.process_id))
+                .is_none_or(|session| {
+                    session.native_session_id.is_none() || session.session_name.trim().is_empty()
+                })
+        })
+        .collect::<Vec<_>>();
+    if unresolved.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut catalogs = HashMap::<IntegrationKind, Vec<ResumableSession>>::new();
+    for process in &unresolved {
+        let Some(kind) = integration_kind_for_agent(&process.agent) else {
+            continue;
+        };
+        catalogs
+            .entry(kind.clone())
+            .or_insert_with(|| integrations::resumable_sessions(&kind).unwrap_or_default());
+    }
+
+    unresolved
+        .into_iter()
+        .filter_map(|process| {
+            let kind = integration_kind_for_agent(&process.agent)?;
+            let candidates = catalogs.get(&kind)?;
+            let exact = candidates.iter().find(|candidate| {
+                process
+                    .native_session_ids
+                    .iter()
+                    .any(|id| id == &candidate.id)
+            });
+            let fallback = if !cfg!(test)
+                && exact.is_none()
+                && discovered
+                    .iter()
+                    .filter(|other| {
+                        other.agent == process.agent
+                            && same_directory(
+                                other.working_directory.as_deref(),
+                                process.working_directory.as_deref(),
+                            )
+                    })
+                    .count()
+                    == 1
+            {
+                candidates.iter().find(|candidate| {
+                    same_directory(
+                        Some(&candidate.working_directory),
+                        process.working_directory.as_deref(),
+                    )
+                })
+            } else {
+                None
+            };
+            exact.or(fallback).map(|candidate| {
+                (
+                    process.process_id,
+                    (candidate.id.clone(), candidate.name.clone()),
+                )
+            })
+        })
+        .collect()
+}
+
+fn integration_kind_for_agent(agent: &AgentKind) -> Option<IntegrationKind> {
+    match agent {
+        AgentKind::Codex => Some(IntegrationKind::Codex),
+        AgentKind::ClaudeCode => Some(IntegrationKind::Claude),
+        AgentKind::Gemini => Some(IntegrationKind::Gemini),
+        AgentKind::ChatGpt | AgentKind::Claude | AgentKind::Unknown => None,
+    }
 }
 
 fn is_provisional_process(session: &AgentSession) -> bool {
@@ -2461,6 +3118,147 @@ mod tests {
     }
 
     #[test]
+    fn codex_internal_memory_events_never_become_sessions() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:memory-maintenance", 4242);
+        event.agent = AgentKind::Codex;
+        event.project = Some("memories".into());
+        event.working_directory = Some("/home/user/.codex/memories".into());
+
+        state.ingest(event).expect("evento interno ignorado");
+
+        assert!(state.sessions().expect("sessões").is_empty());
+    }
+
+    #[test]
+    fn activity_limit_never_discards_conversation_messages() {
+        let mut session = session_from_event(&started_event("codex:long-chat", 4242), 1);
+        for (index, kind) in ["prompt", "message", "prompt", "message"]
+            .into_iter()
+            .enumerate()
+        {
+            remember_activity(
+                &mut session,
+                SessionActivity {
+                    id: format!("chat-{index}"),
+                    kind: kind.into(),
+                    title: kind.into(),
+                    detail: Some(format!("conversation-{index}")),
+                    status: "completed".into(),
+                    created_at: index as i64,
+                    files: Vec::new(),
+                    attachments: Vec::new(),
+                    append_detail: false,
+                },
+            );
+        }
+        for index in 0..220 {
+            remember_activity(
+                &mut session,
+                SessionActivity {
+                    id: format!("tool-{index}"),
+                    kind: "tool".into(),
+                    title: "Command".into(),
+                    detail: Some(format!("command-{index}")),
+                    status: "completed".into(),
+                    created_at: 10 + index,
+                    files: Vec::new(),
+                    attachments: Vec::new(),
+                    append_detail: false,
+                },
+            );
+        }
+
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .filter(|activity| matches!(activity.kind.as_str(), "prompt" | "message"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            session
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "tool")
+                .count(),
+            160
+        );
+        assert!(session
+            .activities
+            .iter()
+            .any(|activity| activity.id == "chat-0"));
+    }
+
+    #[test]
+    fn native_thread_restores_archived_conversation_without_restoring_closed_agent() {
+        let path = std::env::temp_dir().join(format!(
+            "lume-conversation-archive-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ));
+        {
+            let state = AppState::new(&path).expect("primeiro estado");
+            state
+                .ingest(started_event("codex:archive", 4242))
+                .expect("inicia sessão");
+            let mut response = started_event("codex:archive", 4242);
+            response.event = HookEventKind::Activity;
+            response.activity = Some(SessionActivity {
+                id: "archived-message".into(),
+                kind: "message".into(),
+                title: "Codex".into(),
+                detail: Some("mensagem histórica".into()),
+                status: "completed".into(),
+                created_at: now_millis(),
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            });
+            state.ingest(response).expect("arquiva resposta");
+        }
+        {
+            let state = AppState::new(&path).expect("segundo estado");
+            assert!(state
+                .sessions()
+                .expect("sem agentes restaurados")
+                .is_empty());
+            state
+                .ingest(started_event("codex:redetected", 5252))
+                .expect("redetecta thread");
+            let session = state.sessions().expect("sessão reaberta").remove(0);
+            assert!(session
+                .activities
+                .iter()
+                .any(|activity| activity.id == "archived-message"));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn codex_session_can_rebind_an_ephemeral_thread() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:ephemeral", 4242);
+        event.agent = AgentKind::Codex;
+        event.native_session_id = Some("old-thread".into());
+        state.ingest(event).expect("sessão");
+
+        state
+            .rebind_codex_thread("codex:ephemeral", "new-thread".into())
+            .expect("reatar thread");
+
+        assert_eq!(
+            state.sessions().expect("sessões")[0]
+                .native_session_id
+                .as_deref(),
+            Some("new-thread")
+        );
+    }
+
+    #[test]
     fn session_names_are_unique_per_native_thread() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let first = started_event("claude:first", 4101);
@@ -2595,6 +3393,185 @@ mod tests {
         let started = state.sessions().expect("sessões").remove(0);
         assert_eq!(started.activities[0].kind, "prompt");
         assert_eq!(started.activities[0].status, "completed");
+    }
+
+    #[test]
+    fn lume_attachment_transport_is_merged_with_the_local_prompt() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let directory = std::env::temp_dir().join(format!(
+            "lume-prompt-dedup-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&directory).expect("diretório");
+        let file = directory.join("presentation.pdf");
+        fs::write(&file, b"fake pdf").expect("arquivo");
+        let path = fs::canonicalize(&file)
+            .expect("caminho")
+            .to_string_lossy()
+            .to_string();
+        let mut started = started_event("claude:prompt-attachment", 4242);
+        started.working_directory = Some(directory.to_string_lossy().to_string());
+        state.ingest(started.clone()).expect("sessão");
+        state
+            .record_prompt_activity(
+                "claude:prompt-attachment",
+                "Create a presentation",
+                vec![PromptAttachment {
+                    id: "local-file".into(),
+                    name: "presentation.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    preview_data_url: String::new(),
+                    path: Some(path.clone()),
+                }],
+            )
+            .expect("prompt local");
+
+        let mut transcript = started;
+        transcript.event = HookEventKind::Activity;
+        transcript.activity = Some(SessionActivity {
+            id: "codex:prompt-attachment:user-message".into(),
+            kind: "prompt".into(),
+            title: "Prompt sent".into(),
+            detail: Some(format!(
+                "Create a presentation\n\n{LUME_ATTACHED_FILES_MARKER}\n- \"{path}\""
+            )),
+            status: "completed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+        state.ingest(transcript.clone()).expect("evento ao vivo");
+        transcript.activity.as_mut().expect("atividade").id =
+            "codex-rollout:prompt-attachment".into();
+        state.ingest(transcript).expect("evento do rollout");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        let prompts = session
+            .activities
+            .iter()
+            .filter(|activity| activity.kind == "prompt")
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].detail.as_deref(), Some("Create a presentation"));
+        assert_eq!(prompts[0].attachments.len(), 1);
+        assert_eq!(
+            prompts[0].attachments[0].path.as_deref(),
+            Some(path.as_str())
+        );
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn agent_message_exposes_existing_local_files_but_not_sensitive_files() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let directory = std::env::temp_dir().join(format!(
+            "lume-response-files-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&directory).expect("diretório");
+        let image = directory.join("preview.png");
+        let secret = directory.join(".env");
+        fs::write(&image, b"not decoded during discovery").expect("imagem");
+        fs::write(&secret, b"TOKEN=fake").expect("segredo");
+        let mut event = started_event("claude:response-file", 4242);
+        event.working_directory = Some(directory.to_string_lossy().to_string());
+        state.ingest(event.clone()).expect("sessão");
+        event.event = HookEventKind::Activity;
+        event.activity = Some(SessionActivity {
+            id: "response-with-file".into(),
+            kind: "message".into(),
+            title: "Agent response".into(),
+            detail: Some(format!(
+                "Final image: [preview](preview.png) and [secret]({})",
+                secret.to_string_lossy()
+            )),
+            status: "completed".into(),
+            created_at: now_millis(),
+            files: Vec::new(),
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+        state.ingest(event).expect("resposta");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        let message = session
+            .activities
+            .iter()
+            .find(|activity| activity.kind == "message")
+            .expect("mensagem");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].name, "preview.png");
+        assert_eq!(message.attachments[0].mime_type, "image/png");
+
+        let _ = fs::remove_file(image);
+        let _ = fs::remove_file(secret);
+        let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn agent_message_does_not_expose_code_spans_as_downloads() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let directory = std::env::temp_dir().join(format!(
+            "lume-response-code-span-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&directory).expect("diretório");
+        let generator = directory.join("generate.mjs");
+        fs::write(&generator, b"export default true;").expect("gerador");
+        let mut event = started_event("claude:response-code-span", 4242);
+        event.working_directory = Some(directory.to_string_lossy().to_string());
+        state.ingest(event.clone()).expect("sessão");
+        event.event = HookEventKind::Activity;
+        event.activity = Some(SessionActivity {
+            id: "response-with-code-span".into(),
+            kind: "message".into(),
+            title: "Agent response".into(),
+            detail: Some(format!(
+                "The editable generator is in `{}`.",
+                generator.to_string_lossy()
+            )),
+            status: "completed".into(),
+            created_at: now_millis(),
+            files: vec![generator.to_string_lossy().to_string()],
+            attachments: Vec::new(),
+            append_detail: false,
+        });
+        state.ingest(event).expect("resposta");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        let message = session
+            .activities
+            .iter()
+            .find(|activity| activity.kind == "message")
+            .expect("mensagem");
+        assert!(message.attachments.is_empty());
+
+        let _ = fs::remove_file(generator);
+        let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn response_downloads_require_an_explicit_delivery_cue() {
+        assert!(explicit_response_targets(
+            "Main files: [state.rs](/work/lume/src/state.rs) and [TerminalWindow.svelte](/work/lume/src/TerminalWindow.svelte)"
+        )
+        .is_empty());
+        assert_eq!(
+            explicit_response_targets(
+                "Final PDF: [presentation](/work/lume/output/presentation.pdf)"
+            ),
+            vec!["/work/lume/output/presentation.pdf"]
+        );
+        assert_eq!(
+            explicit_response_targets("Download: `/work/lume/output/package.zip`"),
+            vec!["/work/lume/output/package.zip"]
+        );
     }
 
     #[test]
@@ -2969,6 +3946,19 @@ mod tests {
     }
 
     #[test]
+    fn final_response_extracts_markdown_link_targets_without_markdown_fragments() {
+        let (files, _) = extract_result_artifacts(
+            "- [source.txt](/tmp/lume-phase5-test/source.txt): atualizado\n\
+             - [result.txt](/tmp/lume-phase5-test/result.txt): criado\n\
+             - [.env](/tmp/lume-phase5-test/.env): omitido\n\
+             - [test_phase5.py](/tmp/lume-phase5-test/test_phase5.py): criado",
+        );
+
+        assert_eq!(files, vec!["source.txt", "result.txt", "test_phase5.py"]);
+        assert!(files.iter().all(|file| !file.contains("](")));
+    }
+
+    #[test]
     fn completed_task_reports_files_changed_since_it_started() {
         let root = std::env::temp_dir().join(format!(
             "lume-workspace-test-{}-{}",
@@ -3335,6 +4325,41 @@ mod tests {
             sessions[0].permission_profile.approvals_reviewer.as_deref(),
             Some("auto_review")
         );
+    }
+
+    #[test]
+    fn generic_followup_keeps_the_explicit_thread_permission_scope() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut explicit = started_event("codex:chat-1", 4242);
+        explicit.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::WorkspaceWrite,
+            label: "Acesso ao projeto".into(),
+            approval_policy: "on-request".into(),
+            approvals_reviewer: Some("auto_review".into()),
+            can_respond_from_lume: false,
+            available_actions: vec![PermissionAction::OpenSource],
+        });
+        state.ingest(explicit).expect("perfil da thread");
+
+        let mut generic = started_event("codex:chat-1", 4242);
+        generic.event = HookEventKind::Running;
+        generic.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::Custom,
+            label: "Permissões desta sessão".into(),
+            approval_policy: "Decisões encaminhadas pelo Codex App Server".into(),
+            approvals_reviewer: None,
+            can_respond_from_lume: true,
+            available_actions: vec![PermissionAction::AllowOnce, PermissionAction::Deny],
+        });
+        state.ingest(generic).expect("evento genérico");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.permission_profile.mode, AccessMode::WorkspaceWrite);
+        assert_eq!(
+            session.permission_profile.approvals_reviewer.as_deref(),
+            Some("auto_review")
+        );
+        assert!(session.permission_profile.can_respond_from_lume);
     }
 
     #[test]

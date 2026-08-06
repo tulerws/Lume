@@ -1,7 +1,8 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
 };
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,14 @@ pub fn launch(
             return launch_vscode(&payload, &request.agent);
         }
         return Err("Conecte o Lume Companion ao VS Code nos Ajustes".into());
+    }
+    if request.agent == IntegrationKind::Claude
+        && request
+            .initial_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        return launch_background(payload);
     }
     launch_terminal(payload, executable, app_data_dir)
 }
@@ -95,6 +104,14 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         IntegrationKind::Claude => ("claude".to_string(), Vec::new()),
         IntegrationKind::Gemini => ("gemini".to_string(), Vec::new()),
     };
+    if request.agent == IntegrationKind::Claude
+        && request
+            .initial_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        arguments.push("--print".into());
+    }
     apply_permission_profile(request, &mut arguments);
     if request.resume {
         match request.agent {
@@ -125,6 +142,32 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         arguments,
         working_directory: request.working_directory.clone(),
     }
+}
+
+fn launch_background(payload: TerminalPayload) -> Result<(), String> {
+    let mut command = crate::executables::command(&payload.command)?;
+    command
+        .args(&payload.arguments)
+        .current_dir(&payload.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start {}: {error}", payload.command))?;
+    thread::Builder::new()
+        .name("lume-agent-prompt".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn apply_permission_profile(request: &LaunchRequest, arguments: &mut Vec<String>) {
@@ -346,7 +389,7 @@ mod tests {
         let payload = payload_for(&request, None);
         assert_eq!(
             payload.arguments,
-            vec!["--resume", "session-id", "Continue a tarefa"]
+            vec!["--print", "--resume", "session-id", "Continue a tarefa"]
         );
     }
 

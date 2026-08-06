@@ -509,7 +509,7 @@ fn tool_output_event(payload: &RecordPayload, file: &mut ObservedFile) -> Option
         id: tool.activity_id,
         kind: tool.kind,
         title: if is_goal_tool(&tool.name) {
-            format!("functions · {}", tool.name)
+            format!("functions · {}", normalized_tool_name(&tool.name))
         } else {
             tool.title
         },
@@ -590,21 +590,31 @@ fn patch_finished_event(payload: &RecordPayload, file: &mut ObservedFile) -> Opt
 }
 
 fn tool_kind(name: &str) -> &'static str {
-    if name == "exec_command" {
+    let name = normalized_tool_name(name);
+    if matches!(name, "exec" | "exec_command" | "shell" | "terminal") {
         "command"
     } else if name == "apply_patch" {
         "file"
+    } else if name == "update_plan" {
+        "plan"
     } else {
         "tool"
     }
 }
 
 fn tool_title(name: &str) -> String {
-    match name {
-        "exec_command" => "Comando".into(),
+    match normalized_tool_name(name) {
+        "exec" | "exec_command" | "shell" | "terminal" => "Comando".into(),
         "apply_patch" => "Alteração de arquivo".into(),
+        "update_plan" => "Plano atualizado".into(),
+        "view_image" => "Imagem inspecionada".into(),
+        "wait" => "Aguardando comando".into(),
         name => format!("functions · {name}"),
     }
+}
+
+fn normalized_tool_name(name: &str) -> &str {
+    name.rsplit(['.', ':', '/']).next().unwrap_or(name)
 }
 
 fn tool_input_text(payload: &RecordPayload) -> Option<String> {
@@ -706,7 +716,10 @@ fn files_from_patch_text(value: &str) -> Vec<String> {
 }
 
 fn is_goal_tool(name: &str) -> bool {
-    matches!(name, "create_goal" | "get_goal" | "update_goal")
+    matches!(
+        normalized_tool_name(name),
+        "create_goal" | "get_goal" | "update_goal"
+    )
 }
 
 fn record_value_text(value: &Value) -> Option<String> {
@@ -776,7 +789,7 @@ fn event_for(
         process_id: None,
         native_session_id: Some(session.id.clone()),
         working_directory: session.cwd.clone(),
-        permission_profile: Some(file.profile.clone().unwrap_or_else(default_profile)),
+        permission_profile: file.profile.clone(),
         permission: None,
         question: None,
         last_response: last_response.and_then(response_text),
@@ -881,17 +894,6 @@ fn profile_from_context(payload: &RecordPayload) -> PermissionProfile {
             .clone()
             .unwrap_or_else(|| "Gerenciada na origem".into()),
         approvals_reviewer: payload.approvals_reviewer.clone(),
-        can_respond_from_lume: false,
-        available_actions: vec![PermissionAction::OpenSource],
-    }
-}
-
-fn default_profile() -> PermissionProfile {
-    PermissionProfile {
-        mode: AccessMode::Custom,
-        label: "Permissões da sessão".into(),
-        approval_policy: "Gerenciada na origem".into(),
-        approvals_reviewer: None,
         can_respond_from_lume: false,
         available_actions: vec![PermissionAction::OpenSource],
     }
@@ -1149,6 +1151,15 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_exec_and_plan_tools_get_semantic_activity_kinds() {
+        assert_eq!(tool_kind("functions.exec"), "command");
+        assert_eq!(tool_title("functions.exec"), "Comando");
+        assert_eq!(tool_kind("functions.update_plan"), "plan");
+        assert_eq!(tool_title("functions.update_plan"), "Plano atualizado");
+        assert!(is_goal_tool("functions.get_goal"));
+    }
+
+    #[test]
     fn reasoning_summaries_are_visible_without_encrypted_reasoning() {
         let mut file = observed_file(SessionSource::Vscode);
         let events = events_from_records(
@@ -1232,5 +1243,14 @@ mod tests {
         assert_eq!(profile.approval_policy, "on-request");
         assert_eq!(profile.approvals_reviewer.as_deref(), Some("auto_review"));
         assert!(!profile.can_respond_from_lume);
+    }
+
+    #[test]
+    fn events_without_a_turn_context_do_not_publish_a_fallback_permission_profile() {
+        let file = observed_file(SessionSource::Cli);
+        let event =
+            event_for(&file, HookEventKind::Running, "Rodando", None).expect("session event");
+
+        assert!(event.permission_profile.is_none());
     }
 }

@@ -20,7 +20,9 @@
   import BrandIcon from "$lib/BrandIcon.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
+  import LumeSelect from "$lib/LumeSelect.svelte";
   import TerminalWindow from "$lib/TerminalWindow.svelte";
+  import WorkflowBridgeWindow from "$lib/WorkflowBridgeWindow.svelte";
   import { displayText, localize } from "$lib/i18n";
   import {
     clipboardHasImage,
@@ -31,6 +33,7 @@
   } from "$lib/imageAttachments";
   import { sessionCapabilities } from "$lib/sessionCapabilities";
   import { resolveTerminalSession } from "$lib/sessionIdentity";
+  import { stripInternalAgentMetadata } from "$lib/markdown.js";
   import type {
     AgentKind,
     AgentSession,
@@ -92,6 +95,7 @@
     savePreferences,
     saveResultNote,
     restoreTerminalLayout,
+    setTerminalWorkflowEnabled,
     setTerminalWindowsVisible,
     steerQueuedPrompt,
     submitPrompt,
@@ -129,6 +133,7 @@
   const isLinux = runtimePlatform.includes("linux") || runtimePlatform.includes("x11");
   const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
   const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
+  const isWorkflowBridgeWindow = currentWindowLabel.startsWith("workflow-bridge-");
   const compactSize = { width: 78, height: 44 };
   const expandedWidth = 392;
   const expandedMaxHeight = 560;
@@ -200,6 +205,7 @@
   let noteMessage = $state<string | null>(null);
   let selectedProfileKey = $state<string | null>(null);
   let terminalWindows = $state<TerminalWindowState[]>([]);
+  let workflowModeChanging = $state(false);
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
   let layoutName = $state("");
@@ -209,6 +215,9 @@
   let installingPlugin = $state(false);
   let pluginMessage = $state<string | null>(null);
   let paletteOpen = $state(false);
+  let shortcutEditorKey = $state<ShortcutPreferenceKey | null>(null);
+  let shortcutDraft = $state("");
+  let shortcutEditorError = $state<string | null>(null);
   let paletteQuery = $state("");
   let paletteIndex = $state(0);
   let overlayPosition = $state({ x: 0, y: 12 });
@@ -404,7 +413,7 @@
   });
 
   onMount(() => {
-    if (isTerminalWindow) return;
+    if (isTerminalWindow || isWorkflowBridgeWindow) return;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -416,6 +425,7 @@
     syncSystemTheme(colorScheme);
     colorScheme.addEventListener("change", syncSystemTheme);
     window.addEventListener("keydown", handleAppShortcut);
+    window.addEventListener("pointerdown", bringOverlayToFront, true);
     window.addEventListener("pointerup", finishOverlayDragFromWindow, true);
     window.addEventListener("pointercancel", finishOverlayDragFromWindow, true);
     let disposed = false;
@@ -532,6 +542,7 @@
       window.removeEventListener("pageshow", refreshAfterResume);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
       window.removeEventListener("keydown", handleAppShortcut);
+      window.removeEventListener("pointerdown", bringOverlayToFront, true);
       window.removeEventListener("pointerup", finishOverlayDragFromWindow, true);
       window.removeEventListener("pointercancel", finishOverlayDragFromWindow, true);
       if (pollTimer) clearInterval(pollTimer);
@@ -960,7 +971,13 @@
 
   function beginOverlayDrag(event: PointerEvent, compact = false) {
     if (!isTauri || !overlayReady || event.button !== 0 || morphing) return;
+    bringOverlayToFront();
     if (!compact && (event.target as HTMLElement).closest("button, input, select, textarea")) {
+      return;
+    }
+    if (!compact && event.detail === 2) {
+      event.preventDefault();
+      void toggleExpanded();
       return;
     }
     if (displayBackend === "native-gnome") {
@@ -990,6 +1007,10 @@
       compact,
     };
     dragging = false;
+  }
+
+  function bringOverlayToFront() {
+    if (isTauri) void getCurrentWindow().setFocus().catch(() => undefined);
   }
 
   function wakeMascot() {
@@ -1367,6 +1388,20 @@
 
   async function refreshTerminalWindows() {
     terminalWindows = await loadTerminalWindows();
+  }
+
+  async function togglePanelWorkflowMode(enabled: boolean) {
+    if (workflowModeChanging) return;
+    workflowModeChanging = true;
+    terminalMessage = null;
+    try {
+      await updatePreference("workflowEnabled", enabled);
+      if (isTauri) terminalWindows = await setTerminalWorkflowEnabled(enabled);
+    } catch (error) {
+      terminalMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      workflowModeChanging = false;
+    }
   }
 
   async function openTerminal(session: AgentSession) {
@@ -1859,17 +1894,32 @@
     void runShortcutAction(action);
   }
 
-  async function captureShortcut(event: KeyboardEvent, key: ShortcutPreferenceKey) {
+  function captureShortcut(event: KeyboardEvent) {
     event.preventDefault();
     event.stopPropagation();
     if (event.key === "Escape") {
-      (event.currentTarget as HTMLElement).blur();
+      shortcutEditorKey = null;
       return;
     }
     const shortcut = shortcutFromEvent(event);
     if (!shortcut) return;
-    await updatePreference(key, shortcut);
-    (event.currentTarget as HTMLElement).blur();
+    shortcutDraft = shortcut;
+    shortcutEditorError = null;
+  }
+
+  async function openShortcutEditor(key: ShortcutPreferenceKey) {
+    shortcutEditorKey = key;
+    shortcutDraft = preferences[key];
+    shortcutEditorError = null;
+    await tick();
+    document.querySelector<HTMLElement>("[data-shortcut-capture]")?.focus();
+  }
+
+  async function saveShortcut() {
+    if (!shortcutEditorKey || !shortcutDraft) return;
+    const saved = await updatePreference(shortcutEditorKey, shortcutDraft);
+    if (saved) shortcutEditorKey = null;
+    else shortcutEditorError = settingsMessage;
   }
 
   async function showCommandPalette() {
@@ -2023,6 +2073,10 @@
     diagnosingIntegration = integration.kind;
     settingsMessage = null;
     try {
+      if (integration.installed) {
+        await configureIntegration(integration.kind, true);
+        integrations = await loadIntegrationStatuses();
+      }
       integrationDiagnostics = {
         ...integrationDiagnostics,
         [integration.kind]: await diagnoseIntegration(integration.kind),
@@ -2109,7 +2163,7 @@
   async function updatePreference<K extends keyof Preferences>(
     key: K,
     value: Preferences[K],
-  ) {
+  ): Promise<boolean> {
     const previous = preferences;
     preferences = { ...preferences, [key]: value };
     if (key === "language") {
@@ -2124,10 +2178,12 @@
       await savePreferences(preferences);
       if (isTauri) void emit("lume://preferences-changed", preferences);
       if (key === "monitorId") await positionWindow();
+      return true;
     } catch (error) {
       preferences = previous;
       settingsMessageIsError = true;
       settingsMessage = String(error).replace(/^Error:\s*/, "");
+      return false;
     } finally {
       savingSettings = false;
     }
@@ -2344,6 +2400,8 @@
 
 {#if isTerminalWindow}
   <TerminalWindow />
+{:else if isWorkflowBridgeWindow}
+  <WorkflowBridgeWindow />
 {:else}
 <main
   class:expanded
@@ -2495,10 +2553,29 @@
         </div>
       {/if}
 
+      {#if shortcutEditorKey}
+        <div class="shortcut-editor-layer" transition:fade={{ duration: 120 }}>
+          <button class="shortcut-editor-backdrop" type="button" aria-label={tr("Close shortcut editor", "Fechar editor de atalho")} onclick={() => (shortcutEditorKey = null)}></button>
+          <div class="shortcut-editor" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title">
+            <strong id="shortcut-editor-title">{tr("Press a new shortcut", "Pressione um novo atalho")}</strong>
+            <small>{tr("Use one or more modifier keys with another key.", "Use uma ou mais teclas modificadoras com outra tecla.")}</small>
+            <button data-shortcut-capture class="shortcut-capture" type="button" onkeydown={captureShortcut}>
+              <kbd>{shortcutDraft || tr("Press keys…", "Pressione as teclas…")}</kbd>
+            </button>
+            {#if shortcutEditorError}<p>{shortcutEditorError}</p>{/if}
+            <div class="shortcut-editor-actions">
+              <button type="button" onclick={() => (shortcutEditorKey = null)}>{tr("Cancel", "Cancelar")}</button>
+              <button class="primary" disabled={!shortcutDraft || savingSettings} type="button" onclick={() => void saveShortcut()}>{tr("Save", "Salvar")}</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+
       <div class="panel-content">
         {#if view === "sessions"}
           <div class="session-list">
             {#each sessions as session (session.id)}
+              {@const visibleLastResponse = stripInternalAgentMetadata(session.lastResponse)}
               <article
                 animate:flip={{ duration: 220 }}
                 class:attention={session.status === "permission_required"}
@@ -2532,10 +2609,10 @@
                       {/if}
                       {shown(session.statusLabel)}
                     </span>
-                    {#if session.lastResponse && selectedId !== session.id}
+                    {#if visibleLastResponse && selectedId !== session.id}
                       <span class="response-preview">
                         <b>{tr("Final response", "Resposta final")}</b>
-                        <span>{session.lastResponse}</span>
+                        <span>{visibleLastResponse}</span>
                       </span>
                     {/if}
                   </span>
@@ -2548,13 +2625,13 @@
                   {@const capabilities = sessionCapabilities(session)}
                   {@const queuedPrompts = pendingQueuedPrompts(session)}
                   <div class="session-details" transition:slide={{ duration: 190, easing: cubicOut }}>
-                    {#if session.lastResponse}
+                    {#if visibleLastResponse}
                       <div class="final-response">
                         <span class="eyebrow">{tr("Final response", "Resposta final")}</span>
                         <button
                           class="final-response-copy"
                           type="button"
-                          onclick={() => copyResult(`${session.id}-latest`, session.lastResponse ?? "")}
+                          onclick={() => copyResult(`${session.id}-latest`, visibleLastResponse)}
                           aria-label={copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy final response", "Copiar resposta final")}
                           title={copiedResultId === `${session.id}-latest` ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
                         >
@@ -2564,7 +2641,7 @@
                             <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="7" y="6" width="8" height="9" rx="1.5" /><path d="M12 6V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13H7" /></svg>
                           {/if}
                         </button>
-                        <p>{session.lastResponse}</p>
+                        <p>{visibleLastResponse}</p>
                       </div>
                     {/if}
 
@@ -2785,19 +2862,19 @@
         {:else if view === "board"}
           <div class="whiteboard" in:fade={{ duration: 150 }}>
             <div class="layout-toolbar">
-              <select
-                aria-label={tr("Saved whiteboard layout", "Layout salvo do whiteboard")}
+              <LumeSelect
+                ariaLabel={tr("Saved whiteboard layout", "Layout salvo do whiteboard")}
                 value={selectedLayoutId ?? ""}
-                onchange={(event) => {
-                  selectedLayoutId = event.currentTarget.value || null;
+                minWidth={142}
+                options={[
+                  { value: "", label: tr("New layout", "Novo layout") },
+                  ...preferences.whiteboardLayouts.map((layout) => ({ value: layout.id, label: layout.name })),
+                ]}
+                onValueChange={(value) => {
+                  selectedLayoutId = value || null;
                   layoutName = preferences.whiteboardLayouts.find((layout) => layout.id === selectedLayoutId)?.name ?? "";
                 }}
-              >
-                <option value="">{tr("New layout", "Novo layout")}</option>
-                {#each preferences.whiteboardLayouts as layout (layout.id)}
-                  <option value={layout.id}>{layout.name}</option>
-                {/each}
-              </select>
+              />
               {#if !selectedLayoutId}
                 <input bind:value={layoutName} maxlength="48" placeholder={tr("Layout name", "Nome do layout")} />
               {/if}
@@ -2839,6 +2916,38 @@
               {/if}
             </div>
 
+            <div class:enabled={preferences.workflowEnabled} class="workflow-group-row workflow-global-mode">
+              <span class="workflow-group-symbol" aria-hidden="true">
+                <svg viewBox="0 0 24 20">
+                  <path class="normal-link" d="M3 10h18" />
+                  <path class="workflow-link" d="M12 2.5 3 17h18L12 2.5Z" />
+                  <circle class="node-start" cx="3" cy="17" r="2.25" />
+                  <circle class="node-center" cx="12" cy="2.5" r="2.25" />
+                  <circle class="node-end" cx="21" cy="17" r="2.25" />
+                </svg>
+              </span>
+              <span class="workflow-group-copy">
+                <strong>{tr("Terminal mode", "Modo dos terminais")}</strong>
+                <small>{preferences.workflowEnabled
+                  ? tr("New connections become active workflows", "Novas conexões se tornam workflows ativos")
+                  : tr("Docking only, without agent connections", "Somente acoplamento, sem conexão entre agentes")}</small>
+              </span>
+              <span class:workflow-active={preferences.workflowEnabled} class="workflow-mode-switch" role="group" aria-label={tr("Terminal mode", "Modo dos terminais")}>
+                <button
+                  class:active={!preferences.workflowEnabled}
+                  disabled={workflowModeChanging}
+                  type="button"
+                  onclick={() => void togglePanelWorkflowMode(false)}
+                >{tr("Normal", "Normal")}</button>
+                <button
+                  class:active={preferences.workflowEnabled}
+                  disabled={workflowModeChanging}
+                  type="button"
+                  onclick={() => void togglePanelWorkflowMode(true)}
+                >Workflow</button>
+              </span>
+            </div>
+
             <div class="terminal-picker">
               {#each sessions as session (session.id)}
                 <div class="terminal-picker-row">
@@ -2869,6 +2978,7 @@
               <svg viewBox="0 0 32 20" aria-hidden="true"><rect x="2" y="3" width="12" height="14" rx="3" /><rect x="18" y="3" width="12" height="14" rx="3" /><path d="M14 10h4" /></svg>
               <span>{tr("Each window has its own prompt. Dock them side by side or above and below.", "Cada janela tem seu próprio prompt. Acople pelas laterais ou por cima e por baixo.")}</span>
             </div>
+
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
@@ -2882,7 +2992,7 @@
                 {#each resultNotes as note (note.id)}
                   <article class="saved-note">
                     <span><strong>{note.title}</strong><small>{note.project} · {relativeTime(note.createdAt)}</small></span>
-                    <p>{note.body}</p>
+                    <p>{stripInternalAgentMetadata(note.body)}</p>
                     {#if note.files.length || note.tests.length}
                       <div class="artifact-summary">
                         {#if note.files.length}<span>{note.files.length} {tr("files", "arquivos")}</span>{/if}
@@ -2897,6 +3007,7 @@
             <div class="results-list">
               {#each recentResults as item (item.result.id)}
                 {@const capabilities = sessionCapabilities(item.session)}
+                {@const visibleResultResponse = stripInternalAgentMetadata(item.result.response)}
                 <article class="result-card">
                   <div class="result-card-top">
                     <div class="result-heading">
@@ -2909,7 +3020,7 @@
                         type="button"
                         data-label={copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
                         aria-label={copiedResultId === item.result.id ? tr("Copied", "Copiado") : tr("Copy", "Copiar")}
-                        onclick={() => copyResult(item.result.id, item.result.response)}
+                        onclick={() => copyResult(item.result.id, visibleResultResponse)}
                       >
                         {#if copiedResultId === item.result.id}
                           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7" /></svg>
@@ -2951,7 +3062,7 @@
                       {/if}
                     </div>
                   </div>
-                  <p>{item.result.response}</p>
+                  <p>{visibleResultResponse}</p>
                   {#if item.result.files?.length || item.result.tests?.length}
                     <div class="result-artifacts">
                       {#if item.result.files?.length}
@@ -3088,14 +3199,12 @@
               <div class="settings-section-content">
             <label class="field-row">
               <span><strong>{tr("Language", "Idioma")}</strong><small>{tr("Lume interface language.", "Idioma da interface do Lume.")}</small></span>
-              <select
+              <LumeSelect
+                ariaLabel={tr("Language", "Idioma")}
                 value={preferences.language}
-                onchange={(event) =>
-                  updatePreference("language", event.currentTarget.value as Preferences["language"])}
-              >
-                <option value="en">English</option>
-                <option value="pt-BR">Português</option>
-              </select>
+                options={[{ value: "en", label: "English" }, { value: "pt-BR", label: "Português" }]}
+                onValueChange={(value) => updatePreference("language", value as Preferences["language"])}
+              />
             </label>
             <div class="setting-row">
               <div><strong>{tr("Dark mode", "Modo escuro")}</strong><span>{tr("Switch between the light and dark appearance.", "Alterne entre a aparência clara e escura.")}</span></div>
@@ -3117,6 +3226,18 @@
                   checked={preferences.autostart}
                   onchange={(event) =>
                     updatePreference("autostart", event.currentTarget.checked)}
+                />
+                <span></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <div><strong>{tr("Desktop pop-up notifications", "Notificações pop-up no desktop")}</strong><span>{tr("Show task and permission alerts outside Lume.", "Mostre alertas de tarefas e permissões fora do Lume.")}</span></div>
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  checked={preferences.popupNotificationsEnabled}
+                  onchange={(event) =>
+                    updatePreference("popupNotificationsEnabled", event.currentTarget.checked)}
                 />
                 <span></span>
               </label>
@@ -3164,31 +3285,28 @@
             </div>
             <label class="field-row">
               <span><strong>{tr("Monitor", "Monitor")}</strong><small>{tr("The primary display is used by default.", "O principal é usado por padrão.")}</small></span>
-              <select
+              <LumeSelect
+                ariaLabel={tr("Monitor", "Monitor")}
                 value={preferences.monitorId ?? ""}
-                onchange={(event) =>
-                  updatePreference("monitorId", event.currentTarget.value || undefined)}
-              >
-                <option value="">{tr("Primary", "Principal")}</option>
-                {#each monitors as monitor}
-                  <option value={monitor.id}>{monitor.label}</option>
-                {/each}
-              </select>
+                options={[
+                  { value: "", label: tr("Primary", "Principal") },
+                  ...monitors.map((monitor) => ({ value: monitor.id, label: monitor.label })),
+                ]}
+                onValueChange={(value) => updatePreference("monitorId", value || undefined)}
+              />
             </label>
             <label class="field-row">
               <span><strong>{tr("History", "Histórico")}</strong><small>{tr("Local, sanitized summaries.", "Resumos locais e sanitizados.")}</small></span>
-              <select
-                value={preferences.historyRetentionDays}
-                onchange={(event) =>
-                  updatePreference(
-                    "historyRetentionDays",
-                    Number(event.currentTarget.value),
-                  )}
-              >
-                <option value={7}>{tr("7 days", "7 dias")}</option>
-                <option value={30}>{tr("30 days", "30 dias")}</option>
-                <option value={90}>{tr("90 days", "90 dias")}</option>
-              </select>
+              <LumeSelect
+                ariaLabel={tr("History retention", "Retenção do histórico")}
+                value={String(preferences.historyRetentionDays)}
+                options={[
+                  { value: "7", label: tr("7 days", "7 dias") },
+                  { value: "30", label: tr("30 days", "30 dias") },
+                  { value: "90", label: tr("90 days", "90 dias") },
+                ]}
+                onValueChange={(value) => updatePreference("historyRetentionDays", Number(value))}
+              />
             </label>
             <div class="launch-setting">
               <span><strong>{tr("Open sessions in", "Abrir sessões em")}</strong><small>{tr("Use your usual tool.", "Use sua ferramenta habitual.")}</small></span>
@@ -3214,17 +3332,15 @@
                   ["newSessionShortcut", tr("New session", "Nova sessão"), tr("Opens the agent launcher.", "Abre o iniciador de agentes.")],
                   ["whiteboardShortcut", "Whiteboard", tr("Opens the floating terminal hub.", "Abre o hub de terminais flutuantes.")],
                 ] as shortcut}
-                  <label class="field-row shortcut-row">
+                  <div class="field-row shortcut-row">
                     <span><strong>{shortcut[1]}</strong><small>{shortcut[2]}</small></span>
-                    <input
+                    <button
                       class="shortcut-input"
-                      readonly
+                      type="button"
                       aria-label={shortcut[1]}
-                      value={preferences[shortcut[0] as ShortcutPreferenceKey]}
-                      onfocus={(event) => event.currentTarget.select()}
-                      onkeydown={(event) => captureShortcut(event, shortcut[0] as ShortcutPreferenceKey)}
-                    />
-                  </label>
+                      onclick={() => void openShortcutEditor(shortcut[0] as ShortcutPreferenceKey)}
+                    >{preferences[shortcut[0] as ShortcutPreferenceKey]}</button>
+                  </div>
                 {/each}
               </div>
             </details>
@@ -3234,14 +3350,13 @@
             {#if detectedProjects.length > 0}
               <label class="field-row">
                 <span><strong>{tr("Project", "Projeto")}</strong><small>{tr("Overrides only for this project.", "Ajustes somente para este projeto.")}</small></span>
-                <select
+                <LumeSelect
+                  ariaLabel={tr("Project", "Projeto")}
                   value={selectedProfileKey ?? ""}
-                  onchange={(event) => (selectedProfileKey = event.currentTarget.value)}
-                >
-                  {#each detectedProjects as project (project.key)}
-                    <option value={project.key}>{project.label}</option>
-                  {/each}
-                </select>
+                  minWidth={145}
+                  options={detectedProjects.map((project) => ({ value: project.key, label: project.label }))}
+                  onValueChange={(value) => (selectedProfileKey = value)}
+                />
               </label>
               <div class="setting-row">
                 <div><strong>{tr("Project sounds", "Sons do projeto")}</strong><span>{tr("Allow completion, error, and permission sounds.", "Permite sons de conclusão, erro e permissão.")}</span></div>
@@ -3270,12 +3385,15 @@
               </div>
               <label class="field-row">
                 <span><strong>{tr("Profile monitor", "Monitor do perfil")}</strong><small>{tr("Where this project should appear.", "Onde este projeto deve aparecer.")}</small></span>
-                <select value={selectedProjectProfile?.monitorId ?? ""} onchange={(event) => updateSelectedProjectProfile({ monitorId: event.currentTarget.value || undefined })}>
-                  <option value="">{tr("Global", "Global")}</option>
-                  {#each monitors as monitor}
-                    <option value={monitor.id}>{monitor.label}</option>
-                  {/each}
-                </select>
+                <LumeSelect
+                  ariaLabel={tr("Profile monitor", "Monitor do perfil")}
+                  value={selectedProjectProfile?.monitorId ?? ""}
+                  options={[
+                    { value: "", label: tr("Global", "Global") },
+                    ...monitors.map((monitor) => ({ value: monitor.id, label: monitor.label })),
+                  ]}
+                  onValueChange={(value) => updateSelectedProjectProfile({ monitorId: value || undefined })}
+                />
               </label>
               <div class="setting-row">
                 <div><strong>{tr("Capsule position", "Posição da cápsula")}</strong><span>{selectedProjectProfile?.overlayX !== undefined ? `${selectedProjectProfile.overlayX}, ${selectedProjectProfile.overlayY}` : tr("Use the global position", "Usar a posição global")}</span></div>
@@ -3283,31 +3401,45 @@
               </div>
               <label class="field-row">
                 <span><strong>{tr("Permission preset", "Preset de permissão")}</strong><small>{tr("Applied only when Lume starts a new session.", "Aplicado apenas ao iniciar uma nova sessão pelo Lume.")}</small></span>
-                <select value={selectedProjectProfile?.permissionMode ?? ""} onchange={(event) => updateSelectedProjectProfile({ permissionMode: (event.currentTarget.value || undefined) as Preferences["projectProfiles"][string]["permissionMode"] })}>
-                  <option value="">{tr("Agent default", "Padrão do agente")}</option>
-                  <option value="plan">Plan</option>
-                  <option value="read_only">{tr("Read only", "Somente leitura")}</option>
-                  <option value="workspace_write">Workspace write</option>
-                  <option value="full_access">{tr("Full access — no sandbox", "Acesso total — sem sandbox")}</option>
-                </select>
+                <LumeSelect
+                  ariaLabel={tr("Permission preset", "Preset de permissão")}
+                  value={selectedProjectProfile?.permissionMode ?? ""}
+                  minWidth={145}
+                  options={[
+                    { value: "", label: tr("Agent default", "Padrão do agente") },
+                    { value: "plan", label: "Plan" },
+                    { value: "read_only", label: tr("Read only", "Somente leitura") },
+                    { value: "workspace_write", label: "Workspace write" },
+                    { value: "full_access", label: tr("Full access", "Acesso total"), description: tr("No sandbox", "Sem sandbox") },
+                  ]}
+                  onValueChange={(value) => updateSelectedProjectProfile({ permissionMode: (value || undefined) as Preferences["projectProfiles"][string]["permissionMode"] })}
+                />
               </label>
               <label class="field-row">
                 <span><strong>{tr("Approval policy", "Política de aprovação")}</strong><small>{tr("Supported by Codex launch profiles.", "Suportada nos perfis de abertura do Codex.")}</small></span>
-                <select value={selectedProjectProfile?.approvalPolicy ?? ""} onchange={(event) => updateSelectedProjectProfile({ approvalPolicy: (event.currentTarget.value || undefined) as Preferences["projectProfiles"][string]["approvalPolicy"] })}>
-                  <option value="">{tr("Agent default", "Padrão do agente")}</option>
-                  <option value="untrusted">Untrusted</option>
-                  <option value="on-request">On request</option>
-                  <option value="never">Never</option>
-                </select>
+                <LumeSelect
+                  ariaLabel={tr("Approval policy", "Política de aprovação")}
+                  value={selectedProjectProfile?.approvalPolicy ?? ""}
+                  options={[
+                    { value: "", label: tr("Agent default", "Padrão do agente") },
+                    { value: "untrusted", label: "Untrusted" },
+                    { value: "on-request", label: "On request" },
+                    { value: "never", label: "Never" },
+                  ]}
+                  onValueChange={(value) => updateSelectedProjectProfile({ approvalPolicy: (value || undefined) as Preferences["projectProfiles"][string]["approvalPolicy"] })}
+                />
               </label>
               <label class="field-row">
                 <span><strong>Whiteboard</strong><small>{tr("Default saved layout for this project.", "Layout salvo padrão deste projeto.")}</small></span>
-                <select value={selectedProjectProfile?.whiteboardLayoutId ?? ""} onchange={(event) => updateSelectedProjectProfile({ whiteboardLayoutId: event.currentTarget.value || undefined })}>
-                  <option value="">{tr("No layout", "Sem layout")}</option>
-                  {#each preferences.whiteboardLayouts as layout (layout.id)}
-                    <option value={layout.id}>{layout.name}</option>
-                  {/each}
-                </select>
+                <LumeSelect
+                  ariaLabel="Whiteboard"
+                  value={selectedProjectProfile?.whiteboardLayoutId ?? ""}
+                  options={[
+                    { value: "", label: tr("No layout", "Sem layout") },
+                    ...preferences.whiteboardLayouts.map((layout) => ({ value: layout.id, label: layout.name })),
+                  ]}
+                  onValueChange={(value) => updateSelectedProjectProfile({ whiteboardLayoutId: value || undefined })}
+                />
               </label>
               <div class="launch-setting preferred-agents-setting">
                 <span><strong>{tr("Preferred agents", "Agentes preferidos")}</strong><small>{tr("Shown first in the launcher.", "Aparecem primeiro no iniciador.")}</small></span>
@@ -3592,7 +3724,6 @@
 
   button,
   input,
-  select,
   textarea {
     -webkit-tap-highlight-color: transparent;
   }
@@ -3821,6 +3952,19 @@
   .command-results > button span { min-width: 0; flex: 1; display: grid; gap: 2px; }
   .command-results strong { overflow: hidden; color: #34443d; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .command-results small, .command-results > p { margin: 0; color: #89958f; font-size: 8px; }
+  .shortcut-editor-layer { position: absolute; z-index: 18; inset: 0; display: grid; place-items: center; padding: 18px; }
+  .shortcut-editor-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(21, 31, 27, 0.24); backdrop-filter: blur(3px); cursor: default; }
+  .shortcut-editor { position: relative; width: min(270px, 100%); padding: 16px; display: grid; gap: 8px; border: 1px solid rgba(89, 111, 101, 0.18); border-radius: 14px; background: rgba(250, 252, 251, 0.99); box-shadow: 0 18px 45px rgba(24, 38, 32, 0.26); }
+  .shortcut-editor > strong { color: #34443d; font-size: 11px; }
+  .shortcut-editor > small { color: #829089; font-size: 8px; line-height: 1.45; }
+  .shortcut-editor > p { margin: 0; color: #a34d4d; font-size: 8px; line-height: 1.4; }
+  .shortcut-capture { height: 44px; margin-top: 3px; border: 1px solid rgba(70, 113, 95, 0.28); border-radius: 10px; outline: 0; color: #3e6153; background: rgba(74, 122, 102, 0.07); cursor: text; }
+  .shortcut-capture:focus { border-color: rgba(69, 130, 103, 0.58); box-shadow: 0 0 0 3px rgba(74, 122, 102, 0.1); }
+  .shortcut-capture kbd { font: 750 10px Inter, sans-serif; }
+  .shortcut-editor-actions { margin-top: 4px; display: flex; justify-content: flex-end; gap: 6px; }
+  .shortcut-editor-actions button { min-width: 60px; height: 28px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.15); border-radius: 8px; color: #66776e; background: transparent; font-size: 8px; font-weight: 750; cursor: pointer; }
+  .shortcut-editor-actions button.primary { color: #fff; border-color: #317e59; background: #317e59; }
+  .shortcut-editor-actions button:disabled { opacity: 0.45; cursor: default; }
   .session-list,
   .history-list,
   .settings { max-height: 431px; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
@@ -3904,6 +4048,7 @@
   .status-line.status-running { color: #4e7faf; }
   .running-dots { height: 8px; display: inline-flex; align-items: center; gap: 2px; }
   .running-dots i { width: 3px; height: 3px; border-radius: 50%; background: #5388bd; animation: status-dot-bounce 900ms ease-in-out infinite; }
+  .running-dots i { will-change: transform, opacity; }
   .running-dots i:nth-child(2) { animation-delay: 120ms; }
   .running-dots i:nth-child(3) { animation-delay: 240ms; }
   .status-line.status-permission_required { color: #a46522; }
@@ -4021,16 +4166,41 @@
   .reset-settings-control.confirming button.danger:hover:not(:disabled) { background: rgba(165, 76, 76, 0.12); }
   .reset-settings-control button:disabled { opacity: 0.45; cursor: default; }
 
-  .whiteboard { max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
+  .whiteboard { position: relative; max-height: 431px; min-height: 0; padding: 7px 16px 15px; display: flex; flex-direction: column; overflow: hidden; }
   .layout-toolbar { padding: 8px 0 4px; display: flex; align-items: center; gap: 4px; }
-  .layout-toolbar select, .layout-toolbar input { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; outline: 0; color: #52625b; background: rgba(255, 255, 255, 0.42); font: inherit; font-size: 8px; }
-  .layout-toolbar select, .layout-toolbar input { flex: 1 1 auto; }
+  .layout-toolbar input { min-width: 0; height: 27px; padding: 0 6px; flex: 1 1 auto; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; outline: 0; color: #52625b; background: rgba(255, 255, 255, 0.42); font: inherit; font-size: 8px; }
+  .layout-toolbar :global(.lume-select) { flex: 1 1 auto; }
   .layout-toolbar button { width: 27px; height: 27px; padding: 5px; flex: 0 0 27px; display: grid; place-items: center; border: 1px solid rgba(87, 109, 99, 0.13); border-radius: 7px; color: #567165; background: rgba(255, 255, 255, 0.4); font-size: 8px; cursor: pointer; }
   .layout-toolbar button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
   .layout-toolbar button:disabled { opacity: 0.48; cursor: default; }
   .layout-spinner { width: 12px; height: 12px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: layout-spin 650ms linear infinite; }
   @keyframes layout-spin { to { transform: rotate(360deg); } }
   .layout-toolbar .layout-delete { color: #a45a58; }
+  .workflow-group-row { min-width: 0; padding: 7px 8px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(82, 105, 95, 0.11); border-radius: 10px; background: rgba(255, 255, 255, 0.25); transition: border-color 160ms ease, background 160ms ease; }
+  .workflow-global-mode { margin: 5px 0 1px; }
+  .workflow-group-row.enabled { border-color: rgba(55, 151, 103, 0.22); background: rgba(62, 153, 106, 0.055); }
+  .workflow-group-symbol { width: 27px; height: 22px; flex: 0 0 27px; display: grid; place-items: center; overflow: visible; }
+  .workflow-group-symbol svg { width: 24px; height: 20px; overflow: visible; }
+  .workflow-group-symbol path { fill: none; stroke-linejoin: round; }
+  .workflow-group-symbol .normal-link { stroke: #8b9d94; opacity: 1; transition: opacity 150ms ease; }
+  .workflow-group-symbol .workflow-link { stroke: #4aaa79; stroke-dasharray: 48; stroke-dashoffset: 48; opacity: 0; transition: opacity 130ms ease, stroke-dashoffset 420ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-group-symbol circle { fill: #edf2ef; stroke: #7e968a; transform-box: fill-box; transform-origin: center; transition: transform 380ms cubic-bezier(.2,.85,.2,1), fill 180ms ease, stroke 180ms ease, filter 180ms ease; }
+  .workflow-group-symbol .node-start,
+  .workflow-group-symbol .node-end { transform: translateY(-7px); }
+  .workflow-group-symbol .node-center { transform: translateY(7.5px); }
+  .workflow-group-row.enabled .workflow-group-symbol .normal-link { opacity: 0; }
+  .workflow-group-row.enabled .workflow-group-symbol .workflow-link { stroke-dashoffset: 0; opacity: 1; }
+  .workflow-group-row.enabled .workflow-group-symbol circle { fill: #dff4e9; stroke: #43a572; filter: drop-shadow(0 0 3px rgba(64, 167, 111, 0.42)); transform: translateY(0); }
+  .workflow-group-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
+  .workflow-group-copy strong { color: #43574d; font-size: 8px; }
+  .workflow-group-copy small { overflow: hidden; color: #8a9891; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+  .workflow-mode-switch { position: relative; width: 87px; height: 26px; padding: 2px; flex: 0 0 87px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 7px; background: rgba(83, 108, 96, 0.09); isolation: isolate; }
+  .workflow-mode-switch::before { position: absolute; z-index: 0; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / 2); border-radius: 5px; content: ""; background: rgba(255, 255, 255, 0.82); box-shadow: 0 1px 4px rgba(44, 72, 58, 0.13); transform: translateX(0); transition: transform 240ms cubic-bezier(.2,.85,.2,1), background 180ms ease, box-shadow 180ms ease; }
+  .workflow-mode-switch.workflow-active::before { transform: translateX(100%); }
+  .workflow-mode-switch button { position: relative; z-index: 1; min-width: 0; height: 22px; padding: 0 3px; border: 0; border-radius: 5px; color: #87948e; background: transparent; font: 700 7px Inter, sans-serif; cursor: pointer; transition: color 160ms ease, transform 160ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-mode-switch button:active:not(:disabled) { transform: scale(.94); }
+  .workflow-mode-switch button.active { color: #397258; }
+  .workflow-mode-switch button:disabled { opacity: 0.5; cursor: default; }
   .terminal-picker { min-height: 0; padding: 9px 0 6px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
   .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
   .terminal-picker-row:last-child { border-bottom: 0; }
@@ -4184,7 +4354,7 @@
   .volume-control input:disabled { cursor: default; }
   .volume-control output { width: 27px; color: #718078; font-size: 8px; font-variant-numeric: tabular-nums; text-align: right; }
 
-  .field-row select { max-width: 120px; padding: 6px 23px 6px 8px; border: 1px solid rgba(92, 111, 103, 0.16); border-radius: 8px; color: #4b5a54; background: rgba(255, 255, 255, 0.52); font-size: 10px; }
+  .field-row :global(.lume-select) { max-width: 145px; }
   .launch-setting { padding: 14px 0 10px; display: grid; gap: 11px; }
   .segmented { padding: 2px; display: grid; grid-template-columns: repeat(3, 1fr); border-radius: 9px; background: rgba(83, 104, 95, 0.07); }
   .segmented button { height: 29px; border: 0; border-radius: 7px; color: #74817b; background: transparent; font-size: 9px; font-weight: 680; cursor: pointer; transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease; }
@@ -4301,6 +4471,68 @@
   footer button.has-update::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #5f8ac7; }
   footer button.has-mobile-device::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #58a97d; }
 
+  .overlay-shell:not(.dark) .lume-orb {
+    border-color: rgba(73, 101, 88, 0.32);
+    background: #f4f8f6;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72), 0 5px 16px rgba(35, 62, 49, 0.1);
+  }
+  .overlay-shell:not(.dark) .panel {
+    border-color: rgba(65, 91, 79, 0.3);
+    background: #edf3f0;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.62), 0 10px 28px rgba(35, 58, 48, 0.12);
+  }
+  .overlay-shell:not(.dark) .panel-header,
+  .overlay-shell:not(.dark) footer {
+    border-color: rgba(73, 99, 87, 0.18);
+    background: #f7faf8;
+  }
+  .overlay-shell:not(.dark) .panel-content,
+  .overlay-shell:not(.dark) .session-list,
+  .overlay-shell:not(.dark) .history-list,
+  .overlay-shell:not(.dark) .settings,
+  .overlay-shell:not(.dark) .whiteboard { background: #edf3f0; }
+  .overlay-shell:not(.dark) .session-row,
+  .overlay-shell:not(.dark) .history-row,
+  .overlay-shell:not(.dark) .setting-row,
+  .overlay-shell:not(.dark) .field-row,
+  .overlay-shell:not(.dark) .terminal-picker-row,
+  .overlay-shell:not(.dark) .settings-section,
+  .overlay-shell:not(.dark) .dock-guide { border-color: rgba(73, 99, 87, 0.16); }
+  .overlay-shell:not(.dark) .session-row:hover,
+  .overlay-shell:not(.dark) .session-row.selected { background: #e1ebe6; }
+  .overlay-shell:not(.dark) .result-card,
+  .overlay-shell:not(.dark) .diagnostic-card,
+  .overlay-shell:not(.dark) .update-card,
+  .overlay-shell:not(.dark) .mobile-access-card,
+  .overlay-shell:not(.dark) .paired-device-card,
+  .overlay-shell:not(.dark) .saved-note {
+    border-color: rgba(70, 98, 85, 0.2);
+    background: #f7faf8;
+    box-shadow: 0 1px 3px rgba(42, 67, 55, 0.045);
+  }
+  .overlay-shell:not(.dark) .workflow-group-row {
+    border-color: rgba(65, 94, 80, 0.2);
+    background: #f7faf8;
+  }
+  .overlay-shell:not(.dark) .workflow-group-row.enabled {
+    border-color: rgba(45, 139, 92, 0.34);
+    background: #e7f3ed;
+  }
+  .overlay-shell:not(.dark) .layout-toolbar input,
+  .overlay-shell:not(.dark) .layout-toolbar button,
+  .overlay-shell:not(.dark) .terminal-picker-row > button,
+  .overlay-shell:not(.dark) .shortcut-input,
+  .overlay-shell:not(.dark) .inline-composer textarea,
+  .overlay-shell:not(.dark) .permission-actions button {
+    border-color: rgba(68, 94, 82, 0.22);
+    background: #f8fbf9;
+  }
+  .overlay-shell:not(.dark) .final-response,
+  .overlay-shell:not(.dark) .response-preview {
+    border-color: rgba(66, 96, 82, 0.18);
+    background: #f5f9f7;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   }
@@ -4397,7 +4629,6 @@
   .overlay-shell.dark .question-block section > small { color: #8fa59b; }
   .overlay-shell.dark .question-actions button { color: #c5d7cf; border-color: rgba(178, 210, 224, 0.12); background: rgba(219, 235, 228, 0.045); }
   .overlay-shell.dark .permission-actions button,
-  .overlay-shell.dark .field-row select,
   .overlay-shell.dark .shortcut-input,
   .overlay-shell.dark .inline-composer textarea { color: #c5d0cb; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .inline-queue-tray { color: #a7bdcd; border-color: rgba(125, 166, 199, 0.13); background: rgba(91, 143, 184, 0.065); }
@@ -4423,14 +4654,25 @@
   .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
+  .overlay-shell.dark .workflow-group-row { border-color: rgba(207, 223, 215, 0.09); background: rgba(222, 233, 228, 0.025); }
+  .overlay-shell.dark .workflow-group-row.enabled { border-color: rgba(87, 186, 137, 0.2); background: rgba(74, 164, 116, 0.055); }
+  .overlay-shell.dark .workflow-group-copy strong { color: #c0d0c8; }
+  .overlay-shell.dark .workflow-group-copy small { color: #81938a; }
+  .overlay-shell.dark .workflow-mode-switch { background: rgba(220, 235, 227, 0.055); }
+  .overlay-shell.dark .workflow-mode-switch::before { background: rgba(103, 183, 143, 0.12); box-shadow: none; }
+  .overlay-shell.dark .workflow-mode-switch button.active { color: #91d2b1; }
   .overlay-shell.dark .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
   .overlay-shell.dark .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
   .overlay-shell.dark .command-palette { border-color: rgba(207, 223, 215, 0.13); background: rgba(27, 34, 31, 0.985); }
+  .overlay-shell.dark .shortcut-editor { border-color: rgba(207, 223, 215, 0.13); background: rgba(27, 34, 31, 0.99); }
+  .overlay-shell.dark .shortcut-editor > strong { color: #dce7e1; }
+  .overlay-shell.dark .shortcut-editor > small { color: #91a198; }
+  .overlay-shell.dark .shortcut-capture { color: #a9d5be; border-color: rgba(139, 195, 166, 0.22); background: rgba(116, 181, 147, 0.07); }
+  .overlay-shell.dark .shortcut-editor-actions button { color: #bdcbc4; border-color: rgba(207, 223, 215, 0.12); }
   .overlay-shell.dark .command-search { border-color: rgba(207, 223, 215, 0.09); }
   .overlay-shell.dark .command-search input,
   .overlay-shell.dark .command-results strong { color: #dce7e1; }
   .overlay-shell.dark .command-results > button.active { background: rgba(213, 229, 221, 0.07); }
-  .overlay-shell.dark .layout-toolbar select,
   .overlay-shell.dark .layout-toolbar input,
   .overlay-shell.dark .layout-toolbar button,
   .overlay-shell.dark .plugin-actions button,

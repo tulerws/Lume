@@ -18,6 +18,12 @@ export interface WorkItem {
 }
 
 export interface AgentWorkSummary {
+  plan?: {
+    items: WorkItem[];
+    explanation?: string;
+    content?: string;
+    updatedAt: number;
+  };
   todo?: {
     items: WorkItem[];
     updatedAt: number;
@@ -33,6 +39,7 @@ export interface AgentWorkSummary {
 export type HubSession = AgentSession & {
   capabilities: SessionCapabilities;
   workSummary: AgentWorkSummary;
+  activityTotal: number;
 };
 
 export interface HubSnapshot {
@@ -72,6 +79,11 @@ export type HubCommand =
       sessionId: string;
     }
   | {
+      type: "download_response_file";
+      sessionId: string;
+      attachmentId: string;
+    }
+  | {
       type: "open_session_source";
       sessionId: string;
     }
@@ -98,6 +110,7 @@ export interface HubCommandResponse {
   requestId: string;
   ok: boolean;
   error?: ProtocolError;
+  data?: unknown;
 }
 
 export interface HubEventEnvelope {

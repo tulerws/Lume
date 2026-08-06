@@ -35,6 +35,7 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "work_status",
     "prompt_interruption",
     "prompt_delivery",
+    "response_files",
 ];
 pub const STREAM_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 
@@ -151,6 +152,15 @@ pub struct TodoSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSummary {
+    pub items: Vec<WorkItem>,
+    pub explanation: Option<String>,
+    pub content: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
     Active,
@@ -170,6 +180,7 @@ pub struct GoalSummary {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentWorkSummary {
+    pub plan: Option<PlanSummary>,
     pub todo: Option<TodoSummary>,
     pub goal: Option<GoalSummary>,
 }
@@ -181,29 +192,70 @@ pub struct HubSession {
     pub session: AgentSession,
     pub capabilities: SessionCapabilities,
     pub work_summary: AgentWorkSummary,
+    pub activity_total: usize,
 }
 
 impl From<AgentSession> for HubSession {
     fn from(session: AgentSession) -> Self {
         let capabilities = SessionCapabilities::for_session(&session);
         let work_summary = work_summary(&session.activities);
+        let activity_total = session.activities.len();
         Self {
             session,
             capabilities,
             work_summary,
+            activity_total,
         }
     }
 }
 
 fn work_summary(activities: &[SessionActivity]) -> AgentWorkSummary {
     AgentWorkSummary {
+        plan: plan_summary(activities),
         todo: todo_summary(activities),
         goal: goal_summary(activities),
     }
 }
 
+fn plan_summary(activities: &[SessionActivity]) -> Option<PlanSummary> {
+    activities.iter().rev().find_map(|activity| {
+        let content = activity.detail.as_deref()?;
+        (activity.kind == "plan_document").then(|| PlanSummary {
+            items: Vec::new(),
+            explanation: None,
+            content: Some(content.to_string()),
+            updated_at: activity.created_at,
+        })
+    })
+}
+
+pub(crate) fn looks_like_full_plan_document(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    let has_plan_title = normalized.lines().any(|line| {
+        let line = line.trim().trim_start_matches('#').trim();
+        line.starts_with("planejamento")
+            || line.starts_with("plano ")
+            || line == "plano"
+            || line.starts_with("implementation plan")
+            || line.starts_with("workflow plan")
+    });
+    let section_count = content
+        .lines()
+        .filter(|line| line.trim_start().starts_with("## "))
+        .count();
+    let phase_count = normalized
+        .lines()
+        .filter(|line| {
+            let line = line.trim().trim_start_matches('#').trim();
+            line.starts_with("fase ") || line.starts_with("phase ")
+        })
+        .count();
+
+    has_plan_title && (section_count >= 2 || phase_count >= 2)
+}
+
 fn todo_summary(activities: &[SessionActivity]) -> Option<TodoSummary> {
-    let plan = activities
+    let structured_plan = activities
         .iter()
         .rev()
         .filter(|activity| activity.kind == "plan")
@@ -214,7 +266,7 @@ fn todo_summary(activities: &[SessionActivity]) -> Option<TodoSummary> {
                 updated_at: activity.created_at,
             })
         });
-    let tool = activities
+    let tool_todo = activities
         .iter()
         .rev()
         .filter(|activity| activity.kind == "tool")
@@ -230,13 +282,13 @@ fn todo_summary(activities: &[SessionActivity]) -> Option<TodoSummary> {
             })
         });
 
-    match (plan, tool) {
-        (Some(plan), Some(tool)) => Some(if plan.updated_at >= tool.updated_at {
+    match (structured_plan, tool_todo) {
+        (Some(plan), Some(todo)) => Some(if plan.updated_at >= todo.updated_at {
             plan
         } else {
-            tool
+            todo
         }),
-        (plan, tool) => plan.or(tool),
+        (plan, todo) => plan.or(todo),
     }
 }
 
@@ -538,6 +590,22 @@ impl HubSnapshot {
             sessions: sessions.into_iter().map(HubSession::from).collect(),
         }
     }
+
+    pub fn with_activity_limit(sessions: Vec<AgentSession>, activity_limit: usize) -> Self {
+        let mut snapshot = Self::new(sessions);
+        let limit = activity_limit.max(1);
+        for session in &mut snapshot.sessions {
+            let activity_start = session.session.activities.len().saturating_sub(limit);
+            if activity_start > 0 {
+                session.session.activities.drain(..activity_start);
+            }
+            let result_start = session.session.results.len().saturating_sub(limit);
+            if result_start > 0 {
+                session.session.results.drain(..result_start);
+            }
+        }
+        snapshot
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -570,6 +638,10 @@ pub enum HubCommand {
     },
     InterruptPrompt {
         session_id: String,
+    },
+    DownloadResponseFile {
+        session_id: String,
+        attachment_id: String,
     },
     OpenSessionSource {
         session_id: String,
@@ -672,6 +744,13 @@ impl HubCommandRequest {
             | HubCommand::OpenSessionSource { session_id } => {
                 validate_identifier("session_id", session_id, 512)?;
             }
+            HubCommand::DownloadResponseFile {
+                session_id,
+                attachment_id,
+            } => {
+                validate_identifier("session_id", session_id, 512)?;
+                validate_identifier("attachment_id", attachment_id, 512)?;
+            }
             HubCommand::RefreshRateLimits { .. } => {}
             HubCommand::ReportMobileVersion { version } => {
                 validate_identifier("version", version, 32)?;
@@ -763,6 +842,8 @@ pub struct HubCommandResponse {
     pub request_id: String,
     pub ok: bool,
     pub error: Option<ProtocolError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl HubCommandResponse {
@@ -772,6 +853,17 @@ impl HubCommandResponse {
             request_id,
             ok: true,
             error: None,
+            data: None,
+        }
+    }
+
+    pub fn success_with_data(request_id: String, data: Value) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            ok: true,
+            error: None,
+            data: Some(data),
         }
     }
 
@@ -781,6 +873,7 @@ impl HubCommandResponse {
             request_id,
             ok: false,
             error: Some(error),
+            data: None,
         }
     }
 }
@@ -946,6 +1039,30 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_limits_old_activities_but_preserves_total() {
+        let mut session = session();
+        for index in 0..5 {
+            session.activities.push(SessionActivity {
+                id: format!("message-{index}"),
+                kind: "message".into(),
+                title: "Codex".into(),
+                detail: Some(format!("Message {index}")),
+                status: "completed".into(),
+                created_at: index,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            });
+        }
+
+        let snapshot = HubSnapshot::with_activity_limit(vec![session], 2);
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.activity_total, 5);
+        assert_eq!(session.session.activities.len(), 2);
+        assert_eq!(session.session.activities[0].id, "message-3");
+    }
+
+    #[test]
     fn web_chatgpt_does_not_inherit_codex_runtime_capabilities() {
         let mut web = session();
         web.id = "web:chatgpt:tab-1".into();
@@ -1031,6 +1148,51 @@ mod tests {
         assert_eq!(todo.items[0].status, WorkItemStatus::Completed);
         assert_eq!(todo.items[1].status, WorkItemStatus::InProgress);
         assert_eq!(todo.updated_at, 12);
+        assert!(snapshot.sessions[0].work_summary.plan.is_none());
+    }
+
+    #[test]
+    fn snapshot_uses_a_complete_planning_document_instead_of_the_todo() {
+        let mut session = session();
+        session.activities.extend([
+            SessionActivity {
+                id: "plan-1".into(),
+                kind: "plan".into(),
+                title: "Plan updated".into(),
+                detail: Some("○ Implement handoff\n○ Test handoff".into()),
+                status: "completed".into(),
+                created_at: 10,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+            SessionActivity {
+                id: "message-1".into(),
+                kind: "plan_document".into(),
+                title: "Codex".into(),
+                detail: Some(
+                    "# Planejamento — Workflow\n\n## Fase 1\nHandoff manual\n\n## Fase 2\nModo Workflow"
+                        .into(),
+                ),
+                status: "completed".into(),
+                created_at: 20,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            },
+        ]);
+        let snapshot = HubSnapshot::new(vec![session]);
+        let plan = snapshot.sessions[0]
+            .work_summary
+            .plan
+            .as_ref()
+            .expect("plan");
+        assert!(plan.items.is_empty());
+        assert!(plan
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("Modo Workflow")));
+        assert_eq!(plan.updated_at, 20);
     }
 
     #[test]

@@ -1,14 +1,17 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
+        cell::RefCell,
         collections::HashMap,
         ffi::CString,
         sync::{Mutex, OnceLock},
+        time::{Duration, Instant},
     };
 
     use gtk::{
         gdk::prelude::MonitorExt,
         glib::translate::ToGlibPtr,
+        glib::ObjectExt,
         prelude::{GtkWindowExt, WidgetExt},
     };
     use libloading::Library;
@@ -16,6 +19,10 @@ mod linux {
     use x11_dl::xlib;
 
     type GtkWindow = *mut gtk::ffi::GtkWindow;
+
+    thread_local! {
+        static WORKFLOW_CONNECTORS: RefCell<HashMap<String, Vec<gtk::Window>>> = RefCell::new(HashMap::new());
+    }
 
     struct LayerApi {
         _library: Library,
@@ -301,7 +308,265 @@ mod linux {
         gtk_window.input_shape_combine_region(None);
     }
 
+    fn destroy_workflow_connectors(label: &str) {
+        WORKFLOW_CONNECTORS.with(|registry| {
+            if let Some(windows) = registry.borrow_mut().remove(label) {
+                for window in windows {
+                    window.close();
+                }
+            }
+        });
+    }
+
+    fn draw_energy_connector(vertical: bool, direction: f64) -> gtk::Window {
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_app_paintable(true);
+        window.set_accept_focus(false);
+        window.set_focus_on_map(false);
+        window.set_decorated(false);
+        window.set_resizable(false);
+        window.set_keep_above(true);
+        window.set_skip_pager_hint(true);
+        window.set_skip_taskbar_hint(true);
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Dock);
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            if let Some(visual) = screen.rgba_visual() {
+                window.set_visual(Some(&visual));
+            }
+        }
+        window.connect_realize(|window| {
+            let empty = gtk::cairo::Region::create();
+            window.input_shape_combine_region(Some(&empty));
+        });
+        let started = Instant::now();
+        window.connect_draw(move |widget, context| {
+            let allocation = widget.allocation();
+            let width = f64::from(allocation.width().max(1));
+            let height = f64::from(allocation.height().max(1));
+            context.set_operator(gtk::cairo::Operator::Source);
+            context.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+            let _ = context.paint();
+            context.set_operator(gtk::cairo::Operator::Over);
+            let elapsed = started.elapsed().as_secs_f64();
+            let phase = elapsed * 4.2 * direction;
+            let trace = |context: &gtk::cairo::Context| {
+                context.new_path();
+                let length = if vertical { height } else { width };
+                let mut position = 0.0;
+                while position <= length {
+                    let progress = position / length;
+                    let taper = (std::f64::consts::PI * progress).sin();
+                    let offset =
+                        (progress * std::f64::consts::PI * 3.0 + phase).sin() * 3.2 * taper;
+                    let (x, y) = if vertical {
+                        (width / 2.0 + offset, position)
+                    } else {
+                        (position, height / 2.0 + offset)
+                    };
+                    if position == 0.0 {
+                        context.move_to(x, y);
+                    } else {
+                        context.line_to(x, y);
+                    }
+                    position += 0.75;
+                }
+            };
+            trace(context);
+            context.set_source_rgba(0.26, 0.67, 0.45, 0.54);
+            context.set_line_width(2.7);
+            context.set_line_cap(gtk::cairo::LineCap::Round);
+            let _ = context.stroke();
+            trace(context);
+            context.set_source_rgba(0.40, 0.81, 0.60, 1.0);
+            context.set_line_width(3.0);
+            context.set_dash(&[5.0, 8.0], -elapsed * 22.0 * direction);
+            let _ = context.stroke();
+            context.set_dash(&[], 0.0);
+            gtk::glib::Propagation::Stop
+        });
+        let weak = window.downgrade();
+        gtk::glib::timeout_add_local(Duration::from_millis(24), move || {
+            let Some(window) = weak.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            window.queue_draw();
+            gtk::glib::ControlFlow::Continue
+        });
+        window
+    }
+
+    fn configure_native_connector(
+        reference: &WebviewWindow,
+        window: &gtk::Window,
+        monitor_id: Option<&str>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        namespace: &str,
+    ) -> bool {
+        window.set_size_request(width.max(1), height.max(1));
+        window.resize(width.max(1), height.max(1));
+        let backend = std::env::var("LUME_LINUX_BACKEND").ok();
+        if backend.as_deref() == Some("xwayland-fallback") {
+            let monitors = reference.available_monitors().unwrap_or_default();
+            let primary = reference.primary_monitor().ok().flatten();
+            let Some(monitor) = super::select_monitor(&monitors, primary, monitor_id) else {
+                return false;
+            };
+            window.move_(monitor.position().x + x, monitor.position().y + y);
+            window.show_all();
+            return true;
+        }
+        if std::env::var("XDG_SESSION_TYPE").ok().as_deref() != Some("wayland") {
+            return false;
+        }
+        let Some(api) = api() else {
+            return false;
+        };
+        unsafe {
+            if (api.is_supported)() == 0 {
+                return false;
+            }
+            let pointer: *mut gtk::ffi::GtkWindow = window.to_glib_none().0;
+            if (api.is_layer_window)(pointer) == 0 {
+                (api.init)(pointer);
+            }
+            let mut scale = 1.0;
+            if let Some(display) = gtk::gdk::Display::default() {
+                let selected_index = monitor_index(reference, monitor_id);
+                let monitor = selected_index
+                    .and_then(|index| display.monitor(index as i32))
+                    .or_else(|| display.primary_monitor())
+                    .or_else(|| display.monitor(0));
+                if let Some(monitor) = monitor {
+                    scale = f64::from(monitor.scale_factor()).max(1.0);
+                    (api.set_monitor)(pointer, monitor.to_glib_none().0);
+                }
+            }
+            (api.set_layer)(pointer, 3);
+            (api.set_anchor)(pointer, 0, 1);
+            (api.set_anchor)(pointer, 1, 0);
+            (api.set_anchor)(pointer, 2, 1);
+            (api.set_anchor)(pointer, 3, 0);
+            (api.set_margin)(pointer, 0, (f64::from(x) / scale).round() as i32);
+            (api.set_margin)(pointer, 2, (f64::from(y) / scale).round() as i32);
+            (api.set_exclusive_zone)(pointer, -1);
+            (api.set_keyboard_mode)(pointer, 0);
+            if let Ok(namespace) = CString::new(namespace) {
+                (api.set_namespace)(pointer, namespace.as_ptr());
+            }
+        }
+        window.show_all();
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_workflow_connectors(
+        reference: &WebviewWindow,
+        label: &str,
+        monitor_id: Option<&str>,
+        bridge_x: i32,
+        bridge_y: i32,
+        bridge_width: i32,
+        bridge_height: i32,
+        vertical: bool,
+        margin: i32,
+    ) -> bool {
+        destroy_workflow_connectors(label);
+        if margin <= 0 {
+            return false;
+        }
+        let scale = reference.scale_factor().unwrap_or(1.0).max(1.0);
+        let physical = |value: i32| (f64::from(value) * scale).round() as i32;
+        let thickness = 18;
+        let physical_thickness = physical(thickness);
+        let physical_margin = physical(margin);
+        let physical_width = physical(bridge_width);
+        let physical_height = physical(bridge_height);
+        let geometry = if vertical {
+            [
+                (
+                    bridge_x + (physical_width - physical_thickness) / 2,
+                    bridge_y - physical_margin,
+                    thickness,
+                    margin,
+                ),
+                (
+                    bridge_x + (physical_width - physical_thickness) / 2,
+                    bridge_y + physical_height,
+                    thickness,
+                    margin,
+                ),
+            ]
+        } else {
+            [
+                (
+                    bridge_x - physical_margin,
+                    bridge_y + (physical_height - physical_thickness) / 2,
+                    margin,
+                    thickness,
+                ),
+                (
+                    bridge_x + physical_width,
+                    bridge_y + (physical_height - physical_thickness) / 2,
+                    margin,
+                    thickness,
+                ),
+            ]
+        };
+        let mut windows: Vec<gtk::Window> = Vec::with_capacity(2);
+        for (index, (x, y, width, height)) in geometry.into_iter().enumerate() {
+            let connector = draw_energy_connector(vertical, if index == 0 { 1.0 } else { -1.0 });
+            if !configure_native_connector(
+                reference,
+                &connector,
+                monitor_id,
+                x,
+                y,
+                width,
+                height,
+                &format!("lume-{label}-connector-{index}"),
+            ) {
+                connector.close();
+                for window in windows {
+                    window.close();
+                }
+                return false;
+            }
+            windows.push(connector);
+        }
+        WORKFLOW_CONNECTORS.with(|registry| {
+            for window in &windows {
+                window.hide();
+            }
+            registry.borrow_mut().insert(label.to_string(), windows);
+        });
+        true
+    }
+
+    pub fn reveal_workflow_connectors(label: &str) {
+        WORKFLOW_CONNECTORS.with(|registry| {
+            if let Some(windows) = registry.borrow().get(label) {
+                for window in windows {
+                    window.show_all();
+                }
+            }
+        });
+    }
+
+    pub fn hide_workflow_connectors(label: &str) {
+        WORKFLOW_CONNECTORS.with(|registry| {
+            if let Some(windows) = registry.borrow().get(label) {
+                for window in windows {
+                    window.hide();
+                }
+            }
+        });
+    }
+
     pub fn forget_window(label: &str) {
+        destroy_workflow_connectors(label);
         if let Ok(mut monitors) = layer_monitors().lock() {
             monitors.remove(label);
         }
@@ -340,6 +605,8 @@ mod linux {
         gtk_window.resize(width, height);
         let radius = if window.label().starts_with("terminal-") {
             17
+        } else if window.label().starts_with("workflow-bridge-") {
+            15
         } else {
             let expansion = (f64::from(width - 78) / f64::from(392 - 78)).clamp(0.0, 1.0);
             (22.0 - expansion).round() as i32
@@ -539,6 +806,22 @@ mod linux {
             Some(position_x),
             Some(position_y),
             &format!("lume-{}", window.label()),
+        )
+    }
+
+    pub fn configure_workflow_editor(
+        window: &WebviewWindow,
+        monitor_id: Option<&str>,
+        position_x: i32,
+        position_y: i32,
+    ) -> bool {
+        configure_layer(
+            window,
+            true,
+            monitor_id,
+            Some(position_x),
+            Some(position_y),
+            &format!("lume-workflow-editor-{}", window.label()),
         )
     }
 
@@ -855,6 +1138,91 @@ pub fn configure_terminal(
     }
 }
 
+pub fn configure_workflow_editor(
+    window: &tauri::WebviewWindow,
+    monitor_id: Option<&str>,
+    position_x: i32,
+    position_y: i32,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::configure_workflow_editor(window, monitor_id, position_x, position_y)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (window, monitor_id, position_x, position_y);
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn show_workflow_connectors(
+    reference: &tauri::WebviewWindow,
+    label: &str,
+    monitor_id: Option<&str>,
+    bridge_x: i32,
+    bridge_y: i32,
+    bridge_width: i32,
+    bridge_height: i32,
+    vertical: bool,
+    margin: i32,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::show_workflow_connectors(
+            reference,
+            label,
+            monitor_id,
+            bridge_x,
+            bridge_y,
+            bridge_width,
+            bridge_height,
+            vertical,
+            margin,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            reference,
+            label,
+            monitor_id,
+            bridge_x,
+            bridge_y,
+            bridge_width,
+            bridge_height,
+            vertical,
+            margin,
+        );
+        false
+    }
+}
+
+pub fn reveal_workflow_connectors(label: &str) {
+    #[cfg(target_os = "linux")]
+    linux::reveal_workflow_connectors(label);
+    #[cfg(not(target_os = "linux"))]
+    let _ = label;
+}
+
+pub fn hide_workflow_connectors(label: &str) {
+    #[cfg(target_os = "linux")]
+    linux::hide_workflow_connectors(label);
+    #[cfg(not(target_os = "linux"))]
+    let _ = label;
+}
+
+static NATIVE_DIALOG_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_native_dialog_active(active: bool) {
+    NATIVE_DIALOG_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+}
+
+fn native_dialog_active() -> bool {
+    NATIVE_DIALOG_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn set_file_dialog_active(
     window: &tauri::WebviewWindow,
     active: bool,
@@ -932,7 +1300,7 @@ pub fn start_fullscreen_guard(
                 .map(|preferences| preferences.show_over_fullscreen)
                 .unwrap_or(false);
             if let Some(fullscreen) = foreground_is_fullscreen() {
-                let topmost = show_over_fullscreen || !fullscreen;
+                let topmost = !native_dialog_active() && (show_over_fullscreen || !fullscreen);
                 for (label, window) in tauri::Manager::webview_windows(&app) {
                     if label == "main" || label.starts_with("terminal-") {
                         let _ = window.set_always_on_top(topmost);

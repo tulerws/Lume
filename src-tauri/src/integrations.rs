@@ -13,7 +13,9 @@ use std::os::windows::process::CommandExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+use crate::domain::SessionActivity;
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationKind {
     Codex,
@@ -142,6 +144,34 @@ pub fn resumable_sessions(kind: &IntegrationKind) -> Result<Vec<ResumableSession
 }
 
 pub fn resume_preview(kind: &IntegrationKind, session_id: &str) -> Option<ResumePreview> {
+    let path = resume_path(kind, session_id)?;
+    let file = fs::File::open(&path).ok()?;
+    let response = match kind {
+        IntegrationKind::Codex => codex_last_response(BufReader::new(file)),
+        IntegrationKind::Claude => claude_last_response(BufReader::new(file)),
+        IntegrationKind::Gemini => None,
+    }?;
+    Some(ResumePreview {
+        response,
+        updated_at: file_updated_at(&path),
+    })
+}
+
+pub fn resume_work_activities(kind: &IntegrationKind, session_id: &str) -> Vec<SessionActivity> {
+    let Some(path) = resume_path(kind, session_id) else {
+        return Vec::new();
+    };
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    match kind {
+        IntegrationKind::Codex => codex_work_activities(BufReader::new(file), session_id),
+        IntegrationKind::Claude => claude_work_activities(BufReader::new(file), session_id),
+        IntegrationKind::Gemini => Vec::new(),
+    }
+}
+
+fn resume_path(kind: &IntegrationKind, session_id: &str) -> Option<PathBuf> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
@@ -158,20 +188,10 @@ pub fn resume_preview(kind: &IntegrationKind, session_id: &str) -> Option<Resume
         IntegrationKind::Claude => home.join(".claude/projects"),
         IntegrationKind::Gemini => return None,
     };
-    let path = resume_files(&root).into_iter().find(|path| {
+    resume_files(&root).into_iter().find(|path| {
         path.file_stem()
             .and_then(|value| value.to_str())
             .is_some_and(|stem| stem == session_id || stem.ends_with(&filename_suffix))
-    })?;
-    let file = fs::File::open(&path).ok()?;
-    let response = match kind {
-        IntegrationKind::Codex => codex_last_response(BufReader::new(file)),
-        IntegrationKind::Claude => claude_last_response(BufReader::new(file)),
-        IntegrationKind::Gemini => None,
-    }?;
-    Some(ResumePreview {
-        response,
-        updated_at: file_updated_at(&path),
     })
 }
 
@@ -314,6 +334,148 @@ fn claude_session_name(value: &Value) -> Option<String> {
     } else {
         name
     })
+}
+
+fn codex_work_activities(reader: impl BufRead, session_id: &str) -> Vec<SessionActivity> {
+    let mut activities = Vec::new();
+    let mut pending_goals = HashMap::<String, (String, Option<String>, i64)>::new();
+    for (index, line) in reader.lines().map_while(Result::ok).enumerate() {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        let created_at = record_timestamp(&record).unwrap_or(index as i64);
+        match payload.get("type").and_then(Value::as_str) {
+            Some("function_call" | "custom_tool_call") => {
+                let Some(name) = payload.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(name);
+                let input = payload
+                    .get("arguments")
+                    .and_then(json_text)
+                    .or_else(|| payload.get("input").and_then(json_text));
+                if name == "update_plan" {
+                    activities.push(work_activity(
+                        format!("codex:{session_id}:plan:{call_id}"),
+                        "plan",
+                        "Plan updated",
+                        input,
+                        created_at,
+                    ));
+                } else if matches!(name, "create_goal" | "get_goal" | "update_goal") {
+                    pending_goals
+                        .insert(call_id.to_string(), (name.to_string(), input, created_at));
+                }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some((name, input, started_at)) = pending_goals.remove(call_id) else {
+                    continue;
+                };
+                let output = payload.get("output").and_then(json_text);
+                let detail = if name == "get_goal" {
+                    output.or(input)
+                } else {
+                    input.or(output)
+                };
+                activities.push(work_activity(
+                    format!("codex:{session_id}:goal:{call_id}"),
+                    "tool",
+                    format!("functions · {name}"),
+                    detail,
+                    created_at.max(started_at),
+                ));
+            }
+            _ => {}
+        }
+    }
+    activities
+}
+
+fn claude_work_activities(reader: impl BufRead, session_id: &str) -> Vec<SessionActivity> {
+    let mut activities = Vec::new();
+    for (line_index, line) in reader.lines().map_while(Result::ok).enumerate() {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let created_at = record_timestamp(&entry).unwrap_or(line_index as i64);
+        let Some(blocks) = entry.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(name) = block.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().contains("todo") {
+                continue;
+            }
+            let detail = block.get("input").and_then(json_text);
+            let id = block
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{line_index}:{block_index}"));
+            activities.push(work_activity(
+                format!("claude:{session_id}:todo:{id}"),
+                "tool",
+                name,
+                detail,
+                created_at,
+            ));
+        }
+    }
+    activities
+}
+
+fn work_activity(
+    id: String,
+    kind: &str,
+    title: impl Into<String>,
+    detail: Option<String>,
+    created_at: i64,
+) -> SessionActivity {
+    SessionActivity {
+        id,
+        kind: kind.into(),
+        title: title.into(),
+        detail,
+        status: "completed".into(),
+        created_at,
+        files: Vec::new(),
+        attachments: Vec::new(),
+        append_detail: false,
+    }
+}
+
+fn json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Null => None,
+        value => Some(value.to_string()),
+    }
+}
+
+fn record_timestamp(value: &Value) -> Option<i64> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.timestamp_millis())
 }
 
 fn codex_last_response(reader: impl BufRead) -> Option<String> {
@@ -1054,6 +1216,39 @@ mod tests {
             claude_last_response(std::io::Cursor::new(transcript)).as_deref(),
             Some("Resposta anterior do Claude.")
         );
+    }
+
+    #[test]
+    fn codex_work_state_is_rebuilt_from_plan_and_goal_records() {
+        let transcript = concat!(
+            "{\"timestamp\":\"2026-07-30T12:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"update_plan\",\"call_id\":\"plan-1\",\"arguments\":\"{\\\"explanation\\\":\\\"Phase 1\\\",\\\"plan\\\":[{\\\"step\\\":\\\"Test handoff\\\",\\\"status\\\":\\\"completed\\\"}]}\"}}\n",
+            "{\"timestamp\":\"2026-07-30T12:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"get_goal\",\"call_id\":\"goal-1\",\"arguments\":\"{}\"}}\n",
+            "{\"timestamp\":\"2026-07-30T12:01:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"goal-1\",\"output\":\"{\\\"goal\\\":{\\\"objective\\\":\\\"Workflow\\\",\\\"status\\\":\\\"active\\\",\\\"createdAt\\\":1785400000}}\"}}\n",
+        );
+        let activities = codex_work_activities(std::io::Cursor::new(transcript), "thread-1");
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].kind, "plan");
+        assert!(activities[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Test handoff")));
+        assert_eq!(activities[1].title, "functions · get_goal");
+        assert!(activities[1]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Workflow")));
+    }
+
+    #[test]
+    fn claude_work_state_is_rebuilt_from_todo_write() {
+        let transcript = "{\"timestamp\":\"2026-07-30T12:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"todo-1\",\"name\":\"TodoWrite\",\"input\":{\"todos\":[{\"content\":\"Inspect workflow\",\"status\":\"in_progress\"}]}}]}}\n";
+        let activities = claude_work_activities(std::io::Cursor::new(transcript), "session-1");
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].title, "TodoWrite");
+        assert!(activities[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Inspect workflow")));
     }
 
     #[test]

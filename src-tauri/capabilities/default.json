@@ -2,10 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "terminal-*"],
+  "windows": ["main", "terminal-*", "workflow-bridge-*"],
   "permissions": [
     "core:default",
     "core:window:allow-outer-size",
+    "core:window:allow-close",
     "core:window:allow-primary-monitor",
     "core:window:allow-set-fullscreen",
     "core:window:allow-set-position",
@@ -15,8 +16,10 @@
     "core:window:allow-available-monitors",
     "core:webview:allow-set-webview-size",
     "dialog:allow-open",
+    "dialog:allow-save",
     "clipboard-manager:allow-read-image",
     "opener:default",
+    "opener:allow-open-path",
     "process:allow-restart",
     "updater:default"
   ]
