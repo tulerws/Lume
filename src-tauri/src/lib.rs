@@ -138,14 +138,14 @@ fn register_global_shortcuts(app: &AppHandle, preferences: &Preferences) -> Resu
 }
 
 fn apply_global_shortcuts(app: &AppHandle, preferences: &Preferences) -> Result<(), String> {
-    let native = register_global_shortcuts(app, preferences);
     match desktop_shortcuts::configure(preferences) {
-        Ok(true) => Ok(()),
-        Ok(false) => native,
-        Err(desktop_error) => match native {
-            Ok(()) => Err(desktop_error),
-            Err(native_error) => Err(format!("{native_error}. {desktop_error}")),
-        },
+        Ok(true) => app
+            .global_shortcut()
+            .unregister_all()
+            .map_err(|error| error.to_string()),
+        Ok(false) => register_global_shortcuts(app, preferences),
+        Err(desktop_error) => register_global_shortcuts(app, preferences)
+            .map_err(|native_error| format!("{native_error}. {desktop_error}")),
     }
 }
 

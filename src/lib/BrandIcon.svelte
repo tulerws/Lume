@@ -24,7 +24,7 @@
   let { name, size = 18 }: { name: Brand; size?: number } = $props();
 </script>
 
-<span class="brand-icon" class:browsers={name === "browsers"} style:--brand-size={`${size}px`}>
+<span class="brand-icon" class:openai={name === "codex" || name === "chatgpt"} class:browsers={name === "browsers"} style:--brand-size={`${size}px`}>
   {#if name === "codex" || name === "chatgpt"}
     <OfflineIcon icon={openai} />
   {:else if name === "claude" || name === "claude_code"}
@@ -79,6 +79,10 @@
     width: 100%;
     height: 100%;
     display: block;
+  }
+
+  .brand-icon.openai :global(svg) {
+    fill: currentColor;
   }
 
   .unknown {

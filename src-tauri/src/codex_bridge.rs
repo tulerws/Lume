@@ -297,7 +297,7 @@ impl CodexBridge {
             }
             return Ok(false);
         }
-        receiver
+        let outcome = receiver
             .recv_timeout(Duration::from_secs(8))
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => {
@@ -306,7 +306,18 @@ impl CodexBridge {
                 mpsc::RecvTimeoutError::Disconnected => {
                     "The active Codex session closed before accepting the prompt".to_string()
                 }
-            })??;
+            });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Ok(mut threads) = self.active_proxy_threads.lock() {
+                    threads
+                        .retain(|_, connection| connection.connection_id != active.connection_id);
+                }
+                return Err(error);
+            }
+        };
+        outcome?;
         Ok(true)
     }
 
