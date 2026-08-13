@@ -12,8 +12,8 @@ use crate::{
     domain::{
         AccessMode, AgentKind, AgentRateLimit, AgentSession, HistoryEntry, HookEvent,
         HookEventKind, PairedDevice, PermissionAction, PermissionProfile, PermissionRequest,
-        Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity, SessionResult,
-        SessionSource, SessionStatus,
+        Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity, SessionNote,
+        SessionResult, SessionSource, SessionStatus,
     },
     integrations::{self, IntegrationKind, ResumableSession},
     store::Store,
@@ -188,7 +188,47 @@ impl AppState {
                         Some(&activity.id),
                         activity.created_at,
                     )?;
+                    store.save_session_note_if_absent(&SessionNote {
+                        id: format!("plan-document:{native_session_id}:{}", activity.id),
+                        native_session_id: native_session_id.to_string(),
+                        title: plan_note_title(content, "Saved plan"),
+                        body: content.chars().take(128 * 1024).collect(),
+                        kind: "plan".into(),
+                        pinned: false,
+                        created_at: activity.created_at,
+                        updated_at: activity.created_at,
+                    })?;
                 }
+            }
+            let mut plan_groups: Vec<(&SessionActivity, String, String)> = Vec::new();
+            for activity in session
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "plan" || activity.kind == "tool")
+            {
+                let Some((signature, body)) =
+                    crate::protocol::archived_plan_from_activity(activity)
+                else {
+                    continue;
+                };
+                if let Some(last) = plan_groups.last_mut().filter(|last| last.1 == signature) {
+                    *last = (activity, signature, body);
+                } else {
+                    plan_groups.push((activity, signature, body));
+                }
+            }
+            let archived_count = plan_groups.len().saturating_sub(1);
+            for (activity, _, body) in plan_groups.into_iter().take(archived_count) {
+                store.save_session_note_if_absent(&SessionNote {
+                    id: format!("plan-history:{native_session_id}:{}", activity.id),
+                    native_session_id: native_session_id.to_string(),
+                    title: plan_note_title(&body, "Previous plan"),
+                    body: body.chars().take(128 * 1024).collect(),
+                    kind: "plan".into(),
+                    pinned: false,
+                    created_at: activity.created_at,
+                    updated_at: activity.created_at,
+                })?;
             }
             let Some((content, _, updated_at)) = store.session_plan(native_session_id)? else {
                 continue;
@@ -531,6 +571,81 @@ impl AppState {
             .lock()
             .map_err(|_| "Não foi possível acessar as notas".to_string())?
             .result_notes(limit.min(200))
+    }
+
+    pub fn session_notes(&self, session_id: &str) -> Result<Vec<SessionNote>, String> {
+        let native_session_id = self.session_native_id(session_id)?;
+        self.store
+            .lock()
+            .map_err(|_| "Could not access session notes".to_string())?
+            .session_notes(&native_session_id)
+    }
+
+    pub fn save_session_note(
+        &self,
+        session_id: &str,
+        note_id: Option<&str>,
+        title: &str,
+        body: &str,
+        kind: &str,
+        pinned: bool,
+    ) -> Result<SessionNote, String> {
+        let native_session_id = self.session_native_id(session_id)?;
+        let title = title.trim();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err("A note cannot be empty".into());
+        }
+        let kind = if kind == "plan" { "plan" } else { "note" };
+        let now = now_millis();
+        let id = note_id
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("session-note:{native_session_id}:{now}"));
+        let existing = self
+            .store
+            .lock()
+            .map_err(|_| "Could not access session notes".to_string())?
+            .session_notes(&native_session_id)?
+            .into_iter()
+            .find(|note| note.id == id);
+        if note_id.is_some() && existing.is_none() {
+            return Err("This note does not belong to the selected session".into());
+        }
+        let note = SessionNote {
+            id,
+            native_session_id,
+            title: if title.is_empty() {
+                if kind == "plan" { "Saved plan" } else { "Note" }.into()
+            } else {
+                title.chars().take(120).collect()
+            },
+            body: body.chars().take(128 * 1024).collect(),
+            kind: kind.into(),
+            pinned,
+            created_at: existing.as_ref().map(|note| note.created_at).unwrap_or(now),
+            updated_at: now,
+        };
+        self.store
+            .lock()
+            .map_err(|_| "Could not save the session note".to_string())?
+            .save_session_note(&note)?;
+        Ok(note)
+    }
+
+    pub fn delete_session_note(&self, id: &str) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Could not delete the session note".to_string())?
+            .delete_session_note(id)
+    }
+
+    fn session_native_id(&self, session_id: &str) -> Result<String, String> {
+        self.sessions()?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.native_session_id)
+            .ok_or_else(|| "This session does not have a persistent conversation id".to_string())
     }
 
     pub fn save_workflow_run(
@@ -3067,6 +3182,20 @@ fn unique_session_name(base: &str, used: &HashSet<String>) -> String {
         }
     }
     unreachable!("há sempre um próximo sufixo numérico")
+}
+
+fn plan_note_title(content: &str, fallback: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches('#')
+                .trim_start_matches(['-', '*'])
+                .trim()
+        })
+        .find(|line| !line.is_empty() && !line.starts_with('['))
+        .map(|line| line.chars().take(80).collect())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 pub fn now_millis() -> i64 {

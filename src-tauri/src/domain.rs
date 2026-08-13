@@ -229,6 +229,19 @@ pub struct ResultNote {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionNote {
+    pub id: String,
+    pub native_session_id: String,
+    pub title: String,
+    pub body: String,
+    pub kind: String,
+    pub pinned: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSession {
     pub id: String,
     pub agent: AgentKind,
@@ -472,6 +485,32 @@ pub struct WorkflowGroupDefinition {
     pub connections: Vec<WorkflowConnectionDefinition>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowSettings {
+    pub max_transitions: u16,
+    pub max_attempts_per_step: u16,
+    pub step_timeout_minutes: u16,
+    pub max_context_tokens: u32,
+    pub require_approval_for_sensitive_context: bool,
+    pub pause_on_rate_limit: bool,
+    pub minimum_rate_limit_remaining_percent: u8,
+}
+
+impl Default for WorkflowSettings {
+    fn default() -> Self {
+        Self {
+            max_transitions: 10,
+            max_attempts_per_step: 2,
+            step_timeout_minutes: 30,
+            max_context_tokens: 20_000,
+            require_approval_for_sensitive_context: true,
+            pause_on_rate_limit: true,
+            minimum_rate_limit_remaining_percent: 10,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRunStatus {
@@ -520,6 +559,7 @@ pub struct WorkflowRun {
     pub pending_connection_id: Option<String>,
     pub handoff_approved: bool,
     pub recovering: bool,
+    pub transition_count: u16,
     pub steps: Vec<WorkflowStepRun>,
     pub error: Option<String>,
     pub created_at: i64,
@@ -546,6 +586,7 @@ pub struct Preferences {
     pub whiteboard_layouts: Vec<WhiteboardLayout>,
     pub workflow_enabled: bool,
     pub workflow_groups: Vec<WorkflowGroupDefinition>,
+    pub workflow_settings: WorkflowSettings,
     pub global_shortcut: String,
     pub open_shortcut: String,
     pub new_session_shortcut: String,
@@ -572,6 +613,7 @@ impl Default for Preferences {
             whiteboard_layouts: Vec::new(),
             workflow_enabled: false,
             workflow_groups: Vec::new(),
+            workflow_settings: WorkflowSettings::default(),
             global_shortcut: "Ctrl+Shift+Space".into(),
             open_shortcut: "Ctrl+Alt+Shift+L".into(),
             new_session_shortcut: "Ctrl+Alt+Shift+N".into(),

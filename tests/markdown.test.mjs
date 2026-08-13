@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { renderSafeMarkdown, stripInternalAgentMetadata } from "../src/lib/markdown.js";
+import { renderSafeMarkdown as renderMobileMarkdown } from "../mobile-pwa/markdown.js";
 
 const rendered = renderSafeMarkdown(`Resposta visível.
 
@@ -19,5 +20,16 @@ assert.equal(
   renderSafeMarkdown("Arquivo: [README](https://example.com/README.md)"),
   '<p>Arquivo: <a href="https://example.com/README.md" target="_blank" rel="noopener noreferrer">README</a></p>',
 );
+
+const table = renderSafeMarkdown(`| Phase | Status |
+| :--- | ---: |
+| Context Builder | Complete |
+| Safety | **Testing** |`);
+assert.match(table, /<div class="markdown-table-wrap"><table>/);
+assert.match(table, /<th class="align-left">Phase<\/th>/);
+assert.match(table, /<th class="align-right">Status<\/th>/);
+assert.match(table, /<td class="align-right"><strong>Testing<\/strong><\/td>/);
+assert.equal(renderMobileMarkdown(`| Phase | Status |\n| :--- | ---: |\n| Context Builder | Complete |\n| Safety | **Testing** |`), table);
+assert.equal(renderSafeMarkdown("A | B\nStill text"), "<p>A | B<br>Still text</p>");
 
 console.log("markdown test suite passed");

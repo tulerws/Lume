@@ -153,7 +153,7 @@
   .lume-select-trigger > svg { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: #71857a; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; transition: transform 140ms ease; }
   .lume-select-trigger.open > svg { transform: rotate(180deg); }
   .lume-select-trigger:focus-visible { outline: 2px solid rgba(74, 148, 108, .3); outline-offset: 2px; }
-  .lume-select-menu { position: fixed; z-index: 260; padding: 5px; display: grid; gap: 2px; overflow-y: auto; border: 1px solid rgba(73,108,90,.16); border-radius: 11px; background: #f8fbf9; box-shadow: 0 16px 38px rgba(20,42,31,.22); }
+  .lume-select-menu { position: fixed; z-index: 260; padding: 5px; display: grid; gap: 2px; overflow-y: auto; isolation: isolate; contain: paint; overscroll-behavior: contain; border: 1px solid rgba(73,108,90,.16); border-radius: 11px; background: #f8fbf9; background-clip: padding-box; box-shadow: 0 16px 38px rgba(20,42,31,.22); }
   .lume-select-menu > button { width: 100%; min-height: 34px; padding: 5px 7px; display: flex; align-items: center; gap: 6px; border: 0; border-radius: 8px; color: #53665d; background: transparent; cursor: pointer; text-align: left; }
   .lume-select-menu > button:hover,
   .lume-select-menu > button.focused { background: rgba(55,145,99,.055); }

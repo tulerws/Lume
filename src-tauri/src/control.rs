@@ -239,6 +239,12 @@ pub fn submit_prompt(
             app.clone(),
         );
         if let Err(error) = first_attempt {
+            if is_active_codex_writer(&error) {
+                return Err(
+                    "Essa CLI foi aberta fora do Lume. Reinicie a sessão pelo Lume para conseguir enviar mensagens pelo terminal."
+                        .into(),
+                );
+            }
             if !is_missing_codex_rollout(&error) {
                 return Err(error);
             }
@@ -317,6 +323,10 @@ pub fn submit_prompt(
 fn is_missing_codex_rollout(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("no rollout found") || normalized.contains("rollout not found")
+}
+
+fn is_active_codex_writer(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("active writer")
 }
 
 pub fn interrupt_prompt(
@@ -830,6 +840,14 @@ mod tests {
         ));
         assert!(is_missing_codex_rollout("Rollout not found"));
         assert!(!is_missing_codex_rollout("The Codex server is offline"));
+    }
+
+    #[test]
+    fn active_codex_writer_errors_are_detected() {
+        assert!(is_active_codex_writer(
+            "thread thread-1 already has an active writer"
+        ));
+        assert!(!is_active_codex_writer("Rollout not found"));
     }
 
     #[test]

@@ -31,7 +31,7 @@ use std::{
 use domain::{
     AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PermissionAction, Preferences,
     PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionActivity,
-    SessionSource, WorkflowRole, WorkflowRoleContract,
+    SessionNote, SessionSource, WorkflowRole, WorkflowRoleContract,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -498,6 +498,39 @@ fn delete_result_note(state: State<'_, AppState>, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn list_session_notes(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<SessionNote>, String> {
+    state.session_notes(&session_id)
+}
+
+#[tauri::command]
+fn save_session_note(
+    state: State<'_, AppState>,
+    session_id: String,
+    note_id: Option<String>,
+    title: String,
+    body: String,
+    kind: String,
+    pinned: bool,
+) -> Result<SessionNote, String> {
+    state.save_session_note(
+        &session_id,
+        note_id.as_deref(),
+        &title,
+        &body,
+        &kind,
+        pinned,
+    )
+}
+
+#[tauri::command]
+fn delete_session_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.delete_session_note(&id)
+}
+
+#[tauri::command]
 fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
     state.preferences()
 }
@@ -516,12 +549,14 @@ fn preview_workflow_context(
     source_result_id: Option<String>,
 ) -> Result<context_builder::WorkflowContextPackage, String> {
     let sessions = state.sessions()?;
-    context_builder::build_context_package(
+    let settings = state.preferences()?.workflow_settings;
+    context_builder::build_context_package_with_limit(
         &group,
         &connection_id,
         &objective,
         source_result_id.as_deref(),
         &sessions,
+        settings.max_context_tokens as usize,
     )
 }
 
@@ -650,6 +685,24 @@ fn cancel_workflow_run(
 }
 
 #[tauri::command]
+fn rebind_workflow_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, workflow_runtime::WorkflowRuntime>,
+    workflow_id: String,
+    step_id: String,
+    session_native_id: String,
+) -> Result<Option<domain::WorkflowRun>, String> {
+    runtime.rebind_session(
+        &app,
+        state.inner(),
+        &workflow_id,
+        &step_id,
+        &session_native_id,
+    )
+}
+
+#[tauri::command]
 fn display_backend() -> &'static str {
     #[cfg(target_os = "linux")]
     match std::env::var("LUME_LINUX_BACKEND").ok().as_deref() {
@@ -726,6 +779,22 @@ fn workflow_has_cycle(group: &domain::WorkflowGroupDefinition) -> bool {
 }
 
 fn validate_workflow_groups(preferences: &Preferences) -> Result<(), String> {
+    let settings = &preferences.workflow_settings;
+    if !(1..=100).contains(&settings.max_transitions) {
+        return Err("Workflow transitions must be between 1 and 100".into());
+    }
+    if !(1..=10).contains(&settings.max_attempts_per_step) {
+        return Err("Workflow attempts per step must be between 1 and 10".into());
+    }
+    if settings.step_timeout_minutes > 1_440 {
+        return Err("Workflow step timeout cannot exceed 1440 minutes".into());
+    }
+    if !(1_000..=100_000).contains(&settings.max_context_tokens) {
+        return Err("Workflow context limit must be between 1000 and 100000 tokens".into());
+    }
+    if settings.minimum_rate_limit_remaining_percent > 100 {
+        return Err("Workflow rate limit reserve cannot exceed 100 percent".into());
+    }
     let mut group_ids = HashSet::new();
     for group in &preferences.workflow_groups {
         if group.id.trim().is_empty() || group.terminal_group_id.trim().is_empty() {
@@ -1111,8 +1180,20 @@ fn finish_layered_terminal_resize(
     terminals.finish_layered_resize(&app, &label)
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 fn open_workflow_bridge_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    side: terminal_windows::DockSide,
+) -> Result<String, String> {
+    terminals.open_workflow_bridge(&app, &label, side)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+async fn open_workflow_bridge_window(
     app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
@@ -1132,8 +1213,20 @@ fn set_workflow_connection_hover(
     terminals.set_workflow_connection_hover(&app, &label, side, hovered)
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 fn prepare_workflow_bridge_window(
+    app: AppHandle,
+    terminals: State<'_, terminal_windows::TerminalWindows>,
+    label: String,
+    side: terminal_windows::DockSide,
+) -> Result<String, String> {
+    terminals.prepare_workflow_bridge(&app, &label, side)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+async fn prepare_workflow_bridge_window(
     app: AppHandle,
     terminals: State<'_, terminal_windows::TerminalWindows>,
     label: String,
@@ -1650,6 +1743,9 @@ pub fn run() {
             list_result_notes,
             save_result_note,
             delete_result_note,
+            list_session_notes,
+            save_session_note,
+            delete_session_note,
             get_preferences,
             get_workflow_role_contract,
             preview_workflow_context,
@@ -1662,6 +1758,7 @@ pub fn run() {
             retry_workflow_step,
             skip_workflow_step,
             cancel_workflow_run,
+            rebind_workflow_session,
             take_pending_shortcut_action,
             display_backend,
             get_overlay_position,

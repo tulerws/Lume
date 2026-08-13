@@ -789,7 +789,10 @@ impl TerminalWindows {
         if layered {
             let _ = overlay::resize_surface(&window, bridge_width, bridge_height);
         } else {
-            let _ = overlay::move_to(&window, bridge_x, bridge_y, Some(&monitor_id));
+            if let Err(error) = overlay::move_to(&window, bridge_x, bridge_y, Some(&monitor_id)) {
+                let _ = window.close();
+                return Err(error);
+            }
         }
         if cfg!(target_os = "linux") {
             let _ = overlay::show_workflow_connectors(
@@ -804,7 +807,10 @@ impl TerminalWindows {
                 WORKFLOW_BRIDGE_MARGIN,
             );
         }
-        let _ = window.show();
+        if let Err(error) = window.show() {
+            let _ = window.close();
+            return Err(error.to_string());
+        }
         let _ = window.set_focus();
         let _ = window.emit("lume://workflow-bridge-reveal", ());
         overlay::reveal_workflow_connectors(&label);

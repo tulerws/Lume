@@ -218,15 +218,60 @@ fn work_summary(activities: &[SessionActivity]) -> AgentWorkSummary {
 }
 
 fn plan_summary(activities: &[SessionActivity]) -> Option<PlanSummary> {
-    activities.iter().rev().find_map(|activity| {
-        let content = activity.detail.as_deref()?;
-        (activity.kind == "plan_document").then(|| PlanSummary {
-            items: Vec::new(),
-            explanation: None,
-            content: Some(content.to_string()),
-            updated_at: activity.created_at,
-        })
+    activities.iter().rev().find_map(plan_activity_summary)
+}
+
+fn plan_activity_summary(activity: &SessionActivity) -> Option<PlanSummary> {
+    let detail = activity.detail.as_deref()?;
+    let (items, explanation) = if activity.kind == "plan" {
+        (plan_items(detail), plan_explanation(detail))
+    } else if activity.kind == "tool" {
+        (todo_items(detail)?, None)
+    } else {
+        return None;
+    };
+    (!items.is_empty()).then(|| PlanSummary {
+        items,
+        explanation,
+        content: None,
+        updated_at: activity.created_at,
     })
+}
+
+fn plan_explanation(detail: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(detail).ok()?;
+    find_json_value(&value, &["explanation"])
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn archived_plan_from_activity(activity: &SessionActivity) -> Option<(String, String)> {
+    let summary = plan_activity_summary(activity)?;
+    let signature = summary
+        .items
+        .iter()
+        .map(|item| item.label.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if signature.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    if let Some(explanation) = summary.explanation.as_deref() {
+        body.push_str(explanation);
+        body.push_str("\n\n");
+    }
+    for item in &summary.items {
+        let marker = if item.status == WorkItemStatus::Completed {
+            "x"
+        } else {
+            " "
+        };
+        body.push_str(&format!("- [{marker}] {}\n", item.label));
+    }
+    Some((signature, body.trim().to_string()))
 }
 
 pub(crate) fn looks_like_full_plan_document(content: &str) -> bool {
@@ -1121,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_summarizes_latest_todo_plan() {
+    fn snapshot_uses_the_latest_structured_plan_as_the_current_plan() {
         let mut session = session();
         session.activities.push(SessionActivity {
             id: "plan-1".into(),
@@ -1139,20 +1184,19 @@ mod tests {
         });
 
         let snapshot = HubSnapshot::new(vec![session]);
-        let todo = snapshot.sessions[0]
+        let plan = snapshot.sessions[0]
             .work_summary
-            .todo
+            .plan
             .as_ref()
-            .expect("todo");
-        assert_eq!(todo.items.len(), 3);
-        assert_eq!(todo.items[0].status, WorkItemStatus::Completed);
-        assert_eq!(todo.items[1].status, WorkItemStatus::InProgress);
-        assert_eq!(todo.updated_at, 12);
-        assert!(snapshot.sessions[0].work_summary.plan.is_none());
+            .expect("plan");
+        assert_eq!(plan.items.len(), 3);
+        assert_eq!(plan.items[0].status, WorkItemStatus::Completed);
+        assert_eq!(plan.items[1].status, WorkItemStatus::InProgress);
+        assert_eq!(plan.updated_at, 12);
     }
 
     #[test]
-    fn snapshot_uses_a_complete_planning_document_instead_of_the_todo() {
+    fn snapshot_keeps_a_planning_document_out_of_the_current_plan() {
         let mut session = session();
         session.activities.extend([
             SessionActivity {
@@ -1187,12 +1231,9 @@ mod tests {
             .plan
             .as_ref()
             .expect("plan");
-        assert!(plan.items.is_empty());
-        assert!(plan
-            .content
-            .as_deref()
-            .is_some_and(|content| content.contains("Modo Workflow")));
-        assert_eq!(plan.updated_at, 20);
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.content.is_none());
+        assert_eq!(plan.updated_at, 10);
     }
 
     #[test]

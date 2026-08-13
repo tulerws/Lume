@@ -22,6 +22,7 @@ import type {
   QuestionAnswer,
   ResumableSession,
   ResultNote,
+  SessionNote,
   RestoredTerminalPlacement,
   ExternalAgentPlugin,
   TerminalWindowState,
@@ -53,6 +54,15 @@ export const defaultPreferences: Preferences = {
   whiteboardLayouts: [],
   workflowEnabled: false,
   workflowGroups: [],
+  workflowSettings: {
+    maxTransitions: 10,
+    maxAttemptsPerStep: 2,
+    stepTimeoutMinutes: 30,
+    maxContextTokens: 20_000,
+    requireApprovalForSensitiveContext: true,
+    pauseOnRateLimit: true,
+    minimumRateLimitRemainingPercent: 10,
+  },
   globalShortcut: "Ctrl+Shift+Space",
   openShortcut: "Ctrl+Alt+Shift+L",
   newSessionShortcut: "Ctrl+Alt+Shift+N",
@@ -408,6 +418,29 @@ export async function deleteResultNote(id: string): Promise<void> {
   await invoke("delete_result_note", { id });
 }
 
+export async function loadSessionNotes(sessionId: string): Promise<SessionNote[]> {
+  if (!inDesktop()) return [];
+  return invoke<SessionNote[]>("list_session_notes", { sessionId });
+}
+
+export async function saveSessionNote(
+  sessionId: string,
+  note: Pick<SessionNote, "title" | "body" | "kind" | "pinned"> & { id?: string },
+): Promise<SessionNote> {
+  return invoke<SessionNote>("save_session_note", {
+    sessionId,
+    noteId: note.id,
+    title: note.title,
+    body: note.body,
+    kind: note.kind,
+    pinned: note.pinned,
+  });
+}
+
+export async function deleteSessionNote(id: string): Promise<void> {
+  await invoke("delete_session_note", { id });
+}
+
 export async function loadPreferences(): Promise<Preferences> {
   try {
     return await invoke<Preferences>("get_preferences");
@@ -473,6 +506,18 @@ export async function skipWorkflowStep(workflowId: string): Promise<WorkflowRun>
 
 export async function cancelWorkflowRun(workflowId: string): Promise<WorkflowRun> {
   return invoke<WorkflowRun>("cancel_workflow_run", { workflowId });
+}
+
+export async function rebindWorkflowSession(
+  workflowId: string,
+  stepId: string,
+  sessionNativeId: string,
+): Promise<WorkflowRun | null> {
+  return invoke<WorkflowRun | null>("rebind_workflow_session", {
+    workflowId,
+    stepId,
+    sessionNativeId,
+  });
 }
 
 export type DisplayBackend =

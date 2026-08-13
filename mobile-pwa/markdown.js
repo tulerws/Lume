@@ -63,6 +63,58 @@ function renderInline(source) {
 }
 
 /** @param {string} line */
+function tableCells(line) {
+  let source = line.trim();
+  if (!source.includes("|")) return null;
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|") && !source.endsWith("\\|")) source = source.slice(0, -1);
+
+  const cells = [];
+  let cell = "";
+  let escaped = false;
+  let inCode = false;
+  for (const character of source) {
+    if (escaped) {
+      cell += character;
+      escaped = false;
+    } else if (character === "\\") {
+      cell += character;
+      escaped = true;
+    } else if (character === "`") {
+      cell += character;
+      inCode = !inCode;
+    } else if (character === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+/** @param {string[]} cells */
+function tableAlignments(cells) {
+  if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")))) return null;
+  return cells.map((cell) => {
+    const marker = cell.replace(/\s/g, "");
+    if (marker.startsWith(":") && marker.endsWith(":")) return "center";
+    if (marker.endsWith(":")) return "right";
+    return "left";
+  });
+}
+
+/** @param {string[]} lines @param {number} index */
+function tableAt(lines, index) {
+  const header = tableCells(lines[index] ?? "");
+  const separator = tableCells(lines[index + 1] ?? "");
+  if (!header || !separator || header.length !== separator.length) return null;
+  const alignments = tableAlignments(separator);
+  return alignments ? { header, alignments } : null;
+}
+
+/** @param {string} line */
 function startsBlock(line) {
   return /^\s*(?:```|#{1,4}\s+|>\s?|[-*+]\s+|\d+\.\s+|(?:---+|\*\*\*+)\s*$)/.test(line);
 }
@@ -128,6 +180,26 @@ export function renderSafeMarkdown(markdown) {
       continue;
     }
 
+    const table = tableAt(lines, index);
+    if (table) {
+      const rows = [];
+      index += 2;
+      while (index < lines.length) {
+        const cells = tableCells(lines[index]);
+        if (!cells) break;
+        rows.push(cells);
+        index += 1;
+      }
+      const header = table.header.map((cell, cellIndex) =>
+        `<th class="align-${table.alignments[cellIndex]}">${renderInline(cell)}</th>`,
+      ).join("");
+      const body = rows.map((cells) => `<tr>${table.header.map((_, cellIndex) =>
+        `<td class="align-${table.alignments[cellIndex]}">${renderInline(cells[cellIndex] ?? "")}</td>`,
+      ).join("")}</tr>`).join("");
+      output.push(`<div class="markdown-table-wrap"><table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`);
+      continue;
+    }
+
     if (/^\s*>\s?/.test(line)) {
       const quote = [];
       while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
@@ -166,7 +238,7 @@ export function renderSafeMarkdown(markdown) {
 
     const paragraph = [line.trim()];
     index += 1;
-    while (index < lines.length && lines[index].trim() && !startsBlock(lines[index])) {
+    while (index < lines.length && lines[index].trim() && !startsBlock(lines[index]) && !tableAt(lines, index)) {
       paragraph.push(lines[index].trim());
       index += 1;
     }

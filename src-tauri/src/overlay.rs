@@ -385,7 +385,7 @@ mod linux {
             gtk::glib::Propagation::Stop
         });
         let weak = window.downgrade();
-        gtk::glib::timeout_add_local(Duration::from_millis(24), move || {
+        gtk::glib::timeout_add_local(Duration::from_millis(48), move || {
             let Some(window) = weak.upgrade() else {
                 return gtk::glib::ControlFlow::Break;
             };

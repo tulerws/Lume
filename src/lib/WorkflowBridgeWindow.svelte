@@ -34,6 +34,7 @@
   let bridgeShell: HTMLElement;
   let cableStart: HTMLCanvasElement;
   let cableEnd: HTMLCanvasElement;
+
   let bridgeHeightSyncRevision = 0;
   let bridgeHeightSyncQueue = Promise.resolve();
 
@@ -92,8 +93,7 @@
         nextTerminals.filter((terminal) => terminal.groupId === nextContext.groupId),
       );
       const saved = nextPreferences.workflowGroups.find((group) => group.terminalGroupId === nextContext.groupId);
-      const activeKeys = new Set(members.map(terminalKey));
-      const retained = (saved?.steps ?? []).filter((step) => activeKeys.has(step.sessionNativeId));
+      const retained = saved?.steps ?? [];
       const retainedKeys = new Set(retained.map((step) => step.sessionNativeId));
       const appended = await Promise.all(members
         .filter((terminal) => !retainedKeys.has(terminalKey(terminal)))

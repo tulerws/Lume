@@ -55,6 +55,7 @@
     SessionStatus,
     TerminalWindowState,
     WhiteboardLayout,
+    WorkflowRun,
   } from "$lib/domain";
   import { demoSessions } from "$lib/demo";
   import {
@@ -76,6 +77,7 @@
     loadOverlayPosition,
     loadPairedDevices,
     loadPreferences,
+    loadWorkflowRun,
     loadSessions,
     loadTerminalWindows,
     loadExternalPlugins,
@@ -88,6 +90,7 @@
     interruptPrompt,
     removeExternalPlugin,
     readLocalImageDataUrl,
+    rebindWorkflowSession,
     renameSession,
     revealBrowserCompanion,
     revokePairedDevice,
@@ -206,6 +209,10 @@
   let selectedProfileKey = $state<string | null>(null);
   let terminalWindows = $state<TerminalWindowState[]>([]);
   let workflowModeChanging = $state(false);
+  let workflowSettingsOpen = $state(false);
+  let workflowSettingsSaving = $state(false);
+  let workflowRunStates = $state<Record<string, WorkflowRun | null>>({});
+  let workflowRebindingStepId = $state<string | null>(null);
   let openingTerminal = $state<string | null>(null);
   let terminalMessage = $state<string | null>(null);
   let layoutName = $state("");
@@ -1009,8 +1016,9 @@
     dragging = false;
   }
 
-  function bringOverlayToFront() {
-    if (isTauri) void getCurrentWindow().setFocus().catch(() => undefined);
+  async function bringOverlayToFront() {
+    if (!isTauri) return;
+    await getCurrentWindow().setFocus().catch(() => undefined);
   }
 
   function wakeMascot() {
@@ -1401,6 +1409,88 @@
       terminalMessage = String(error).replace(/^Error:\s*/, "");
     } finally {
       workflowModeChanging = false;
+    }
+  }
+
+  async function toggleWorkflowSettings() {
+    workflowSettingsOpen = !workflowSettingsOpen;
+    if (!workflowSettingsOpen || !isTauri) return;
+    await refreshTerminalWindows();
+    const entries = await Promise.all(preferences.workflowGroups.map(async (group) => {
+      try {
+        return [group.id, await loadWorkflowRun(group.id)] as const;
+      } catch {
+        return [group.id, null] as const;
+      }
+    }));
+    workflowRunStates = Object.fromEntries(entries);
+  }
+
+  function workflowSessionKey(session: AgentSession) {
+    return session.nativeSessionId?.trim() || session.id;
+  }
+
+  function missingWorkflowSteps() {
+    const connected = new Set(sessions.map(workflowSessionKey));
+    return preferences.workflowGroups
+      .filter((group) => {
+        const run = workflowRunStates[group.id];
+        return Boolean(run && !["completed", "cancelled"].includes(run.status));
+      })
+      .flatMap((group) => {
+        const runStepIds = new Set(workflowRunStates[group.id]?.steps.map((step) => step.stepId));
+        return group.steps
+          .filter((step) => runStepIds.has(step.id) && !connected.has(step.sessionNativeId))
+          .map((step, index) => ({ group, step, index }));
+      });
+  }
+
+  function workflowReplacementSessions(groupId: string, stepId: string) {
+    const group = preferences.workflowGroups.find((item) => item.id === groupId);
+    const occupied = new Set(
+      group?.steps
+        .filter((step) => step.id !== stepId)
+        .map((step) => step.sessionNativeId) ?? [],
+    );
+    return sessions.filter((session) => !occupied.has(workflowSessionKey(session)));
+  }
+
+  async function updateWorkflowSetting<K extends keyof Preferences["workflowSettings"]>(
+    key: K,
+    value: Preferences["workflowSettings"][K],
+  ) {
+    if (workflowSettingsSaving) return;
+    workflowSettingsSaving = true;
+    try {
+      await updatePreference("workflowSettings", {
+        ...preferences.workflowSettings,
+        [key]: value,
+      });
+    } finally {
+      workflowSettingsSaving = false;
+    }
+  }
+
+  async function replaceWorkflowSession(
+    workflowId: string,
+    stepId: string,
+    sessionNativeId: string,
+  ) {
+    if (!sessionNativeId || workflowRebindingStepId) return;
+    workflowRebindingStepId = stepId;
+    terminalMessage = null;
+    try {
+      await rebindWorkflowSession(workflowId, stepId, sessionNativeId);
+      preferences = await loadPreferences();
+      if (isTauri) void emit("lume://preferences-changed", preferences);
+      terminalMessage = tr(
+        "Workflow agent replaced. Retry the step if it was interrupted.",
+        "Agente do workflow substituído. Tente a etapa novamente se ela foi interrompida.",
+      );
+    } catch (error) {
+      terminalMessage = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      workflowRebindingStepId = null;
     }
   }
 
@@ -2428,7 +2518,7 @@
       <span class="agent-count">{activeCount}</span>
     </button>
   {:else}
-    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class:measuring={measuringPanel} class:palette-open={paletteOpen} class:launcher-open={launcherOpen} class="panel">
+    <section use:observePanelSize class:content-visible={contentVisible} class:morphing class:measuring={measuringPanel} class:palette-open={paletteOpen} class:launcher-open={launcherOpen} class:workflow-settings-open={workflowSettingsOpen} class="panel">
       <header
         role="banner"
         class:dragging
@@ -2476,52 +2566,131 @@
       {/if}
 
       {#if launcherOpen}
-        <div class="launcher-popover" transition:fly={{ y: -5, duration: 170, easing: cubicOut }}>
-          <span class="launcher-title">{tr("Open session", "Abrir sessão")}</span>
-          {#each launcherIntegrations() as integration}
-            <div class:expanded={resumeAgent === integration.kind} class="launcher-agent">
-              <div class="launcher-row">
-                <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
-                <strong>{integration.label}</strong>
-                <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind)}>{tr("New", "Nova")}</button>
-                {#if integration.kind !== "gemini"}
-                  <button
-                    class:active={resumeAgent === integration.kind}
-                    disabled={launching !== null || loadingResumeAgent !== null}
-                    type="button"
-                    onclick={() => toggleResumeSessions(integration.kind)}
-                  >{loadingResumeAgent === integration.kind ? "…" : tr("Resume", "Retomar")}</button>
+        <div class="launcher-popover" transition:fade={{ duration: 100 }}>
+          <div class="launcher-popover-scroll">
+            <span class="launcher-title">{tr("Open session", "Abrir sessão")}</span>
+            {#each launcherIntegrations() as integration}
+              <div class:expanded={resumeAgent === integration.kind} class="launcher-agent">
+                <div class="launcher-row">
+                  <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={17} /></span>
+                  <strong>{integration.label}</strong>
+                  <button disabled={launching !== null} type="button" onclick={() => startSession(integration.kind)}>{tr("New", "Nova")}</button>
+                  {#if integration.kind !== "gemini"}
+                    <button
+                      class:active={resumeAgent === integration.kind}
+                      disabled={launching !== null || loadingResumeAgent !== null}
+                      type="button"
+                      onclick={() => toggleResumeSessions(integration.kind)}
+                    >{loadingResumeAgent === integration.kind ? "…" : tr("Resume", "Retomar")}</button>
+                  {/if}
+                </div>
+                {#if resumeAgent === integration.kind}
+                  <div class="resume-session-list">
+                    {#each resumableSessions as stored (stored.id)}
+                      <button
+                        class="resume-session"
+                        disabled={launching !== null}
+                        type="button"
+                        title={stored.workingDirectory}
+                        onclick={() => resumeStoredSession(stored)}
+                      >
+                        <span>
+                          <strong>{stored.name}</strong>
+                          <small>{stored.source} · {relativeTime(stored.updatedAt)}</small>
+                        </span>
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h8v8M13.5 5.5 5 14" /></svg>
+                      </button>
+                    {:else}
+                      {#if loadingResumeAgent !== integration.kind}
+                        <p>{tr("No resumable sessions were found.", "Nenhuma sessão retomável foi encontrada.")}</p>
+                      {/if}
+                    {/each}
+                  </div>
                 {/if}
               </div>
-              {#if resumeAgent === integration.kind}
-                <div class="resume-session-list">
-                  {#each resumableSessions as stored (stored.id)}
-                    <button
-                      class="resume-session"
-                      disabled={launching !== null}
-                      type="button"
-                      title={stored.workingDirectory}
-                      onclick={() => resumeStoredSession(stored)}
-                    >
-                      <span>
-                        <strong>{stored.name}</strong>
-                        <small>{stored.source} · {relativeTime(stored.updatedAt)}</small>
-                      </span>
-                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h8v8M13.5 5.5 5 14" /></svg>
-                    </button>
-                  {:else}
-                    {#if loadingResumeAgent !== integration.kind}
-                      <p>{tr("No resumable sessions were found.", "Nenhuma sessão retomável foi encontrada.")}</p>
-                    {/if}
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {:else}
-            <p>{tr("No compatible CLI was found.", "Nenhuma CLI compatível foi encontrada.")}</p>
-          {/each}
-          {#if launchError}<p class="launcher-error">{launchError}</p>{/if}
+            {:else}
+              <p>{tr("No compatible CLI was found.", "Nenhuma CLI compatível foi encontrada.")}</p>
+            {/each}
+            {#if launchError}<p class="launcher-error">{launchError}</p>{/if}
+          </div>
         </div>
+      {/if}
+
+      {#if workflowSettingsOpen}
+        <button class="workflow-settings-dismiss" type="button" aria-label={tr("Close workflow settings", "Fechar configurações do workflow")} onclick={() => (workflowSettingsOpen = false)}></button>
+        <section class="workflow-settings-popover" transition:fade={{ duration: 100 }}>
+          <div class="workflow-settings-scroll">
+          <header>
+            <div>
+              <strong>{tr("Workflow settings", "Configurações do workflow")}</strong>
+              <small>{tr("Global safety limits", "Limites globais de segurança")}</small>
+            </div>
+            <button type="button" aria-label={tr("Close", "Fechar")} onclick={() => (workflowSettingsOpen = false)}>×</button>
+          </header>
+
+          <div class="workflow-setting-grid">
+            <label>
+              <span>{tr("Transitions", "Transições")}</span>
+              <input type="number" min="1" max="100" value={preferences.workflowSettings.maxTransitions} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("maxTransitions", Number(event.currentTarget.value))} />
+            </label>
+            <label>
+              <span>{tr("Attempts per step", "Tentativas por etapa")}</span>
+              <input type="number" min="1" max="10" value={preferences.workflowSettings.maxAttemptsPerStep} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("maxAttemptsPerStep", Number(event.currentTarget.value))} />
+            </label>
+            <label>
+              <span>{tr("Timeout (minutes)", "Timeout (minutos)")}</span>
+              <input type="number" min="0" max="1440" value={preferences.workflowSettings.stepTimeoutMinutes} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("stepTimeoutMinutes", Number(event.currentTarget.value))} />
+            </label>
+            <label>
+              <span>{tr("Context tokens", "Tokens de contexto")}</span>
+              <input type="number" min="1000" max="100000" step="1000" value={preferences.workflowSettings.maxContextTokens} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("maxContextTokens", Number(event.currentTarget.value))} />
+            </label>
+          </div>
+
+          <label class="workflow-setting-toggle">
+            <span>{tr("Approve sensitive handoffs", "Aprovar handoffs sensíveis")}</span>
+            <input type="checkbox" checked={preferences.workflowSettings.requireApprovalForSensitiveContext} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("requireApprovalForSensitiveContext", event.currentTarget.checked)} />
+            <i aria-hidden="true"></i>
+          </label>
+          <label class="workflow-setting-toggle">
+            <span>{tr("Protect agent rate limits", "Proteger limites dos agentes")}</span>
+            <input type="checkbox" checked={preferences.workflowSettings.pauseOnRateLimit} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("pauseOnRateLimit", event.currentTarget.checked)} />
+            <i aria-hidden="true"></i>
+          </label>
+          {#if preferences.workflowSettings.pauseOnRateLimit}
+            <label class="workflow-reserve-setting">
+              <span>{tr("Minimum remaining", "Reserva mínima")}</span>
+              <input type="range" min="0" max="50" step="5" value={preferences.workflowSettings.minimumRateLimitRemainingPercent} disabled={workflowSettingsSaving} onchange={(event) => void updateWorkflowSetting("minimumRateLimitRemainingPercent", Number(event.currentTarget.value))} />
+              <strong>{preferences.workflowSettings.minimumRateLimitRemainingPercent}%</strong>
+            </label>
+          {/if}
+
+          {#if missingWorkflowSteps().length > 0}
+            <div class="workflow-missing-sessions">
+              <strong>{tr("Missing agents", "Agentes ausentes")}</strong>
+              {#each missingWorkflowSteps() as missing (`${missing.group.id}:${missing.step.id}`)}
+                <label>
+                    <span title={`${missing.step.customRoleLabel || missing.step.role} · ${tr("Step", "Etapa")} ${missing.index + 1}`}>{missing.step.customRoleLabel || missing.step.role} · {missing.index + 1}</span>
+                  <LumeSelect
+                    ariaLabel={tr("Replacement agent session", "Sessão substituta do agente")}
+                    value=""
+                    minWidth={168}
+                    options={[
+                      { value: "", label: workflowRebindingStepId === missing.step.id ? tr("Replacing…", "Substituindo…") : tr("Replace session…", "Substituir sessão…") },
+                      ...workflowReplacementSessions(missing.group.id, missing.step.id).map((session) => ({
+                        value: workflowSessionKey(session),
+                        label: sessionDisplayName(session),
+                        description: `${session.agentLabel} · ${session.project}`,
+                      })),
+                    ]}
+                    onValueChange={(value) => void replaceWorkflowSession(missing.group.id, missing.step.id, value)}
+                  />
+                </label>
+              {/each}
+            </div>
+          {/if}
+          </div>
+        </section>
       {/if}
 
       {#if paletteOpen}
@@ -2928,9 +3097,6 @@
               </span>
               <span class="workflow-group-copy">
                 <strong>{tr("Terminal mode", "Modo dos terminais")}</strong>
-                <small>{preferences.workflowEnabled
-                  ? tr("New connections become active workflows", "Novas conexões se tornam workflows ativos")
-                  : tr("Docking only, without agent connections", "Somente acoplamento, sem conexão entre agentes")}</small>
               </span>
               <span class:workflow-active={preferences.workflowEnabled} class="workflow-mode-switch" role="group" aria-label={tr("Terminal mode", "Modo dos terminais")}>
                 <button
@@ -2946,6 +3112,17 @@
                   onclick={() => void togglePanelWorkflowMode(true)}
                 >Workflow</button>
               </span>
+              <button
+                class:active={workflowSettingsOpen}
+                class="workflow-settings-trigger"
+                type="button"
+                title={tr("Workflow settings", "Configurações do workflow")}
+                aria-label={tr("Workflow settings", "Configurações do workflow")}
+                aria-expanded={workflowSettingsOpen}
+                onclick={() => void toggleWorkflowSettings()}
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M4 10h12M4 14h12" /></svg>
+              </button>
             </div>
 
             <div class="terminal-picker">
@@ -2974,11 +3151,6 @@
               {/each}
             </div>
             {#if terminalMessage}<p class="board-message" transition:fade>{terminalMessage}</p>{/if}
-            <div class="dock-guide">
-              <svg viewBox="0 0 32 20" aria-hidden="true"><rect x="2" y="3" width="12" height="14" rx="3" /><rect x="18" y="3" width="12" height="14" rx="3" /><path d="M14 10h4" /></svg>
-              <span>{tr("Each window has its own prompt. Dock them side by side or above and below.", "Cada janela tem seu próprio prompt. Acople pelas laterais ou por cima e por baixo.")}</span>
-            </div>
-
           </div>
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
@@ -3788,7 +3960,8 @@
     min-height: 390px;
   }
 
-  .panel.launcher-open {
+  .panel.launcher-open,
+  .panel.workflow-settings-open {
     overflow: visible;
   }
 
@@ -3918,7 +4091,8 @@
   }
 
   .panel-content { position: relative; max-height: 431px; min-height: 0; flex: 0 1 auto; overflow: hidden; }
-  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: calc(100vh - 65px); padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: rgba(250, 252, 251, 0.985); box-shadow: 0 14px 38px rgba(27, 42, 35, 0.18); backdrop-filter: blur(22px); }
+  .launcher-popover { position: absolute; z-index: 4; top: 53px; right: 13px; width: 320px; max-height: calc(100vh - 65px); overflow: hidden; isolation: isolate; border: 1px solid rgba(99, 119, 110, 0.14); border-radius: 14px; background: #fafcfb; background-clip: padding-box; }
+  .launcher-popover-scroll { box-sizing: border-box; width: 100%; max-height: calc(100vh - 65px); padding: 10px 11px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
   .launcher-title { display: block; padding: 1px 3px 7px; color: #8c9691; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
   .launcher-row { min-height: 45px; display: flex; align-items: center; gap: 7px; border-top: 1px solid rgba(105, 123, 115, 0.08); }
   .launcher-row .agent-avatar { width: 25px; height: 25px; border-radius: 8px; font-size: 9px; }
@@ -3937,7 +4111,7 @@
   .resume-session strong { color: #3e5048; font-size: 9px; }
   .resume-session small { color: #89958f; font-size: 7px; }
   .resume-session svg { width: 12px; height: 12px; flex: 0 0 auto; }
-  .launcher-popover > p { margin: 8px 3px; color: #89938f; font-size: 10px; }
+  .launcher-popover-scroll > p { margin: 8px 3px; color: #89938f; font-size: 10px; }
   .launcher-popover .launcher-error { color: #a54c4c; }
   .command-palette-layer { position: absolute; z-index: 12; inset: 0 0 16px; display: grid; place-items: start center; padding-top: 66px; }
   .command-palette-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(21, 31, 27, 0.2); backdrop-filter: blur(3px); cursor: default; }
@@ -4177,7 +4351,7 @@
   @keyframes layout-spin { to { transform: rotate(360deg); } }
   .layout-toolbar .layout-delete { color: #a45a58; }
   .workflow-group-row { min-width: 0; padding: 7px 8px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(82, 105, 95, 0.11); border-radius: 10px; background: rgba(255, 255, 255, 0.25); transition: border-color 160ms ease, background 160ms ease; }
-  .workflow-global-mode { margin: 5px 0 1px; }
+  .workflow-global-mode { position: relative; margin: 5px 0 1px; }
   .workflow-group-row.enabled { border-color: rgba(55, 151, 103, 0.22); background: rgba(62, 153, 106, 0.055); }
   .workflow-group-symbol { width: 27px; height: 22px; flex: 0 0 27px; display: grid; place-items: center; overflow: visible; }
   .workflow-group-symbol svg { width: 24px; height: 20px; overflow: visible; }
@@ -4191,16 +4365,46 @@
   .workflow-group-row.enabled .workflow-group-symbol .normal-link { opacity: 0; }
   .workflow-group-row.enabled .workflow-group-symbol .workflow-link { stroke-dashoffset: 0; opacity: 1; }
   .workflow-group-row.enabled .workflow-group-symbol circle { fill: #dff4e9; stroke: #43a572; filter: drop-shadow(0 0 3px rgba(64, 167, 111, 0.42)); transform: translateY(0); }
-  .workflow-group-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
-  .workflow-group-copy strong { color: #43574d; font-size: 8px; }
-  .workflow-group-copy small { overflow: hidden; color: #8a9891; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
-  .workflow-mode-switch { position: relative; width: 87px; height: 26px; padding: 2px; flex: 0 0 87px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 7px; background: rgba(83, 108, 96, 0.09); isolation: isolate; }
+  .workflow-group-copy { min-width: 0; flex: 1; }
+  .workflow-group-copy strong { color: #43574d; font-size: 9.5px; }
+  .workflow-mode-switch { position: relative; width: 101px; height: 28px; padding: 2px; flex: 0 0 101px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 8px; background: rgba(83, 108, 96, 0.09); isolation: isolate; }
   .workflow-mode-switch::before { position: absolute; z-index: 0; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / 2); border-radius: 5px; content: ""; background: rgba(255, 255, 255, 0.82); box-shadow: 0 1px 4px rgba(44, 72, 58, 0.13); transform: translateX(0); transition: transform 240ms cubic-bezier(.2,.85,.2,1), background 180ms ease, box-shadow 180ms ease; }
   .workflow-mode-switch.workflow-active::before { transform: translateX(100%); }
-  .workflow-mode-switch button { position: relative; z-index: 1; min-width: 0; height: 22px; padding: 0 3px; border: 0; border-radius: 5px; color: #87948e; background: transparent; font: 700 7px Inter, sans-serif; cursor: pointer; transition: color 160ms ease, transform 160ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-mode-switch button { position: relative; z-index: 1; min-width: 0; height: 24px; padding: 0 4px; border: 0; border-radius: 6px; color: #87948e; background: transparent; font: 720 8px Inter, sans-serif; cursor: pointer; transition: color 160ms ease, transform 160ms cubic-bezier(.2,.8,.2,1); }
   .workflow-mode-switch button:active:not(:disabled) { transform: scale(.94); }
   .workflow-mode-switch button.active { color: #397258; }
   .workflow-mode-switch button:disabled { opacity: 0.5; cursor: default; }
+  .workflow-settings-trigger { width: 28px; height: 28px; padding: 5px; flex: 0 0 28px; display: grid; place-items: center; border: 0; border-radius: 7px; color: #708078; background: transparent; cursor: pointer; }
+  .workflow-settings-trigger:hover,
+  .workflow-settings-trigger.active { color: #377e59; background: rgba(55, 142, 98, 0.09); }
+  .workflow-settings-trigger svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; }
+  .workflow-settings-dismiss { position: fixed; z-index: 238; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: transparent; cursor: default; }
+  .workflow-settings-popover { position: absolute; z-index: 240; top: 84px; right: 16px; width: min(310px, calc(100% - 32px)); max-height: calc(100vh - 96px); overflow: hidden; isolation: isolate; border: 1px solid rgba(67, 105, 86, 0.18); border-radius: 12px; color: #485b51; background: #f7faf8; background-clip: padding-box; }
+  .workflow-settings-scroll { box-sizing: border-box; width: 100%; max-height: calc(100vh - 96px); padding: 11px; display: grid; gap: 9px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+  .workflow-settings-scroll > header { display: flex; align-items: flex-start; gap: 8px; }
+  .workflow-settings-scroll > header div { min-width: 0; flex: 1; display: grid; gap: 2px; }
+  .workflow-settings-scroll > header strong { color: #33483d; font-size: 10px; }
+  .workflow-settings-scroll > header small { color: #829087; font-size: 7.5px; }
+  .workflow-settings-scroll > header button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; color: #73827a; background: transparent; font-size: 16px; cursor: pointer; }
+  .workflow-setting-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .workflow-setting-grid label { min-width: 0; display: grid; gap: 4px; color: #718078; font-size: 7.5px; font-weight: 700; }
+  .workflow-setting-grid input { width: 100%; min-width: 0; height: 29px; padding: 0 7px; border: 1px solid rgba(75, 105, 90, 0.15); border-radius: 7px; outline: 0; color: #3f574a; background: rgba(73, 105, 88, 0.045); font: 750 9px Inter, sans-serif; }
+  .workflow-setting-grid input:focus { border-color: rgba(50, 143, 96, 0.45); box-shadow: 0 0 0 2px rgba(50, 143, 96, 0.07); }
+  .workflow-setting-toggle { min-height: 29px; display: flex; align-items: center; gap: 8px; color: #596d62; font-size: 8.5px; font-weight: 700; cursor: pointer; }
+  .workflow-setting-toggle span { min-width: 0; flex: 1; }
+  .workflow-setting-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+  .workflow-setting-toggle i { width: 27px; height: 15px; padding: 2px; flex: 0 0 auto; border-radius: 9px; background: #c4cec9; transition: background 150ms ease; }
+  .workflow-setting-toggle i::before { width: 11px; height: 11px; display: block; border-radius: 50%; content: ""; background: white; box-shadow: 0 1px 3px rgba(34, 55, 44, 0.2); transition: transform 170ms cubic-bezier(.2,.8,.2,1); }
+  .workflow-setting-toggle input:checked + i { background: #3e9568; }
+  .workflow-setting-toggle input:checked + i::before { transform: translateX(12px); }
+  .workflow-reserve-setting { display: grid; grid-template-columns: minmax(0, 1fr) 100px 30px; align-items: center; gap: 7px; color: #65766d; font-size: 8px; font-weight: 700; }
+  .workflow-reserve-setting input { width: 100%; accent-color: #3c9266; }
+  .workflow-reserve-setting strong { color: #397b59; font-size: 8px; text-align: right; }
+  .workflow-missing-sessions { padding-top: 8px; display: grid; gap: 6px; border-top: 1px solid rgba(75, 105, 90, 0.12); }
+  .workflow-missing-sessions > strong { color: #9a6c3b; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; }
+  .workflow-missing-sessions label { display: grid; grid-template-columns: 74px minmax(0, 1fr); align-items: center; gap: 7px; }
+  .workflow-missing-sessions label > span { overflow: hidden; color: #64766c; font-size: 8px; font-weight: 700; text-overflow: ellipsis; text-transform: capitalize; white-space: nowrap; }
+  .workflow-missing-sessions :global(.lume-select) { width: 100%; }
   .terminal-picker { min-height: 0; padding: 9px 0 6px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #cad2ce transparent; }
   .terminal-picker-row { min-height: 59px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(105, 123, 115, 0.09); }
   .terminal-picker-row:last-child { border-bottom: 0; }
@@ -4212,8 +4416,6 @@
   .terminal-picker-row > button:disabled { opacity: 0.5; cursor: default; }
   .board-empty { margin: 22px 0; color: #89938f; font-size: 9px; line-height: 1.45; }
   .board-message { margin: 1px 0 4px; color: #5f756b; font-size: 9px; }
-  .dock-guide { margin-top: 9px; padding: 11px 9px; display: flex; align-items: center; gap: 9px; border-top: 1px solid rgba(105, 123, 115, 0.1); color: #8a9590; font-size: 8px; line-height: 1.4; }
-  .dock-guide svg { width: 34px; height: 22px; flex: 0 0 auto; fill: none; stroke: #6f8f81; stroke-width: 1.3; }
 
   .empty-state { height: 100%; min-height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #73807a; text-align: center; }
   .empty-state strong { margin-top: 10px; color: #44524c; font-size: 11px; }
@@ -4496,8 +4698,7 @@
   .overlay-shell:not(.dark) .setting-row,
   .overlay-shell:not(.dark) .field-row,
   .overlay-shell:not(.dark) .terminal-picker-row,
-  .overlay-shell:not(.dark) .settings-section,
-  .overlay-shell:not(.dark) .dock-guide { border-color: rgba(73, 99, 87, 0.16); }
+  .overlay-shell:not(.dark) .settings-section { border-color: rgba(73, 99, 87, 0.16); }
   .overlay-shell:not(.dark) .session-row:hover,
   .overlay-shell:not(.dark) .session-row.selected { background: #e1ebe6; }
   .overlay-shell:not(.dark) .result-card,
@@ -4539,7 +4740,7 @@
 
   .overlay-shell.dark { color-scheme: dark; }
   .overlay-shell.dark .lume-orb,
-  .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: rgba(27, 34, 31, 0.96); }
+  .overlay-shell.dark .launcher-popover { color: #dfe8e3; border-color: rgba(190, 209, 200, 0.13); background: #1b221f; }
   .overlay-shell.dark .resume-session { color: #afc0b7; background: rgba(216, 229, 223, 0.035); }
   .overlay-shell.dark .resume-session:hover { background: rgba(101, 180, 141, 0.08); }
   .overlay-shell.dark .resume-session strong { color: #dbe7e1; }
@@ -4651,16 +4852,28 @@
   .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
   .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }
   .overlay-shell.dark .terminal-picker-row,
-  .overlay-shell.dark .dock-guide { border-color: rgba(190, 209, 200, 0.09); }
+  .overlay-shell.dark .workflow-missing-sessions { border-color: rgba(190, 209, 200, 0.09); }
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }
   .overlay-shell.dark .terminal-picker-row > button:hover:not(:disabled) { background: rgba(222, 233, 228, 0.09); }
   .overlay-shell.dark .workflow-group-row { border-color: rgba(207, 223, 215, 0.09); background: rgba(222, 233, 228, 0.025); }
   .overlay-shell.dark .workflow-group-row.enabled { border-color: rgba(87, 186, 137, 0.2); background: rgba(74, 164, 116, 0.055); }
   .overlay-shell.dark .workflow-group-copy strong { color: #c0d0c8; }
-  .overlay-shell.dark .workflow-group-copy small { color: #81938a; }
   .overlay-shell.dark .workflow-mode-switch { background: rgba(220, 235, 227, 0.055); }
   .overlay-shell.dark .workflow-mode-switch::before { background: rgba(103, 183, 143, 0.12); box-shadow: none; }
   .overlay-shell.dark .workflow-mode-switch button.active { color: #91d2b1; }
+  .overlay-shell.dark .workflow-settings-trigger { color: #98aaa1; }
+  .overlay-shell.dark .workflow-settings-trigger:hover,
+  .overlay-shell.dark .workflow-settings-trigger.active { color: #91d2b1; background: rgba(91, 177, 137, 0.08); }
+  .overlay-shell.dark .workflow-settings-popover { color: #bdcbc4; border-color: rgba(202, 220, 211, 0.12); background: #18221d; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.38); }
+  .overlay-shell.dark .workflow-settings-scroll > header strong { color: #d9e5df; }
+  .overlay-shell.dark .workflow-settings-scroll > header small,
+  .overlay-shell.dark .workflow-setting-grid label,
+  .overlay-shell.dark .workflow-reserve-setting { color: #91a39a; }
+  .overlay-shell.dark .workflow-setting-grid input { color: #cfddd5; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 235, 227, 0.045); }
+  .overlay-shell.dark .workflow-setting-toggle { color: #b4c4bc; }
+  .overlay-shell.dark .workflow-setting-toggle i { background: #46534d; }
+  .overlay-shell.dark .workflow-missing-sessions { border-color: rgba(205, 222, 213, 0.1); }
+  .overlay-shell.dark .workflow-missing-sessions label > span { color: #9fb0a7; }
   .overlay-shell.dark .permission-actions button:hover { background: rgba(222, 233, 228, 0.09); }
   .overlay-shell.dark .segmented button.active { color: #dfe8e3; background: rgba(214, 229, 221, 0.1); }
   .overlay-shell.dark .command-palette { border-color: rgba(207, 223, 215, 0.13); background: rgba(27, 34, 31, 0.985); }

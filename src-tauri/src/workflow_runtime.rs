@@ -14,7 +14,8 @@ use crate::{
     domain::{
         AgentSession, PromptDelivery, SessionStatus, WorkflowAdvanceMode,
         WorkflowConnectionDefinition, WorkflowGroupDefinition, WorkflowRole, WorkflowRun,
-        WorkflowRunStatus, WorkflowStepDefinition, WorkflowStepRun, WorkflowStepRunStatus,
+        WorkflowRunStatus, WorkflowSettings, WorkflowStepDefinition, WorkflowStepRun,
+        WorkflowStepRunStatus,
     },
     state::{now_millis, AppState},
 };
@@ -151,8 +152,10 @@ impl WorkflowRuntime {
         }
 
         let sessions = state.sessions()?;
+        let settings = state.preferences()?.workflow_settings;
         let first_step = workflow_step(&group, &order[0])?;
         let session = available_session_for_step(&sessions, first_step)?;
+        ensure_rate_limit_reserve(session, &settings)?;
         let prompt = initial_step_prompt(&group, first_step, objective);
         let baseline = result_ids(session);
         submit_workflow_prompt(app, state, bridge, browser, session, &prompt)?;
@@ -183,6 +186,7 @@ impl WorkflowRuntime {
             pending_connection_id: None,
             handoff_approved: false,
             recovering: false,
+            transition_count: 0,
             steps,
             error: None,
             created_at: now,
@@ -229,6 +233,7 @@ impl WorkflowRuntime {
         }
         active.run.handoff_approved = true;
         active.run.status = WorkflowRunStatus::Ready;
+        active.run.error = None;
         active.run.updated_at = now_millis();
         persist_active(state, active)?;
         let run = active.run.clone();
@@ -249,6 +254,15 @@ impl WorkflowRuntime {
         let snapshot = self.snapshot(workflow_id)?;
         if snapshot.run.status != WorkflowRunStatus::Ready {
             return Err("The current workflow step is not ready to advance".into());
+        }
+        let settings = state.preferences()?.workflow_settings;
+        if snapshot.run.transition_count >= settings.max_transitions {
+            return self.pause_for_guardrail(
+                app,
+                state,
+                workflow_id,
+                "Workflow paused after reaching the transition limit",
+            );
         }
         let connection_id = snapshot
             .run
@@ -273,18 +287,22 @@ impl WorkflowRuntime {
         let prompt = if source_run.status == WorkflowStepRunStatus::Skipped {
             skipped_step_prompt(&snapshot.group, connection, &snapshot.run.objective)?
         } else {
-            context_builder::build_context_package(
+            context_builder::build_context_package_with_limit(
                 &snapshot.group,
                 connection_id,
                 &snapshot.run.objective,
                 source_run.result_id.as_deref(),
                 &state.sessions()?,
+                settings.max_context_tokens as usize,
             )?
             .markdown
         };
         let target = workflow_step(&snapshot.group, &connection.to_step_id)?;
         let sessions = state.sessions()?;
         let session = available_session_for_step(&sessions, target)?;
+        if let Err(error) = ensure_rate_limit_reserve(session, &settings) {
+            return self.pause_for_guardrail(app, state, workflow_id, &error);
+        }
         let baseline = result_ids(session);
         submit_workflow_prompt(app, state, bridge, browser, session, &prompt)?;
 
@@ -314,6 +332,7 @@ impl WorkflowRuntime {
         active.run.current_step_id = Some(target.id.clone());
         active.run.pending_connection_id = None;
         active.run.handoff_approved = false;
+        active.run.transition_count = active.run.transition_count.saturating_add(1);
         active.run.status = WorkflowRunStatus::Running;
         active.run.error = None;
         active.run.updated_at = now;
@@ -375,6 +394,7 @@ impl WorkflowRuntime {
         let resumed_status = status_after_pause(active);
         active.run.status = resumed_status;
         active.paused_from = None;
+        active.run.error = None;
         active.run.updated_at = now_millis();
         persist_active(state, active)?;
         let run = active.run.clone();
@@ -402,6 +422,17 @@ impl WorkflowRuntime {
             .as_deref()
             .ok_or_else(|| "The workflow has no current step".to_string())?;
         let step = workflow_step(&snapshot.group, step_id)?;
+        let settings = state.preferences()?.workflow_settings;
+        let current_attempt = snapshot
+            .run
+            .steps
+            .iter()
+            .find(|candidate| candidate.step_id == step_id)
+            .map(|candidate| candidate.attempt)
+            .unwrap_or_default();
+        if current_attempt >= settings.max_attempts_per_step {
+            return Err("This workflow step reached its retry limit".into());
+        }
         let prompt = snapshot
             .prompts
             .get(step_id)
@@ -409,6 +440,7 @@ impl WorkflowRuntime {
             .ok_or_else(|| "The failed step prompt is no longer available".to_string())?;
         let sessions = state.sessions()?;
         let session = available_session_for_step(&sessions, step)?;
+        ensure_rate_limit_reserve(session, &settings)?;
         let baseline = result_ids(session);
         submit_workflow_prompt(app, state, bridge, browser, session, &prompt)?;
 
@@ -535,6 +567,91 @@ impl WorkflowRuntime {
             .map(|session| session.id))
     }
 
+    pub fn rebind_session(
+        &self,
+        app: &AppHandle,
+        state: &AppState,
+        workflow_id: &str,
+        step_id: &str,
+        session_native_id: &str,
+    ) -> Result<Option<WorkflowRun>, String> {
+        let session_native_id = session_native_id.trim();
+        if session_native_id.is_empty()
+            || !state
+                .sessions()?
+                .iter()
+                .any(|session| session.native_session_id.as_deref() == Some(session_native_id))
+        {
+            return Err("Choose an agent session that is currently connected".into());
+        }
+
+        let mut preferences = state.preferences()?;
+        let group = preferences
+            .workflow_groups
+            .iter_mut()
+            .find(|group| group.id == workflow_id)
+            .ok_or_else(|| "Workflow group not found".to_string())?;
+        if group
+            .steps
+            .iter()
+            .any(|step| step.id != step_id && step.session_native_id == session_native_id)
+        {
+            return Err("This agent session is already used by another workflow step".into());
+        }
+        let step = group
+            .steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| "Workflow step not found".to_string())?;
+        step.session_native_id = session_native_id.to_string();
+        state.save_preferences(&preferences)?;
+
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| "Could not access workflow runs".to_string())?;
+        let Some(active) = runs.get_mut(workflow_id) else {
+            return Ok(None);
+        };
+        if active
+            .group
+            .steps
+            .iter()
+            .any(|step| step.id != step_id && step.session_native_id == session_native_id)
+        {
+            return Err("This agent session is already used by another workflow step".into());
+        }
+        let active_step = active
+            .group
+            .steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| "Workflow step not found".to_string())?;
+        active_step.session_native_id = session_native_id.to_string();
+        active.unavailable_since.remove(step_id);
+        active.recovery_deadline = None;
+        active.run.recovering = false;
+        if active.run.current_step_id.as_deref() == Some(step_id)
+            && matches!(
+                active.run.status,
+                WorkflowRunStatus::Running | WorkflowRunStatus::Paused
+            )
+        {
+            fail_step(
+                active,
+                step_id,
+                "The workflow agent was replaced. Retry this step to continue",
+            );
+        } else {
+            active.run.updated_at = now_millis();
+        }
+        persist_active(state, active)?;
+        let run = active.run.clone();
+        drop(runs);
+        emit_changed(app, &run);
+        Ok(Some(run))
+    }
+
     fn snapshot(&self, workflow_id: &str) -> Result<ActiveWorkflowRun, String> {
         self.runs
             .lock()
@@ -590,12 +707,38 @@ impl WorkflowRuntime {
         })
     }
 
+    fn pause_for_guardrail(
+        &self,
+        app: &AppHandle,
+        state: &AppState,
+        workflow_id: &str,
+        message: &str,
+    ) -> Result<WorkflowRun, String> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| "Could not access workflow runs".to_string())?;
+        let active = runs
+            .get_mut(workflow_id)
+            .ok_or_else(|| "Workflow run not found".to_string())?;
+        active.paused_from = Some(active.run.status);
+        active.run.status = WorkflowRunStatus::Paused;
+        active.run.error = Some(message.to_string());
+        active.run.updated_at = now_millis();
+        persist_active(state, active)?;
+        let run = active.run.clone();
+        drop(runs);
+        emit_changed(app, &run);
+        Ok(run)
+    }
+
     fn reconcile(
         &self,
         state: &AppState,
         workflow_id: &str,
     ) -> Result<Option<WorkflowRun>, String> {
         let sessions = state.sessions()?;
+        let settings = state.preferences()?.workflow_settings;
         let mut runs = self
             .runs
             .lock()
@@ -629,6 +772,21 @@ impl WorkflowRuntime {
             session.native_session_id.as_deref() == Some(step.session_native_id.as_str())
         });
         let now = now_millis();
+        let started_at = active.run.steps[step_index].started_at.unwrap_or_default();
+        if !active.run.recovering
+            && active.run.status == WorkflowRunStatus::Running
+            && settings.step_timeout_minutes > 0
+            && now.saturating_sub(started_at)
+                >= i64::from(settings.step_timeout_minutes) * 60 * 1_000
+        {
+            fail_step(
+                active,
+                &step_id,
+                "The workflow step exceeded its configured timeout",
+            );
+            persist_active(state, active)?;
+            return Ok(Some(active.run.clone()));
+        }
         let Some(session) = session else {
             if active
                 .recovery_deadline
@@ -670,7 +828,6 @@ impl WorkflowRuntime {
             .iter()
             .filter(|result| !baseline.contains(&result.id))
             .max_by_key(|result| result.created_at);
-        let started_at = active.run.steps[step_index].started_at.unwrap_or_default();
         if session.status == SessionStatus::Failed && session.updated_at >= started_at {
             active.unavailable_since.remove(&step_id);
             fail_step(
@@ -680,13 +837,43 @@ impl WorkflowRuntime {
             );
         } else if let Some(result) = result.filter(|_| !agent_is_busy) {
             active.unavailable_since.remove(&step_id);
-            let step_run = &mut active.run.steps[step_index];
-            step_run.status = WorkflowStepRunStatus::Completed;
-            step_run.completed_at = Some(result.created_at);
-            step_run.result_id = Some(result.id.clone());
-            step_run.error = None;
+            let result_id = result.id.clone();
+            {
+                let step_run = &mut active.run.steps[step_index];
+                step_run.status = WorkflowStepRunStatus::Completed;
+                step_run.completed_at = Some(result.created_at);
+                step_run.result_id = Some(result_id.clone());
+                step_run.error = None;
+            }
             active.run.error = None;
             set_pending_transition(active, &step_id, now)?;
+            if settings.require_approval_for_sensitive_context
+                && active
+                    .run
+                    .pending_connection_id
+                    .as_deref()
+                    .is_some_and(|connection_id| {
+                        context_builder::build_context_package_with_limit(
+                            &active.group,
+                            connection_id,
+                            &active.run.objective,
+                            Some(&result_id),
+                            &sessions,
+                            settings.max_context_tokens as usize,
+                        )
+                        .ok()
+                        .is_some_and(|package| {
+                            package
+                                .redactions
+                                .iter()
+                                .any(|entry| matches!(entry.kind.as_str(), "secret" | "file"))
+                        })
+                    })
+            {
+                active.run.status = WorkflowRunStatus::WaitingForApproval;
+                active.run.error =
+                    Some("Sensitive context was redacted. Review and approve this handoff".into());
+            }
         } else if !agent_is_busy
             && session.updated_at >= started_at
             && prompt_ended_without_result(session, started_at)
@@ -851,6 +1038,28 @@ fn available_session_for_step<'a>(
     Ok(session)
 }
 
+fn ensure_rate_limit_reserve(
+    session: &AgentSession,
+    settings: &WorkflowSettings,
+) -> Result<(), String> {
+    if !settings.pause_on_rate_limit || settings.minimum_rate_limit_remaining_percent == 0 {
+        return Ok(());
+    }
+    let maximum_used = session
+        .rate_limits
+        .iter()
+        .map(|limit| limit.used_percent)
+        .max();
+    let blocked_at = 100_u8.saturating_sub(settings.minimum_rate_limit_remaining_percent);
+    if maximum_used.is_some_and(|used| used >= blocked_at) {
+        return Err(format!(
+            "Workflow paused to preserve at least {}% of this agent's rate limit",
+            settings.minimum_rate_limit_remaining_percent
+        ));
+    }
+    Ok(())
+}
+
 fn submit_workflow_prompt(
     app: &AppHandle,
     state: &AppState,
@@ -975,6 +1184,11 @@ fn fail_step(active: &mut ActiveWorkflowRun, step_id: &str, message: &str) {
 }
 
 fn status_after_pause(active: &ActiveWorkflowRun) -> WorkflowRunStatus {
+    if active.paused_from == Some(WorkflowRunStatus::WaitingForApproval)
+        && !active.run.handoff_approved
+    {
+        return WorkflowRunStatus::WaitingForApproval;
+    }
     let Some(step_id) = active.run.current_step_id.as_deref() else {
         return WorkflowRunStatus::Draft;
     };
@@ -1156,6 +1370,25 @@ mod tests {
         assert_eq!(active.run.status, WorkflowRunStatus::WaitingForApproval);
         assert_eq!(active.run.pending_connection_id.as_deref(), Some("one-two"));
         assert!(!active.run.handoff_approved);
+    }
+
+    #[test]
+    fn sensitive_approval_is_not_bypassed_by_pause_and_resume() {
+        let group = WorkflowGroupDefinition {
+            id: "workflow".into(),
+            terminal_group_id: "terminals".into(),
+            steps: vec![step("one"), step("two")],
+            connections: vec![connection("one", "two")],
+        };
+        let mut active = active_run(group, "one");
+        set_pending_transition(&mut active, "one", 42).expect("transition");
+        active.paused_from = Some(WorkflowRunStatus::WaitingForApproval);
+        active.run.status = WorkflowRunStatus::Paused;
+
+        assert_eq!(
+            status_after_pause(&active),
+            WorkflowRunStatus::WaitingForApproval
+        );
     }
 
     #[test]

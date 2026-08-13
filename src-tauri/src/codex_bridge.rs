@@ -657,6 +657,20 @@ fn proxy_connection(
             match client.read() {
                 Ok(message) => {
                     let closing = matches!(message, Message::Close(_));
+                    if let Some(thread_id) = proxy_client_resumed_thread(&message) {
+                        active_proxy_threads
+                            .lock()
+                            .map_err(|_| {
+                                "Could not register the resumed Codex session".to_string()
+                            })?
+                            .insert(
+                                thread_id,
+                                ActiveProxyConnection {
+                                    connection_id,
+                                    sender: proxy_sender.clone(),
+                                },
+                            );
+                    }
                     observe_client_message(&message, &mut profiles);
                     server.send(message).map_err(|error| error.to_string())?;
                     if closing {
@@ -727,6 +741,15 @@ fn proxy_connection(
         ));
     }
     result
+}
+
+fn proxy_client_resumed_thread(message: &Message) -> Option<String> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    (value.get("method").and_then(Value::as_str)? == "thread/resume")
+        .then(|| text_at(value.get("params")?, "threadId").map(str::to_string))?
 }
 
 fn proxy_thread_lifecycle(message: &Message) -> Option<(String, bool)> {
@@ -2588,6 +2611,30 @@ mod tests {
             proxy_thread_lifecycle(&closed),
             Some(("thread-live".into(), false))
         );
+    }
+
+    #[test]
+    fn proxy_registers_a_resumed_thread_before_a_started_notification() {
+        let resumed = Message::Text(
+            json!({
+                "method": "thread/resume",
+                "id": 2,
+                "params": { "threadId": "thread-live" }
+            })
+            .to_string()
+            .into(),
+        );
+        let unrelated = Message::Text(
+            json!({ "method": "turn/start", "params": { "threadId": "thread-live" } })
+                .to_string()
+                .into(),
+        );
+
+        assert_eq!(
+            proxy_client_resumed_thread(&resumed),
+            Some("thread-live".into())
+        );
+        assert_eq!(proxy_client_resumed_thread(&unrelated), None);
     }
 
     #[test]

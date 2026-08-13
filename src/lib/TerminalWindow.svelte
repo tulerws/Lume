@@ -5,13 +5,14 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { AgentSession, DockPreviewEvent, DockSide, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, TerminalWindowState, WorkflowGroupDefinition, WorkflowRole, WorkflowRoleContract, WorkflowStepDefinition } from "$lib/domain";
+  import type { AgentSession, DockPreviewEvent, DockSide, PermissionAction, Preferences, PromptAttachmentInput, QuestionAnswer, SessionActivity, SessionNote, TerminalWindowState, WorkflowGroupDefinition, WorkflowRole, WorkflowRoleContract, WorkflowStepDefinition } from "$lib/domain";
   import type { HubSession, WorkItemStatus } from "$lib/hubProtocol";
   import BrandIcon from "$lib/BrandIcon.svelte";
   import ActivityTraceGroup from "$lib/ActivityTraceGroup.svelte";
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
   import FileTypeIcon from "$lib/FileTypeIcon.svelte";
+  import WorkflowRoleIcon from "$lib/WorkflowRoleIcon.svelte";
   import ResponseAttachments from "$lib/ResponseAttachments.svelte";
   import { cleanPromptTransport, promptTextKey } from "$lib/chatAttachments";
   import { isHiddenAgentActivity, isPresentableTraceActivity, needsUserAuthorization } from "$lib/activityPresentation";
@@ -59,6 +60,7 @@
     interruptPrompt,
     loadDisplayBackend,
     loadPreferences,
+    loadSessionNotes,
     loadTerminalHubSnapshot,
     loadWorkflowRoleContract,
     loadHubSnapshot,
@@ -75,6 +77,7 @@
     renameSession,
     resizeTerminalWindow,
     savePreferences,
+    saveSessionNote,
     setWorkflowConnectionHover,
     setSessionCollaborationMode,
     setTerminalFileDialogActive,
@@ -83,6 +86,7 @@
     syncTerminalWindowPosition,
     terminalGroupFullscreenActive,
     terminateSession,
+    deleteSessionNote,
     toggleTerminalGroupFullscreen,
     undockTerminalWindow,
     type CollaborationMode,
@@ -182,8 +186,19 @@
   let renamingSession = $state(false);
   let renameDraft = $state("");
   let savingSessionName = $state(false);
-  type TerminalTab = "chat" | "changes" | "plan";
+  type TerminalTab = "chat" | "changes" | "plan" | "notes";
   let activeTab = $state<TerminalTab>("chat");
+  let sessionNotes = $state<SessionNote[]>([]);
+  let notesSessionId = $state<string | null>(null);
+  let notesLoading = $state(false);
+  let noteSaving = $state(false);
+  let noteEditor = $state<{
+    id?: string;
+    title: string;
+    body: string;
+    kind: "plan" | "note";
+    pinned: boolean;
+  } | null>(null);
   let workTrayExpanded = $state(true);
   let rateLimitRefreshRequested = false;
   let outputElement = $state<HTMLDivElement | null>(null);
@@ -405,8 +420,7 @@
         allTerminals.filter((terminal) => terminal.groupId === windowState?.groupId),
       );
       const saved = workflowGroups.find((group) => group.terminalGroupId === windowState?.groupId);
-      const activeKeys = new Set(terminals.map(terminalWorkflowKey));
-      const retained = (saved?.steps ?? []).filter((step) => activeKeys.has(step.sessionNativeId));
+      const retained = saved?.steps ?? [];
       const currentTerminalKey = terminalWorkflowKey(windowState);
       workflowRoleConfigured = retained.some((step) => step.sessionNativeId === currentTerminalKey);
       workflowContractExpanded = false;
@@ -904,16 +918,15 @@
       ? Math.max(0, Math.min(100, Math.round(100 - Number(activeRateLimit.usedPercent))))
       : 0,
   );
-  const todoSource = $derived(session?.workSummary.todo ?? null);
   const plan = $derived(session?.workSummary.plan ?? null);
   const goalSource = $derived(session?.workSummary.goal ?? null);
-  const todo = $derived(
-    todoSource
+  const activePlan = $derived(
+    plan
       && (
-        todoSource.items.some((item) => item.status !== "completed")
-        || workClock - todoSource.updatedAt < 12_000
+        plan.items.some((item) => item.status !== "completed")
+        || workClock - plan.updatedAt < 12_000
       )
-      ? todoSource
+      ? plan
       : null,
   );
   const goal = $derived(
@@ -926,13 +939,13 @@
       : null,
   );
   $effect(() => {
-    const currentTodo = todoSource;
+    const currentPlan = plan;
     const currentGoal = goalSource;
     const activeGoal = currentGoal?.status === "active";
     const now = Date.now();
     const expiryDelays = [
-      currentTodo && currentTodo.items.every((item) => item.status === "completed")
-        ? currentTodo.updatedAt + 12_000 - now
+      currentPlan && currentPlan.items.every((item) => item.status === "completed")
+        ? currentPlan.updatedAt + 12_000 - now
         : Number.POSITIVE_INFINITY,
       currentGoal && currentGoal.status !== "active"
         ? currentGoal.updatedAt + 12_000 - now
@@ -963,9 +976,6 @@
       workClockTimer = undefined;
     };
   });
-  const completedTodoItems = $derived(
-    todo?.items.filter((item) => item.status === "completed").length ?? 0,
-  );
   const completedPlanItems = $derived(
     plan?.items.filter((item) => item.status === "completed").length ?? 0,
   );
@@ -1682,6 +1692,7 @@
     const snapshot = await loadTerminalHubSnapshot(label, visibleChatItemLimit);
     const shouldFollow = activeTab === "chat" && outputFollowingTail;
     const nextSession = windowState ? resolveTerminalSession(windowState, snapshot.sessions) ?? null : null;
+    const notesSourceChanged = session?.id !== nextSession?.id;
     const previousActivity = session?.activities.at(-1);
     const nextActivity = nextSession?.activities.at(-1);
     const sessionChanged = !session || !nextSession
@@ -1696,6 +1707,12 @@
         || previousActivity?.status !== nextActivity?.status
         || previousActivity?.detail?.length !== nextActivity?.detail?.length;
     if (sessionChanged) session = nextSession;
+    if (notesSourceChanged) {
+      sessionNotes = [];
+      notesSessionId = null;
+      noteEditor = null;
+      if (activeTab === "notes" && session) void refreshSessionNotes();
+    }
     if (sessionChanged && shouldFollow && outputFollowingTail) {
       await tick();
       if (outputFollowingTail) {
@@ -1731,6 +1748,7 @@
       chatFollowingTail = outputFollowingTail;
     }
     activeTab = nextTab;
+    if (nextTab === "notes") await refreshSessionNotes();
     await tick();
     if (!outputElement) return;
     if (nextTab === "chat" && chatFollowingTail) {
@@ -1744,12 +1762,108 @@
     }
   }
 
+  async function refreshSessionNotes(force = false) {
+    if (!session || notesLoading) return;
+    if (!force && notesSessionId === session.id) return;
+    notesLoading = true;
+    try {
+      sessionNotes = await loadSessionNotes(session.id);
+      notesSessionId = session.id;
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      notesLoading = false;
+    }
+  }
+
+  function currentPlanBody() {
+    if (!plan) return "";
+    if (plan.content) return plan.content;
+    return [
+      plan.explanation?.trim(),
+      plan.items.map((item) => `- [${item.status === "completed" ? "x" : " "}] ${item.label}`).join("\n"),
+    ].filter(Boolean).join("\n\n");
+  }
+
+  function createNoteFromCurrentPlan() {
+    if (!plan) return;
+    noteEditor = {
+      title: tr("Saved plan", "Planejamento salvo"),
+      body: currentPlanBody(),
+      kind: "plan",
+      pinned: false,
+    };
+  }
+
+  function createBlankNote() {
+    noteEditor = { title: "", body: "", kind: "note", pinned: false };
+  }
+
+  function editSessionNote(note: SessionNote) {
+    noteEditor = {
+      id: note.id,
+      title: note.title,
+      body: note.body,
+      kind: note.kind,
+      pinned: note.pinned,
+    };
+  }
+
+  async function persistSessionNote() {
+    if (!session || !noteEditor?.body.trim() || noteSaving) return;
+    noteSaving = true;
+    try {
+      await saveSessionNote(session.id, noteEditor);
+      noteEditor = null;
+      notesSessionId = null;
+      await refreshSessionNotes(true);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      noteSaving = false;
+    }
+  }
+
+  async function toggleSessionNotePin(note: SessionNote) {
+    if (!session) return;
+    try {
+      await saveSessionNote(session.id, { ...note, pinned: !note.pinned });
+      notesSessionId = null;
+      await refreshSessionNotes(true);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function removeSessionNote(note: SessionNote) {
+    try {
+      await deleteSessionNote(note.id);
+      sessionNotes = sessionNotes.filter((candidate) => candidate.id !== note.id);
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+    }
+  }
+
+  async function useSessionNote(note: SessionNote) {
+    prompt = `${tr("Continue from this saved context:", "Continue a partir deste contexto salvo:")}\n\n${note.body}`;
+    await selectTab("chat");
+    await tick();
+    promptInput?.focus();
+  }
+
   function activityTime(createdAt: number) {
     return new Intl.DateTimeFormat(language, {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
     }).format(new Date(createdAt));
+  }
+
+  function noteDate(updatedAt: number) {
+    return new Intl.DateTimeFormat(language, {
+      dateStyle: "short",
+      timeStyle: "short",
+    }).format(new Date(updatedAt));
   }
 
   function handoffTargetCanReceive(target: HandoffTarget): boolean {
@@ -2876,7 +2990,7 @@
         </span>
       </header>
 
-      {#if todo || goal}
+      {#if activePlan || goal}
         <aside class:collapsed={!workTrayExpanded} class="work-tray" aria-label={tr("Agent work status", "Status do trabalho do agente")} transition:slide={{ duration: 160 }}>
           <button
             class="work-tray-toggle"
@@ -2887,32 +3001,32 @@
           >
             <strong>{tr("Agent work", "Trabalho do agente")}</strong>
             <span>
-              {#if todo}<small>TO DO {completedTodoItems}/{todo.items.length}</small>{/if}
+              {#if activePlan}<small>PLAN {completedPlanItems}/{activePlan.items.length}</small>{/if}
               {#if goal}<small>GOAL · {goalStatusLabel(goal.status)} · {elapsedGoalTime()}</small>{/if}
             </span>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"></path></svg>
           </button>
           <div class="work-tray-body" aria-hidden={!workTrayExpanded}>
             <div class="work-tray-grid">
-              {#if todo}
+              {#if activePlan}
                 <section class="work-card todo-card" transition:fade={{ duration: 140 }}>
                   <div class="work-card-heading">
-                    <strong>TO DO</strong>
-                    <span>{completedTodoItems}/{todo.items.length}</span>
+                    <strong>{tr("PLAN", "PLANO")}</strong>
+                    <span>{completedPlanItems}/{activePlan.items.length}</span>
                   </div>
-                  <i class="todo-progress" style={`--todo-progress: ${(completedTodoItems / todo.items.length) * 100}%`}>
+                  <i class="todo-progress" style={`--todo-progress: ${(completedPlanItems / activePlan.items.length) * 100}%`}>
                     <em></em>
                   </i>
                   <ul>
-                    {#each todo.items.slice(0, 4) as item}
+                    {#each activePlan.items.slice(0, 4) as item}
                       <li class:active={item.status === "in_progress"} class:done={item.status === "completed"} title={workItemLabel(item.status)}>
                         <span aria-hidden="true"></span>
                         <small>{item.label}</small>
                       </li>
                     {/each}
                   </ul>
-                  {#if todo.items.length > 4}
-                    <small class="work-more">+{todo.items.length - 4} {tr("more", "a mais")}</small>
+                  {#if activePlan.items.length > 4}
+                    <small class="work-more">+{activePlan.items.length - 4} {tr("more", "a mais")}</small>
                   {/if}
                 </section>
               {/if}
@@ -2948,6 +3062,9 @@
             {tr("Plan", "Plano")} <span>{plan.items.length || 1}</span>
           </button>
         {/if}
+        <button class:active={activeTab === "notes"} type="button" onclick={() => void selectTab("notes")}>
+          {tr("Notes", "Notas")} {#if sessionNotes.length}<span>{sessionNotes.length}</span>{/if}
+        </button>
       </nav>
 
       {#if activeTab === "chat" && windowState?.workflowEnabled && windowState.docked}
@@ -2964,9 +3081,9 @@
             onclick={() => workflowDraft ? (workflowDraft = null) : void openWorkflowRoleEditor()}
           >
             {#if workflowStep}
-              <i class="role-symbol role-{workflowStep.role}" aria-hidden="true"><span></span></i>
+              <i class="role-symbol role-{workflowStep.role}" aria-hidden="true"><WorkflowRoleIcon role={workflowStep.role} /></i>
             {:else}
-              <i class="role-symbol role-custom" aria-hidden="true"><span></span></i>
+              <i class="role-symbol role-custom" aria-hidden="true"><WorkflowRoleIcon role="custom" /></i>
             {/if}
             {#if workflowStepOrder}<span class="workflow-step-badge" aria-hidden="true">{workflowStepOrder}</span>{/if}
             <span class="workflow-role-tooltip">
@@ -3001,7 +3118,7 @@
                 <div class="workflow-role-picker">
                   <span class="workflow-field-label">{tr("Agent role", "Papel do agente")}</span>
                   <button class:open={workflowRolePickerOpen} class="workflow-role-trigger" type="button" aria-haspopup="listbox" aria-expanded={workflowRolePickerOpen} onclick={() => { workflowPendingRole = null; workflowRolePickerOpen = !workflowRolePickerOpen; }}>
-                    <i class="role-symbol role-{workflowRoleConfigured ? workflowEditingStep.role : 'custom'}" aria-hidden="true"><span></span></i>
+                    <i class="role-symbol role-{workflowRoleConfigured ? workflowEditingStep.role : 'custom'}" aria-hidden="true"><WorkflowRoleIcon role={workflowRoleConfigured ? workflowEditingStep.role : "custom"} /></i>
                     <span>
                       <strong>{workflowRoleConfigured ? workflowStepRoleLabel(workflowEditingStep) : tr("Choose a role", "Escolha um papel")}</strong>
                       <small>{workflowRoleConfigured ? workflowRoleDescription(workflowEditingStep.role) : tr("Select this agent's responsibility", "Selecione a responsabilidade deste agente")}</small>
@@ -3012,7 +3129,7 @@
                     <div class="workflow-role-menu" role="listbox" aria-label={tr("Agent role", "Papel do agente")}>
                       {#each workflowRoles as role}
                         <button class:active={workflowRoleConfigured && workflowEditingStep.role === role} disabled={workflowDraftSaving} type="button" role="option" aria-selected={workflowRoleConfigured && workflowEditingStep.role === role} onclick={() => void selectWorkflowRole(role)}>
-                          <i class="role-symbol role-{role}" aria-hidden="true"><span></span></i>
+                          <i class="role-symbol role-{role}" aria-hidden="true"><WorkflowRoleIcon {role} /></i>
                           <span><strong>{workflowRoleOptionLabel(role)}</strong><small>{workflowRoleDescription(role)}</small></span>
                           {#if workflowRoleConfigured && workflowEditingStep.role === role}<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7"></path></svg>{/if}
                         </button>
@@ -3022,7 +3139,7 @@
                 </div>
                 {#if workflowPendingRole}
                   <div class="workflow-role-replace-warning" role="alert">
-                    <i class="role-symbol role-{workflowPendingRole}" aria-hidden="true"><span></span></i>
+                    <i class="role-symbol role-{workflowPendingRole}" aria-hidden="true"><WorkflowRoleIcon role={workflowPendingRole} /></i>
                     <span>
                       <strong>{tr("Replace customized instructions?", "Substituir instruções personalizadas?")}</strong>
                       <small>{tr(`Changing to ${workflowRoleOptionLabel(workflowPendingRole)} restores that role's defaults.`, `Mudar para ${workflowRoleOptionLabel(workflowPendingRole)} restaura os padrões desse papel.`)}</small>
@@ -3084,8 +3201,10 @@
         onscroll={handleOutputScroll}
         onwheel={handleOutputWheel}
       >
-        <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
-        <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
+        {#if activeTab === "chat"}
+          <p><span>$</span> {session.agentLabel.toLowerCase()} <i>{session.project}</i></p>
+          <p class="status status-{session.status}"><span>&gt;</span> {displayText(language, session.statusLabel)}</p>
+        {/if}
         {#if session.pendingQuestion}
           <section class="agent-question" aria-label={tr("Agent question", "Pergunta do agente")}>
             {#each session.pendingQuestion.questions as question}
@@ -3301,16 +3420,22 @@
               <p class="empty-state">{tr("No file changes were reported in this session.", "Nenhuma alteração de arquivo foi informada nesta sessão.")}</p>
             {/if}
           </section>
-        {:else if plan}
+        {:else if activeTab === "plan" && plan}
           <section class="plan-panel">
             <header>
               <div>
                 <small>{tr("Agent planning", "Planejamento do agente")}</small>
                 <strong>{tr("Current plan", "Plano atual")}</strong>
               </div>
-              {#if plan.items.length}
-                <span>{completedPlanItems}/{plan.items.length} {tr("completed", "concluídos")}</span>
-              {/if}
+              <div class="plan-header-actions">
+                {#if plan.items.length}
+                  <span>{completedPlanItems}/{plan.items.length} {tr("completed", "concluídos")}</span>
+                {/if}
+                <button type="button" onclick={createNoteFromCurrentPlan}>
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 3.5h9l3 3V16.5H4zM7 3.5v5h6v-5M7 13h6" /></svg>
+                  {tr("Save to Notes", "Salvar em Notas")}
+                </button>
+              </div>
             </header>
             {#if plan.content}
               <div class="plan-document markdown-content">{@html renderCachedMarkdown(plan.content)}</div>
@@ -3334,6 +3459,62 @@
                   {/each}
                 </ol>
               {/if}
+            {/if}
+          </section>
+        {:else if activeTab === "notes"}
+          <section class="notes-panel">
+            <header>
+              <div>
+                <small>{tr("Session notebook", "Caderno da sessão")}</small>
+                <strong>{tr("Notes and previous plans", "Notas e planos anteriores")}</strong>
+              </div>
+              <button type="button" onclick={createBlankNote}>
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
+                {tr("New note", "Nova nota")}
+              </button>
+            </header>
+
+            {#if noteEditor}
+              <form class="note-editor" onsubmit={(event) => { event.preventDefault(); void persistSessionNote(); }}>
+                <div class="note-editor-heading">
+                  <input bind:value={noteEditor.title} maxlength="120" placeholder={tr("Note title", "Título da nota")} />
+                  <label title={tr("Keep this note at the top", "Manter esta nota no topo")}>
+                    <input type="checkbox" bind:checked={noteEditor.pinned} />
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 3 6 2-1.5 4 3 3-4.5.5L8 17l-1-4-4-2.5 4-2z" /></svg>
+                  </label>
+                </div>
+                <textarea bind:value={noteEditor.body} rows="8" maxlength="131072" placeholder={tr("Write a note or paste a longer plan…", "Escreva uma nota ou cole um planejamento maior…")}></textarea>
+                <footer>
+                  <button type="button" onclick={() => (noteEditor = null)}>{tr("Cancel", "Cancelar")}</button>
+                  <button class="primary" disabled={noteSaving || !noteEditor.body.trim()} type="submit">{noteSaving ? tr("Saving…", "Salvando…") : tr("Save", "Salvar")}</button>
+                </footer>
+              </form>
+            {/if}
+
+            {#if notesLoading}
+              <p class="empty-state">{tr("Loading notes…", "Carregando notas…")}</p>
+            {:else if sessionNotes.length}
+              <div class="session-note-list">
+                {#each sessionNotes as note (note.id)}
+                  <article class:pinned={note.pinned} class="session-note">
+                    <header>
+                      <div>
+                        <small>{note.kind === "plan" ? tr("PLAN", "PLANO") : tr("NOTE", "NOTA")} · {noteDate(note.updatedAt)}</small>
+                        <strong>{note.title}</strong>
+                      </div>
+                      <span class="session-note-actions">
+                        <button class:active={note.pinned} type="button" title={tr("Pin note", "Fixar nota")} aria-label={tr("Pin note", "Fixar nota")} onclick={() => void toggleSessionNotePin(note)}><svg viewBox="0 0 20 20"><path d="m7 3 6 2-1.5 4 3 3-4.5.5L8 17l-1-4-4-2.5 4-2z" /></svg></button>
+                        <button type="button" title={tr("Edit note", "Editar nota")} aria-label={tr("Edit note", "Editar nota")} onclick={() => editSessionNote(note)}><svg viewBox="0 0 20 20"><path d="m4 14.5-.5 2 2-.5L15 6.5 12.5 4zM11.5 5l2.5 2.5" /></svg></button>
+                        <button type="button" title={tr("Delete note", "Excluir nota")} aria-label={tr("Delete note", "Excluir nota")} onclick={() => void removeSessionNote(note)}><svg viewBox="0 0 20 20"><path d="M5 6h10M8 6V4h4v2M7 8v7M10 8v7M13 8v7M6 6l.6 11h6.8L14 6" /></svg></button>
+                      </span>
+                    </header>
+                    <div class="session-note-body markdown-content">{@html renderCachedMarkdown(note.body)}</div>
+                    <button class="use-note-button" type="button" onclick={() => void useSessionNote(note)}>{tr("Use as context", "Usar como contexto")}</button>
+                  </article>
+                {/each}
+              </div>
+            {:else if !noteEditor}
+              <p class="empty-state">{tr("Save the current plan or create a note to keep long-term context here.", "Salve o plano atual ou crie uma nota para manter aqui o contexto de longo prazo.")}</p>
             {/if}
           </section>
         {/if}
@@ -3854,7 +4035,8 @@
   .goal-card p { min-width: 0; margin: 0; overflow: hidden; color: #4b5f55; font: 680 var(--chat-small-font-size)/1.35 Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .goal-time { display: flex; align-items: center; gap: 3px; color: #86948d; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; }
   .goal-time svg { width: 9px; height: 9px; }
-  .hub-tabs { min-height: 29px; padding: 4px 9px 0; display: flex; gap: 3px; border-bottom: 1px solid rgba(97, 119, 109, 0.09); }
+  .hub-tabs { min-height: 29px; padding: 4px 9px 0; display: flex; gap: 3px; overflow-x: auto; border-bottom: 1px solid rgba(97, 119, 109, 0.09); scrollbar-width: none; }
+  .hub-tabs::-webkit-scrollbar { display: none; }
   .hub-tabs button { min-width: 0; padding: 0 7px 4px; border: 0; border-bottom: 2px solid transparent; color: #8b9791; background: transparent; font: 700 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .hub-tabs button.active { color: #39785d; border-bottom-color: #3b9c70; }
   .hub-tabs span { min-width: 14px; height: 14px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 999px; color: #72827a; background: rgba(76, 101, 90, 0.075); font-size: var(--chat-tiny-font-size); }
@@ -3919,9 +4101,17 @@
   .markdown-content :global(code) { max-width: 100%; padding: 1px 4px; border-radius: 4px; color: #3f6553; background: rgba(53, 116, 84, 0.08); font: 0.92em/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; white-space: break-spaces; }
   .markdown-content :global(pre) { max-width: 100%; max-height: 220px; margin: 6px 0; padding: 7px 8px; overflow: auto; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 6px; background: rgba(42, 63, 53, 0.055); }
   .markdown-content :global(pre code) { padding: 0; color: #465a50; background: transparent; font-size: var(--chat-small-font-size); white-space: pre-wrap; word-break: break-word; }
-  .markdown-content :global(table) { box-sizing: border-box; width: 100%; max-width: 100%; display: block; overflow-x: auto; border-collapse: collapse; }
+  .markdown-content :global(.markdown-table-wrap) { box-sizing: border-box; width: 100%; max-width: 100%; margin: 7px 0; overflow-x: auto; border: 1px solid rgba(74, 107, 91, 0.12); border-radius: 8px; background: rgba(58, 91, 75, 0.025); }
+  .markdown-content :global(table) { width: 100%; min-width: 310px; border-collapse: collapse; }
   .markdown-content :global(th),
-  .markdown-content :global(td) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .markdown-content :global(td) { min-width: 88px; padding: 6px 8px; overflow-wrap: anywhere; border-right: 1px solid rgba(74, 107, 91, 0.09); border-bottom: 1px solid rgba(74, 107, 91, 0.09); word-break: normal; }
+  .markdown-content :global(th:last-child),
+  .markdown-content :global(td:last-child) { border-right: 0; }
+  .markdown-content :global(tbody tr:last-child td) { border-bottom: 0; }
+  .markdown-content :global(th) { color: #385146; background: rgba(62, 126, 94, 0.075); font-weight: 800; }
+  .markdown-content :global(tbody tr:nth-child(even)) { background: rgba(63, 101, 82, 0.028); }
+  .markdown-content :global(.align-center) { text-align: center; }
+  .markdown-content :global(.align-right) { text-align: right; }
   .markdown-content :global(img),
   .markdown-content :global(video) { max-width: 100%; height: auto; }
   .markdown-content :global(hr) { height: 1px; margin: 8px 0; border: 0; background: rgba(77, 104, 91, 0.12); }
@@ -3987,7 +4177,14 @@
   .plan-panel > header > div { min-width: 0; display: grid; gap: 2px; }
   .plan-panel > header small { color: #8b9791; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
   .plan-panel > header strong { color: #4d6358; font: 780 var(--chat-font-size) Inter, sans-serif; }
-  .plan-panel > header > span { flex: 0 0 auto; color: #4c8b6c; font: 700 var(--chat-small-font-size) Inter, sans-serif; }
+  .plan-header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
+  .plan-header-actions > span { color: #4c8b6c; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
+  .plan-header-actions button,
+  .notes-panel > header > button { min-height: 29px; padding: 0 9px; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; border: 1px solid rgba(62, 137, 98, 0.14); border-radius: 7px; color: #39795a; background: rgba(61, 145, 100, 0.06); font: 700 var(--chat-small-font-size)/1 Inter, sans-serif; white-space: nowrap; cursor: pointer; }
+  .plan-header-actions button:hover,
+  .notes-panel > header > button:hover { background: rgba(61, 145, 100, 0.11); }
+  .plan-header-actions svg,
+  .notes-panel > header > button svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
   .plan-explanation { margin: 0 !important; padding: 7px 8px; border-left: 2px solid #4d98c3; border-radius: 0 7px 7px 0; color: #5d6f67; background: rgba(77, 152, 195, 0.055); font: var(--chat-small-font-size)/1.5 Inter, sans-serif; white-space: pre-wrap; }
   .plan-document { min-width: 0; padding: 9px 10px; overflow-x: hidden; border: 1px solid rgba(78, 106, 93, 0.09); border-radius: 9px; background: rgba(70, 101, 86, 0.03); overflow-wrap: anywhere; word-break: break-word; }
   .plan-progress { height: 3px; overflow: hidden; border-radius: 999px; background: rgba(69, 112, 91, 0.1); }
@@ -4001,6 +4198,39 @@
   .plan-items li.active { border-color: rgba(77, 152, 195, 0.17); background: rgba(77, 152, 195, 0.055); }
   .plan-items li.active > span { border-color: #4d98c3; color: #4d98c3; box-shadow: 0 0 0 2px rgba(77, 152, 195, 0.08); }
   .plan-items li.done > span { border-color: #55a77b; color: white; background: #55a77b; }
+  .notes-panel { margin: 9px 0 10px; display: grid; gap: 9px; }
+  .notes-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .notes-panel > header > div { min-width: 0; display: grid; gap: 2px; }
+  .notes-panel > header small { color: #8b9791; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+  .notes-panel > header strong { color: #4d6358; font: 780 var(--chat-font-size) Inter, sans-serif; }
+  .note-editor { padding: 8px; display: grid; gap: 7px; border: 1px solid rgba(64, 126, 96, .13); border-radius: 9px; background: rgba(68, 116, 91, .035); }
+  .note-editor-heading { display: grid; grid-template-columns: minmax(0, 1fr) 26px; gap: 6px; }
+  .note-editor-heading > input { min-width: 0; padding: 6px 7px; border: 1px solid rgba(79, 108, 94, .13); border-radius: 7px; outline: 0; color: #405249; background: rgba(255, 255, 255, .48); font: 700 var(--chat-small-font-size) Inter, sans-serif; }
+  .note-editor-heading label { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid rgba(79, 108, 94, .12); border-radius: 7px; color: #849188; cursor: pointer; }
+  .note-editor-heading label:has(input:checked) { color: #408661; border-color: rgba(55, 143, 96, .24); background: rgba(55, 143, 96, .08); }
+  .note-editor-heading input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
+  .note-editor-heading svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .note-editor textarea { min-height: 105px; padding: 7px 8px; resize: vertical; border: 1px solid rgba(79, 108, 94, .13); border-radius: 7px; outline: 0; color: #465a50; background: rgba(255, 255, 255, .48); font: var(--chat-small-font-size)/1.5 "SFMono-Regular", Consolas, monospace; }
+  .note-editor input:focus,
+  .note-editor textarea:focus { border-color: rgba(52, 151, 103, .4); box-shadow: 0 0 0 2px rgba(52, 151, 103, .06); }
+  .note-editor footer { display: flex; justify-content: flex-end; gap: 5px; }
+  .note-editor footer button { min-height: 27px; padding: 0 9px; border: 0; border-radius: 6px; color: #718078; background: rgba(80, 107, 94, .06); font: 700 var(--chat-small-font-size)/1 Inter, sans-serif; cursor: pointer; }
+  .note-editor footer button.primary { color: white; background: #3f9369; }
+  .note-editor footer button:disabled { opacity: .45; cursor: default; }
+  .session-note-list { display: grid; gap: 7px; }
+  .session-note { min-width: 0; padding: 8px 9px; display: grid; gap: 6px; border: 1px solid rgba(76, 106, 91, .09); border-radius: 9px; background: rgba(70, 101, 86, .025); }
+  .session-note.pinned { border-color: rgba(63, 145, 99, .18); background: rgba(63, 145, 99, .045); }
+  .session-note > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 7px; }
+  .session-note > header > div { min-width: 0; display: grid; gap: 2px; }
+  .session-note > header small { color: #8a9790; font: 650 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .session-note > header strong { overflow: hidden; color: #4b6055; font: 760 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .session-note-actions { display: flex; flex: 0 0 auto; gap: 3px; }
+  .session-note-actions button { width: 27px; height: 27px; padding: 5px; display: grid; place-items: center; border: 0; border-radius: 7px; color: #87938d; background: transparent; cursor: pointer; }
+  .session-note-actions button:hover,
+  .session-note-actions button.active { color: #3f8862; background: rgba(61, 145, 100, .08); }
+  .session-note-actions svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .session-note-body { max-height: 180px; margin: 0; overflow: auto; }
+  .use-note-button { width: max-content; min-height: 27px; padding: 0 9px; border: 0; border-radius: 6px; color: #3c805d; background: rgba(61, 145, 100, .07); font: 700 var(--chat-small-font-size)/1 Inter, sans-serif; cursor: pointer; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
@@ -4210,6 +4440,12 @@
   .workflow-role-menu > button { width: 100%; min-height: 40px; padding: 5px 6px; display: flex; align-items: center; gap: 7px; border: 0; border-radius: 8px; color: #53665d; background: transparent; cursor: pointer; text-align: left; }
   .workflow-role-menu > button:hover,
   .workflow-role-menu > button.active { background: rgba(54, 145, 99, 0.065); }
+  .workflow-role-menu > button:hover .role-planner :global(.workflow-role-icon) { animation: role-icon-plan 1.15s ease-in-out infinite; }
+  .workflow-role-menu > button:hover .role-implementer :global(.workflow-role-icon) { animation: role-icon-build .85s ease-in-out infinite; }
+  .workflow-role-menu > button:hover .role-reviewer :global(.workflow-role-icon) { animation: role-icon-review 1.05s ease-in-out infinite; }
+  .workflow-role-menu > button:hover .role-tester :global(.workflow-role-icon) { animation: role-icon-test .95s ease-in-out infinite; }
+  .workflow-role-menu > button:hover .role-researcher :global(.workflow-role-icon) { animation: role-icon-research 1.8s linear infinite; }
+  .workflow-role-menu > button:hover .role-custom :global(.workflow-role-icon) { animation: role-icon-custom .9s ease-in-out infinite; }
   .workflow-role-menu > button > span { min-width: 0; flex: 1; display: grid; gap: 1px; }
   .workflow-role-menu strong { color: #40544a; font: 780 8px Inter, sans-serif; }
   .workflow-role-menu small { color: #829088; font: 7px Inter, sans-serif; }
@@ -4227,7 +4463,6 @@
   .workflow-contract-toggle > svg:first-child { width: 15px; height: 15px; justify-self: center; color: #438763; }
   .workflow-contract-toggle > span { min-width: 0; display: grid; gap: 1px; }
   .workflow-contract-toggle strong { color: #40564b; font: 800 8px Inter, sans-serif; }
-  .workflow-contract-toggle small { overflow: hidden; color: #87958e; font: 7px Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
   .workflow-contract-toggle .contract-chevron { width: 13px; height: 13px; transition: transform 150ms ease; }
   .workflow-contract-toggle.open .contract-chevron { transform: rotate(180deg); }
   .workflow-contract-body { min-height: 0; display: grid; gap: 7px; }
@@ -4237,26 +4472,18 @@
   .workflow-instruction-meta > span.customized { color: #8a6836; background: rgba(170, 119, 43, 0.09); }
   .workflow-readiness-note { margin: 0; color: #a06f45; font: 7px/1.4 Inter, sans-serif; }
   .role-symbol { position: relative; width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; overflow: hidden; border: 1px solid rgba(73, 121, 98, 0.12); border-radius: 9px; background: rgba(70, 108, 89, 0.055); }
-  .role-symbol::before,
-  .role-symbol::after,
-  .role-symbol span { position: absolute; content: ""; }
   .role-planner { color: #4e78a0; background: rgba(70, 123, 171, 0.08); }
-  .role-planner::before { width: 12px; height: 9px; border: 1.5px solid currentColor; border-radius: 3px; }
-  .role-planner::after { width: 6px; border-top: 1.5px solid currentColor; box-shadow: 0 4px 0 currentColor; }
   .role-implementer { color: #438c66; background: rgba(54, 145, 94, 0.08); }
-  .role-implementer::before { width: 11px; height: 11px; border: 1.5px solid currentColor; transform: rotate(45deg); }
-  .role-implementer::after { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
   .role-reviewer { color: #8a6c46; background: rgba(155, 111, 56, 0.08); }
-  .role-reviewer::before { width: 9px; height: 9px; border: 1.5px solid currentColor; border-radius: 50%; transform: translate(-2px, -2px); }
-  .role-reviewer::after { width: 6px; border-top: 1.5px solid currentColor; transform: translate(5px, 5px) rotate(45deg); }
   .role-tester { color: #745e9c; background: rgba(111, 82, 158, 0.08); }
-  .role-tester::before { width: 12px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px; }
-  .role-tester::after { width: 6px; height: 3px; border-bottom: 1.5px solid currentColor; border-left: 1.5px solid currentColor; transform: rotate(-45deg); }
   .role-researcher { color: #4e7f88; background: rgba(63, 128, 138, 0.08); }
-  .role-researcher::before { width: 12px; height: 8px; border: 1.5px solid currentColor; border-radius: 50%; }
-  .role-researcher::after { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
   .role-custom { color: #6d7d75; background: rgba(85, 109, 98, 0.07); }
-  .role-custom::before { width: 3px; height: 3px; border-radius: 50%; background: currentColor; box-shadow: -6px 0 0 currentColor, 6px 0 0 currentColor; }
+  @keyframes role-icon-plan { 0%, 100% { transform: translate(0, 0); } 48% { transform: translate(1px, -1px); } }
+  @keyframes role-icon-build { 0%, 100% { transform: scale(1); } 45% { transform: scale(.9); } 70% { transform: scale(1.04); } }
+  @keyframes role-icon-review { 0%, 100% { transform: translate(0, 0) rotate(0); } 50% { transform: translate(1px, 1px) rotate(-4deg); } }
+  @keyframes role-icon-test { 0%, 100% { transform: translateY(0); } 42% { transform: translateY(-1.5px); } 65% { transform: translateY(.5px); } }
+  @keyframes role-icon-research { to { transform: rotate(360deg); } }
+  @keyframes role-icon-custom { 0%, 100% { transform: translateX(0); } 40% { transform: translateX(-1px); } 70% { transform: translateX(1px); } }
   .workflow-instruction-field textarea { min-height: 54px; }
   .workflow-contract-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 
@@ -4338,10 +4565,19 @@
   .terminal-window.dark .hub-tabs button.active { color: #83c6a6; border-bottom-color: #59ad84; }
   .terminal-window.dark .hub-tabs span { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .plan-panel > header strong,
-  .terminal-window.dark .plan-items strong { color: #b8cbc1; }
+  .terminal-window.dark .plan-items strong,
+  .terminal-window.dark .notes-panel > header strong,
+  .terminal-window.dark .session-note > header strong { color: #b8cbc1; }
   .terminal-window.dark .plan-explanation { color: #a9bbb2; background: rgba(77, 152, 195, 0.07); }
   .terminal-window.dark .plan-items li { border-color: rgba(205, 222, 213, 0.07); background: rgba(218, 234, 226, 0.025); }
   .terminal-window.dark .plan-items li.active { border-color: rgba(100, 170, 207, 0.2); background: rgba(77, 152, 195, 0.07); }
+  .terminal-window.dark .note-editor,
+  .terminal-window.dark .session-note { border-color: rgba(205, 222, 213, .08); background: rgba(218, 234, 226, .025); }
+  .terminal-window.dark .session-note.pinned { border-color: rgba(91, 177, 137, .17); background: rgba(91, 177, 137, .045); }
+  .terminal-window.dark .note-editor-heading > input,
+  .terminal-window.dark .note-editor textarea { color: #c7d6ce; border-color: rgba(205, 222, 213, .1); background: rgba(218, 234, 226, .035); }
+  .terminal-window.dark .note-editor-heading label { border-color: rgba(205, 222, 213, .09); }
+  .terminal-window.dark .session-note-body { color: #aebfb6; }
   .terminal-window.dark .terminal-output { color: #b8c6bf; background: linear-gradient(180deg, rgba(114, 151, 134, 0.035), transparent); }
   .terminal-window.dark .load-earlier-chat { color: #9aaba2; border-color: rgba(205, 222, 213, 0.08); background: rgba(218, 234, 226, 0.02); }
   .terminal-window.dark .load-earlier-chat:hover { color: #88c8a8; border-color: rgba(91, 177, 137, 0.17); background: rgba(91, 177, 137, 0.045); }
@@ -4385,6 +4621,10 @@
   .terminal-window.dark .markdown-content :global(code) { color: #b9d9c9; background: rgba(157, 205, 181, 0.075); }
   .terminal-window.dark .markdown-content :global(pre) { border-color: rgba(205, 222, 213, 0.08); background: rgba(7, 16, 12, 0.2); }
   .terminal-window.dark .markdown-content :global(pre code) { color: #bdcbc4; background: transparent; }
+  .terminal-window.dark .markdown-content :global(.markdown-table-wrap) { border-color: rgba(205, 222, 213, 0.1); background: rgba(7, 16, 12, 0.12); }
+  .terminal-window.dark .markdown-content :global(th) { color: #d2e0d9; background: rgba(98, 178, 138, 0.08); }
+  .terminal-window.dark .markdown-content :global(th),
+  .terminal-window.dark .markdown-content :global(td) { border-color: rgba(205, 222, 213, 0.075); }
   .terminal-window.dark .reasoning-update { border-color: #6c9abc; background: linear-gradient(90deg, rgba(90, 139, 174, .085), rgba(90, 139, 174, .018)); }
   .terminal-window.dark .reasoning-update > header { color: #92b3ca; }
   .terminal-window.dark .reasoning-update > header > span { background: rgba(105, 157, 194, .1); }
@@ -4418,7 +4658,6 @@
   .terminal-window.dark .workflow-role-replace-warning button.confirm { color: #fff; border-color: #8c6734; background: #8c6734; }
   .terminal-window.dark .workflow-contract-toggle { color: #b8c9c0; border-color: rgba(205, 222, 213, 0.11); background: rgba(222, 235, 228, 0.035); }
   .terminal-window.dark .workflow-contract-toggle strong { color: #d6e3dc; }
-  .terminal-window.dark .workflow-contract-toggle small { color: #91a39a; }
   .terminal-window.dark .workflow-instruction-meta > span { color: #a2b0a9; background: rgba(218, 234, 226, 0.055); }
   .terminal-window.dark .workflow-instruction-meta > span.ready { color: #8bc9aa; background: rgba(76, 171, 122, 0.09); }
   .terminal-window.dark .workflow-instruction-meta > span.customized { color: #d1b27e; background: rgba(190, 132, 48, 0.09); }

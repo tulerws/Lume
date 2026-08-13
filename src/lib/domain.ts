@@ -149,6 +149,17 @@ export interface ResultNote {
   createdAt: number;
 }
 
+export interface SessionNote {
+  id: string;
+  nativeSessionId: string;
+  title: string;
+  body: string;
+  kind: "plan" | "note";
+  pinned: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface HistoryEntry {
   id: string;
   sessionId: string;
@@ -177,6 +188,7 @@ export interface Preferences {
   whiteboardLayouts: WhiteboardLayout[];
   workflowEnabled: boolean;
   workflowGroups: WorkflowGroupDefinition[];
+  workflowSettings: WorkflowSettings;
   globalShortcut: string;
   openShortcut: string;
   newSessionShortcut: string;
@@ -280,6 +292,16 @@ export interface WorkflowGroupDefinition {
   connections: WorkflowConnectionDefinition[];
 }
 
+export interface WorkflowSettings {
+  maxTransitions: number;
+  maxAttemptsPerStep: number;
+  stepTimeoutMinutes: number;
+  maxContextTokens: number;
+  requireApprovalForSensitiveContext: boolean;
+  pauseOnRateLimit: boolean;
+  minimumRateLimitRemainingPercent: number;
+}
+
 export type WorkflowRunStatus =
   | "draft"
   | "ready"
@@ -316,6 +338,7 @@ export interface WorkflowRun {
   pendingConnectionId?: string;
   handoffApproved: boolean;
   recovering: boolean;
+  transitionCount: number;
   steps: WorkflowStepRun[];
   error?: string;
   createdAt: number;

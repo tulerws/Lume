@@ -15,6 +15,8 @@ const MAX_DIFF_CHARS: usize = 1_600;
 const MAX_FILES: usize = 32;
 const MAX_CHECKS: usize = 16;
 const MAX_ACTIVITIES: usize = 18;
+#[cfg(test)]
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 20_000;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,12 +114,31 @@ pub fn effective_selection(connection: &WorkflowConnectionDefinition) -> Workflo
     }
 }
 
+#[cfg(test)]
 pub fn build_context_package(
     group: &WorkflowGroupDefinition,
     connection_id: &str,
     objective: &str,
     source_result_id: Option<&str>,
     sessions: &[AgentSession],
+) -> Result<WorkflowContextPackage, String> {
+    build_context_package_with_limit(
+        group,
+        connection_id,
+        objective,
+        source_result_id,
+        sessions,
+        DEFAULT_MAX_CONTEXT_TOKENS,
+    )
+}
+
+pub fn build_context_package_with_limit(
+    group: &WorkflowGroupDefinition,
+    connection_id: &str,
+    objective: &str,
+    source_result_id: Option<&str>,
+    sessions: &[AgentSession],
+    max_context_tokens: usize,
 ) -> Result<WorkflowContextPackage, String> {
     let objective = objective.trim();
     if objective.is_empty() {
@@ -207,9 +228,63 @@ pub fn build_context_package(
         estimated_tokens: 0,
         markdown: String::new(),
     };
-    package.markdown = render_markdown(&package);
-    package.estimated_tokens = package.markdown.chars().count().div_ceil(4);
+    refresh_rendered_package(&mut package);
+    enforce_global_limit(&mut package, max_context_tokens.max(1_000));
     Ok(package)
+}
+
+fn refresh_rendered_package(package: &mut WorkflowContextPackage) {
+    package.markdown = render_markdown(package);
+    package.estimated_tokens = package.markdown.chars().count().div_ceil(4);
+}
+
+fn enforce_global_limit(package: &mut WorkflowContextPackage, max_tokens: usize) {
+    if package.estimated_tokens <= max_tokens {
+        return;
+    }
+
+    package.relevant_activity.clear();
+    for file in &mut package.files {
+        file.diff = None;
+    }
+    package.plan = None;
+    while package.checks.len() > 1 {
+        package.checks.pop();
+    }
+    while package.files.len() > 1 {
+        package.files.pop();
+    }
+    refresh_rendered_package(package);
+
+    if package.estimated_tokens > max_tokens {
+        if let Some(response) = package.result.take() {
+            refresh_rendered_package(package);
+            let reserved = package.markdown.chars().count();
+            let available = max_tokens.saturating_mul(4).saturating_sub(reserved + 80);
+            if available > 0 {
+                let mut shortened = response.chars().take(available).collect::<String>();
+                if shortened.chars().count() < response.chars().count() {
+                    shortened.push_str("\n… [truncated by Lume]");
+                }
+                package.result = Some(shortened);
+            }
+        }
+    }
+
+    if let Some(limit) = package
+        .redactions
+        .iter_mut()
+        .find(|entry| entry.kind == "limit")
+    {
+        limit.count = limit.count.saturating_add(1);
+    } else {
+        package.redactions.push(WorkflowContextRedaction {
+            kind: "limit".into(),
+            summary: "Oversized context sections were truncated".into(),
+            count: 1,
+        });
+    }
+    refresh_rendered_package(package);
 }
 
 fn workflow_step<'a>(
@@ -1164,6 +1239,27 @@ mod tests {
         assert!(!package.markdown.contains("Old turn"));
         assert!(package.plan.is_none());
         assert!(package.relevant_activity.is_empty());
+    }
+
+    #[test]
+    fn global_context_limit_preserves_instructions_and_truncates_large_results() {
+        let mut source = session();
+        source.results[0].response = "large result ".repeat(2_000);
+        let package = build_context_package_with_limit(
+            &group(WorkflowContextPolicy::Detailed),
+            "edge-1",
+            "Ship the requested change",
+            None,
+            &[source],
+            1_000,
+        )
+        .expect("limited context");
+
+        assert!(package.estimated_tokens <= 1_000);
+        assert!(package
+            .markdown
+            .contains("## Instructions for the next agent"));
+        assert!(package.redactions.iter().any(|entry| entry.kind == "limit"));
     }
 
     #[test]

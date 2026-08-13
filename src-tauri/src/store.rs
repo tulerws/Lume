@@ -3,7 +3,8 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 
 use crate::domain::{
-    AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote, SessionActivity,
+    AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote,
+    SessionActivity, SessionNote,
 };
 
 pub struct Store {
@@ -64,6 +65,22 @@ impl Store {
                     content TEXT NOT NULL,
                     source_activity_id TEXT,
                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_notes (
+                    id TEXT PRIMARY KEY,
+                    native_session_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_session_notes_session
+                    ON session_notes(native_session_id, pinned DESC, updated_at DESC);
+                 CREATE TABLE IF NOT EXISTS dismissed_session_notes (
+                    id TEXT PRIMARY KEY,
+                    dismissed_at INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS conversation_activities (
                     thread_key TEXT NOT NULL,
@@ -233,6 +250,102 @@ impl Store {
             row.get(1).map_err(|error| error.to_string())?,
             row.get(2).map_err(|error| error.to_string())?,
         )))
+    }
+
+    pub fn save_session_note(&self, note: &SessionNote) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO session_notes
+                 (id, native_session_id, title, body, kind, pinned, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    body = excluded.body,
+                    kind = excluded.kind,
+                    pinned = excluded.pinned,
+                    updated_at = excluded.updated_at",
+                params![
+                    note.id,
+                    note.native_session_id,
+                    note.title,
+                    note.body,
+                    note.kind,
+                    note.pinned,
+                    note.created_at,
+                    note.updated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn save_session_note_if_absent(&self, note: &SessionNote) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO session_notes
+                 (id, native_session_id, title, body, kind, pinned, created_at, updated_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM dismissed_session_notes WHERE id = ?1
+                 )",
+                params![
+                    note.id,
+                    note.native_session_id,
+                    note.title,
+                    note.body,
+                    note.kind,
+                    note.pinned,
+                    note.created_at,
+                    note.updated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn session_notes(&self, native_session_id: &str) -> Result<Vec<SessionNote>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, native_session_id, title, body, kind, pinned, created_at, updated_at
+                 FROM session_notes WHERE native_session_id = ?1
+                 ORDER BY pinned DESC, updated_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([native_session_id], |row| {
+                Ok(SessionNote {
+                    id: row.get(0)?,
+                    native_session_id: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    kind: row.get(4)?,
+                    pinned: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn delete_session_note(&self, id: &str) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO dismissed_session_notes (id, dismissed_at)
+                 VALUES (?1, strftime('%s', 'now') * 1000)",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM session_notes WHERE id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn add_history(&self, entry: &HistoryEntry) -> Result<(), String> {
@@ -705,6 +818,36 @@ mod tests {
         assert_eq!(plan.0, "# Plan\n\n## Phase 1\nBuild");
         assert_eq!(plan.1.as_deref(), Some("message-1"));
         assert_eq!(plan.2, 42);
+    }
+
+    #[test]
+    fn session_notes_round_trip_and_deleted_automatic_notes_stay_dismissed() {
+        let store = Store::open(Path::new(":memory:")).expect("in-memory database");
+        let note = SessionNote {
+            id: "plan-history:thread-1:plan-1".into(),
+            native_session_id: "thread-1".into(),
+            title: "Saved plan".into(),
+            body: "- [x] Inspect\n- [ ] Implement".into(),
+            kind: "plan".into(),
+            pinned: true,
+            created_at: 42,
+            updated_at: 42,
+        };
+        store.save_session_note_if_absent(&note).expect("save note");
+        let notes = store.session_notes("thread-1").expect("load notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note.id);
+        assert_eq!(notes[0].body, note.body);
+        assert!(notes[0].pinned);
+
+        store.delete_session_note(&note.id).expect("dismiss note");
+        store
+            .save_session_note_if_absent(&note)
+            .expect("try to restore automatic note");
+        assert!(store
+            .session_notes("thread-1")
+            .expect("load dismissed notes")
+            .is_empty());
     }
 
     #[test]
