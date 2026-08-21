@@ -4,7 +4,7 @@ use rusqlite::{params, Connection};
 
 use crate::domain::{
     AgentSession, HistoryEntry, MobileScope, PairedDevice, Preferences, ResultNote,
-    SessionActivity, SessionNote,
+    SessionActivity, SessionNote, WorkflowHistoryRecord,
 };
 
 pub struct Store {
@@ -95,7 +95,16 @@ impl Store {
                     workflow_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS workflow_run_history (
+                    run_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_workflow_run_history_updated
+                    ON workflow_run_history(updated_at DESC);",
             )
             .map_err(|error| error.to_string())?;
 
@@ -204,6 +213,43 @@ impl Store {
         Ok(activities)
     }
 
+    pub fn recent_conversation_activities(
+        &self,
+        session: &AgentSession,
+        limit: usize,
+    ) -> Result<Vec<SessionActivity>, String> {
+        let Some(thread_key) = Self::conversation_key(session) else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload FROM (
+                    SELECT payload, created_at, activity_id
+                    FROM conversation_activities
+                    WHERE thread_key = ?1
+                    ORDER BY created_at DESC, activity_id DESC
+                    LIMIT ?2
+                 ) ORDER BY created_at ASC, activity_id ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![thread_key, limit.max(1) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut activities = Vec::new();
+        for payload in rows {
+            let payload = payload.map_err(|error| error.to_string())?;
+            if let Ok(activity) = serde_json::from_str(&payload) {
+                if Self::is_archivable_conversation_activity(&activity) {
+                    activities.push(activity);
+                }
+            }
+        }
+        Ok(activities)
+    }
+
     pub fn save_session_plan(
         &self,
         native_session_id: &str,
@@ -220,7 +266,9 @@ impl Store {
                     content = excluded.content,
                     source_activity_id = excluded.source_activity_id,
                     updated_at = excluded.updated_at
-                 WHERE excluded.updated_at >= session_plans.updated_at",
+                 WHERE excluded.updated_at > session_plans.updated_at
+                    OR excluded.content != session_plans.content
+                    OR excluded.source_activity_id IS NOT session_plans.source_activity_id",
                 params![native_session_id, content, source_activity_id, updated_at],
             )
             .map_err(|error| error.to_string())?;
@@ -482,6 +530,56 @@ impl Store {
             .collect()
     }
 
+    pub fn save_workflow_history(&self, record: &WorkflowHistoryRecord) -> Result<(), String> {
+        let payload = serde_json::to_string(record).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO workflow_run_history
+                 (run_id, workflow_id, payload, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at",
+                params![
+                    record.run.id,
+                    record.run.workflow_id,
+                    payload,
+                    record.run.created_at,
+                    record.run.updated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "DELETE FROM workflow_run_history
+                 WHERE run_id NOT IN (
+                    SELECT run_id FROM workflow_run_history
+                    ORDER BY updated_at DESC LIMIT 200
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn workflow_history(&self, limit: usize) -> Result<Vec<WorkflowHistoryRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload FROM workflow_run_history
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([limit.clamp(1, 200) as i64], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let payload = row.map_err(|error| error.to_string())?;
+            serde_json::from_str(&payload).map_err(|error| error.to_string())
+        })
+        .collect()
+    }
+
     pub fn save_mobile_device(
         &self,
         device: &PairedDevice,
@@ -733,6 +831,7 @@ mod tests {
             project: "Lume".into(),
             source: SessionSource::Cli,
             source_app: None,
+            control_origin: crate::domain::SessionControlOrigin::Lume,
             status: SessionStatus::PermissionRequired,
             status_label: "Aguardando permissão".into(),
             started_at: "0".into(),
@@ -798,6 +897,31 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].detail.as_deref(), Some("resposta preservada"));
         assert!(archived[0].attachments[0].preview_data_url.is_empty());
+
+        for index in 2..=4 {
+            threaded.activities.push(SessionActivity {
+                id: format!("message-{index}"),
+                kind: "message".into(),
+                title: "Codex".into(),
+                detail: Some(format!("resposta {index}")),
+                status: "completed".into(),
+                created_at: index,
+                files: Vec::new(),
+                attachments: Vec::new(),
+                append_detail: false,
+            });
+        }
+        store.save_session(&threaded).expect("atualiza conversa");
+        let recent = store
+            .recent_conversation_activities(&threaded, 2)
+            .expect("carrega somente o fim da conversa");
+        assert_eq!(
+            recent
+                .iter()
+                .map(|activity| activity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message-3", "message-4"]
+        );
     }
 
     #[test]
@@ -871,6 +995,54 @@ mod tests {
     }
 
     #[test]
+    fn workflow_history_keeps_distinct_runs_and_updates_the_same_run() {
+        let store = Store::open(Path::new(":memory:")).expect("in-memory database");
+        let mut record: WorkflowHistoryRecord = serde_json::from_value(serde_json::json!({
+            "run": {
+                "id": "run-1",
+                "workflowId": "workflow-1",
+                "objective": "Ship the feature",
+                "status": "running",
+                "handoffApproved": false,
+                "recovering": false,
+                "transitionCount": 0,
+                "steps": [],
+                "createdAt": 42,
+                "updatedAt": 42
+            },
+            "group": {
+                "id": "workflow-1",
+                "terminalGroupId": "terminals",
+                "steps": [],
+                "connections": []
+            },
+            "events": [],
+            "steps": []
+        }))
+        .expect("workflow history record");
+        store.save_workflow_history(&record).expect("save history");
+        record.run.status = crate::domain::WorkflowRunStatus::Completed;
+        record.run.updated_at = 43;
+        store
+            .save_workflow_history(&record)
+            .expect("update same history run");
+        record.run.id = "run-2".into();
+        record.run.created_at = 44;
+        record.run.updated_at = 44;
+        store
+            .save_workflow_history(&record)
+            .expect("save second history run");
+
+        let history = store.workflow_history(10).expect("load history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].run.id, "run-2");
+        assert_eq!(
+            history[1].run.status,
+            crate::domain::WorkflowRunStatus::Completed
+        );
+    }
+
+    #[test]
     fn old_preferences_gain_optional_overlay_position() {
         let preferences: Preferences = serde_json::from_str(
             r#"{"soundEnabled":true,"autostart":true,"monitorId":null,"showOverFullscreen":false,"historyRetentionDays":30,"launchTarget":"auto"}"#,
@@ -884,6 +1056,7 @@ mod tests {
         assert!(preferences.project_profiles.is_empty());
         assert!(preferences.session_aliases.is_empty());
         assert!(preferences.whiteboard_layouts.is_empty());
+        assert!(!preferences.mobile_gateway_enabled);
         assert_eq!(preferences.global_shortcut, "Ctrl+Shift+Space");
     }
 

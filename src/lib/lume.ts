@@ -29,6 +29,7 @@ import type {
   WhiteboardLayout,
   WorkflowContextPackage,
   WorkflowGroupDefinition,
+  WorkflowHistoryRecord,
   WorkflowRole,
   WorkflowRoleContract,
   WorkflowRun,
@@ -44,6 +45,7 @@ export const defaultPreferences: Preferences = {
   soundVolume: 55,
   popupNotificationsEnabled: true,
   autostart: true,
+  mobileGatewayEnabled: false,
   overlayX: undefined,
   overlayY: undefined,
   showOverFullscreen: false,
@@ -202,11 +204,40 @@ export async function terminateSession(sessionId: string): Promise<void> {
   await invoke("terminate_session", { sessionId });
 }
 
+export async function takeControlSession(sessionId: string): Promise<void> {
+  await invoke("take_control_session", { sessionId });
+}
+
 export async function interruptPrompt(sessionId: string): Promise<void> {
   await invoke("interrupt_prompt", { sessionId });
 }
 
 export type CollaborationMode = "default" | "plan";
+
+export interface CodexReasoningEffortOption {
+  value: string;
+  description: string;
+}
+
+export interface CodexModelOption {
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  defaultReasoningEffort: string;
+  supportedReasoningEfforts: CodexReasoningEffortOption[];
+}
+
+export interface CodexThreadModelSettings {
+  model: string;
+  reasoningEffort?: string;
+  models: CodexModelOption[];
+}
+
+export interface SessionModelOverride {
+  model?: string;
+  reasoningEffort?: string;
+}
 
 export async function getSessionCollaborationMode(
   sessionId: string,
@@ -219,6 +250,42 @@ export async function setSessionCollaborationMode(
   mode: CollaborationMode,
 ): Promise<CollaborationMode> {
   return invoke<CollaborationMode>("set_session_collaboration_mode", { sessionId, mode });
+}
+
+export async function getSessionModelSettings(
+  sessionId: string,
+): Promise<CodexThreadModelSettings> {
+  return invoke<CodexThreadModelSettings>("get_session_model_settings", { sessionId });
+}
+
+export async function setSessionModelSettings(
+  sessionId: string,
+  model: string,
+  effort: string,
+): Promise<CodexThreadModelSettings> {
+  return invoke<CodexThreadModelSettings>("set_session_model_settings", {
+    sessionId,
+    model,
+    effort,
+  });
+}
+
+export async function getClaudeSessionModelSettings(
+  sessionId: string,
+): Promise<SessionModelOverride> {
+  return invoke<SessionModelOverride>("get_claude_session_model_settings", { sessionId });
+}
+
+export async function setClaudeSessionModelSettings(
+  sessionId: string,
+  model?: string,
+  effort?: string,
+): Promise<SessionModelOverride> {
+  return invoke<SessionModelOverride>("set_claude_session_model_settings", {
+    sessionId,
+    model: model || null,
+    effort: effort || null,
+  });
 }
 
 export async function steerQueuedPrompt(
@@ -401,6 +468,11 @@ export async function loadHistory(): Promise<HistoryEntry[]> {
   }
 }
 
+export async function loadWorkflowHistory(): Promise<WorkflowHistoryRecord[]> {
+  if (!inDesktop()) return [];
+  return invoke<WorkflowHistoryRecord[]>("list_workflow_history", { limit: 100 });
+}
+
 export async function loadResultNotes(): Promise<ResultNote[]> {
   if (!inDesktop()) return [];
   return invoke<ResultNote[]>("list_result_notes", { limit: 100 });
@@ -554,9 +626,11 @@ export async function takePendingShortcutAction(): Promise<
 export async function loadIntegrationStatuses(): Promise<IntegrationStatus[]> {
   if (!("__TAURI_INTERNALS__" in window)) {
     return [
-      { kind: "codex", label: "Codex", installed: true, configured: false, directPermissions: false, detail: "Ready to connect" },
-      { kind: "claude", label: "Claude Code", installed: true, configured: true, directPermissions: true, detail: "Monitoring and decisions connected" },
-      { kind: "gemini", label: "Gemini", installed: true, configured: false, directPermissions: false, detail: "Ready to connect" },
+      { kind: "codex", label: "Codex", installed: true, configured: false, canConfigure: true, canLaunch: true, directPermissions: true, detail: "Ready to connect" },
+      { kind: "claude", label: "Claude Code", installed: true, configured: true, canConfigure: true, canLaunch: true, directPermissions: true, detail: "Monitoring and decisions connected" },
+      { kind: "antigravity", label: "Antigravity", installed: true, configured: false, canConfigure: true, canLaunch: true, directPermissions: false, detail: "Ready to connect" },
+      { kind: "deepseek", label: "DeepSeek Harness", installed: false, configured: false, canConfigure: false, canLaunch: true, directPermissions: false, detail: "CLI not found" },
+      { kind: "gemini", label: "Gemini CLI (legacy)", installed: true, configured: false, canConfigure: true, canLaunch: false, directPermissions: false, detail: "Legacy enterprise/API monitoring" },
     ];
   }
   return invoke<IntegrationStatus[]>("integration_statuses");

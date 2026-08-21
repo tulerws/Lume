@@ -5,6 +5,8 @@ import type {
   PromptAttachmentInput,
   PromptDelivery,
   QuestionAnswer,
+  WorkflowGroupDefinition,
+  WorkflowHistoryRecord,
 } from "$lib/domain";
 import type { SessionCapabilities } from "$lib/sessionCapabilities";
 
@@ -48,6 +50,8 @@ export interface HubSnapshot {
   generatedAt: number;
   features: string[];
   sessions: HubSession[];
+  workflowGroups: WorkflowGroupDefinition[];
+  workflowHistory: WorkflowHistoryRecord[];
 }
 
 export type HubCommand =
@@ -92,6 +96,39 @@ export type HubCommand =
       agent: AgentKind;
     }
   | {
+      type: "start_workflow";
+      workflowId: string;
+      objective: string;
+    }
+  | {
+      type: "approve_workflow_handoff";
+      workflowId: string;
+    }
+  | {
+      type: "advance_workflow";
+      workflowId: string;
+    }
+  | {
+      type: "pause_workflow";
+      workflowId: string;
+    }
+  | {
+      type: "resume_workflow";
+      workflowId: string;
+    }
+  | {
+      type: "retry_workflow_step";
+      workflowId: string;
+    }
+  | {
+      type: "skip_workflow_step";
+      workflowId: string;
+    }
+  | {
+      type: "cancel_workflow";
+      workflowId: string;
+    }
+  | {
       type: "report_mobile_version";
       version: string;
     };
@@ -118,5 +155,5 @@ export interface HubEventEnvelope {
   eventId: string;
   sequence: number;
   occurredAt: number;
-  type: "sessions_changed";
+  type: "sessions_changed" | "workflows_changed";
 }

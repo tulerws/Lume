@@ -25,6 +25,10 @@ pub struct LaunchRequest {
     pub permission_mode: Option<AccessMode>,
     #[serde(default)]
     pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -81,6 +85,7 @@ pub fn run_terminal_payload(path: &str) -> i32 {
     };
     match command
         .args(&payload.arguments)
+        .env("LUME_MANAGED_SESSION", "1")
         .current_dir(&payload.working_directory)
         .status()
     {
@@ -102,6 +107,8 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
             ("codex".to_string(), arguments)
         }
         IntegrationKind::Claude => ("claude".to_string(), Vec::new()),
+        IntegrationKind::Antigravity => ("agy".to_string(), Vec::new()),
+        IntegrationKind::DeepSeek => ("dsh".to_string(), vec!["--profile".into(), "tui".into()]),
         IntegrationKind::Gemini => ("gemini".to_string(), Vec::new()),
     };
     if request.agent == IntegrationKind::Claude
@@ -113,6 +120,22 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         arguments.push("--print".into());
     }
     apply_permission_profile(request, &mut arguments);
+    if request.agent == IntegrationKind::Claude {
+        if let Some(model) = request
+            .model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            arguments.extend(["--model".into(), model.into()]);
+        }
+        if let Some(effort) = request
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            arguments.extend(["--effort".into(), effort.into()]);
+        }
+    }
     if request.resume {
         match request.agent {
             IntegrationKind::Codex => {
@@ -127,6 +150,14 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
                     arguments.push(id.clone());
                 }
             }
+            IntegrationKind::Antigravity => {
+                if let Some(id) = &request.resume_id {
+                    arguments.extend(["--conversation".into(), id.clone()]);
+                } else {
+                    arguments.push("--continue".into());
+                }
+            }
+            IntegrationKind::DeepSeek => {}
         }
     }
     if let Some(prompt) = request
@@ -148,6 +179,7 @@ fn launch_background(payload: TerminalPayload) -> Result<(), String> {
     let mut command = crate::executables::command(&payload.command)?;
     command
         .args(&payload.arguments)
+        .env("LUME_MANAGED_SESSION", "1")
         .current_dir(&payload.working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -208,7 +240,7 @@ fn apply_permission_profile(request: &LaunchRequest, arguments: &mut Vec<String>
                 arguments.extend(["--permission-mode".into(), mode.into()]);
             }
         }
-        IntegrationKind::Gemini => {}
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => {}
     }
 }
 
@@ -296,6 +328,8 @@ fn launch_vscode(payload: &TerminalPayload, agent: &IntegrationKind) -> Result<(
         "agent": match agent {
             IntegrationKind::Codex => "codex",
             IntegrationKind::Claude => "claude",
+            IntegrationKind::Antigravity => "antigravity",
+            IntegrationKind::DeepSeek => "deepseek",
             IntegrationKind::Gemini => "gemini",
         },
         "cwd": payload.working_directory,
@@ -356,6 +390,8 @@ mod tests {
             initial_prompt: None,
             permission_mode: None,
             approval_policy: None,
+            model: None,
+            reasoning_effort: None,
         }
     }
 
@@ -380,6 +416,32 @@ mod tests {
         );
         assert_eq!(payload.command, "claude");
         assert_eq!(payload.arguments, vec!["--resume", "session-id"]);
+    }
+
+    #[test]
+    fn deepseek_launches_the_configured_tui_profile() {
+        let payload = payload_for(&request(IntegrationKind::DeepSeek, false, None), None);
+        assert_eq!(payload.command, "dsh");
+        assert_eq!(payload.arguments, vec!["--profile", "tui"]);
+    }
+
+    #[test]
+    fn claude_resume_applies_the_selected_model_and_effort() {
+        let mut request = request(IntegrationKind::Claude, true, Some("session-id"));
+        request.model = Some("sonnet".into());
+        request.reasoning_effort = Some("high".into());
+        let payload = payload_for(&request, None);
+        assert_eq!(
+            payload.arguments,
+            vec![
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+                "--resume",
+                "session-id"
+            ]
+        );
     }
 
     #[test]

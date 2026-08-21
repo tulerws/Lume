@@ -1,6 +1,6 @@
 [package]
 name = "lume"
-version = "0.13.1"
+version = "0.14.0"
 description = "Monitor local e discreto para agentes de IA no Windows e Linux"
 authors = ["tulerws"]
 edition = "2021"
@@ -48,6 +48,7 @@ mdns-sd = "0.20.2"
 gtk = "0.18"
 gdkx11 = "0.18"
 libloading = "0.8"
+libc = "0.2"
 x11-dl = "2.21"
 
 [target.'cfg(windows)'.dependencies]

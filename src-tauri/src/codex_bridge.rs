@@ -11,15 +11,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
 use serde_json::{json, Value};
+use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use tauri::AppHandle;
-use tungstenite::{accept, connect, stream::MaybeTlsStream, Message, WebSocket};
+use tungstenite::{
+    accept, client::connect_with_config, protocol::WebSocketConfig, stream::MaybeTlsStream,
+    Message, WebSocket,
+};
 
 use crate::{
     domain::{
         AccessMode, AgentKind, AgentRateLimit, HookEvent, HookEventKind, InteractiveQuestion,
         PendingQuestion, PermissionAction, PermissionProfile, PermissionRequest, QuestionOption,
-        SessionActivity, SessionSource,
+        SessionActivity, SessionControlOrigin, SessionSource,
     },
     event_server,
     state::{now_millis, AppState},
@@ -29,6 +34,7 @@ const SERVER_ADDRESS: &str = "127.0.0.1:43130";
 const SERVER_URL: &str = "ws://127.0.0.1:43130";
 const PROXY_ADDRESS: &str = "127.0.0.1:43131";
 pub const PROXY_URL: &str = "ws://127.0.0.1:43131";
+const MAX_LOCAL_CODEX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
 static NEXT_PROXY_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -65,6 +71,32 @@ pub struct PreparedThread {
     pub permission_profile: PermissionProfile,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningEffortOption {
+    pub value: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelOption {
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<CodexReasoningEffortOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexThreadModelSettings {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub models: Vec<CodexModelOption>,
+}
+
 #[derive(Clone)]
 pub struct CodexBridge {
     process: Arc<Mutex<Option<Child>>>,
@@ -75,6 +107,7 @@ pub struct CodexBridge {
 
 impl CodexBridge {
     pub fn start(state: AppState, app: AppHandle) -> Result<Self, String> {
+        cleanup_orphaned_server()?;
         let listener = TcpListener::bind(PROXY_ADDRESS)
             .map_err(|error| format!("Could not start the Codex bridge: {error}"))?;
         let active_proxy_threads = Arc::new(Mutex::new(HashMap::new()));
@@ -131,6 +164,23 @@ impl CodexBridge {
         )
     }
 
+    pub fn prepare_existing_thread_launch(
+        &self,
+        thread_id: &str,
+        thread_name: Option<String>,
+        permission_mode: Option<&AccessMode>,
+        approval_policy: Option<&str>,
+    ) -> Result<PreparedThread, String> {
+        self.ensure_server()?;
+        let (_, params) =
+            prepare_thread_request_params(".", Some(thread_id), permission_mode, approval_policy);
+        Ok(PreparedThread {
+            thread_id: thread_id.to_string(),
+            thread_name,
+            permission_profile: profile_from_params(&params, direct_profile()),
+        })
+    }
+
     pub fn collaboration_mode(&self, thread_id: &str) -> Result<String, String> {
         self.collaboration_modes
             .lock()
@@ -146,6 +196,25 @@ impl CodexBridge {
     pub fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<(), String> {
         self.ensure_server()?;
         set_thread_name_connection(thread_id, name)
+    }
+
+    pub fn thread_model_settings(
+        &self,
+        thread_id: &str,
+    ) -> Result<CodexThreadModelSettings, String> {
+        self.ensure_server()?;
+        thread_model_settings_connection(thread_id)
+    }
+
+    pub fn set_thread_model_settings(
+        &self,
+        thread_id: &str,
+        model: &str,
+        effort: &str,
+    ) -> Result<CodexThreadModelSettings, String> {
+        self.ensure_server()?;
+        let collaboration_mode = self.collaboration_mode(thread_id)?;
+        set_thread_model_settings_connection(thread_id, model, effort, &collaboration_mode)
     }
 
     pub fn set_collaboration_mode(
@@ -205,7 +274,7 @@ impl CodexBridge {
         app: AppHandle,
     ) -> Result<(), String> {
         self.ensure_server()?;
-        let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+        let mut server = connect_server()?;
         set_server_timeout(&mut server, Duration::from_secs(5))?;
         send_json(
             &mut server,
@@ -438,7 +507,7 @@ impl CodexBridge {
 
     pub fn refresh_rate_limits(&self, state: &AppState, app: &AppHandle) -> Result<(), String> {
         self.ensure_server()?;
-        let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+        let mut server = connect_server()?;
         set_server_timeout(&mut server, Duration::from_secs(5))?;
         let profiles = HashMap::new();
         send_json(
@@ -501,6 +570,82 @@ fn ensure_server_process(process_slot: &Mutex<Option<Child>>) -> Result<(), Stri
     Err("O servidor do Codex não respondeu a tempo".into())
 }
 
+fn cleanup_orphaned_server() -> Result<(), String> {
+    let own_pid = get_current_pid().ok();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let candidates = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            if Some(*pid) == own_pid || !is_lume_server_command(process.cmd()) {
+                return None;
+            }
+            let owned_by_live_lume = process
+                .parent()
+                .and_then(|parent| system.process(parent))
+                .is_some_and(|parent| {
+                    parent
+                        .name()
+                        .to_string_lossy()
+                        .trim_end_matches(".exe")
+                        .eq_ignore_ascii_case("lume")
+                });
+            (!owned_by_live_lume).then_some(*pid)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    for pid in &candidates {
+        if let Some(process) = system.process(*pid) {
+            let _ = process.kill_with(Signal::Term);
+        }
+    }
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(50));
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&candidates),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        if candidates.iter().all(|pid| system.process(*pid).is_none()) {
+            return Ok(());
+        }
+    }
+    for pid in &candidates {
+        if let Some(process) = system.process(*pid) {
+            let _ = process.kill();
+        }
+    }
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(50));
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&candidates),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        if candidates.iter().all(|pid| system.process(*pid).is_none()) {
+            return Ok(());
+        }
+    }
+    Err("Could not release the orphaned Codex app-server from the previous Lume instance".into())
+}
+
+fn is_lume_server_command(command: &[std::ffi::OsString]) -> bool {
+    let command = command
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    command.contains("app-server") && command.contains(SERVER_URL)
+}
+
 impl Drop for CodexBridge {
     fn drop(&mut self) {
         if let Ok(mut process) = self.process.lock() {
@@ -519,6 +664,26 @@ fn command_for_server() -> Result<Command, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let lume_pid = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != lume_pid {
+                    return Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "Lume exited while starting the Codex app-server",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -533,6 +698,19 @@ fn server_available() -> bool {
         .ok()
         .and_then(|address| TcpStream::connect_timeout(&address, Duration::from_millis(120)).ok())
         .is_some()
+}
+
+fn connect_server() -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    // The local App Server can return the complete thread on resume. Long-lived
+    // sessions may legitimately exceed tungstenite's 64 MiB default, so the
+    // trusted loopback connection uses an explicit cap instead of failing the
+    // resume before Codex can reopen the thread.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_LOCAL_CODEX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_LOCAL_CODEX_MESSAGE_BYTES));
+    connect_with_config(SERVER_URL, Some(config), 3)
+        .map(|(server, _)| server)
+        .map_err(|error| error.to_string())
 }
 
 fn start_queue_dispatcher(
@@ -629,7 +807,7 @@ fn proxy_connection(
     active_proxy_threads: ActiveProxyThreads,
 ) -> Result<(), String> {
     let mut client = accept(stream).map_err(|error| error.to_string())?;
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     configure_client_timeout(&mut client)?;
     configure_server_timeout(&mut server)?;
     let connection_id = NEXT_PROXY_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -822,7 +1000,7 @@ fn prompt_connection(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     set_server_timeout(&mut server, Duration::from_secs(5))?;
     let mut profiles = HashMap::from([(thread_id.to_string(), profile)]);
 
@@ -862,7 +1040,7 @@ fn prepare_thread_connection(
     permission_mode: Option<&AccessMode>,
     approval_policy: Option<&str>,
 ) -> Result<PreparedThread, String> {
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     set_server_timeout(&mut server, Duration::from_secs(5))?;
 
     send_json(
@@ -915,7 +1093,7 @@ fn prepare_thread_connection(
 }
 
 fn set_thread_name_connection(thread_id: &str, name: &str) -> Result<(), String> {
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     set_server_timeout(&mut server, Duration::from_secs(5))?;
     send_json(
         &mut server,
@@ -954,9 +1132,9 @@ fn prepare_thread_request_params(
         "thread/start"
     };
     if let Some(sandbox) = permission_mode.and_then(|mode| match mode {
-        AccessMode::ReadOnly | AccessMode::Plan => Some("readOnly"),
-        AccessMode::WorkspaceWrite => Some("workspaceWrite"),
-        AccessMode::FullAccess => Some("dangerFullAccess"),
+        AccessMode::ReadOnly | AccessMode::Plan => Some("read-only"),
+        AccessMode::WorkspaceWrite => Some("workspace-write"),
+        AccessMode::FullAccess => Some("danger-full-access"),
         AccessMode::Custom => None,
     }) {
         params.insert("sandbox".into(), json!(sandbox));
@@ -1012,13 +1190,200 @@ fn prompt_input(prompt: &str, attachment_paths: &[String]) -> Vec<Value> {
     input
 }
 
+fn connect_initialized_plain() -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let mut server = connect_server()?;
+    set_server_timeout(&mut server, Duration::from_secs(5))?;
+    send_json(
+        &mut server,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "lume", "title": "Lume", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }
+        }),
+    )?;
+    wait_for_plain_value_response(&mut server, 1)?;
+    send_json(
+        &mut server,
+        json!({ "method": "initialized", "params": {} }),
+    )?;
+    Ok(server)
+}
+
+fn thread_model_settings_connection(thread_id: &str) -> Result<CodexThreadModelSettings, String> {
+    let mut server = connect_initialized_plain()?;
+    load_thread_model_settings(&mut server, thread_id).map(|(settings, _)| settings)
+}
+
+fn set_thread_model_settings_connection(
+    thread_id: &str,
+    model: &str,
+    effort: &str,
+    collaboration_mode: &str,
+) -> Result<CodexThreadModelSettings, String> {
+    let mut server = connect_initialized_plain()?;
+    let (mut settings, resumed) = load_thread_model_settings(&mut server, thread_id)?;
+    let selected_model = settings
+        .models
+        .iter()
+        .find(|option| option.model == model)
+        .ok_or_else(|| "The selected Codex model is not available for this account".to_string())?;
+    let effort = if effort.trim().is_empty() {
+        selected_model.default_reasoning_effort.as_str()
+    } else {
+        effort
+    };
+    if !selected_model
+        .supported_reasoning_efforts
+        .iter()
+        .any(|option| option.value == effort)
+    {
+        return Err("The selected reasoning effort is not supported by this model".into());
+    }
+    send_json(
+        &mut server,
+        json!({ "method": "collaborationMode/list", "id": 4, "params": {} }),
+    )?;
+    let presets = wait_for_plain_value_response(&mut server, 4)?;
+    let mut collaboration =
+        collaboration_mode_from_responses(collaboration_mode, &resumed, &presets)?;
+    collaboration["settings"]["model"] = json!(model);
+    collaboration["settings"]["reasoning_effort"] = json!(effort);
+    send_json(
+        &mut server,
+        thread_settings_update_request(thread_id, model, effort, collaboration),
+    )?;
+    wait_for_plain_value_response(&mut server, 5)?;
+    settings.model = model.to_string();
+    settings.reasoning_effort = Some(effort.to_string());
+    Ok(settings)
+}
+
+fn load_thread_model_settings(
+    server: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    thread_id: &str,
+) -> Result<(CodexThreadModelSettings, Value), String> {
+    send_json(
+        server,
+        json!({ "method": "thread/resume", "id": 2, "params": { "threadId": thread_id } }),
+    )?;
+    let resumed = wait_for_plain_value_response(server, 2)?;
+    send_json(
+        server,
+        json!({
+            "method": "model/list",
+            "id": 3,
+            "params": { "limit": 100, "includeHidden": false }
+        }),
+    )?;
+    let models = wait_for_plain_value_response(server, 3)?;
+    let settings = model_settings_from_responses(&resumed, &models)?;
+    Ok((settings, resumed))
+}
+
+fn thread_settings_update_request(
+    thread_id: &str,
+    model: &str,
+    effort: &str,
+    collaboration_mode: Value,
+) -> Value {
+    json!({
+        "method": "thread/settings/update",
+        "id": 5,
+        "params": {
+            "threadId": thread_id,
+            "model": model,
+            "effort": effort,
+            "collaborationMode": collaboration_mode
+        }
+    })
+}
+
+fn model_settings_from_responses(
+    resumed: &Value,
+    catalog: &Value,
+) -> Result<CodexThreadModelSettings, String> {
+    let model = resumed
+        .pointer("/result/model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Codex did not report the current thread model".to_string())?
+        .to_string();
+    let reasoning_effort = resumed
+        .pointer("/result/reasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let models = catalog
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex did not return its model catalog".to_string())?
+        .iter()
+        .filter_map(|value| {
+            let model = value.get("model")?.as_str()?.trim();
+            if model.is_empty() {
+                return None;
+            }
+            let efforts = value
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|effort| {
+                    Some(CodexReasoningEffortOption {
+                        value: effort.get("reasoningEffort")?.as_str()?.to_string(),
+                        description: effort
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let default_reasoning_effort = value
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .or_else(|| efforts.first().map(|effort| effort.value.as_str()))?
+                .to_string();
+            Some(CodexModelOption {
+                model: model.to_string(),
+                display_name: value
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(model)
+                    .to_string(),
+                description: value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                is_default: value
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                default_reasoning_effort,
+                supported_reasoning_efforts: efforts,
+            })
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("Codex did not return any available models".into());
+    }
+    Ok(CodexThreadModelSettings {
+        model,
+        reasoning_effort,
+        models,
+    })
+}
+
 fn update_thread_collaboration_mode(
     thread_id: &str,
     mode: &str,
     state: &AppState,
     app: &AppHandle,
 ) -> Result<(), String> {
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     set_server_timeout(&mut server, Duration::from_secs(5))?;
     let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
 
@@ -1138,7 +1503,7 @@ fn control_connection(
     ),
     String,
 > {
-    let (mut server, _) = connect(SERVER_URL).map_err(|error| error.to_string())?;
+    let mut server = connect_server()?;
     set_server_timeout(&mut server, Duration::from_secs(5))?;
     let profiles = HashMap::from([(thread_id.to_string(), direct_profile())]);
     send_json(
@@ -1392,6 +1757,7 @@ fn prompt_monitor_disconnected_event(thread_id: &str) -> HookEvent {
         project: None,
         source: Some(SessionSource::Cli),
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some("Conexão do prompt encerrada".into()),
         started_at: None,
         process_id: None,
@@ -1448,6 +1814,20 @@ fn rate_limits_from_message(value: &Value) -> Vec<AgentRateLimit> {
         .get("result")
         .or_else(|| value.get("params"))
         .unwrap_or(value);
+    if let Some(snapshot) = root
+        .get("rateLimits")
+        .filter(|snapshot| !snapshot.is_null())
+    {
+        let id = snapshot
+            .get("limitId")
+            .and_then(Value::as_str)
+            .unwrap_or("codex");
+        let mut limits = Vec::new();
+        append_rate_limit_windows(&mut limits, id, snapshot);
+        if !limits.is_empty() {
+            return limits;
+        }
+    }
     if let Some(buckets) = root.get("rateLimitsByLimitId").and_then(Value::as_object) {
         let mut limits = Vec::new();
         for (id, snapshot) in buckets {
@@ -1457,16 +1837,7 @@ fn rate_limits_from_message(value: &Value) -> Vec<AgentRateLimit> {
             return limits;
         }
     }
-    let Some(snapshot) = root.get("rateLimits") else {
-        return Vec::new();
-    };
-    let id = snapshot
-        .get("limitId")
-        .and_then(Value::as_str)
-        .unwrap_or("codex");
-    let mut limits = Vec::new();
-    append_rate_limit_windows(&mut limits, id, snapshot);
-    limits
+    Vec::new()
 }
 
 fn append_rate_limit_windows(limits: &mut Vec<AgentRateLimit>, id: &str, snapshot: &Value) {
@@ -1570,6 +1941,7 @@ fn user_input_response(
         project: None,
         source: None,
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some("Aguardando sua resposta".into()),
         started_at: None,
         process_id: None,
@@ -1691,6 +2063,7 @@ fn approval_response(
         project: cwd.as_deref().and_then(project_name),
         source: None,
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some("Aguardando sua permissão".into()),
         started_at: None,
         process_id: None,
@@ -1881,6 +2254,7 @@ fn activity_event(value: &Value, method: &str) -> Option<HookEvent> {
         project: None,
         source: None,
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: None,
         started_at: None,
         process_id: None,
@@ -2271,6 +2645,7 @@ fn notification_event(
         project: cwd.and_then(project_name),
         source: Some(SessionSource::Cli),
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some(status_label.into()),
         started_at,
         process_id: None,
@@ -2410,6 +2785,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identifies_only_the_lume_codex_server_command() {
+        let managed = [
+            std::ffi::OsString::from("codex"),
+            std::ffi::OsString::from("app-server"),
+            std::ffi::OsString::from("--listen"),
+            std::ffi::OsString::from(SERVER_URL),
+        ];
+        let unrelated = [
+            std::ffi::OsString::from("codex"),
+            std::ffi::OsString::from("resume"),
+            std::ffi::OsString::from("thread-id"),
+        ];
+
+        assert!(is_lume_server_command(&managed));
+        assert!(!is_lume_server_command(&unrelated));
+    }
+
+    #[test]
     fn queued_prompts_keep_their_order_until_the_active_turn_finishes() {
         let bridge = CodexBridge {
             process: Arc::new(Mutex::new(None)),
@@ -2545,6 +2938,72 @@ mod tests {
                 "params": {
                     "threadId": "thread-1",
                     "input": [{ "type": "text", "text": "Continue os testes" }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn model_catalog_keeps_server_advertised_efforts() {
+        let settings = model_settings_from_responses(
+            &json!({
+                "result": {
+                    "model": "gpt-test",
+                    "reasoningEffort": "high"
+                }
+            }),
+            &json!({
+                "result": {
+                    "data": [{
+                        "model": "gpt-test",
+                        "displayName": "GPT Test",
+                        "description": "Test model",
+                        "isDefault": true,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            { "reasoningEffort": "medium", "description": "Balanced" },
+                            { "reasoningEffort": "high", "description": "Deeper" }
+                        ]
+                    }]
+                }
+            }),
+        )
+        .expect("model settings");
+
+        assert_eq!(settings.model, "gpt-test");
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(settings.models[0].supported_reasoning_efforts.len(), 2);
+        assert_eq!(
+            settings.models[0].supported_reasoning_efforts[1].value,
+            "high"
+        );
+    }
+
+    #[test]
+    fn model_settings_use_the_documented_thread_update_shape() {
+        let collaboration_mode = json!({
+            "mode": "default",
+            "settings": {
+                "model": "gpt-test",
+                "reasoning_effort": "high",
+                "developer_instructions": null
+            }
+        });
+        assert_eq!(
+            thread_settings_update_request(
+                "thread-1",
+                "gpt-test",
+                "high",
+                collaboration_mode.clone(),
+            ),
+            json!({
+                "method": "thread/settings/update",
+                "id": 5,
+                "params": {
+                    "threadId": "thread-1",
+                    "model": "gpt-test",
+                    "effort": "high",
+                    "collaborationMode": collaboration_mode
                 }
             })
         );
@@ -2754,6 +3213,30 @@ mod tests {
     }
 
     #[test]
+    fn canonical_codex_rate_limit_wins_over_unrelated_metered_buckets() {
+        let limits = rate_limits_from_message(&json!({
+            "result": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": { "usedPercent": 24, "windowDurationMins": 300 }
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": { "usedPercent": 24, "windowDurationMins": 300 }
+                    },
+                    "codex_other": {
+                        "primary": { "usedPercent": 91, "windowDurationMins": 60 }
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].id, "codex:primary");
+        assert_eq!(limits[0].used_percent, 24);
+    }
+
+    #[test]
     fn disconnected_prompt_monitor_releases_the_running_state() {
         let event = prompt_monitor_disconnected_event("thread-1");
         assert!(matches!(event.event, HookEventKind::WaitingForInput));
@@ -2952,9 +3435,23 @@ mod tests {
         assert_eq!(method, "thread/start");
         assert_eq!(text_at(&params, "cwd"), Some("/work/lume"));
         assert_eq!(text_at(&params, "serviceName"), Some("lume"));
-        assert_eq!(text_at(&params, "sandbox"), Some("workspaceWrite"));
+        assert_eq!(text_at(&params, "sandbox"), Some("workspace-write"));
         assert_eq!(text_at(&params, "approvalPolicy"), Some("on-request"));
         assert!(params.get("threadId").is_none());
+    }
+
+    #[test]
+    fn legacy_thread_sandbox_uses_protocol_enum_values() {
+        for (mode, expected) in [
+            (AccessMode::ReadOnly, "read-only"),
+            (AccessMode::Plan, "read-only"),
+            (AccessMode::WorkspaceWrite, "workspace-write"),
+            (AccessMode::FullAccess, "danger-full-access"),
+        ] {
+            let (_, params) =
+                prepare_thread_request_params("/work/lume", Some("thread-1"), Some(&mode), None);
+            assert_eq!(text_at(&params, "sandbox"), Some(expected));
+        }
     }
 
     #[test]

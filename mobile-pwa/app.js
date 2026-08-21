@@ -22,6 +22,7 @@ const appContent = document.querySelector("#app-content");
 const loadingView = document.querySelector("#loading-view");
 const sessionList = document.querySelector("#session-list");
 const resultsList = document.querySelector("#results-list");
+const workflowList = document.querySelector("#workflow-list");
 const chatScreen = document.querySelector("#chat-screen");
 const chatFeed = document.querySelector("#mobile-chat-feed");
 const chatComposer = document.querySelector("#mobile-chat-composer");
@@ -36,13 +37,11 @@ const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
 connectionLabel.textContent = "Starting";
 const headerMascot = document.querySelector("#header-mascot");
-const androidInstallCard = document.querySelector("#android-install-card");
 const pairInstallPrompt = document.querySelector("#pair-install-prompt");
 const closePairInstallPrompt = document.querySelector("#close-pair-install");
+const continueInBrowser = document.querySelector("#continue-in-browser");
 const openLumeMobile = document.querySelector("#open-lume-mobile");
-const openInstalledMobile = document.querySelector("#open-installed-mobile");
 const mobileApkDeviceDownload = document.querySelector("#mobile-apk-device-download");
-const pwaInstallButton = document.querySelector("#pwa-install-button");
 const mobileUpdateCard = document.querySelector("#mobile-update-card");
 const mobileUpdateButton = document.querySelector("#mobile-update-button");
 const mobileUpdateDetail = document.querySelector("#mobile-update-detail");
@@ -65,7 +64,6 @@ let previousQuestionIds = new Map();
 let hasRenderedSnapshot = false;
 let currentSnapshot;
 let activeFilter = "all";
-let deferredInstallPrompt;
 let installedMobileInfo;
 let availableMobileUpdate;
 let mobileUpdateBusy = false;
@@ -668,7 +666,9 @@ function applyPairingTarget(target) {
   }
   pairingCode = target.code;
   desktopId = target.desktopId || null;
-  pairInstallPromptDismissed = false;
+  pairInstallPromptDismissed = sessionStorage.getItem(
+    `lume-install-prompt-dismissed:${pairingCode}`,
+  ) === "1";
   localStorage.setItem(baseKey, apiBase);
   pairMessage.textContent = "";
   pairMessage.className = "message";
@@ -716,15 +716,17 @@ function updateInstallOptions() {
     Boolean(pairingCode) && isAndroidBrowser && !isNative && !pairInstallPromptDismissed;
   scanPairingButton.hidden = !(isNative && nativePlatform() === "android");
   pairInstallPrompt.hidden = !showPairInstallPrompt;
+  pairInstallPrompt.setAttribute("aria-hidden", String(!showPairInstallPrompt));
   document.body.classList.toggle("install-modal-open", showPairInstallPrompt);
-  androidInstallCard.hidden =
-    Boolean(pairingCode) || !isAndroidBrowser || isNative;
   mobileApkDeviceDownload.hidden = isNative || !isAndroidBrowser;
-  openInstalledMobile.hidden = isNative || !isAndroidBrowser || !token || !deviceId;
-  if (!openInstalledMobile.hidden) {
-    openInstalledMobile.href = pairingIntentUrl({ gateway: apiBase, token, deviceId });
+}
+
+function dismissPairInstallPrompt() {
+  pairInstallPromptDismissed = true;
+  if (pairingCode) {
+    sessionStorage.setItem(`lume-install-prompt-dismissed:${pairingCode}`, "1");
   }
-  pwaInstallButton.hidden = !deferredInstallPrompt;
+  updateInstallOptions();
 }
 
 function statusLabel(status, hasQuestion = false) {
@@ -851,6 +853,15 @@ function cleanPromptTransport(value) {
   return (marker >= 0 ? normalized.slice(0, marker) : normalized).trim();
 }
 
+function cleanMobileNarrative(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*(?:[-_*=─━]\s*){3,}\s*$/.test(line))
+    .join("\n")
+    .trim();
+}
+
 function promptTextKey(value) {
   return chatTextKey(cleanPromptTransport(value));
 }
@@ -967,29 +978,29 @@ function groupMobileChatItems(items) {
 }
 
 function mobileTraceMarkup(trace, active) {
-  return `<details class="mobile-activity-cluster${active ? " active" : ""}" ${active ? "open" : ""}>
-    <summary class="mobile-activity-summary">
+  const visibleItems = trace.items.slice(-6);
+  const hiddenCount = trace.items.length - visibleItems.length;
+  return `<section class="mobile-activity-cluster${active ? " active" : ""}" ${active ? 'aria-live="polite"' : ""}>
+    <header class="mobile-activity-summary">
       <span class="mobile-activity-mark">${mobileActivityIcon("tool")}</span>
       <strong>${escapeHtml(mobileActivitySummary(trace.items))}</strong>
       <small>${trace.items.length}</small>
-      <svg class="mobile-activity-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
-    </summary>
+    </header>
     <div class="mobile-activity-list">
-      ${trace.items.map((activity) => {
+      ${hiddenCount ? `<small class="mobile-activity-omitted">${hiddenCount} earlier ${hiddenCount === 1 ? "event" : "events"} summarized</small>` : ""}
+      ${visibleItems.map((activity) => {
         const category = mobileActivityCategory(activity);
         const preview = mobileActivityPreview(activity);
-        return `<details class="mobile-activity-row ${escapeHtml(activity.status || "completed")}">
-          <summary>
+        return `<article class="mobile-activity-row ${escapeHtml(activity.status || "completed")}">
+          <div class="mobile-activity-entry">
             <i class="mobile-activity-status"></i>
             <span class="mobile-activity-icon" data-category="${category}">${mobileActivityIcon(category)}</span>
             <span class="mobile-activity-copy"><strong>${escapeHtml(mobileActivityTitle(activity))}</strong>${preview ? `<code>${escapeHtml(preview)}</code>` : ""}</span>
-            ${activity.detail ? '<svg class="mobile-row-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>' : ""}
-          </summary>
-          ${activity.detail ? `<pre>${escapeHtml(activity.detail)}</pre>` : ""}
-        </details>`;
+          </div>
+        </article>`;
       }).join("")}
     </div>
-  </details>`;
+  </section>`;
 }
 
 function buildChatTurns(session) {
@@ -1459,17 +1470,18 @@ function renderChat(sessions) {
           return mobileTraceMarkup(entry, active);
         }
         const item = entry.item;
-        if (item.kind === "message" && (item.detail || item.attachments?.length)) {
+        const narrative = cleanMobileNarrative(item.detail);
+        if (item.kind === "message" && (narrative || item.attachments?.length)) {
           return `<div class="mobile-chat-message agent">
             <header><strong>${escapeHtml(sessionDisplayName(session))}</strong><time>${activityTime(item.createdAt)}</time></header>
-            ${item.detail ? `<div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>` : ""}
+            ${narrative ? `<div class="mobile-markdown">${renderSafeMarkdown(narrative)}</div>` : ""}
             ${responseAttachmentsMarkup(session.id, item.attachments)}
           </div>`;
         }
-        if (item.kind === "analysis" && item.detail) {
+        if (item.kind === "analysis" && narrative) {
           return `<section class="mobile-reasoning${item.status === "running" ? " running" : ""}">
             <header><span>${mobileActivityIcon("tool")}</span><strong>${escapeHtml(item.title || "Agent reasoning")}</strong><time>${activityTime(item.createdAt)}</time></header>
-            <div class="mobile-markdown">${renderSafeMarkdown(item.detail)}</div>
+            <div class="mobile-markdown">${renderSafeMarkdown(narrative)}</div>
           </section>`;
         }
         return "";
@@ -1586,6 +1598,7 @@ function renderSessions(snapshot, trackChanges = true) {
   document.querySelector("#updated-at").textContent =
     `Updated ${new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
   renderResults(sessions);
+  renderWorkflows(snapshot);
   renderDevice();
   renderChat(sessions);
   const visibleSessions = filterSessions(sessions);
@@ -1698,6 +1711,87 @@ function renderResults(sessions) {
           </details>` : ""}
       </article>`;
   }).join("");
+}
+
+function workflowStatusLabel(status) {
+  return {
+    draft: "Draft",
+    ready: "Ready for next step",
+    running: "Running",
+    waiting_for_approval: "Waiting for approval",
+    paused: "Paused",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+  }[status] || status;
+}
+
+function workflowElapsed(run) {
+  const terminal = ["completed", "failed", "cancelled"].includes(run.status);
+  const minutes = Math.max(0, Math.round(((terminal ? run.updatedAt : Date.now()) - run.createdAt) / 60_000));
+  if (minutes < 1) return "under a minute";
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function workflowStepStatusLabel(status) {
+  return {
+    pending: "Waiting",
+    running: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    skipped: "Skipped",
+  }[status] || "Waiting";
+}
+
+function workflowRunMarkup(record, compact = false) {
+  const completed = record.run.steps.filter((step) => ["completed", "skipped"].includes(step.status)).length;
+  const progress = record.run.steps.length ? Math.round((completed / record.run.steps.length) * 100) : 0;
+  const steps = compact ? [] : record.run.steps.map((state) => {
+    const identity = record.steps.find((step) => step.stepId === state.stepId);
+    const definition = record.group?.steps?.find((step) => step.id === state.stepId);
+    const role = identity?.roleLabel || definition?.customRoleLabel || definition?.role || "Agent";
+    const agent = identity?.sessionName || identity?.agentLabel || identity?.project || "Agent session";
+    const current = state.stepId === record.run.currentStepId
+      && !["completed", "cancelled"].includes(record.run.status);
+    return `<article class="mobile-workflow-agent state-${escapeHtml(state.status)} ${current ? "current" : ""}">
+      <i></i>
+      <span><strong>${escapeHtml(role)}</strong><small>${escapeHtml(agent)}</small></span>
+      <b>${escapeHtml(workflowStepStatusLabel(state.status))}</b>
+    </article>`;
+  }).join("");
+  return `<article class="mobile-workflow-card status-${escapeHtml(record.run.status)} ${compact ? "compact" : ""}">
+    <header class="mobile-workflow-summary">
+      <span class="mobile-workflow-symbol"><i></i><i></i><i></i></span>
+      <span><strong>${escapeHtml(record.run.objective)}</strong><small>${escapeHtml(workflowStatusLabel(record.run.status))} · ${completed}/${record.run.steps.length} steps · ${workflowElapsed(record.run)}</small></span>
+    </header>
+    <div class="mobile-workflow-progress"><i style="width:${progress}%"></i></div>
+    ${steps ? `<div class="mobile-workflow-agents">${steps}</div>` : ""}
+  </article>`;
+}
+
+function renderWorkflows(snapshot) {
+  if (!workflowList) return;
+  const history = [...(snapshot.workflowHistory || [])]
+    .sort((left, right) => right.run.updatedAt - left.run.updatedAt);
+  const latest = new Map();
+  for (const record of history) {
+    if (!latest.has(record.run.workflowId)) latest.set(record.run.workflowId, record);
+  }
+  const active = [...latest.values()].filter((record) =>
+    !["completed", "cancelled"].includes(record.run.status));
+  const activeIds = new Set(active.map((record) => record.run.id));
+  const recent = history
+    .filter((record) => !activeIds.has(record.run.id))
+    .slice(0, 5);
+  const activeMarkup = active.length
+    ? `<h2 class="mobile-workflow-heading">Active workflows</h2>${active.map((record) => workflowRunMarkup(record)).join("")}`
+    : "";
+  const historyMarkup = recent.length
+    ? `<h2 class="mobile-workflow-heading">Recent</h2>${recent.map((record) => workflowRunMarkup(record, true)).join("")}`
+    : "";
+  workflowList.innerHTML = activeMarkup + historyMarkup
+    || `<div class="empty-list">${mascotMarkup("awake")}<strong>No active workflows</strong><p>Workflows started on the desktop will appear here.</p></div>`;
 }
 
 function renderDevice() {
@@ -2291,6 +2385,7 @@ function setView(view) {
   const screens = {
     sessions: dashboard,
     results: document.querySelector("#results-screen"),
+    workflows: document.querySelector("#workflows-screen"),
     device: document.querySelector("#device-screen"),
     chat: chatScreen,
   };
@@ -2339,18 +2434,16 @@ document.querySelectorAll(".bottom-nav button").forEach((button) => {
   button.addEventListener("click", () => setView(button.dataset.view));
 });
 closePairInstallPrompt.addEventListener("click", () => {
-  pairInstallPromptDismissed = true;
-  updateInstallOptions();
+  dismissPairInstallPrompt();
 });
+continueInBrowser.addEventListener("click", dismissPairInstallPrompt);
 pairInstallPrompt.addEventListener("click", (event) => {
   if (event.target !== pairInstallPrompt) return;
-  pairInstallPromptDismissed = true;
-  updateInstallOptions();
+  dismissPairInstallPrompt();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape" || pairInstallPrompt.hidden) return;
-  pairInstallPromptDismissed = true;
-  updateInstallOptions();
+  dismissPairInstallPrompt();
 });
 document.querySelectorAll(".filter-bar button").forEach((button) => {
   button.addEventListener("click", () => {
@@ -2819,21 +2912,8 @@ mobileUpdateButton.addEventListener("click", () => {
   if (availableMobileUpdate) void installMobileUpdate();
   else void checkMobileUpdate({ manual: true });
 });
-pwaInstallButton.addEventListener("click", async () => {
-  if (!deferredInstallPrompt) return;
-  deferredInstallPrompt.prompt();
-  await deferredInstallPrompt.userChoice;
-  deferredInstallPrompt = undefined;
-  updateInstallOptions();
-});
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();
-  deferredInstallPrompt = event;
-  updateInstallOptions();
-});
-window.addEventListener("appinstalled", () => {
-  deferredInstallPrompt = undefined;
-  updateInstallOptions();
 });
 document.querySelector("#disconnect-button").addEventListener("click", async () => {
   if (!confirm("Disconnect this phone from Lume?")) return;

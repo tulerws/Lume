@@ -33,6 +33,22 @@ const DOCK_ANIMATION_STEPS: i32 = 9;
 const MAX_REASONABLE_COORDINATE: i32 = 65_536;
 const TERMINAL_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn terminal_webview_path() -> &'static str {
+    if cfg!(debug_assertions) {
+        "terminal/"
+    } else {
+        "terminal/index.html"
+    }
+}
+
+fn workflow_bridge_webview_path() -> &'static str {
+    if cfg!(debug_assertions) {
+        "workflow-bridge/"
+    } else {
+        "workflow-bridge/index.html"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DockSide {
@@ -713,28 +729,31 @@ impl TerminalWindows {
             let cleanup_label = label.clone();
             let cleanup_app = app.clone();
             let build_label = label.clone();
-            let window =
-                WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-                    .title("Lume · Connection")
-                    .inner_size(f64::from(bridge_width), f64::from(bridge_height))
-                    .min_inner_size(
-                        f64::from(bridge_width),
-                        f64::from(WORKFLOW_BRIDGE_MIN_HEIGHT),
-                    )
-                    .decorations(false)
-                    .transparent(true)
-                    .always_on_top(true)
-                    .skip_taskbar(true)
-                    .shadow(false)
-                    .resizable(false)
-                    .visible(false)
-                    .build()
-                    .map_err(|error| {
-                        if let Ok(mut bridges) = self.workflow_bridges.lock() {
-                            bridges.remove(&build_label);
-                        }
-                        error.to_string()
-                    })?;
+            let window = WebviewWindowBuilder::new(
+                app,
+                &label,
+                WebviewUrl::App(workflow_bridge_webview_path().into()),
+            )
+            .title("Lume · Connection")
+            .inner_size(f64::from(bridge_width), f64::from(bridge_height))
+            .min_inner_size(
+                f64::from(bridge_width),
+                f64::from(WORKFLOW_BRIDGE_MIN_HEIGHT),
+            )
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .shadow(false)
+            .resizable(false)
+            .visible(false)
+            .build()
+            .map_err(|error| {
+                if let Ok(mut bridges) = self.workflow_bridges.lock() {
+                    bridges.remove(&build_label);
+                }
+                error.to_string()
+            })?;
             window.on_window_event(move |event| {
                 if matches!(event, WindowEvent::Destroyed) {
                     overlay::forget_window(&cleanup_label);
@@ -1111,37 +1130,40 @@ impl TerminalWindows {
 
         let ready_registry = self.clone();
         let ready_label = label.clone();
-        let window =
-            match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-                .title(format!("Lume · {}", session.agent_label))
-                .inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
-                .min_inner_size(
-                    f64::from(TERMINAL_MIN_WIDTH),
-                    f64::from(TERMINAL_MIN_HEIGHT),
-                )
-                .decorations(false)
-                .transparent(true)
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .shadow(false)
-                .resizable(true)
-                .visible(false)
-                .on_page_load(move |window, payload| {
-                    let ready_event = matches!(payload.event(), PageLoadEvent::Finished)
-                        || (cfg!(target_os = "windows")
-                            && matches!(payload.event(), PageLoadEvent::Started));
-                    if ready_event && ready_registry.mark_ready(&ready_label) {
-                        ready_registry.present_if_ready(&window, &ready_label);
-                    }
-                })
-                .build()
-            {
-                Ok(window) => window,
-                Err(error) => {
-                    self.remove(&label);
-                    return Err(error.to_string());
-                }
-            };
+        let window = match WebviewWindowBuilder::new(
+            app,
+            &label,
+            WebviewUrl::App(terminal_webview_path().into()),
+        )
+        .title(format!("Lume · {}", session.agent_label))
+        .inner_size(f64::from(TERMINAL_WIDTH), f64::from(TERMINAL_HEIGHT))
+        .min_inner_size(
+            f64::from(TERMINAL_MIN_WIDTH),
+            f64::from(TERMINAL_MIN_HEIGHT),
+        )
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .resizable(true)
+        .visible(false)
+        .on_page_load(move |window, payload| {
+            let ready_event = matches!(payload.event(), PageLoadEvent::Finished)
+                || (cfg!(target_os = "windows")
+                    && matches!(payload.event(), PageLoadEvent::Started));
+            if ready_event && ready_registry.mark_ready(&ready_label) {
+                ready_registry.present_if_ready(&window, &ready_label);
+            }
+        })
+        .build()
+        {
+            Ok(window) => window,
+            Err(error) => {
+                self.remove(&label);
+                return Err(error.to_string());
+            }
+        };
 
         let registry = self.clone();
         let cleanup_label = label.clone();
@@ -3415,6 +3437,14 @@ fn move_native_windows(app: &AppHandle, states: &[TerminalWindowState], resize: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn development_webviews_use_vite_routes_without_index_html() {
+        if cfg!(debug_assertions) {
+            assert_eq!(terminal_webview_path(), "terminal/");
+            assert_eq!(workflow_bridge_webview_path(), "workflow-bridge/");
+        }
+    }
 
     fn placement(label: &str, x: i32, y: i32) -> Placement {
         Placement {

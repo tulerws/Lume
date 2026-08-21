@@ -21,8 +21,6 @@
   import LumeLogo from "$lib/LumeLogo.svelte";
   import LumeMascot from "$lib/LumeMascot.svelte";
   import LumeSelect from "$lib/LumeSelect.svelte";
-  import TerminalWindow from "$lib/TerminalWindow.svelte";
-  import WorkflowBridgeWindow from "$lib/WorkflowBridgeWindow.svelte";
   import { displayText, localize } from "$lib/i18n";
   import {
     clipboardHasImage,
@@ -32,7 +30,7 @@
     prepareClipboardImage,
   } from "$lib/imageAttachments";
   import { sessionCapabilities } from "$lib/sessionCapabilities";
-  import { resolveTerminalSession } from "$lib/sessionIdentity";
+  import { resolveLiveResumableSession, resolveTerminalSession } from "$lib/sessionIdentity";
   import { stripInternalAgentMetadata } from "$lib/markdown.js";
   import type {
     AgentKind,
@@ -56,6 +54,7 @@
     TerminalWindowState,
     WhiteboardLayout,
     WorkflowRun,
+    WorkflowHistoryRecord,
   } from "$lib/domain";
   import { demoSessions } from "$lib/demo";
   import {
@@ -70,6 +69,7 @@
     deleteResultNote,
     loadDisplayBackend,
     loadHistory,
+    loadWorkflowHistory,
     loadResultNotes,
     loadResumableSessions,
     loadIntegrationStatuses,
@@ -134,9 +134,6 @@
     ? ""
     : `${navigator.userAgent} ${navigator.platform}`.toLowerCase();
   const isLinux = runtimePlatform.includes("linux") || runtimePlatform.includes("x11");
-  const currentWindowLabel = isTauri ? getCurrentWindow().label : "main";
-  const isTerminalWindow = currentWindowLabel.startsWith("terminal-");
-  const isWorkflowBridgeWindow = currentWindowLabel.startsWith("workflow-bridge-");
   const compactSize = { width: 78, height: 44 };
   const expandedWidth = 392;
   const expandedMaxHeight = 560;
@@ -161,6 +158,7 @@
   let view = $state<View>("sessions");
   let sessions = $state<AgentSession[]>(isTauri ? [] : structuredClone(demoSessions));
   let history = $state<HistoryEntry[]>([]);
+  let workflowHistory = $state<WorkflowHistoryRecord[]>([]);
   let resultNotes = $state<ResultNote[]>([]);
   let preferences = $state<Preferences>({ ...defaultPreferences });
   let monitors = $state<MonitorOption[]>([]);
@@ -246,15 +244,12 @@
     pointerId: number;
     startX: number;
     startY: number;
-    lastX: number;
-    lastY: number;
     originX: number;
     originY: number;
     scale: number;
     target: HTMLElement;
     compact: boolean;
   } | null = null;
-  let moveFrame: number | null = null;
   let pendingOverlayMove: { x: number; y: number } | null = null;
   let overlayMoveTask: Promise<void> | null = null;
   let systemDark = $state(false);
@@ -420,7 +415,6 @@
   });
 
   onMount(() => {
-    if (isTerminalWindow || isWorkflowBridgeWindow) return;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -444,6 +438,7 @@
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let updateTimer: ReturnType<typeof setInterval> | undefined;
     let resumeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let sessionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
     const refreshAfterResume = () => {
       void refreshSessions(false);
       if (resumeRefreshTimer) clearTimeout(resumeRefreshTimer);
@@ -517,7 +512,11 @@
           // Mobile settings still expose the connection error when opened.
         }
         stopListening = await listen("lume://sessions-changed", () => {
-          void refreshSessions(true);
+          if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer);
+          sessionRefreshTimer = setTimeout(() => {
+            sessionRefreshTimer = undefined;
+            void refreshSessions(true);
+          }, 120);
         });
         stopTerminalListening = await listen("lume://terminal-windows-changed", () => {
           void refreshTerminalWindows();
@@ -555,6 +554,7 @@
       if (pollTimer) clearInterval(pollTimer);
       if (updateTimer) clearInterval(updateTimer);
       if (resumeRefreshTimer) clearTimeout(resumeRefreshTimer);
+      if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer);
       if (mascotSleepTimer) clearTimeout(mascotSleepTimer);
       if (pendingUpdate) void pendingUpdate.close();
     };
@@ -1005,8 +1005,6 @@
       pointerId: event.pointerId,
       startX: event.screenX,
       startY: event.screenY,
-      lastX: event.screenX,
-      lastY: event.screenY,
       originX: overlayPosition.x,
       originY: overlayPosition.y,
       scale: monitorBounds.scale,
@@ -1033,20 +1031,6 @@
 
   function moveOverlayDrag(event: PointerEvent) {
     if (!dragState || dragState.pointerId !== event.pointerId) return;
-    const stepX = (event.screenX - dragState.lastX) * dragState.scale;
-    const stepY = (event.screenY - dragState.lastY) * dragState.scale;
-    const pointerJumpLimit = Math.max(120, 160 * dragState.scale);
-    if (Math.hypot(stepX, stepY) > pointerJumpLimit) {
-      dragState.startX = event.screenX;
-      dragState.startY = event.screenY;
-      dragState.lastX = event.screenX;
-      dragState.lastY = event.screenY;
-      dragState.originX = overlayPosition.x;
-      dragState.originY = overlayPosition.y;
-      return;
-    }
-    dragState.lastX = event.screenX;
-    dragState.lastY = event.screenY;
     const dx = (event.screenX - dragState.startX) * dragState.scale;
     const dy = (event.screenY - dragState.startY) * dragState.scale;
     if (!dragging && Math.hypot(dx, dy) < 3) return;
@@ -1056,11 +1040,7 @@
       dragState.originX + dx,
       dragState.originY + dy,
     );
-    if (moveFrame !== null) cancelAnimationFrame(moveFrame);
-    moveFrame = requestAnimationFrame(() => {
-      moveFrame = null;
-      queueOverlayMove(overlayPosition.x, overlayPosition.y);
-    });
+    queueOverlayMove(overlayPosition.x, overlayPosition.y);
   }
 
   function queueOverlayMove(x: number, y: number) {
@@ -1864,7 +1844,11 @@
     terminalMessage = null;
     if (nextView === "board") await refreshTerminalWindows();
     if (nextView === "history") {
-      [history, resultNotes] = await Promise.all([loadHistory(), loadResultNotes()]);
+      [history, resultNotes, workflowHistory] = await Promise.all([
+        loadHistory(),
+        loadResultNotes(),
+        loadWorkflowHistory(),
+      ]);
     }
     if (nextView === "settings") {
       selectedProfileKey ??= detectedProjects[0]?.key ?? null;
@@ -2116,6 +2100,15 @@
     launching = stored.agent;
     launchError = null;
     try {
+      const liveSession = resolveLiveResumableSession(stored, sessions);
+      if (liveSession) {
+        await openTerminalWindow(liveSession.id);
+        await refreshTerminalWindows();
+        launcherOpen = false;
+        resumeAgent = null;
+        resumableSessions = [];
+        return;
+      }
       const profile = preferences.projectProfiles[projectKey(stored.workingDirectory)];
       await launchAgentSession(
         stored.agent,
@@ -2390,7 +2383,7 @@
   function launcherIntegrations() {
     const preferred = selectedProjectProfile?.preferredAgents ?? [];
     return integrations
-      .filter((integration) => integration.installed)
+      .filter((integration) => integration.installed && integration.canLaunch)
       .slice()
       .sort((left, right) => {
         const leftIndex = preferred.indexOf(integrationAgentKind(left.kind));
@@ -2419,15 +2412,17 @@
       const notes = kind === "completed"
         ? [620, 820]
         : kind === "permission"
-          ? [520, 690, 520]
+          ? [440, 440]
           : [330, 250];
       notes.forEach((frequency, index) => {
         const oscillator = context.createOscillator();
-        oscillator.type = "sine";
+        oscillator.type = kind === "permission" ? "triangle" : "sine";
         oscillator.frequency.value = frequency;
         oscillator.connect(gain);
-        oscillator.start(context.currentTime + index * 0.09);
-        oscillator.stop(context.currentTime + 0.25 + index * 0.09);
+        const spacing = kind === "permission" ? 0.18 : 0.09;
+        const duration = kind === "permission" ? 0.12 : 0.25;
+        oscillator.start(context.currentTime + index * spacing);
+        oscillator.stop(context.currentTime + duration + index * spacing);
       });
       setTimeout(() => void context.close(), 600);
     } catch {
@@ -2481,6 +2476,30 @@
       permission_denied: tr("Denied", "Recusado"),
     }[event];
   }
+
+  function workflowRunLabel(status: WorkflowRun["status"]) {
+    return {
+      draft: tr("Draft", "Rascunho"),
+      ready: tr("Ready for next step", "Pronto para próxima etapa"),
+      running: tr("Running", "Executando"),
+      waiting_for_approval: tr("Waiting for approval", "Aguardando aprovação"),
+      paused: tr("Paused", "Pausado"),
+      completed: tr("Completed", "Concluído"),
+      failed: tr("Failed", "Falhou"),
+      cancelled: tr("Cancelled", "Cancelado"),
+    }[status];
+  }
+
+  function workflowElapsed(record: WorkflowHistoryRecord) {
+    const end = ["completed", "failed", "cancelled"].includes(record.run.status)
+      ? record.run.updatedAt
+      : Date.now();
+    const minutes = Math.max(0, Math.round((end - record.run.createdAt) / 60_000));
+    if (minutes < 1) return tr("under a minute", "menos de um minuto");
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
+  }
 </script>
 
 <svelte:head>
@@ -2488,11 +2507,6 @@
   <meta name="description" content="A discreet local monitor for AI agent sessions." />
 </svelte:head>
 
-{#if isTerminalWindow}
-  <TerminalWindow />
-{:else if isWorkflowBridgeWindow}
-  <WorkflowBridgeWindow />
-{:else}
 <main
   class:expanded
   class:dark={effectiveDark}
@@ -2761,10 +2775,16 @@
                         {sourceLabel(session)}
                       </span>
                       {#if session.permissionProfile.approvalsReviewer === "auto_review" && session.permissionProfile.mode !== "full_access"}
-                        <span class="access-badge auto-review">{tr("Approve for me", "Aprovar por mim")}</span>
+                        <span class="access-badge auto-review">
+                          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M6.8.8 2.9 6.3h2.5L4.9 11l4.2-5.7H6.5Z" /></svg>
+                          {tr("Auto", "Auto")}
+                        </span>
                       {/if}
                       {#if session.permissionProfile.mode === "full_access"}
-                        <span class="access-badge full-access">{tr("Full access", "Acesso total")}</span>
+                        <span class="access-badge full-access">
+                          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 5V3.7a3 3 0 0 1 5.6-1.5M2.2 5.2h7.6v5.5H2.2Z" /></svg>
+                          {tr("Full access", "Acesso total")}
+                        </span>
                       {/if}
                     </span>
                     <span class="project-name" title={session.workingDirectory}>
@@ -3155,9 +3175,55 @@
         {:else if view === "history"}
           <div class="history-list" in:fade={{ duration: 150 }}>
             <div class="results-intro">
-              <strong>{tr("Final responses from your agents", "Respostas finais dos seus agentes")}</strong>
-              <p>{tr("Kept only while Lume is running.", "Mantidas apenas enquanto o Lume está aberto.")}</p>
+              <strong>{tr("Results, notes, and workflow runs", "Resultados, notas e execuções de workflow")}</strong>
+              <p>{tr("Workflow history and saved notes stay local on this computer.", "O histórico de workflows e as notas permanecem localmente neste computador.")}</p>
             </div>
+            {#if workflowHistory.length > 0}
+              <div class="settings-section-label history-label">{tr("Workflow runs", "Execuções de workflow")}</div>
+              <div class="workflow-history-list">
+                {#each workflowHistory as record (record.run.id)}
+                  {@const completedSteps = record.run.steps.filter((step) => step.status === "completed" || step.status === "skipped").length}
+                  <details class="workflow-history-card status-{record.run.status}">
+                    <summary>
+                      <span class="workflow-history-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+                      <span>
+                        <strong>{record.run.objective}</strong>
+                        <small>{workflowRunLabel(record.run.status)} · {completedSteps}/{record.run.steps.length} {tr("steps", "etapas")} · {workflowElapsed(record)}</small>
+                      </span>
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4" /></svg>
+                    </summary>
+                    <div class="workflow-history-body">
+                      <div class="workflow-history-progress"><i style:width={`${record.run.steps.length ? (completedSteps / record.run.steps.length) * 100 : 0}%`}></i></div>
+                      {#each record.steps as step (step.stepId)}
+                        {@const stepRun = record.run.steps.find((item) => item.stepId === step.stepId)}
+                        <article class="workflow-history-step step-{stepRun?.status ?? 'pending'}">
+                          <span class="workflow-step-state" aria-hidden="true"></span>
+                          <div>
+                            <strong>{step.roleLabel}</strong>
+                            <small>{step.sessionName || step.agentLabel || step.project || tr("Agent session", "Sessão do agente")} · {stepRun?.attempt ?? 0} {tr("attempts", "tentativas")}</small>
+                            {#if stepRun?.error}<p class="workflow-history-error">{stepRun.error}</p>{/if}
+                            {#if step.response}<p>{stripInternalAgentMetadata(step.response)}</p>{/if}
+                            {#if step.files.length || step.tests.length}
+                              <div class="workflow-history-artifacts">
+                                {#if step.files.length}<span>{step.files.length} {tr("files", "arquivos")}</span>{/if}
+                                {#if step.tests.length}<span>{step.tests.length} {tr("checks", "verificações")}</span>{/if}
+                              </div>
+                            {/if}
+                          </div>
+                        </article>
+                      {/each}
+                      {#if record.events.length > 0}
+                        <div class="workflow-history-events">
+                          {#each record.events as event (event.id)}
+                            <span><i></i><small>{relativeTime(event.createdAt)}</small><strong>{event.summary}</strong></span>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  </details>
+                {/each}
+              </div>
+            {/if}
             {#if resultNotes.length > 0}
               <div class="settings-section-label history-label">{tr("Saved notes", "Notas salvas")}</div>
               <div class="saved-notes">
@@ -3268,48 +3334,56 @@
           </div>
         {:else}
           <div class="settings" in:fade={{ duration: 150 }}>
-            <details class="settings-section" open>
+            <details class="settings-section">
               <summary class="settings-section-label">{tr("Agents", "Agentes")}</summary>
               <div class="settings-section-content">
-                {#each integrations as integration}
-                  {@const diagnostic = integrationDiagnostics[integration.kind]}
-                  <div class="integration-row">
-                    <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
-                    <div>
-                      <strong>{integration.label}</strong>
-                      <span>{shown(integration.detail)}</span>
+                {#each [
+                  { key: "available", label: null, items: integrations.filter((integration) => integration.canLaunch) },
+                  { key: "monitoring", label: tr("Monitoring only", "Somente monitoramento"), items: integrations.filter((integration) => !integration.canLaunch) },
+                ] as group (group.key)}
+                  {#if group.label}<div class="integration-group-label">{group.label}</div>{/if}
+                  {#each group.items as integration (integration.kind)}
+                    {@const diagnostic = integrationDiagnostics[integration.kind]}
+                    <div class="integration-row">
+                      <span class="agent-avatar agent-{integration.kind}"><BrandIcon name={integration.kind} size={18} /></span>
+                      <div>
+                        <strong>{integration.label}</strong>
+                        <span>{shown(integration.detail)}</span>
+                      </div>
+                      <div class="integration-actions">
+                        <button
+                          class="diagnose-button"
+                          disabled={diagnosingIntegration !== null}
+                          type="button"
+                          onclick={() => runIntegrationDiagnostic(integration)}
+                        >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
+                        {#if integration.canConfigure}
+                          <button
+                            class:connected={integration.configured}
+                            disabled={!integration.installed || configuringIntegration === integration.kind}
+                            type="button"
+                            onclick={() => toggleIntegration(integration)}
+                          >
+                            {configuringIntegration === integration.kind
+                              ? "…"
+                              : integration.configured
+                                ? tr("Connected", "Conectado")
+                                : tr("Connect", "Conectar")}
+                          </button>
+                        {/if}
+                      </div>
                     </div>
-                    <div class="integration-actions">
-                      <button
-                        class="diagnose-button"
-                        disabled={diagnosingIntegration !== null}
-                        type="button"
-                        onclick={() => runIntegrationDiagnostic(integration)}
-                      >{diagnosingIntegration === integration.kind ? "…" : tr("Test", "Testar")}</button>
-                      <button
-                        class:connected={integration.configured}
-                        disabled={!integration.installed || configuringIntegration === integration.kind}
-                        type="button"
-                        onclick={() => toggleIntegration(integration)}
-                      >
-                        {configuringIntegration === integration.kind
-                          ? "…"
-                          : integration.configured
-                            ? tr("Connected", "Conectado")
-                            : tr("Connect", "Conectar")}
-                      </button>
-                    </div>
-                  </div>
-                  {#if diagnostic}
-                    <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
-                      {#each diagnostic.checks as check (check.id)}
-                        <div class="diagnostic-check status-{check.status}">
-                          <i aria-hidden="true"></i>
-                          <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
-                        </div>
-                      {/each}
-                    </div>
-                  {/if}
+                    {#if diagnostic}
+                      <div class:healthy={diagnostic.healthy} class="diagnostic-card" transition:slide={{ duration: 150, easing: cubicOut }}>
+                        {#each diagnostic.checks as check (check.id)}
+                          <div class="diagnostic-check status-{check.status}">
+                            <i aria-hidden="true"></i>
+                            <span><strong>{shown(check.label)}</strong><small>{check.id === "activity" && diagnostic.lastEventAt ? relativeTime(diagnostic.lastEventAt) : shown(check.detail)}</small></span>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  {/each}
                 {/each}
               </div>
             </details>
@@ -3616,7 +3690,7 @@
               <div class="launch-setting preferred-agents-setting">
                 <span><strong>{tr("Preferred agents", "Agentes preferidos")}</strong><small>{tr("Shown first in the launcher.", "Aparecem primeiro no iniciador.")}</small></span>
                 <div class="agent-preferences">
-                  {#each integrations as integration (integration.kind)}
+                  {#each integrations.filter((integration) => integration.canLaunch) as integration (integration.kind)}
                     <button class:active={(selectedProjectProfile?.preferredAgents ?? []).includes(integrationAgentKind(integration.kind))} type="button" onclick={() => togglePreferredAgent(integrationAgentKind(integration.kind))}>
                       <BrandIcon name={integrationAgentKind(integration.kind)} size={14} />{integration.label}
                     </button>
@@ -3870,7 +3944,6 @@
     </section>
   {/if}
 </main>
-{/if}
 
 <style>
   .overlay-shell {
@@ -4203,6 +4276,8 @@
   .agent-chatgpt { color: #202523; background: #edf0ee; }
   .agent-claude,
   .agent-claude_code { color: #d97757; background: #f7ece6; }
+  .agent-antigravity { color: #476c5b; background: #e8f1ec; }
+  .agent-deepseek { color: #5786fe; background: #edf2ff; }
   .agent-gemini { color: #6e73ca; background: #eef0fb; }
   .agent-vscode { color: #287aa9; background: #edf6fb; }
   .agent-browser { color: #52615a; background: #f1f3f2; }
@@ -4212,9 +4287,11 @@
   .session-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
   .session-title-row strong { color: #27342f; font-size: 11px; }
   .source-label { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 8px; font-weight: 720; letter-spacing: 0.045em; line-height: 1.25; text-transform: uppercase; }
-  .access-badge { padding: 2px 5px; border: 1px solid transparent; border-radius: 999px; font-size: 7px; font-weight: 760; letter-spacing: 0.025em; line-height: 1.25; white-space: nowrap; }
-  .access-badge.auto-review { border-color: rgba(80, 120, 170, 0.12); color: #5579a3; background: rgba(80, 120, 170, 0.08); }
-  .access-badge.full-access { border-color: rgba(177, 115, 65, 0.13); color: #9b663d; background: rgba(177, 115, 65, 0.09); }
+  .access-badge { padding: 2px 5px; display: inline-flex; align-items: center; gap: 3px; border: 0; border-radius: 999px; font-size: 7px; font-weight: 780; letter-spacing: 0.025em; line-height: 1.25; white-space: nowrap; }
+  .access-badge svg { width: 9px; height: 9px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.35; }
+  .access-badge.auto-review { color: #315f86; background: #cbdff0; }
+  .access-badge.auto-review svg { fill: currentColor; stroke: none; }
+  .access-badge.full-access { color: #764c2e; background: #e8ceb1; }
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
@@ -4427,6 +4504,35 @@
   .results-intro { padding: 8px 1px 12px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .results-intro strong { color: #2d3a35; font-size: 12px; }
   .results-intro p { margin: 4px 0 0; color: #7f8a85; font-size: 9px; }
+  .workflow-history-list { display: grid; gap: 6px; }
+  .workflow-history-card { overflow: hidden; border: 1px solid rgba(86, 116, 102, 0.12); border-radius: 11px; background: rgba(255, 255, 255, 0.22); }
+  .workflow-history-card > summary { min-height: 48px; padding: 7px 9px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 14px; align-items: center; gap: 7px; cursor: pointer; list-style: none; }
+  .workflow-history-card > summary::-webkit-details-marker { display: none; }
+  .workflow-history-card > summary > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
+  .workflow-history-card > summary strong { overflow: hidden; color: #34453d; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .workflow-history-card > summary small { color: #829088; font-size: 7px; }
+  .workflow-history-card > summary svg { width: 13px; fill: none; stroke: #7b8a83; stroke-width: 1.5; transition: transform 140ms ease; }
+  .workflow-history-card[open] > summary svg { transform: rotate(180deg); }
+  .workflow-history-mark { position: relative; width: 22px; height: 22px; display: block; }
+  .workflow-history-mark i { position: absolute; width: 5px; height: 5px; border-radius: 50%; background: #668375; }
+  .workflow-history-mark i:nth-child(1) { top: 2px; left: 8px; }.workflow-history-mark i:nth-child(2) { right: 2px; bottom: 3px; }.workflow-history-mark i:nth-child(3) { bottom: 3px; left: 2px; }
+  .workflow-history-mark::before { content: ""; position: absolute; inset: 5px 4px 4px; border: 1px solid rgba(86, 121, 104, 0.45); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+  .workflow-history-card.status-completed .workflow-history-mark i { background: #4d956c; }
+  .workflow-history-card.status-failed .workflow-history-mark i { background: #b56561; }
+  .workflow-history-card.status-running .workflow-history-mark i { background: #5e8fc3; }
+  .workflow-history-body { padding: 0 9px 9px; display: grid; gap: 7px; }
+  .workflow-history-progress { height: 2px; overflow: hidden; border-radius: 999px; background: rgba(79, 107, 94, 0.1); }
+  .workflow-history-progress i { height: 100%; display: block; border-radius: inherit; background: #57906f; }
+  .workflow-history-step { display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 6px; }
+  .workflow-history-step > div { min-width: 0; display: grid; gap: 2px; }
+  .workflow-history-step strong { color: #40534a; font-size: 8px; }.workflow-history-step small { color: #87928d; font-size: 7px; }
+  .workflow-history-step p { margin: 3px 0 0; overflow-wrap: anywhere; color: #627169; font-size: 8px; line-height: 1.4; }
+  .workflow-step-state { width: 6px; height: 6px; margin-top: 3px; border: 1px solid #a1ada7; border-radius: 50%; }
+  .workflow-history-step.step-completed .workflow-step-state { border-color: #57906f; background: #57906f; }.workflow-history-step.step-running .workflow-step-state { border-color: #5e8fc3; background: #5e8fc3; }.workflow-history-step.step-failed .workflow-step-state { border-color: #b56561; background: #b56561; }
+  .workflow-history-error { color: #a45e59 !important; }
+  .workflow-history-artifacts { display: flex; flex-wrap: wrap; gap: 4px; }.workflow-history-artifacts span { padding: 2px 5px; border-radius: 999px; color: #587064; background: rgba(76, 119, 98, 0.08); font-size: 7px; font-weight: 720; }
+  .workflow-history-events { padding-top: 5px; display: grid; gap: 4px; border-top: 1px solid rgba(86, 116, 102, 0.1); }
+  .workflow-history-events span { min-width: 0; display: grid; grid-template-columns: 5px 44px minmax(0, 1fr); align-items: center; gap: 5px; }.workflow-history-events i { width: 4px; height: 4px; border-radius: 50%; background: #789087; }.workflow-history-events small { color: #929d98; font-size: 6px; }.workflow-history-events strong { overflow: hidden; color: #65756d; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
   .results-list { display: grid; gap: 8px; padding: 10px 0 3px; }
   .result-card { padding: 9px 10px; border: 1px solid rgba(91, 115, 104, 0.1); border-radius: 11px; background: rgba(75, 105, 91, 0.03); }
   .result-card-top { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
@@ -4505,6 +4611,8 @@
   .settings-section-static > .settings-section-label::after { content: none; }
   .settings-section-static > .settings-section-label:hover { color: #929c97; }
   .settings-section-content { padding: 0 1px 6px; }
+  .integration-group-label { padding: 9px 2px 3px; color: #77847e; font-size: 8px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
+  .integration-group-label:first-child { padding-top: 3px; }
   .integration-row { min-height: 55px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(105, 123, 115, 0.1); }
   .integration-row .agent-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: 10px; }
   .integration-row > div:not(.integration-actions) { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -4674,25 +4782,25 @@
   footer button.has-mobile-device::after { content: ""; position: absolute; top: 5px; right: 14px; width: 5px; height: 5px; border: 2px solid rgba(248, 250, 249, 0.95); border-radius: 50%; background: #58a97d; }
 
   .overlay-shell:not(.dark) .lume-orb {
-    border-color: rgba(73, 101, 88, 0.32);
-    background: #f4f8f6;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72), 0 5px 16px rgba(35, 62, 49, 0.1);
+    border-color: rgba(54, 92, 70, 0.38);
+    background: #e6ead7;
+    box-shadow: inset 0 0 0 1px rgba(247, 242, 220, 0.62), 0 5px 16px rgba(35, 62, 49, 0.12);
   }
   .overlay-shell:not(.dark) .panel {
-    border-color: rgba(65, 91, 79, 0.3);
-    background: #edf3f0;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.62), 0 10px 28px rgba(35, 58, 48, 0.12);
+    border-color: rgba(48, 86, 64, 0.34);
+    background: #dce6d8;
+    box-shadow: inset 0 0 0 1px rgba(244, 239, 218, 0.48), 0 10px 28px rgba(35, 58, 48, 0.14);
   }
   .overlay-shell:not(.dark) .panel-header,
   .overlay-shell:not(.dark) footer {
     border-color: rgba(73, 99, 87, 0.18);
-    background: #f7faf8;
+    background: #e8e5d2;
   }
   .overlay-shell:not(.dark) .panel-content,
   .overlay-shell:not(.dark) .session-list,
   .overlay-shell:not(.dark) .history-list,
   .overlay-shell:not(.dark) .settings,
-  .overlay-shell:not(.dark) .whiteboard { background: #edf3f0; }
+  .overlay-shell:not(.dark) .whiteboard { background: #d7e3d5; }
   .overlay-shell:not(.dark) .session-row,
   .overlay-shell:not(.dark) .history-row,
   .overlay-shell:not(.dark) .setting-row,
@@ -4700,7 +4808,7 @@
   .overlay-shell:not(.dark) .terminal-picker-row,
   .overlay-shell:not(.dark) .settings-section { border-color: rgba(73, 99, 87, 0.16); }
   .overlay-shell:not(.dark) .session-row:hover,
-  .overlay-shell:not(.dark) .session-row.selected { background: #e1ebe6; }
+  .overlay-shell:not(.dark) .session-row.selected { background: #c8ddcc; }
   .overlay-shell:not(.dark) .result-card,
   .overlay-shell:not(.dark) .diagnostic-card,
   .overlay-shell:not(.dark) .update-card,
@@ -4708,16 +4816,16 @@
   .overlay-shell:not(.dark) .paired-device-card,
   .overlay-shell:not(.dark) .saved-note {
     border-color: rgba(70, 98, 85, 0.2);
-    background: #f7faf8;
+    background: #ebe8d6;
     box-shadow: 0 1px 3px rgba(42, 67, 55, 0.045);
   }
   .overlay-shell:not(.dark) .workflow-group-row {
     border-color: rgba(65, 94, 80, 0.2);
-    background: #f7faf8;
+    background: #e8e6d2;
   }
   .overlay-shell:not(.dark) .workflow-group-row.enabled {
     border-color: rgba(45, 139, 92, 0.34);
-    background: #e7f3ed;
+    background: #cce2d1;
   }
   .overlay-shell:not(.dark) .layout-toolbar input,
   .overlay-shell:not(.dark) .layout-toolbar button,
@@ -4726,13 +4834,21 @@
   .overlay-shell:not(.dark) .inline-composer textarea,
   .overlay-shell:not(.dark) .permission-actions button {
     border-color: rgba(68, 94, 82, 0.22);
-    background: #f8fbf9;
+    background: #eee9d8;
   }
   .overlay-shell:not(.dark) .final-response,
   .overlay-shell:not(.dark) .response-preview {
     border-color: rgba(66, 96, 82, 0.18);
-    background: #f5f9f7;
+    background: #e2e9d6;
   }
+  .overlay-shell:not(.dark) .launcher-popover,
+  .overlay-shell:not(.dark) .workflow-settings-popover { background: #e9e7d6; }
+  .overlay-shell:not(.dark) .segmented,
+  .overlay-shell:not(.dark) .mobile-pairing { background: #cfdccd; }
+  .overlay-shell:not(.dark) .segmented button.active { color: #245f43; background: #e9e6d3; }
+  .overlay-shell:not(.dark) footer button.active,
+  .overlay-shell:not(.dark) .add-button.active { color: #276f4a; background: rgba(55, 137, 89, 0.11); }
+  .overlay-shell:not(.dark) .agent-count { background: #2f6749; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -4814,6 +4930,13 @@
   .overlay-shell.dark .diagnostic-check strong,
   .overlay-shell.dark .result-heading strong,
   .overlay-shell.dark .results-intro strong { color: #dce7e1; }
+  .overlay-shell.dark .workflow-history-card { border-color: rgba(190, 209, 200, 0.09); background: rgba(216, 229, 223, 0.025); }
+  .overlay-shell.dark .workflow-history-card > summary strong,
+  .overlay-shell.dark .workflow-history-step strong { color: #d7e4dd; }
+  .overlay-shell.dark .workflow-history-card > summary small,
+  .overlay-shell.dark .workflow-history-step small,
+  .overlay-shell.dark .workflow-history-step p,
+  .overlay-shell.dark .workflow-history-events strong { color: #93a59b; }
   .overlay-shell.dark .diagnostic-check small,
   .overlay-shell.dark .result-heading small,
   .overlay-shell.dark .results-intro p,
@@ -4849,8 +4972,8 @@
   .overlay-shell.dark .final-response-copy { color: #98aaa1; }
   .overlay-shell.dark .final-response-copy:hover { color: #d1ded7; background: rgba(222, 233, 228, 0.07); }
   .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
-  .overlay-shell.dark .access-badge.auto-review { border-color: rgba(123, 165, 211, 0.16); color: #9ab9d9; background: rgba(92, 137, 187, 0.12); }
-  .overlay-shell.dark .access-badge.full-access { border-color: rgba(216, 157, 105, 0.17); color: #d4a77f; background: rgba(186, 122, 71, 0.12); }
+  .overlay-shell.dark .access-badge.auto-review { color: #b4d3ee; background: #29445d; }
+  .overlay-shell.dark .access-badge.full-access { color: #e4b88f; background: #543b29; }
   .overlay-shell.dark .terminal-picker-row,
   .overlay-shell.dark .workflow-missing-sessions { border-color: rgba(190, 209, 200, 0.09); }
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }

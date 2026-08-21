@@ -161,6 +161,8 @@
       loading = false;
     }
     if (draft) await syncBridgeHeight();
+    await tick();
+    await emit("lume://workflow-bridge-ready", { label: currentWindow.label });
   }
 
   function updateConnection(patch: Partial<WorkflowConnectionDefinition>) {
@@ -316,7 +318,12 @@
       .catch(() => undefined)
       .then(async () => {
         await tick();
-        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        const visible = await currentWindow.isVisible().catch(() => true);
+        if (visible) {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        } else {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
         if (revision !== bridgeHeightSyncRevision || !bridgeShell || !context) return;
         const expanded = instructionExpanded || previewControlsExpanded || Boolean(workflowRun);
         const contentHeight = measureBridgeContentHeight();
@@ -462,6 +469,7 @@
     window.addEventListener("keydown", escape);
     let animationFrame = 0;
     let stopReveal: (() => void) | undefined;
+    let stopPrepare: (() => void) | undefined;
     let stopRunChanged: (() => void) | undefined;
     let stopSessionsChanged: (() => void) | undefined;
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -473,17 +481,27 @@
       animationFrame = requestAnimationFrame(animateCable);
     };
     if (!nativeConnectorHost) animationFrame = requestAnimationFrame(animateCable);
-    void listen("lume://workflow-bridge-reveal", () => {
-      entering = false;
-      requestAnimationFrame(() => (entering = true));
-    }).then((unlisten) => (stopReveal = unlisten));
+    void (async () => {
+      [stopReveal, stopPrepare] = await Promise.all([
+        listen("lume://workflow-bridge-reveal", () => {
+          entering = false;
+          requestAnimationFrame(() => (entering = true));
+        }),
+        listen("lume://workflow-bridge-prepare", () => {
+          if (!loading) void emit("lume://workflow-bridge-ready", { label: currentWindow.label });
+        }),
+      ]);
+      await initialize();
+    })();
     void listen<WorkflowRun>("lume://workflow-run-changed", (event) => {
       if (!draft || event.payload.workflowId !== draft.id) return;
       if (!acceptWorkflowRun(event.payload)) return;
       previewControlsExpanded = true;
       void syncBridgeHeight();
     }).then((unlisten) => (stopRunChanged = unlisten));
-    void listen("lume://sessions-changed", () => {
+    void listen<{ sessionId?: string; nativeSessionId?: string }>("lume://sessions-changed", ({ payload }) => {
+      const changedKey = payload?.nativeSessionId || payload?.sessionId;
+      if (changedKey && draft && !draft.steps.some((step) => step.sessionNativeId === changedKey)) return;
       if (refreshTimer) clearTimeout(refreshTimer);
       refreshTimer = setTimeout(() => void refreshWorkflowRun(), 180);
     }).then((unlisten) => (stopSessionsChanged = unlisten));
@@ -497,7 +515,6 @@
       });
       bridgeResizeObserver.observe(bridgeShell);
     }
-    void initialize();
     return () => {
       if (animationFrame) cancelAnimationFrame(animationFrame);
       if (refreshTimer) clearTimeout(refreshTimer);
@@ -505,6 +522,7 @@
       if (bridgeResizeFrame) cancelAnimationFrame(bridgeResizeFrame);
       bridgeResizeObserver?.disconnect();
       stopReveal?.();
+      stopPrepare?.();
       stopRunChanged?.();
       stopSessionsChanged?.();
       media.removeEventListener("change", sync);
@@ -754,6 +772,18 @@
   .dark .workflow-runtime { border-color: rgba(101,201,150,.15); background: rgba(74,164,116,.055); }.dark .run-state strong { color: #a9d7bd; }.dark .workflow-runtime > header small { color: #93a59b; }.dark .run-actions button { color: #a5b6ad; border-color: rgba(205,222,213,.11); }.dark .run-actions button.primary { color: #fff; border-color: #398d64; background: #398d64; }.dark .run-actions button.stop { color: #d58e88; border-color: rgba(213,142,136,.16); }
   .vertical.bridge-window { padding: 22px 4px; }.vertical.native-connectors { padding: 0; }.vertical .energy-cable { top: auto; left: 50%; transform: translateX(-50%) rotate(90deg); }.vertical .cable-start { top: 2px; }.vertical .cable-end { right: auto; bottom: 2px; }.vertical .bridge-shell { height: max-content; padding-right: 12px; padding-left: 12px; gap: 6px; }.vertical.native-connectors .bridge-shell { height: max-content; gap: 9px; }.vertical .route-heading { grid-template-columns: minmax(0,1fr) 28px minmax(0,1fr) 25px; }.vertical .share-options button { height: 46px; }.vertical .behavior-row { grid-template-columns: 1fr 1fr; }.vertical .instruction-toggle { height: 32px; }
   .dark .help-tooltip { color: #9eb0a7; border-color: rgba(205,222,213,.12); background: #1b2821; box-shadow: 0 16px 34px rgba(0,0,0,.38); }.dark .help-tooltip > strong { color: #d8e5de; }.dark .help-tooltip b { color: #91cdae; }
+  .bridge-window:not(.dark) .bridge-shell { background: #dce6d8; box-shadow: inset 0 0 0 1px rgba(244,239,218,.5), 0 8px 24px rgba(30,58,44,.14); }
+  .bridge-window:not(.dark) .context-policy > div { background: #cbdacc; }
+  .bridge-window:not(.dark) .context-policy button.active,
+  .bridge-window:not(.dark) .transition-toggle button.active { color: #246b47; background: #ebe7d4; }
+  .bridge-window:not(.dark) textarea,
+  .bridge-window:not(.dark) .share-options button,
+  .bridge-window:not(.dark) .transition-toggle,
+  .bridge-window:not(.dark) .approval { background: rgba(73,103,87,.055); }
+  .bridge-window:not(.dark) .preview-actions textarea.expanded,
+  .bridge-window:not(.dark) .context-preview,
+  .bridge-window:not(.dark) .help-tooltip { background: #e9e6d4; }
+  .bridge-window:not(.dark) .context-preview pre { background: #dfe6d5; }
   @keyframes bridge-fade-in { from { opacity: 0; } to { opacity: 1; } }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes run-pulse { 50% { opacity: .45; transform: scale(.78); } }

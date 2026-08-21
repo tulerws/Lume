@@ -75,7 +75,7 @@
 
   const cleanTitle = () =>
     document.title
-      .replace(/\s*[|·-]\s*(ChatGPT|Claude|Gemini).*$/i, "")
+      .replace(/\s*[|·-]\s*(ChatGPT|Claude|DeepSeek|Gemini).*$/i, "")
       .trim()
       .slice(0, 100) || "Sessão web";
 
@@ -84,7 +84,9 @@
       ? ['[data-message-author-role="assistant"]']
       : provider === "claude"
         ? ['[data-testid="assistant-message"]', '.font-claude-response']
-        : ['model-response .markdown', 'model-response', '.model-response-text'];
+        : provider === "deepseek"
+          ? ['[data-role="assistant"] .ds-markdown', '.ds-markdown', '[class*="ds-markdown"]']
+          : ['model-response .markdown', 'model-response', '.model-response-text'];
     const candidates = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
     const response = candidates
       .filter((element) => element.textContent?.trim())

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
 
   type MascotStatus =
     | "idle"
@@ -26,6 +26,22 @@
   const targetStatus = $derived<VisualStatus>(status === "idle" && awake ? "awake" : status);
   let displayStatus = $state<VisualStatus>("idle");
   let phase = $state<TransitionPhase>("steady");
+  let motionActive = $state(true);
+
+  onMount(() => {
+    const updateMotion = () => {
+      motionActive = document.visibilityState === "visible" && document.hasFocus();
+    };
+    updateMotion();
+    window.addEventListener("focus", updateMotion);
+    window.addEventListener("blur", updateMotion);
+    document.addEventListener("visibilitychange", updateMotion);
+    return () => {
+      window.removeEventListener("focus", updateMotion);
+      window.removeEventListener("blur", updateMotion);
+      document.removeEventListener("visibilitychange", updateMotion);
+    };
+  });
 
   $effect(() => {
     const next = targetStatus;
@@ -66,6 +82,7 @@
 
 <span
   class="mascot status-{displayStatus} phase-{phase}"
+  class:motion-paused={!motionActive}
   style:--mascot-size={`${size}px`}
   aria-hidden="true"
 >
@@ -132,7 +149,8 @@
     color: #263d35;
   }
 
-  svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  svg { width: 100%; height: 100%; display: block; overflow: visible; stroke: none !important; stroke-width: 0 !important; }
+  svg * { stroke: none !important; stroke-width: 0 !important; }
   .body { fill: var(--mascot-color); transition: fill 280ms ease; }
   .belly { fill: rgba(255, 255, 255, 0.34); transition: fill 280ms ease; }
   .snout { fill: rgba(24, 48, 39, 0.16); }
@@ -196,6 +214,8 @@
   :global(.dark) .mascot { color: #20322c; }
   :global(.dark) .belly { fill: rgba(255, 255, 255, 0.22); }
   :global(.dark) .eye-light { fill: #eaf2ee; }
+
+  .mascot.motion-paused * { animation-play-state: paused !important; }
 
   @media (prefers-reduced-motion: reduce) {
     .mascot *,

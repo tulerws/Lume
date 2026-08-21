@@ -16,7 +16,7 @@ use tauri_plugin_notification::NotificationExt;
 use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        PermissionRequest, SessionSource,
+        PermissionRequest, SessionControlOrigin, SessionSource,
     },
     state::{now_millis, AppState},
 };
@@ -184,11 +184,7 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                     let provider = canonical_provider(&browser_event.provider)?;
                     let session_id = format!("web:{}:{}", provider, browser_event.session_id);
                     let supports_prompt_ack = browser_event.protocol_version >= 2;
-                    let previous_status = state
-                        .sessions()?
-                        .into_iter()
-                        .find(|session| session.id == session_id)
-                        .map(|session| session.status);
+                    let previous_status = state.session_status(&session_id, None)?;
                     let focus = control.take_focus(&session_id);
                     let prompt_request = if supports_prompt_ack {
                         control.pending_prompt(&session_id)
@@ -202,7 +198,7 @@ fn handle(mut stream: TcpStream, state: AppState, app: AppHandle, control: Brows
                     let project = event.project.clone().unwrap_or_else(|| "sessão web".into());
                     let event_kind = event.event.clone();
                     state.ingest(event)?;
-                    crate::protocol::emit_sessions_changed(&app);
+                    crate::protocol::emit_session_changed(&app, &session_id, None);
                     if notification {
                         let title = match event_kind {
                             HookEventKind::PermissionRequest => "Lume · Ação necessária",
@@ -330,6 +326,7 @@ fn canonical_provider(provider: &str) -> Result<&'static str, String> {
     match provider {
         "codex" | "chatgpt" => Ok("chatgpt"),
         "claude" => Ok("claude"),
+        "deepseek" => Ok("deepseek"),
         "gemini" => Ok("gemini"),
         _ => Err("Agente web desconhecido".into()),
     }
@@ -343,6 +340,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
     let (agent, label) = match provider {
         "chatgpt" => (AgentKind::ChatGpt, "ChatGPT"),
         "claude" => (AgentKind::Claude, "Claude"),
+        "deepseek" => (AgentKind::DeepSeek, "DeepSeek"),
         "gemini" => (AgentKind::Gemini, "Gemini"),
         _ => unreachable!(),
     };
@@ -383,6 +381,7 @@ fn map_event(event: BrowserEvent) -> Result<HookEvent, String> {
         project: Some(truncate(&event.origin, 100)),
         source: Some(SessionSource::Web),
         source_app,
+        control_origin: SessionControlOrigin::External,
         status_label: Some(status_label.into()),
         started_at: None,
         process_id: None,
@@ -484,6 +483,25 @@ mod tests {
 
         assert_eq!(event.agent, AgentKind::Claude);
         assert_eq!(event.agent_label.as_deref(), Some("Claude"));
+    }
+
+    #[test]
+    fn deepseek_web_uses_its_own_agent_identity() {
+        let event = map_event(BrowserEvent {
+            provider: "deepseek".into(),
+            session_id: "deepseek-tab".into(),
+            title: "DeepSeek".into(),
+            origin: "https://chat.deepseek.com".into(),
+            browser: Some("chrome".into()),
+            protocol_version: 2,
+            state: BrowserState::Running,
+            last_response: None,
+        })
+        .expect("deepseek browser event");
+
+        assert_eq!(event.agent, AgentKind::DeepSeek);
+        assert_eq!(event.agent_label.as_deref(), Some("DeepSeek"));
+        assert_eq!(event.session_id, "web:deepseek:deepseek-tab");
     }
 
     #[test]

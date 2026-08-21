@@ -108,8 +108,28 @@ pub fn catalog() -> Vec<Box<dyn AgentPlugin>> {
             ],
         }),
         Box::new(BuiltInAgentPlugin {
+            kind: IntegrationKind::Antigravity,
+            label: "Antigravity",
+            executable: "agy",
+            direct_permissions: false,
+            hook_events: &[
+                "PreInvocation",
+                "PreToolUse",
+                "PostToolUse",
+                "PostInvocation",
+                "Stop",
+            ],
+        }),
+        Box::new(BuiltInAgentPlugin {
+            kind: IntegrationKind::DeepSeek,
+            label: "DeepSeek Harness",
+            executable: "dsh",
+            direct_permissions: false,
+            hook_events: &[],
+        }),
+        Box::new(BuiltInAgentPlugin {
             kind: IntegrationKind::Gemini,
-            label: "Gemini",
+            label: "Gemini CLI (legacy)",
             executable: "gemini",
             direct_permissions: false,
             hook_events: &[
@@ -221,7 +241,7 @@ mod tests {
     #[test]
     fn built_in_plugins_expose_their_monitoring_contract() {
         let plugins = catalog();
-        assert_eq!(plugins.len(), 3);
+        assert_eq!(plugins.len(), 5);
         let claude = plugins
             .iter()
             .find(|plugin| plugin.kind() == IntegrationKind::Claude)
@@ -241,6 +261,22 @@ mod tests {
             .find(|plugin| plugin.kind() == IntegrationKind::Codex)
             .expect("plugin Codex");
         assert!(codex.hook_events().contains(&"PostToolUse"));
+
+        let antigravity = plugins
+            .iter()
+            .find(|plugin| plugin.kind() == IntegrationKind::Antigravity)
+            .expect("plugin Antigravity");
+        assert_eq!(antigravity.executable(), "agy");
+        assert!(antigravity.hook_events().contains(&"PreInvocation"));
+        assert!(antigravity.hook_events().contains(&"Stop"));
+        assert!(!antigravity.direct_permissions());
+
+        let deepseek = plugins
+            .iter()
+            .find(|plugin| plugin.kind() == IntegrationKind::DeepSeek)
+            .expect("plugin DeepSeek");
+        assert_eq!(deepseek.executable(), "dsh");
+        assert!(deepseek.hook_events().is_empty());
 
         let gemini = plugins
             .iter()

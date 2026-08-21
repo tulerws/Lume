@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
@@ -20,6 +20,9 @@ use crate::domain::SessionActivity;
 pub enum IntegrationKind {
     Codex,
     Claude,
+    Antigravity,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
     Gemini,
 }
 
@@ -30,6 +33,8 @@ pub struct IntegrationStatus {
     pub label: String,
     pub installed: bool,
     pub configured: bool,
+    pub can_configure: bool,
+    pub can_launch: bool,
     pub direct_permissions: bool,
     pub detail: String,
 }
@@ -95,8 +100,14 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
             let configured = config_path(&kind)
                 .and_then(|path| fs::read_to_string(path).ok())
                 .is_some_and(|content| configured_content(&content, &kind, executable));
+            let can_configure = config_path(&kind).is_some();
+            let can_launch = kind != IntegrationKind::Gemini;
             let detail = if !installed {
                 "CLI não encontrada".into()
+            } else if kind == IntegrationKind::DeepSeek {
+                "CLI detectada; requer o perfil TUI do DeepSeek Harness".into()
+            } else if plugin.hook_events().is_empty() {
+                "Detecção local de processos disponível".into()
             } else if configured {
                 if kind == IntegrationKind::Codex {
                     "Hook conectado; /hooks está disponível no Codex CLI".into()
@@ -115,6 +126,8 @@ pub fn statuses(executable: &str) -> Vec<IntegrationStatus> {
                 label: plugin.label().into(),
                 installed,
                 configured,
+                can_configure,
+                can_launch,
                 direct_permissions: plugin.direct_permissions(),
                 detail,
             }
@@ -136,20 +149,63 @@ pub fn resumable_sessions(kind: &IntegrationKind) -> Result<Vec<ResumableSession
             codex_resumable_sessions(&root)
         }
         IntegrationKind::Claude => claude_resumable_sessions(&home.join(".claude/projects")),
-        IntegrationKind::Gemini => Vec::new(),
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => {
+            Vec::new()
+        }
     };
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(250);
     Ok(sessions)
 }
 
+/// Returns names that the provider already indexed for live native sessions.
+///
+/// Process discovery calls this frequently, so this path must stay bounded: it
+/// intentionally does not walk or parse the rollout history. The complete
+/// history scan remains exclusive to the user-triggered resume picker.
+pub(crate) fn indexed_session_names(
+    kind: &IntegrationKind,
+) -> Result<HashMap<String, String>, String> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "Could not find the user home directory".to_string())?;
+    Ok(match kind {
+        IntegrationKind::Codex => {
+            let root = env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("sessions");
+            codex_session_names(&root)
+        }
+        // Claude does not currently maintain a compact thread-name index.
+        // Its hook events remain the authoritative source for live names.
+        IntegrationKind::Claude
+        | IntegrationKind::Antigravity
+        | IntegrationKind::DeepSeek
+        | IntegrationKind::Gemini => HashMap::new(),
+    })
+}
+
+pub(crate) fn native_session_title(kind: &IntegrationKind, session_id: &str) -> Option<String> {
+    let path = resume_path(kind, session_id)?;
+    let file = fs::File::open(path).ok()?;
+    match kind {
+        IntegrationKind::Codex => codex_session_title(BufReader::new(file)),
+        IntegrationKind::Claude
+        | IntegrationKind::Antigravity
+        | IntegrationKind::DeepSeek
+        | IntegrationKind::Gemini => None,
+    }
+}
+
 pub fn resume_preview(kind: &IntegrationKind, session_id: &str) -> Option<ResumePreview> {
     let path = resume_path(kind, session_id)?;
-    let file = fs::File::open(&path).ok()?;
+    let recent = read_file_tail(&path, 8 * 1024 * 1024)?;
     let response = match kind {
-        IntegrationKind::Codex => codex_last_response(BufReader::new(file)),
-        IntegrationKind::Claude => claude_last_response(BufReader::new(file)),
-        IntegrationKind::Gemini => None,
+        IntegrationKind::Codex => codex_last_response(std::io::Cursor::new(recent)),
+        IntegrationKind::Claude => claude_last_response(std::io::Cursor::new(recent)),
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => None,
     }?;
     Some(ResumePreview {
         response,
@@ -161,14 +217,30 @@ pub fn resume_work_activities(kind: &IntegrationKind, session_id: &str) -> Vec<S
     let Some(path) = resume_path(kind, session_id) else {
         return Vec::new();
     };
-    let Ok(file) = fs::File::open(path) else {
+    let Some(recent) = read_file_tail(&path, 8 * 1024 * 1024) else {
         return Vec::new();
     };
     match kind {
-        IntegrationKind::Codex => codex_work_activities(BufReader::new(file), session_id),
-        IntegrationKind::Claude => claude_work_activities(BufReader::new(file), session_id),
-        IntegrationKind::Gemini => Vec::new(),
+        IntegrationKind::Codex => codex_work_activities(std::io::Cursor::new(recent), session_id),
+        IntegrationKind::Claude => claude_work_activities(std::io::Cursor::new(recent), session_id),
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => {
+            Vec::new()
+        }
     }
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((length - start).min(max_bytes) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    if start > 0 {
+        let first_complete_line = bytes.iter().position(|byte| *byte == b'\n')? + 1;
+        bytes.drain(..first_complete_line);
+    }
+    Some(bytes)
 }
 
 fn resume_path(kind: &IntegrationKind, session_id: &str) -> Option<PathBuf> {
@@ -186,7 +258,9 @@ fn resume_path(kind: &IntegrationKind, session_id: &str) -> Option<PathBuf> {
             .unwrap_or_else(|| home.join(".codex"))
             .join("sessions"),
         IntegrationKind::Claude => home.join(".claude/projects"),
-        IntegrationKind::Gemini => return None,
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => {
+            return None
+        }
     };
     resume_files(&root).into_iter().find(|path| {
         path.file_stem()
@@ -206,10 +280,78 @@ fn codex_resumable_sessions(root: &Path) -> Vec<ResumableSession> {
             let mut session = codex_resume_metadata(&value, file_updated_at(&path))?;
             if let Some(name) = names.get(&session.id) {
                 session.name = name.clone();
+            } else if let Ok(file) = fs::File::open(&path) {
+                if let Some(name) = codex_session_title(BufReader::new(file)) {
+                    session.name = name;
+                }
             }
             Some(session)
         })
         .collect()
+}
+
+fn codex_session_title(reader: impl BufRead) -> Option<String> {
+    const MAX_SCAN_BYTES: usize = 512 * 1024;
+    let mut scanned = 0usize;
+    for line in reader.lines().take(160).map_while(Result::ok) {
+        scanned = scanned.saturating_add(line.len());
+        if scanned > MAX_SCAN_BYTES {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        for message in codex_user_messages(&value) {
+            if let Some(title) = meaningful_session_title(message) {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+fn codex_user_messages(value: &Value) -> Vec<&str> {
+    match (
+        value.get("type").and_then(Value::as_str),
+        value.pointer("/payload/type").and_then(Value::as_str),
+        value.pointer("/payload/role").and_then(Value::as_str),
+    ) {
+        (Some("event_msg"), Some("user_message"), _) => value
+            .pointer("/payload/message")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        (Some("response_item"), Some("message"), Some("user")) => value
+            .pointer("/payload/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("input_text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn meaningful_session_title(message: &str) -> Option<String> {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = compact.trim();
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("# AGENTS.md")
+        || normalized.starts_with("<environment_context")
+        || normalized.starts_with("# Lume workflow")
+        || normalized.starts_with("## Context handoff from Codex")
+    {
+        return None;
+    }
+    let mut chars = normalized.chars();
+    let title = chars.by_ref().take(72).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{title}…")
+    } else {
+        title
+    })
 }
 
 fn codex_session_names(root: &Path) -> HashMap<String, String> {
@@ -662,21 +804,35 @@ pub fn diagnose(
         });
     }
 
-    let hook_path = config_path(kind);
-    let configured = hook_path
-        .as_ref()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .is_some_and(|content| configured_content(&content, kind, executable));
-    checks.push(DiagnosticCheck {
-        id: "hooks".into(),
-        label: "Monitoramento".into(),
-        status: if configured { "ok" } else { "warning" }.into(),
-        detail: if configured {
-            format!("{} eventos configurados", plugin.hook_events().len())
-        } else {
-            "Hook do Lume ainda não conectado".into()
-        },
-    });
+    if plugin.hook_events().is_empty() {
+        checks.push(DiagnosticCheck {
+            id: "monitoring".into(),
+            label: "Monitoramento".into(),
+            status: if executable_path.is_some() {
+                "ok"
+            } else {
+                "warning"
+            }
+            .into(),
+            detail: "Detecção baseada no processo local da CLI".into(),
+        });
+    } else {
+        let hook_path = config_path(kind);
+        let configured = hook_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|content| configured_content(&content, kind, executable));
+        checks.push(DiagnosticCheck {
+            id: "hooks".into(),
+            label: "Monitoramento".into(),
+            status: if configured { "ok" } else { "warning" }.into(),
+            detail: if configured {
+                format!("{} eventos configurados", plugin.hook_events().len())
+            } else {
+                "Hook do Lume ainda não conectado".into()
+            },
+        });
+    }
     checks.push(DiagnosticCheck {
         id: "activity".into(),
         label: "Último evento".into(),
@@ -713,19 +869,23 @@ pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Res
             path.display()
         ));
     }
-    let hooks = root
-        .as_object_mut()
-        .expect("validado acima")
-        .entry("hooks")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !hooks.is_object() {
-        return Err("A chave hooks existente não contém um objeto".into());
-    }
+    if *kind == IntegrationKind::Antigravity {
+        apply_antigravity_hooks(&mut root, executable, enabled)?;
+    } else {
+        let hooks = root
+            .as_object_mut()
+            .expect("validado acima")
+            .entry("hooks")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !hooks.is_object() {
+            return Err("A chave hooks existente não contém um objeto".into());
+        }
 
-    for event in events(kind) {
-        remove_lume_handlers(hooks, event, kind, executable);
-        if enabled {
-            add_handler(hooks, event, kind, executable)?;
+        for event in events(kind) {
+            remove_lume_handlers(hooks, event, kind, executable);
+            if enabled {
+                add_handler(hooks, event, kind, executable)?;
+            }
         }
     }
 
@@ -740,6 +900,38 @@ pub fn configure(kind: &IntegrationKind, executable: &str, enabled: bool) -> Res
     }
     let payload = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{payload}\n")).map_err(|error| error.to_string())
+}
+
+fn apply_antigravity_hooks(
+    root: &mut Value,
+    executable: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let root = root
+        .as_object_mut()
+        .ok_or_else(|| "A configuração do Antigravity não contém um objeto JSON".to_string())?;
+    root.remove("lume");
+    if !enabled {
+        return Ok(());
+    }
+
+    let mut lume = Map::new();
+    for event in events(&IntegrationKind::Antigravity) {
+        let provider = format!("antigravity:{event}");
+        let handler = json!({
+            "type": "command",
+            "command": shell_command(executable, &provider),
+            "timeout": 10
+        });
+        let handlers = if matches!(*event, "PreToolUse" | "PostToolUse") {
+            json!([{ "matcher": "*", "hooks": [handler] }])
+        } else {
+            Value::Array(vec![handler])
+        };
+        lume.insert((*event).into(), handlers);
+    }
+    root.insert("lume".into(), Value::Object(lume));
+    Ok(())
 }
 
 pub fn refresh_connected(executable: &str) {
@@ -835,13 +1027,15 @@ fn add_handler(
             "timeout": timeout,
             "statusMessage": status_message
         }),
-        IntegrationKind::Gemini => json!({
-            "type": "command",
-            "name": "Lume",
-            "command": shell_command(executable, provider),
-            "timeout": timeout * 1_000,
-            "description": "Envia o estado da sessão ao Lume"
-        }),
+        IntegrationKind::Antigravity | IntegrationKind::DeepSeek | IntegrationKind::Gemini => {
+            json!({
+                "type": "command",
+                "name": "Lume",
+                "command": shell_command(executable, provider),
+                "timeout": timeout * 1_000,
+                "description": "Envia o estado da sessão ao Lume"
+            })
+        }
         IntegrationKind::Codex => json!({
             "type": "command",
             "command": shell_command(executable, provider),
@@ -921,6 +1115,8 @@ fn config_path(kind: &IntegrationKind) -> Option<PathBuf> {
     let directory = match kind {
         IntegrationKind::Codex => ".codex/hooks.json",
         IntegrationKind::Claude => ".claude/settings.json",
+        IntegrationKind::Antigravity => ".gemini/config/hooks.json",
+        IntegrationKind::DeepSeek => return None,
         IntegrationKind::Gemini => ".gemini/settings.json",
     };
     Some(PathBuf::from(user_home).join(directory))
@@ -995,6 +1191,8 @@ fn provider(kind: &IntegrationKind) -> &'static str {
     match kind {
         IntegrationKind::Codex => "codex",
         IntegrationKind::Claude => "claude",
+        IntegrationKind::Antigravity => "antigravity",
+        IntegrationKind::DeepSeek => "deepseek",
         IntegrationKind::Gemini => "gemini",
     }
 }
@@ -1007,6 +1205,11 @@ fn configured_content(content: &str, kind: &IntegrationKind, executable: &str) -
     let Ok(root) = serde_json::from_str::<Value>(content) else {
         return false;
     };
+    if *kind == IntegrationKind::Antigravity {
+        return root
+            .get("lume")
+            .is_some_and(|value| value_contains_command(value, executable, " hook antigravity:"));
+    }
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return false;
     };
@@ -1049,6 +1252,11 @@ fn has_lume_handler(content: &str, kind: &IntegrationKind) -> bool {
     let Ok(root) = serde_json::from_str::<Value>(content) else {
         return false;
     };
+    if *kind == IntegrationKind::Antigravity {
+        return root
+            .get("lume")
+            .is_some_and(|value| value_contains_text(value, " hook antigravity:"));
+    }
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return false;
     };
@@ -1073,6 +1281,35 @@ fn has_lume_handler(content: &str, kind: &IntegrationKind) -> bool {
             })
         })
     })
+}
+
+fn value_contains_command(value: &Value, executable: &str, marker: &str) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            (key == "command"
+                && value.as_str().is_some_and(|command| {
+                    command.contains(executable) && command.contains(marker)
+                }))
+                || value_contains_command(value, executable, marker)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_command(value, executable, marker)),
+        _ => false,
+    }
+}
+
+fn value_contains_text(value: &Value, marker: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(marker),
+        Value::Object(object) => object
+            .values()
+            .any(|value| value_contains_text(value, marker)),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_text(value, marker)),
+        _ => false,
+    }
 }
 
 fn shell_command(executable: &str, provider: &str) -> String {
@@ -1177,6 +1414,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_resume_name_falls_back_to_the_first_real_user_message() {
+        let records = [
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "# Lume workflow context" }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Corrija a retomada das sessões sem perder o contexto"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert_eq!(
+            codex_session_title(BufReader::new(records.as_bytes())).as_deref(),
+            Some("Corrija a retomada das sessões sem perder o contexto")
+        );
+    }
+
+    #[test]
+    fn codex_resume_name_reads_modern_response_item_prompts() {
+        let records = [
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "# AGENTS.md instructions" },
+                        { "type": "input_text", "text": "<environment_context>ignored</environment_context>" }
+                    ]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Prepare o jogo Invicto para lançamento"
+                    }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert_eq!(
+            codex_session_title(BufReader::new(records.as_bytes())).as_deref(),
+            Some("Prepare o jogo Invicto para lançamento")
+        );
+    }
+
+    #[test]
     fn claude_resume_name_uses_the_first_meaningful_prompt() {
         assert!(claude_session_name(&json!({
             "message": { "content": "/plan" }
@@ -1203,6 +1503,27 @@ mod tests {
             codex_last_response(std::io::Cursor::new(transcript)).as_deref(),
             Some("Tudo pronto.")
         );
+    }
+
+    #[test]
+    fn resume_tail_discards_a_partial_record_and_keeps_recent_records() {
+        let path = std::env::temp_dir().join(format!(
+            "lume-resume-tail-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&path, b"old-record\nrecent-one\nrecent-two\n").expect("arquivo");
+
+        let recent = read_file_tail(&path, 24).expect("cauda recente");
+
+        assert_eq!(
+            String::from_utf8(recent).unwrap(),
+            "recent-one\nrecent-two\n"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1356,6 +1677,36 @@ mod tests {
             &IntegrationKind::Codex,
             "/usr/bin/lume"
         ));
+    }
+
+    #[test]
+    fn antigravity_hooks_use_the_named_registry_and_preserve_other_entries() {
+        let mut root = json!({
+            "existing": {
+                "Stop": [{ "type": "command", "command": "notify-existing" }]
+            }
+        });
+        apply_antigravity_hooks(&mut root, "/opt/Lume App/lume", true)
+            .expect("configura hooks Antigravity");
+
+        assert_eq!(root["existing"]["Stop"][0]["command"], "notify-existing");
+        assert_eq!(root["lume"]["PreToolUse"][0]["matcher"], "*");
+        assert!(root["lume"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("hook antigravity:PreToolUse")));
+        assert!(root["lume"]["PreInvocation"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("hook antigravity:PreInvocation")));
+        assert!(configured_content(
+            &root.to_string(),
+            &IntegrationKind::Antigravity,
+            "/opt/Lume App/lume"
+        ));
+
+        apply_antigravity_hooks(&mut root, "/opt/Lume App/lume", false)
+            .expect("remove hooks Antigravity");
+        assert!(root.get("lume").is_none());
+        assert!(root.get("existing").is_some());
     }
 
     #[test]

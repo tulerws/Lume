@@ -102,27 +102,10 @@
         </form>
       </section>
 
-      <section id="android-install-card" class="android-install-card" hidden>
-        <img src="./lume-mobile-icon.svg" alt="" />
-        <span>
-          <small>Android application</small>
-          <strong>Install Lume on this phone</strong>
-          <p>Use the native app for a faster launch and automatic update checks.</p>
-        </span>
-        <button id="pwa-install-button" class="secondary-button" type="button" hidden>Install web app</button>
-        <a id="open-installed-mobile" class="secondary-button" href="#" hidden>Open mobile app</a>
-        <a
-          id="android-apk-download"
-          class="primary-button"
-          href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
-          rel="noopener"
-        >Download APK</a>
-      </section>
-
       <div id="app-content" hidden>
         <section id="dashboard" class="screen">
           <div class="page-heading">
-            <span><small>Live workspace</small><h1>Your agents</h1></span>
+            <span><h1>Your agents</h1></span>
             <time id="updated-at">Connecting…</time>
           </div>
           <div class="filter-bar" role="tablist" aria-label="Filter sessions">
@@ -136,9 +119,16 @@
 
         <section id="results-screen" class="screen" hidden>
           <div class="page-heading">
-            <span><small>Recent work</small><h1>Results</h1></span>
+            <span><h1>Results</h1></span>
           </div>
           <div id="results-list" class="results-list"></div>
+        </section>
+
+        <section id="workflows-screen" class="screen" hidden>
+          <div class="page-heading">
+            <span><h1>Workflow monitor</h1></span>
+          </div>
+          <div id="workflow-list" class="mobile-workflow-list"></div>
         </section>
 
         <section id="chat-screen" class="screen chat-screen" hidden>
@@ -161,7 +151,7 @@
 
         <section id="device-screen" class="screen" hidden>
           <div class="page-heading">
-            <span><small>Local controls</small><h1>Device</h1></span>
+            <span><h1>Device</h1></span>
           </div>
           <article class="device-card">
             <div class="device-identity">
@@ -230,6 +220,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
             <span>Results</span>
           </button>
+          <button data-view="workflows" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2.5" /><circle cx="5" cy="18" r="2.5" /><circle cx="19" cy="18" r="2.5" /><path d="m10.8 7.2-4.4 8.1M13.2 7.2l4.4 8.1M7.5 18h9" /></svg>
+            <span>Workflows</span>
+          </button>
           <button data-view="device" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M10 18h4" /></svg>
             <span>Device</span>
@@ -266,6 +260,7 @@
           href="https://github.com/tulerws/Lume/releases/latest/download/Lume-Mobile.apk"
           rel="noopener"
         >Download the app</a>
+        <button id="continue-in-browser" class="pair-dismiss-button" type="button">Continue in browser</button>
       </div>
     </aside>
     <script src="./app.js" type="module"></script>

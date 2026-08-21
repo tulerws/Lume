@@ -123,6 +123,8 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                         AgentKind::ChatGpt => "ChatGPT",
                         AgentKind::Claude => "Claude",
                         AgentKind::ClaudeCode => "Claude Code",
+                        AgentKind::Antigravity => "Antigravity",
+                        AgentKind::DeepSeek => "DeepSeek",
                         AgentKind::Gemini => "Gemini",
                         AgentKind::Unknown => "Agent",
                     };
@@ -194,7 +196,7 @@ fn scan(system: &mut System, external_plugins: &[ExternalAgentPlugin]) -> Proces
                 source: source_for(&system, pid),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     ProcessScan {
         discovered,
@@ -261,19 +263,25 @@ fn native_session_ids_for_pid(pid: sysinfo::Pid) -> Vec<(u64, String)> {
         .filter_map(|entry| {
             let descriptor = entry.file_name().to_str()?.parse::<u64>().ok()?;
             let path = std::fs::read_link(entry.path()).ok()?;
+            let id = codex_rollout_id_from_path(&path)?;
             if !rollout_is_user_facing(&path) {
                 return None;
             }
-            let name = path.file_name()?.to_str()?;
-            let stem = name.strip_suffix(".jsonl")?;
-            let id = if let Some(rollout) = stem.strip_prefix("rollout-") {
-                rollout.get(rollout.len().checked_sub(36)?..)?
-            } else {
-                stem
-            };
-            is_codex_session_id(id).then(|| (descriptor, id.to_string()))
+            Some((descriptor, id))
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn codex_rollout_id_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".jsonl")?;
+    let id = if let Some(rollout) = stem.strip_prefix("rollout-") {
+        rollout.get(rollout.len().checked_sub(36)?..)?
+    } else {
+        stem
+    };
+    is_codex_session_id(id).then(|| id.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -486,6 +494,18 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
             .is_some_and(|executable| is_versioned_claude_executable(executable))
     {
         Some(AgentKind::ClaudeCode)
+    } else if matches!(name, "agy" | "agy.exe")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "agy" | "agy.exe"))
+    {
+        Some(AgentKind::Antigravity)
+    } else if matches!(name, "dsh" | "dsh.exe")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "dsh" | "dsh.exe"))
+    {
+        Some(AgentKind::DeepSeek)
     } else if name == "gemini" || tokens.iter().any(|token| token == &"gemini") {
         Some(AgentKind::Gemini)
     } else {
@@ -512,6 +532,65 @@ fn detect_external_agent(
 }
 
 pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> Result<(), String> {
+    let (system, target_pid, targets) = agent_process_tree(process_id, expected_agent)?;
+    let mut terminated_root = false;
+    for pid in targets {
+        let Some(process) = system.process(pid) else {
+            continue;
+        };
+        let terminated = process.kill_with(Signal::Term).unwrap_or(false) || process.kill();
+        if pid == target_pid {
+            terminated_root = terminated;
+        }
+    }
+    if terminated_root {
+        Ok(())
+    } else {
+        Err("O sistema recusou o encerramento do agente".into())
+    }
+}
+
+pub fn release_agent_process_for_takeover(
+    process_id: u32,
+    expected_agent: &AgentKind,
+) -> Result<(), String> {
+    let (system, target_pid, targets) = agent_process_tree(process_id, expected_agent)?;
+    let mut requested_root = false;
+    for pid in targets {
+        let Some(process) = system.process(pid) else {
+            continue;
+        };
+        #[cfg(not(target_os = "windows"))]
+        let requested = process.kill_with(Signal::Term).unwrap_or(false);
+        #[cfg(target_os = "windows")]
+        let requested = process.kill();
+        if pid == target_pid {
+            requested_root = requested;
+        }
+    }
+    if !requested_root {
+        return Err("The operating system refused to release this agent session".into());
+    }
+
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut refreshed = System::new();
+        refreshed.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target_pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        if refreshed.process(target_pid).is_none() {
+            return Ok(());
+        }
+    }
+    Err("The external CLI did not close in time; Lume did not take control".into())
+}
+
+fn agent_process_tree(
+    process_id: u32,
+    expected_agent: &AgentKind,
+) -> Result<(System, Pid, Vec<Pid>), String> {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -522,7 +601,7 @@ pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> R
     );
     let target_pid = Pid::from_u32(process_id);
     let Some(target) = system.process(target_pid) else {
-        return Ok(());
+        return Err("The agent process is no longer open".into());
     };
     let command = target
         .cmd()
@@ -550,21 +629,7 @@ pub fn terminate_agent_process(process_id: u32, expected_agent: &AgentKind) -> R
         .filter(|pid| *pid == target_pid || process_descends_from(&system, *pid, target_pid))
         .collect::<Vec<_>>();
     targets.sort_by_key(|pid| std::cmp::Reverse(process_depth(&system, *pid)));
-    let mut terminated_root = false;
-    for pid in targets {
-        let Some(process) = system.process(pid) else {
-            continue;
-        };
-        let terminated = process.kill_with(Signal::Term).unwrap_or(false) || process.kill();
-        if pid == target_pid {
-            terminated_root = terminated;
-        }
-    }
-    if terminated_root {
-        Ok(())
-    } else {
-        Err("O sistema recusou o encerramento do agente".into())
-    }
+    Ok((system, target_pid, targets))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -742,6 +807,22 @@ mod tests {
         assert!(rollout_metadata_is_user_facing(&cli));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_descriptors_are_rejected_before_any_rollout_read() {
+        assert!(codex_rollout_id_from_path(Path::new("/dev/pts/7")).is_none());
+        assert!(codex_rollout_id_from_path(Path::new(
+            "/home/user/.codex/thread-writer-locks/019f8061-7032-7521-b333-84f84c744fa8.lock"
+        ))
+        .is_none());
+        assert_eq!(
+            codex_rollout_id_from_path(Path::new(
+                "/home/user/.codex/sessions/2026/07/20/rollout-2026-07-20T13-34-57-019f8061-7032-7521-b333-84f84c744fa8.jsonl"
+            )),
+            Some("019f8061-7032-7521-b333-84f84c744fa8".into())
+        );
+    }
+
     #[test]
     fn lume_codex_app_server_is_ignored_but_its_user_cli_is_detectable() {
         assert!(is_lume_codex_infrastructure_process(
@@ -884,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_detection_does_not_change_codex_or_gemini() {
+    fn claude_detection_does_not_change_other_built_in_agents() {
         assert_eq!(
             detect_agent("codex", "/usr/bin/codex"),
             Some(AgentKind::Codex)
@@ -902,6 +983,26 @@ mod tests {
             Some(AgentKind::Gemini)
         );
         assert_eq!(detect_agent("bash", "gemini chat"), Some(AgentKind::Gemini));
+        assert_eq!(
+            detect_agent("agy", "/usr/local/bin/agy"),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            detect_agent("bash", "agy --conversation abc"),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            detect_agent("agy.exe", r#"C:\Users\dev\bin\agy.exe"#),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            detect_agent("dsh", "/usr/local/bin/dsh --profile tui"),
+            Some(AgentKind::DeepSeek)
+        );
+        assert_eq!(
+            detect_agent("dsh.exe", r#"C:\Users\dev\bin\dsh.exe --profile tui"#),
+            Some(AgentKind::DeepSeek)
+        );
         assert_eq!(
             detect_agent("claude", "/usr/bin/claude"),
             Some(AgentKind::ClaudeCode)

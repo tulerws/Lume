@@ -5,11 +5,12 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     browser_server::BrowserControl,
-    codex_bridge::CodexBridge,
+    codex_bridge::{CodexBridge, CodexThreadModelSettings},
     discovery,
     domain::{
         AgentKind, PendingQuestion, PermissionAction, PromptAttachment, PromptAttachmentInput,
-        PromptDelivery, QuestionAnswer, SessionSource, SessionStatus,
+        PromptDelivery, QuestionAnswer, SessionControlOrigin, SessionModelOverride, SessionSource,
+        SessionStatus,
     },
     integrations::{self, IntegrationKind},
     launcher::{self, LaunchRequest},
@@ -153,6 +154,15 @@ pub fn submit_prompt(
         protocol::emit_sessions_changed(app);
         return Ok(());
     }
+    if session.control_origin == SessionControlOrigin::External
+        && session.source != SessionSource::Web
+        && matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode)
+    {
+        return Err(
+            "This session is controlled by an external CLI. Transfer it to Lume before sending a prompt."
+                .into(),
+        );
+    }
     let is_running = matches!(
         session.status,
         SessionStatus::Running | SessionStatus::PermissionRequired
@@ -266,6 +276,8 @@ pub fn submit_prompt(
     } else {
         let agent = match session.agent {
             AgentKind::ClaudeCode => IntegrationKind::Claude,
+            AgentKind::Antigravity => IntegrationKind::Antigravity,
+            AgentKind::DeepSeek => IntegrationKind::DeepSeek,
             AgentKind::Gemini => IntegrationKind::Gemini,
             AgentKind::Codex => unreachable!(),
             AgentKind::ChatGpt | AgentKind::Claude | AgentKind::Unknown => {
@@ -296,6 +308,11 @@ pub fn submit_prompt(
             .map(|attachment| attachment.path.clone())
             .collect::<Vec<_>>();
         let prompt = prompt_with_attachment_paths(prompt, &attachment_paths);
+        let model_settings = if agent == IntegrationKind::Claude {
+            state.session_model_override(&session.id)?
+        } else {
+            Default::default()
+        };
         launcher::launch(
             LaunchRequest {
                 agent,
@@ -306,6 +323,8 @@ pub fn submit_prompt(
                 initial_prompt: Some(prompt),
                 permission_mode: None,
                 approval_policy: None,
+                model: model_settings.model,
+                reasoning_effort: model_settings.reasoning_effort,
             },
             &executable,
             &app_data_dir,
@@ -393,6 +412,9 @@ pub fn session_collaboration_mode(
     if session.agent != AgentKind::Codex {
         return Err("Collaboration modes are only available for Codex sessions".into());
     }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its mode".into());
+    }
     let thread_id = session
         .native_session_id
         .as_deref()
@@ -415,6 +437,9 @@ pub fn set_session_collaboration_mode(
     if session.agent != AgentKind::Codex {
         return Err("Collaboration modes are only available for Codex sessions".into());
     }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its mode".into());
+    }
     let thread_id = session
         .native_session_id
         .as_deref()
@@ -422,6 +447,125 @@ pub fn set_session_collaboration_mode(
     let mode = bridge.set_collaboration_mode(thread_id, mode, state, app)?;
     protocol::emit_sessions_changed(app);
     Ok(mode)
+}
+
+pub fn session_model_settings(
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+) -> Result<CodexThreadModelSettings, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if session.agent != AgentKind::Codex {
+        return Err("Model settings are currently available only for Codex sessions".into());
+    }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its model".into());
+    }
+    let thread_id = session
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+    bridge.thread_model_settings(thread_id)
+}
+
+pub fn set_session_model_settings(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+    model: &str,
+    effort: &str,
+) -> Result<CodexThreadModelSettings, String> {
+    let session = state
+        .sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    if session.agent != AgentKind::Codex {
+        return Err("Model settings are currently available only for Codex sessions".into());
+    }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its model".into());
+    }
+    if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::PermissionRequired
+    ) {
+        return Err("Wait for the current task to finish before changing the model".into());
+    }
+    let thread_id = session
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| "The Codex session did not provide its thread id".to_string())?;
+    let settings = bridge.set_thread_model_settings(thread_id, model, effort)?;
+    protocol::emit_sessions_changed(app);
+    Ok(settings)
+}
+
+pub fn claude_session_model_settings(
+    state: &AppState,
+    session_id: &str,
+) -> Result<SessionModelOverride, String> {
+    let session = state.connected_session(session_id)?;
+    if session.agent != AgentKind::ClaudeCode {
+        return Err("These model settings are only available for Claude Code sessions".into());
+    }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its model".into());
+    }
+    state.session_model_override(session_id)
+}
+
+pub fn set_claude_session_model_settings(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<SessionModelOverride, String> {
+    let session = state.connected_session(session_id)?;
+    if session.agent != AgentKind::ClaudeCode {
+        return Err("These model settings are only available for Claude Code sessions".into());
+    }
+    if session.control_origin != SessionControlOrigin::Lume {
+        return Err("Take control of this external CLI before changing its model".into());
+    }
+    if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::PermissionRequired
+    ) {
+        return Err("Wait for the current task to finish before changing the model".into());
+    }
+    let model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if model.as_ref().is_some_and(|value| value.len() > 128) {
+        return Err("The Claude model name is too long".into());
+    }
+    let effort = effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if effort
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "low" | "medium" | "high" | "xhigh" | "max"))
+    {
+        return Err("Unsupported Claude reasoning effort".into());
+    }
+    let settings = state.set_session_model_override(
+        session_id,
+        SessionModelOverride {
+            model,
+            reasoning_effort: effort,
+        },
+    )?;
+    protocol::emit_sessions_changed(app);
+    Ok(settings)
 }
 
 pub fn steer_queued_prompt(
@@ -720,11 +864,149 @@ pub fn terminate_session(
     Ok(())
 }
 
+pub fn take_control_session(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &CodexBridge,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = state.connected_session(session_id)?;
+    if session.control_origin == SessionControlOrigin::Lume {
+        return Ok(());
+    }
+    if !matches!(session.source, SessionSource::Cli | SessionSource::Vscode) {
+        return Err("Only external CLI sessions can transfer control to Lume".into());
+    }
+    if !matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode) {
+        return Err("This agent cannot transfer an existing session to Lume yet".into());
+    }
+    session
+        .native_session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "This external CLI did not provide a resumable session id".to_string())?;
+    let process_id = session
+        .process_id
+        .ok_or_else(|| "The external CLI process is no longer available".to_string())?;
+
+    match session.agent {
+        AgentKind::Codex => bridge.ensure_server()?,
+        AgentKind::ClaudeCode if !crate::executables::available("claude") => {
+            return Err("Could not find the official Claude CLI".into());
+        }
+        AgentKind::ClaudeCode => {}
+        _ => unreachable!(),
+    }
+
+    discovery::release_agent_process_for_takeover(process_id, &session.agent)?;
+    if session.agent == AgentKind::Codex {
+        let thread_id = session.native_session_id.as_deref().ok_or_else(|| {
+            "This external CLI did not provide a resumable session id".to_string()
+        })?;
+        let working_directory = session
+            .working_directory
+            .as_deref()
+            .filter(|directory| !directory.trim().is_empty())
+            .unwrap_or(".");
+        let mut last_writer_error = None;
+        for attempt in 0..25 {
+            match bridge.prepare_thread(
+                working_directory,
+                Some(thread_id),
+                Some(&session.permission_profile.mode),
+                Some(&session.permission_profile.approval_policy),
+            ) {
+                Ok(prepared) if prepared.thread_id == thread_id => {
+                    last_writer_error = None;
+                    break;
+                }
+                Ok(prepared) => {
+                    return Err(format!(
+                        "Codex resumed a different thread ({}) instead of {thread_id}",
+                        prepared.thread_id
+                    ));
+                }
+                Err(error) if is_active_codex_writer(&error) => {
+                    last_writer_error = Some(error);
+                    if attempt < 24 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if last_writer_error.is_some() {
+            return Err("The external CLI closed, but Codex has not released this thread yet. Wait a moment and try transferring it again.".into());
+        }
+    }
+    let integration = match session.agent {
+        AgentKind::Codex => IntegrationKind::Codex,
+        AgentKind::ClaudeCode => IntegrationKind::Claude,
+        _ => unreachable!(),
+    };
+    let model_settings = if session.agent == AgentKind::ClaudeCode {
+        state.session_model_override(session_id)?
+    } else {
+        SessionModelOverride::default()
+    };
+    let launch_request = takeover_launch_request(&session, integration.clone(), model_settings)?;
+    let executable = integrations::lume_executable()?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    state.mark_session_lume_controlled(session_id)?;
+    protocol::emit_sessions_changed(app);
+    launcher::launch(
+        launch_request,
+        &executable,
+        &app_data_dir,
+        (integration == IntegrationKind::Codex).then_some(crate::codex_bridge::PROXY_URL),
+    )
+    .map_err(|error| {
+        format!("Lume took control, but could not open the replacement CLI: {error}")
+    })?;
+    Ok(())
+}
+
+fn takeover_launch_request(
+    session: &crate::domain::AgentSession,
+    agent: IntegrationKind,
+    model_settings: SessionModelOverride,
+) -> Result<LaunchRequest, String> {
+    let resume_id = session
+        .native_session_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "This external CLI did not provide a resumable session id".to_string())?;
+    Ok(LaunchRequest {
+        agent,
+        working_directory: session
+            .working_directory
+            .clone()
+            .filter(|directory| !directory.trim().is_empty())
+            .unwrap_or_else(|| ".".into()),
+        resume: true,
+        resume_id: Some(resume_id),
+        target: if session.source == SessionSource::Vscode {
+            "vscode".into()
+        } else {
+            "terminal".into()
+        },
+        initial_prompt: None,
+        permission_mode: Some(session.permission_profile.mode.clone()),
+        approval_policy: Some(session.permission_profile.approval_policy.clone()),
+        model: model_settings.model,
+        reasoning_effort: model_settings.reasoning_effort,
+    })
+}
+
 pub fn execute_hub_command(
     app: &AppHandle,
     state: &AppState,
     bridge: &CodexBridge,
     browser: &BrowserControl,
+    workflow_runtime: &crate::workflow_runtime::WorkflowRuntime,
     request: protocol::HubCommandRequest,
 ) -> protocol::HubCommandResponse {
     let request_id = request.request_id.clone();
@@ -778,6 +1060,62 @@ pub fn execute_hub_command(
             } else {
                 Ok(None)
             }
+        }
+        protocol::HubCommand::StartWorkflow {
+            workflow_id,
+            objective,
+        } => state
+            .preferences()
+            .and_then(|preferences| {
+                preferences
+                    .workflow_groups
+                    .into_iter()
+                    .find(|group| group.id == workflow_id)
+                    .ok_or_else(|| "Workflow group not found".to_string())
+            })
+            .and_then(|group| {
+                workflow_runtime.start(app, state, bridge, browser, group, &objective)
+            })
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::ApproveWorkflowHandoff { workflow_id } => workflow_runtime
+            .approve(app, state, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::AdvanceWorkflow { workflow_id } => workflow_runtime
+            .advance(app, state, bridge, browser, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::PauseWorkflow { workflow_id } => workflow_runtime
+            .pause(app, state, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::ResumeWorkflow { workflow_id } => workflow_runtime
+            .resume(app, state, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::RetryWorkflowStep { workflow_id } => workflow_runtime
+            .retry(app, state, bridge, browser, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::SkipWorkflowStep { workflow_id } => workflow_runtime
+            .skip(app, state, &workflow_id)
+            .and_then(|run| serde_json::to_value(run).map_err(|error| error.to_string()))
+            .map(Some),
+        protocol::HubCommand::CancelWorkflow { workflow_id } => {
+            let session_id = workflow_runtime
+                .current_session_id(state, &workflow_id)
+                .ok()
+                .flatten();
+            workflow_runtime
+                .cancel(app, state, &workflow_id)
+                .and_then(|run| {
+                    if let Some(session_id) = session_id {
+                        let _ = interrupt_prompt(app, state, bridge, &session_id);
+                    }
+                    serde_json::to_value(run).map_err(|error| error.to_string())
+                })
+                .map(Some)
         }
         protocol::HubCommand::ReportMobileVersion { version } => {
             if protocol::is_version_newer(&version, env!("CARGO_PKG_VERSION")) {
@@ -851,6 +1189,61 @@ mod tests {
     }
 
     #[test]
+    fn takeover_reopens_the_same_codex_thread_in_a_managed_terminal() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(crate::domain::HookEvent {
+                event: crate::domain::HookEventKind::SessionStarted,
+                session_id: "codex:external".into(),
+                agent: AgentKind::Codex,
+                agent_label: Some("Codex".into()),
+                session_name: Some("External thread".into()),
+                project: Some("lume".into()),
+                source: Some(SessionSource::Cli),
+                source_app: None,
+                control_origin: SessionControlOrigin::External,
+                status_label: None,
+                started_at: None,
+                process_id: Some(4242),
+                native_session_id: Some("thread-external".into()),
+                working_directory: Some("/work/lume".into()),
+                permission_profile: Some(crate::domain::PermissionProfile {
+                    mode: crate::domain::AccessMode::WorkspaceWrite,
+                    label: "Workspace".into(),
+                    approval_policy: "on-request".into(),
+                    approvals_reviewer: None,
+                    can_respond_from_lume: false,
+                    available_actions: Vec::new(),
+                }),
+                permission: None,
+                question: None,
+                last_response: None,
+                activity: None,
+                activities: Vec::new(),
+                wait_for_decision: false,
+            })
+            .expect("sessão externa");
+        let session = state.sessions().expect("sessões").remove(0);
+
+        let request = takeover_launch_request(
+            &session,
+            IntegrationKind::Codex,
+            SessionModelOverride::default(),
+        )
+        .expect("retomada");
+
+        assert!(request.resume);
+        assert_eq!(request.resume_id.as_deref(), Some("thread-external"));
+        assert_eq!(request.working_directory, "/work/lume");
+        assert_eq!(request.target, "terminal");
+        assert_eq!(
+            request.permission_mode,
+            Some(crate::domain::AccessMode::WorkspaceWrite)
+        );
+        assert_eq!(request.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
     fn cached_attachment_names_cannot_create_nested_paths() {
         assert_eq!(
             cache_attachment_name("../monthly report.xlsx"),
@@ -881,6 +1274,7 @@ mod tests {
                 project: Some("lume".into()),
                 source: Some(SessionSource::Cli),
                 source_app: None,
+                control_origin: SessionControlOrigin::External,
                 status_label: None,
                 started_at: None,
                 process_id: Some(4242),

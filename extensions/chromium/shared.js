@@ -2,6 +2,7 @@
   const providerForHost = (host) => {
     const normalized = String(host || "").toLowerCase();
     if (normalized === "claude.ai" || normalized.endsWith(".claude.ai")) return "claude";
+    if (normalized === "chat.deepseek.com" || normalized.endsWith(".chat.deepseek.com")) return "deepseek";
     if (normalized === "gemini.google.com" || normalized.endsWith(".gemini.google.com")) return "gemini";
     if (
       normalized === "chatgpt.com"

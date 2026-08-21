@@ -53,6 +53,15 @@ const REALTIME_PATH: &str = "/api/v1/ws";
 const REALTIME_SUBPROTOCOL: &str = "lume.hub.v1";
 const REALTIME_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const REALTIME_READ_TIMEOUT: Duration = Duration::from_millis(5);
+const MOBILE_ACTIVITY_LIMIT: usize = 120;
+const MOBILE_WORKFLOW_HISTORY_LIMIT: usize = 50;
+
+fn mobile_snapshot(state: &AppState) -> Result<HubSnapshot, String> {
+    let sessions = state.bounded_sessions(MOBILE_ACTIVITY_LIMIT)?;
+    let groups = state.preferences()?.workflow_groups;
+    let history = state.workflow_history(MOBILE_WORKFLOW_HISTORY_LIMIT)?;
+    Ok(HubSnapshot::new(sessions).with_workflows(groups, history))
+}
 const MDNS_SERVICE_TYPE: &str = "_lume._tcp.local.";
 const MOBILE_INDEX: &str = include_str!("../../mobile-pwa/index.html");
 const MOBILE_APP: &str = include_str!("../../mobile-pwa/app.js");
@@ -733,8 +742,8 @@ fn handle_realtime_stream<S: MobileStream>(
     }
 
     let mut event_sequence = protocol::latest_event_sequence();
-    let snapshot = match state.sessions() {
-        Ok(sessions) => HubSnapshot::new(sessions),
+    let snapshot = match mobile_snapshot(&state) {
+        Ok(snapshot) => snapshot,
         Err(message) => {
             let _ = send_secure_stream_message(
                 &mut socket,
@@ -777,8 +786,8 @@ fn handle_realtime_stream<S: MobileStream>(
         }
         let events = protocol::events_since(event_sequence);
         if !events.is_empty() {
-            let snapshot = match state.sessions() {
-                Ok(sessions) => HubSnapshot::new(sessions),
+            let snapshot = match mobile_snapshot(&state) {
+                Ok(snapshot) => snapshot,
                 Err(message) => {
                     if send_secure_stream_message(
                         &mut socket,
@@ -1130,6 +1139,20 @@ fn route_core(
                 )
             }
             protocol::HubCommand::RefreshRateLimits { .. } => MobileScope::Monitor,
+            protocol::HubCommand::StartWorkflow { .. }
+            | protocol::HubCommand::ApproveWorkflowHandoff { .. }
+            | protocol::HubCommand::AdvanceWorkflow { .. }
+            | protocol::HubCommand::PauseWorkflow { .. }
+            | protocol::HubCommand::ResumeWorkflow { .. }
+            | protocol::HubCommand::RetryWorkflowStep { .. }
+            | protocol::HubCommand::SkipWorkflowStep { .. }
+            | protocol::HubCommand::CancelWorkflow { .. } => {
+                return json_error(
+                    403,
+                    "desktop_only",
+                    "Workflow controls are only available on the desktop",
+                )
+            }
             protocol::HubCommand::ReportMobileVersion { .. } => MobileScope::Monitor,
         };
         if !device.scopes.contains(&required_scope) {
@@ -1151,14 +1174,16 @@ fn route_core(
             state,
             app.state::<CodexBridge>().inner(),
             app.state::<BrowserControl>().inner(),
+            app.state::<crate::workflow_runtime::WorkflowRuntime>()
+                .inner(),
             command,
         );
         return json_response(if response.ok { 200 } else { 400 }, &response);
     }
 
     if request.method == "GET" && request.path == "/api/v1/snapshot" {
-        return match state.sessions() {
-            Ok(sessions) => json_response(200, &HubSnapshot::new(sessions)),
+        return match mobile_snapshot(state) {
+            Ok(snapshot) => json_response(200, &snapshot),
             Err(message) => json_error(500, "snapshot_failed", &message),
         };
     }
@@ -1961,6 +1986,47 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 403"));
         assert!(response.contains("scope_required"));
+    }
+
+    #[test]
+    fn paired_mobile_cannot_control_workflows_even_with_all_scopes() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let gateway = MobileGateway::default();
+        gateway.set_pairing_base_url("https://127.0.0.1:43122".into());
+        let offer = gateway.begin_pairing().expect("oferta");
+        let credentials = gateway
+            .complete_pairing(&state, &offer.code, "Telefone")
+            .expect("pareamento");
+        state
+            .set_mobile_device_scopes(
+                &credentials.device.id,
+                &[
+                    MobileScope::Monitor,
+                    MobileScope::Prompt,
+                    MobileScope::Approve,
+                    MobileScope::Terminate,
+                ],
+            )
+            .expect("escopos");
+
+        let response = route(
+            request(
+                "POST",
+                "/api/v1/commands",
+                Some(&credentials.token),
+                serde_json::json!({
+                    "requestId": "workflow-mobile-test",
+                    "type": "start_workflow",
+                    "workflowId": "workflow-1",
+                    "objective": "Do the work",
+                }),
+            ),
+            &state,
+            &gateway,
+        );
+
+        assert!(response.starts_with("HTTP/1.1 403"));
+        assert!(response.contains("desktop_only"));
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub enum AgentKind {
     ChatGpt,
     Claude,
     ClaudeCode,
+    Antigravity,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
     Gemini,
     Unknown,
 }
@@ -21,6 +24,14 @@ pub enum SessionSource {
     Vscode,
     Web,
     Desktop,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionControlOrigin {
+    #[default]
+    External,
+    Lume,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -127,6 +138,13 @@ pub struct SessionResult {
     pub files: Vec<String>,
     #[serde(default)]
     pub tests: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelOverride {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -252,6 +270,8 @@ pub struct AgentSession {
     pub source: SessionSource,
     #[serde(default)]
     pub source_app: Option<String>,
+    #[serde(default)]
+    pub control_origin: SessionControlOrigin,
     pub status: SessionStatus,
     pub status_label: String,
     pub started_at: String,
@@ -566,6 +586,60 @@ pub struct WorkflowRun {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowHistoryEventKind {
+    Started,
+    StepStarted,
+    StepCompleted,
+    HandoffReady,
+    HandoffApproved,
+    Paused,
+    Resumed,
+    StepFailed,
+    StepRetried,
+    StepSkipped,
+    SessionReplaced,
+    GuardrailPaused,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowHistoryEvent {
+    pub id: String,
+    pub kind: WorkflowHistoryEventKind,
+    pub step_id: Option<String>,
+    pub connection_id: Option<String>,
+    pub summary: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowStepHistory {
+    pub step_id: String,
+    pub session_native_id: String,
+    pub role_label: String,
+    pub agent_label: String,
+    pub session_name: String,
+    pub project: String,
+    pub response: Option<String>,
+    pub files: Vec<String>,
+    pub tests: Vec<String>,
+    pub captured_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowHistoryRecord {
+    pub run: WorkflowRun,
+    pub group: WorkflowGroupDefinition,
+    pub events: Vec<WorkflowHistoryEvent>,
+    pub steps: Vec<WorkflowStepHistory>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
@@ -575,6 +649,7 @@ pub struct Preferences {
     pub sound_volume: u8,
     pub popup_notifications_enabled: bool,
     pub autostart: bool,
+    pub mobile_gateway_enabled: bool,
     pub monitor_id: Option<String>,
     pub overlay_x: Option<i32>,
     pub overlay_y: Option<i32>,
@@ -602,6 +677,7 @@ impl Default for Preferences {
             sound_volume: 55,
             popup_notifications_enabled: true,
             autostart: true,
+            mobile_gateway_enabled: false,
             monitor_id: None,
             overlay_x: None,
             overlay_y: None,
@@ -662,6 +738,8 @@ pub struct HookEvent {
     pub source: Option<SessionSource>,
     #[serde(default)]
     pub source_app: Option<String>,
+    #[serde(default)]
+    pub control_origin: SessionControlOrigin,
     pub status_label: Option<String>,
     pub started_at: Option<String>,
     pub process_id: Option<u32>,

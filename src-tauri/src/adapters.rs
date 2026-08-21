@@ -13,7 +13,7 @@ use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, InteractiveQuestion, PendingQuestion,
         PermissionAction, PermissionProfile, PermissionRequest, QuestionAnswer, QuestionOption,
-        SessionActivity, SessionSource,
+        SessionActivity, SessionControlOrigin, SessionSource,
     },
     event_server,
     state::now_millis,
@@ -56,18 +56,29 @@ pub fn run_hook(provider: &str) -> i32 {
 }
 
 fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
+    let (provider, forced_hook_name) = provider
+        .split_once(':')
+        .map_or((provider, None), |(provider, event)| {
+            (provider, Some(event))
+        });
     let agent = match provider {
         "codex" => AgentKind::Codex,
         "claude" => AgentKind::ClaudeCode,
+        "antigravity" => AgentKind::Antigravity,
         "gemini" => AgentKind::Gemini,
         _ => return None,
     };
-    let hook_name = string(raw, "hook_event_name")?;
+    let hook_name = forced_hook_name
+        .map(str::to_string)
+        .or_else(|| string(raw, "hook_event_name"))?;
     let (process_id, source, headless_resume) = agent_process_context(provider);
     let event = match (provider, hook_name.as_str()) {
         (_, "SessionStart") => HookEventKind::SessionStarted,
         ("codex", "UserPromptSubmit") | ("claude", "UserPromptSubmit") => HookEventKind::Running,
         ("gemini", "BeforeAgent") => HookEventKind::Running,
+        ("antigravity", "PreInvocation" | "PreToolUse" | "PostToolUse" | "PostInvocation") => {
+            HookEventKind::Running
+        }
         ("claude", "PreToolUse") if is_claude_question(raw) => HookEventKind::QuestionRequest,
         ("codex" | "claude", "PreToolUse") | ("gemini", "BeforeTool") => HookEventKind::Running,
         ("codex", "PostToolUse")
@@ -100,17 +111,24 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
                 HookEventKind::Completed
             }
         }
-        ("codex", "Stop") | ("claude", "Stop") | ("gemini", "AfterAgent") => {
-            HookEventKind::Completed
-        }
+        ("codex", "Stop")
+        | ("claude", "Stop")
+        | ("antigravity", "Stop")
+        | ("gemini", "AfterAgent") => HookEventKind::Completed,
         (_, "StopFailure") => HookEventKind::Failed,
         ("claude", "SessionEnd") if headless_resume => HookEventKind::Completed,
         (_, "SessionEnd") => HookEventKind::SessionEnded,
         _ => return None,
     };
 
-    let session_id = string(raw, "session_id")?;
-    let cwd = string(raw, "cwd");
+    let session_id = string(raw, "session_id").or_else(|| string(raw, "conversationId"))?;
+    let cwd = string(raw, "cwd").or_else(|| {
+        raw.get("workspacePaths")
+            .and_then(Value::as_array)
+            .and_then(|paths| paths.first())
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let process_id = (!headless_resume).then_some(process_id).flatten();
     let permission_mode = string(raw, "permission_mode");
     let is_permission = matches!(event, HookEventKind::PermissionRequest);
@@ -171,6 +189,11 @@ fn map_event(provider: &str, raw: &Value) -> Option<HookEvent> {
         project: cwd.as_deref().and_then(project_name),
         source: Some(source),
         source_app: None,
+        control_origin: if matches!(std::env::var("LUME_MANAGED_SESSION").as_deref(), Ok("1")) {
+            SessionControlOrigin::Lume
+        } else {
+            SessionControlOrigin::External
+        },
         status_label: event_status_label,
         started_at: string(raw, "timestamp"),
         process_id,
@@ -308,10 +331,15 @@ fn hook_activity(
         return None;
     }
 
+    let tool_call = raw.get("toolCall");
     let tool_name = string(raw, "tool_name")
         .or_else(|| string(raw, "tool"))
+        .or_else(|| tool_call.and_then(|call| string(call, "name")))
         .unwrap_or_else(|| "Ferramenta".into());
-    let input = raw.get("tool_input").or_else(|| raw.get("details"));
+    let input = raw
+        .get("tool_input")
+        .or_else(|| raw.get("details"))
+        .or_else(|| tool_call.and_then(|call| call.get("args")));
     let resource = input
         .and_then(resource_from_input)
         .unwrap_or_else(|| tool_name.clone());
@@ -343,6 +371,7 @@ fn hook_activity(
     let result = raw
         .get("tool_response")
         .or_else(|| raw.get("tool_result"))
+        .or_else(|| raw.get("toolResponse"))
         .or_else(|| raw.get("result"))
         .and_then(|value| serde_json::to_string_pretty(value).ok());
     let input_detail = input.and_then(|value| serde_json::to_string_pretty(value).ok());
@@ -353,6 +382,11 @@ fn hook_activity(
     };
     let tool_id = string(raw, "tool_use_id")
         .or_else(|| string(raw, "tool_call_id"))
+        .or_else(|| {
+            raw.get("stepIdx")
+                .and_then(Value::as_i64)
+                .map(|id| id.to_string())
+        })
         .unwrap_or_else(|| now_millis().to_string());
     let files = if kind == "file" {
         input
@@ -684,8 +718,10 @@ fn claude_question_output(answers: Option<Vec<QuestionAnswer>>, raw: &Value) -> 
 fn status_label(hook: &str, event: &HookEventKind) -> Option<&'static str> {
     match hook {
         "SessionStart" => Some("Sessão detectada"),
-        "UserPromptSubmit" | "BeforeAgent" | "PostToolUse" | "PostToolUseFailure"
-        | "PostToolBatch" | "AfterTool" => Some("Executando"),
+        "UserPromptSubmit" | "BeforeAgent" | "PreInvocation" | "PreToolUse" | "PostToolUse"
+        | "PostToolUseFailure" | "PostToolBatch" | "PostInvocation" | "AfterTool" => {
+            Some("Executando")
+        }
         "PermissionRequest" => Some("Aguardando permissão"),
         "PermissionDenied" => Some("Permissão negada"),
         "Notification" if matches!(event, HookEventKind::PermissionRequest) => {
@@ -740,7 +776,19 @@ fn agent_process_context(provider: &str) -> (Option<u32>, SessionSource, bool) {
         // também contém o provider. Continua subindo para guardar o processo
         // estável mais externo da sessão, em vez do wrapper que termina logo
         // após enviar o evento ao Lume.
-        if command.contains(provider) {
+        let process_marker = if provider == "antigravity" {
+            "agy"
+        } else {
+            provider
+        };
+        if command.split_whitespace().any(|part| {
+            let executable = part
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(part)
+                .trim_matches(['\"', '\'']);
+            executable == process_marker || executable.strip_suffix(".exe") == Some(process_marker)
+        }) {
             agent_pid = Some(pid.as_u32());
         }
         if provider == "claude"
@@ -1398,5 +1446,47 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|value| value.contains("Validate tray")));
+    }
+
+    #[test]
+    fn antigravity_hooks_use_conversation_and_workspace_fields() {
+        let raw = json!({
+            "conversationId": "agy-conversation",
+            "workspacePaths": ["/work/antigravity"],
+            "stepIdx": 2
+        });
+        let running =
+            map_event("antigravity:PreInvocation", &raw).expect("evento Antigravity em execução");
+        assert_eq!(running.agent, AgentKind::Antigravity);
+        assert!(matches!(running.event, HookEventKind::Running));
+        assert_eq!(
+            running.native_session_id.as_deref(),
+            Some("agy-conversation")
+        );
+        assert_eq!(
+            running.working_directory.as_deref(),
+            Some("/work/antigravity")
+        );
+
+        let tool = map_event(
+            "antigravity:PreToolUse",
+            &json!({
+                "conversationId": "agy-conversation",
+                "workspacePaths": ["/work/antigravity"],
+                "stepIdx": 3,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": { "command": "cargo test" }
+                }
+            }),
+        )
+        .expect("evento de ferramenta Antigravity")
+        .activity
+        .expect("atividade Antigravity");
+        assert_eq!(tool.kind, "test");
+        assert_eq!(tool.title, "cargo test");
+
+        let completed = map_event("antigravity:Stop", &raw).expect("evento Antigravity finalizado");
+        assert!(matches!(completed.event, HookEventKind::Completed));
     }
 }

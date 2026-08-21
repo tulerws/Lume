@@ -3,6 +3,8 @@ export type AgentKind =
   | "chatgpt"
   | "claude"
   | "claude_code"
+  | "antigravity"
+  | "deepseek"
   | "gemini"
   | "unknown";
 
@@ -12,6 +14,8 @@ export type SessionStatus =
   | "waiting_for_input"
   | "completed"
   | "failed";
+
+export type SessionControlOrigin = "external" | "lume";
 
 export type PromptDelivery = "new_turn" | "steer" | "queue";
 
@@ -79,6 +83,7 @@ export interface AgentSession {
   project: string;
   source: "cli" | "vscode" | "web" | "desktop";
   sourceApp?: "chrome" | "edge" | "brave";
+  controlOrigin: SessionControlOrigin;
   status: SessionStatus;
   statusLabel: string;
   startedAt: string;
@@ -177,6 +182,7 @@ export interface Preferences {
   soundVolume: number;
   popupNotificationsEnabled: boolean;
   autostart: boolean;
+  mobileGatewayEnabled: boolean;
   monitorId?: string;
   overlayX?: number;
   overlayY?: number;
@@ -345,6 +351,51 @@ export interface WorkflowRun {
   updatedAt: number;
 }
 
+export type WorkflowHistoryEventKind =
+  | "started"
+  | "step_started"
+  | "step_completed"
+  | "handoff_ready"
+  | "handoff_approved"
+  | "paused"
+  | "resumed"
+  | "step_failed"
+  | "step_retried"
+  | "step_skipped"
+  | "session_replaced"
+  | "guardrail_paused"
+  | "completed"
+  | "cancelled";
+
+export interface WorkflowHistoryEvent {
+  id: string;
+  kind: WorkflowHistoryEventKind;
+  stepId?: string;
+  connectionId?: string;
+  summary: string;
+  createdAt: number;
+}
+
+export interface WorkflowStepHistory {
+  stepId: string;
+  sessionNativeId: string;
+  roleLabel: string;
+  agentLabel: string;
+  sessionName: string;
+  project: string;
+  response?: string;
+  files: string[];
+  tests: string[];
+  capturedAt?: number;
+}
+
+export interface WorkflowHistoryRecord {
+  run: WorkflowRun;
+  group: WorkflowGroupDefinition;
+  events: WorkflowHistoryEvent[];
+  steps: WorkflowStepHistory[];
+}
+
 export interface WorkflowContextFile {
   path: string;
   external: boolean;
@@ -393,10 +444,12 @@ export interface WorkflowContextPackage {
 }
 
 export interface IntegrationStatus {
-  kind: "codex" | "claude" | "gemini";
+  kind: "codex" | "claude" | "antigravity" | "deepseek" | "gemini";
   label: string;
   installed: boolean;
   configured: boolean;
+  canConfigure: boolean;
+  canLaunch: boolean;
   directPermissions: boolean;
   detail: string;
 }

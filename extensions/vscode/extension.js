@@ -1,6 +1,6 @@
 const vscode = require("vscode");
 
-const agents = new Set(["codex", "claude", "gemini"]);
+const agents = new Set(["codex", "claude", "antigravity", "deepseek", "gemini"]);
 
 function activate(context) {
   const openSession = (request) => {
@@ -14,7 +14,11 @@ function activate(context) {
     const terminal = vscode.window.createTerminal({
       name: `Lume · ${request.agent[0].toUpperCase()}${request.agent.slice(1)}`,
       cwd: vscode.Uri.file(request.cwd),
-      shellPath: request.agent,
+      shellPath: request.agent === "antigravity"
+        ? "agy"
+        : request.agent === "deepseek"
+          ? "dsh"
+          : request.agent,
       shellArgs: args,
       iconPath: new vscode.ThemeIcon("sparkle"),
     });

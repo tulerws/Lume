@@ -203,6 +203,8 @@
 <style>
   .file-type-icon { display: inline-grid; place-items: center; flex: 0 0 auto; color: inherit; opacity: .72; }
   .file-type-icon.brand { filter: grayscale(1) contrast(.8); opacity: .78; }
+  .file-type-icon.brand :global(svg),
+  .file-type-icon.brand :global(svg *) { stroke: none !important; stroke-width: 0 !important; }
   .file-type-icon.maintained { color: inherit; opacity: .76; }
   svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
   .maintained-icon { fill: currentColor; stroke: none; }

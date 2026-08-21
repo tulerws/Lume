@@ -15,6 +15,9 @@ const MAX_DIFF_CHARS: usize = 1_600;
 const MAX_FILES: usize = 32;
 const MAX_CHECKS: usize = 16;
 const MAX_ACTIVITIES: usize = 18;
+const MAX_HISTORY_RESPONSE_CHARS: usize = 8_000;
+const MAX_HISTORY_FILES: usize = 64;
+const MAX_HISTORY_CHECKS: usize = 32;
 #[cfg(test)]
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 20_000;
 
@@ -112,6 +115,37 @@ pub fn effective_selection(connection: &WorkflowConnectionDefinition) -> Workflo
         },
         WorkflowContextPolicy::Custom => connection.context_selection.clone(),
     }
+}
+
+pub(crate) fn sanitize_workflow_history_result(
+    result: &SessionResult,
+    working_directory: Option<&str>,
+) -> (String, Vec<String>, Vec<String>) {
+    let mut redactions = RedactionCounts::default();
+    let response = clean_text(
+        &result.response,
+        MAX_HISTORY_RESPONSE_CHARS,
+        &mut redactions,
+    );
+    let mut seen_files = HashSet::new();
+    let files = result
+        .files
+        .iter()
+        .filter_map(|path| safe_path(path, working_directory).ok())
+        .map(|(path, _)| path)
+        .filter(|path| seen_files.insert(path.clone()))
+        .take(MAX_HISTORY_FILES)
+        .collect();
+    let mut seen_checks = HashSet::new();
+    let tests = result
+        .tests
+        .iter()
+        .map(|check| clean_text(check, 500, &mut redactions))
+        .filter(|check| !check.is_empty())
+        .filter(|check| seen_checks.insert(normalized_check_key(check)))
+        .take(MAX_HISTORY_CHECKS)
+        .collect();
+    (response, files, tests)
 }
 
 #[cfg(test)]
@@ -956,6 +990,8 @@ fn redact_secret_line(line: &str, redactions: &mut RedactionCounts) -> String {
         let sensitive_key = [
             "api_key",
             "apikey",
+            "token",
+            "secret",
             "access_token",
             "auth_token",
             "password",
@@ -1155,6 +1191,7 @@ mod tests {
             project: "Lume".into(),
             source: SessionSource::Cli,
             source_app: None,
+            control_origin: crate::domain::SessionControlOrigin::Lume,
             status: SessionStatus::Completed,
             status_label: "Finished".into(),
             started_at: "now".into(),
@@ -1703,5 +1740,34 @@ mod tests {
         assert_eq!(package.source_result_id, "result-1");
         assert!(package.markdown.contains("cargo test: passed"));
         assert!(!package.markdown.contains("super-secret"));
+    }
+
+    #[test]
+    fn workflow_history_result_is_bounded_sanitized_and_deduplicated() {
+        let result = SessionResult {
+            id: "history-result".into(),
+            response: "Completed\napi_key=workflow-history-secret".into(),
+            created_at: 100,
+            files: vec![
+                "/workspace/lume/src/lib.rs".into(),
+                "/workspace/lume/src/lib.rs".into(),
+                "/workspace/lume/.env".into(),
+                "[bad](https://example.com)".into(),
+            ],
+            tests: vec![
+                "cargo test: passed".into(),
+                "cargo test: passed".into(),
+                "token=workflow-history-secret".into(),
+            ],
+        };
+
+        let (response, files, tests) =
+            sanitize_workflow_history_result(&result, Some("/workspace/lume"));
+
+        assert!(response.contains("[REDACTED]"));
+        assert!(!response.contains("workflow-history-secret"));
+        assert_eq!(files, vec!["src/lib.rs"]);
+        assert_eq!(tests.len(), 2);
+        assert!(!tests.join("\n").contains("workflow-history-secret"));
     }
 }

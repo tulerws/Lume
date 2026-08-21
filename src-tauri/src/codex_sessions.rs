@@ -18,7 +18,7 @@ use tauri::AppHandle;
 use crate::{
     domain::{
         AccessMode, AgentKind, HookEvent, HookEventKind, PermissionAction, PermissionProfile,
-        SessionActivity, SessionSource,
+        SessionActivity, SessionControlOrigin, SessionSource,
     },
     event_server,
     state::{now_millis, AppState},
@@ -784,6 +784,7 @@ fn event_for(
         project,
         source: Some(session.source.clone()),
         source_app: None,
+        control_origin: SessionControlOrigin::External,
         status_label: Some(label.into()),
         started_at: session.started_at.clone(),
         process_id: None,

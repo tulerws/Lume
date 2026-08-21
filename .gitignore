@@ -3,6 +3,7 @@ node_modules
 /build
 /.svelte-kit
 /package
+/landing-dist
 .env
 .env.*
 !.env.example

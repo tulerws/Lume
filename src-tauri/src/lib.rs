@@ -12,6 +12,7 @@ mod event_server;
 mod executables;
 mod integrations;
 mod launcher;
+mod legacy_cli_gateway_cleanup;
 mod mobile_gateway;
 mod mobile_server;
 mod overlay;
@@ -31,7 +32,7 @@ use std::{
 use domain::{
     AgentKind, AgentSession, HistoryEntry, HookEvent, HookEventKind, PermissionAction, Preferences,
     PromptAttachmentInput, PromptDelivery, QuestionAnswer, ResultNote, SessionActivity,
-    SessionNote, SessionSource, WorkflowRole, WorkflowRoleContract,
+    SessionControlOrigin, SessionNote, SessionSource, WorkflowRole, WorkflowRoleContract,
 };
 use integrations::{CompanionStatus, IntegrationDiagnostic, IntegrationKind, IntegrationStatus};
 use launcher::LaunchRequest;
@@ -151,7 +152,7 @@ fn apply_global_shortcuts(app: &AppHandle, preferences: &Preferences) -> Result<
 
 #[tauri::command]
 fn list_sessions(state: State<'_, AppState>) -> Result<Vec<AgentSession>, String> {
-    state.sessions()
+    state.bounded_sessions(60)
 }
 
 #[tauri::command]
@@ -177,7 +178,10 @@ fn rename_session(
 
 #[tauri::command]
 fn get_hub_snapshot(state: State<'_, AppState>) -> Result<protocol::HubSnapshot, String> {
-    Ok(protocol::HubSnapshot::new(state.sessions()?))
+    Ok(protocol::HubSnapshot::with_activity_limit(
+        state.bounded_sessions(60)?,
+        60,
+    ))
 }
 
 #[tauri::command]
@@ -188,8 +192,8 @@ fn get_terminal_hub_snapshot(
     activity_limit: Option<usize>,
 ) -> Result<protocol::HubSnapshot, String> {
     let terminal = terminals.state(&label)?;
-    let mut sessions = state.sessions()?;
-    sessions.retain(|session| {
+    let activity_limit = activity_limit.unwrap_or(60).max(1);
+    let sessions = state.terminal_sessions(activity_limit, |session| {
         session.id == terminal.session_id
             || (terminal.session_native_id.is_some()
                 && terminal.session_native_id == session.native_session_id
@@ -201,10 +205,10 @@ fn get_terminal_hub_snapshot(
                 && terminal.session_source == session.source
                 && terminal.session_project == session.project
                 && terminal.session_working_directory == session.working_directory)
-    });
+    })?;
     Ok(protocol::HubSnapshot::with_activity_limit(
         sessions,
-        activity_limit.unwrap_or(60),
+        activity_limit,
     ))
 }
 
@@ -228,16 +232,32 @@ fn get_mobile_gateway_status(
 
 #[tauri::command]
 fn enable_mobile_gateway(
+    state: State<'_, AppState>,
     server: State<'_, mobile_server::MobileServer>,
 ) -> Result<mobile_server::MobileServerStatus, String> {
-    server.enable_network()
+    let status = server.enable_network()?;
+    let mut preferences = state.preferences()?;
+    preferences.mobile_gateway_enabled = true;
+    if let Err(error) = state.save_preferences(&preferences) {
+        let _ = server.disable_network();
+        return Err(error);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
 fn disable_mobile_gateway(
+    state: State<'_, AppState>,
     server: State<'_, mobile_server::MobileServer>,
 ) -> Result<mobile_server::MobileServerStatus, String> {
-    server.disable_network()
+    let status = server.disable_network()?;
+    let mut preferences = state.preferences()?;
+    preferences.mobile_gateway_enabled = false;
+    if let Err(error) = state.save_preferences(&preferences) {
+        let _ = server.enable_network();
+        return Err(error);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -273,6 +293,7 @@ fn execute_hub_command(
     state: State<'_, AppState>,
     bridge: State<'_, codex_bridge::CodexBridge>,
     browser: State<'_, browser_server::BrowserControl>,
+    workflow_runtime: State<'_, workflow_runtime::WorkflowRuntime>,
     request: protocol::HubCommandRequest,
 ) -> protocol::HubCommandResponse {
     control::execute_hub_command(
@@ -280,6 +301,7 @@ fn execute_hub_command(
         state.inner(),
         bridge.inner(),
         browser.inner(),
+        workflow_runtime.inner(),
         request,
     )
 }
@@ -314,7 +336,7 @@ fn open_session_source(
 }
 
 #[tauri::command]
-fn submit_prompt(
+async fn submit_prompt(
     app: AppHandle,
     state: State<'_, AppState>,
     bridge: State<'_, codex_bridge::CodexBridge>,
@@ -324,17 +346,24 @@ fn submit_prompt(
     attachments: Vec<PromptAttachmentInput>,
     delivery: Option<PromptDelivery>,
 ) -> Result<(), String> {
-    control::submit_prompt(
-        &app,
-        state.inner(),
-        bridge.inner(),
-        browser.inner(),
-        &session_id,
-        &prompt,
-        attachments,
-        delivery.unwrap_or_default(),
-        true,
-    )
+    let state = state.inner().clone();
+    let bridge = bridge.inner().clone();
+    let browser = browser.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        control::submit_prompt(
+            &app,
+            &state,
+            &bridge,
+            &browser,
+            &session_id,
+            &prompt,
+            attachments,
+            delivery.unwrap_or_default(),
+            true,
+        )
+    })
+    .await
+    .map_err(|error| format!("Could not complete the prompt submission task: {error}"))?
 }
 
 #[tauri::command]
@@ -420,6 +449,22 @@ fn terminate_session(
 }
 
 #[tauri::command]
+async fn take_control_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        control::take_control_session(&app, &state, &bridge, &session_id)
+    })
+    .await
+    .map_err(|error| format!("Could not complete the session takeover task: {error}"))?
+}
+
+#[tauri::command]
 fn interrupt_prompt(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -450,6 +495,59 @@ fn set_session_collaboration_mode(
 }
 
 #[tauri::command]
+fn get_session_model_settings(
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+) -> Result<codex_bridge::CodexThreadModelSettings, String> {
+    control::session_model_settings(state.inner(), bridge.inner(), &session_id)
+}
+
+#[tauri::command]
+fn set_session_model_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, codex_bridge::CodexBridge>,
+    session_id: String,
+    model: String,
+    effort: String,
+) -> Result<codex_bridge::CodexThreadModelSettings, String> {
+    control::set_session_model_settings(
+        &app,
+        state.inner(),
+        bridge.inner(),
+        &session_id,
+        &model,
+        &effort,
+    )
+}
+
+#[tauri::command]
+fn get_claude_session_model_settings(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<domain::SessionModelOverride, String> {
+    control::claude_session_model_settings(state.inner(), &session_id)
+}
+
+#[tauri::command]
+fn set_claude_session_model_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<domain::SessionModelOverride, String> {
+    control::set_claude_session_model_settings(
+        &app,
+        state.inner(),
+        &session_id,
+        model.as_deref(),
+        effort.as_deref(),
+    )
+}
+
+#[tauri::command]
 fn steer_queued_prompt(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -472,6 +570,14 @@ fn list_history(
     limit: Option<usize>,
 ) -> Result<Vec<HistoryEntry>, String> {
     state.history(limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn list_workflow_history(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<domain::WorkflowHistoryRecord>, String> {
+    state.workflow_history(limit.unwrap_or(50))
 }
 
 #[tauri::command]
@@ -548,7 +654,7 @@ fn preview_workflow_context(
     objective: String,
     source_result_id: Option<String>,
 ) -> Result<context_builder::WorkflowContextPackage, String> {
-    let sessions = state.sessions()?;
+    let sessions = state.bounded_sessions(200)?;
     let settings = state.preferences()?.workflow_settings;
     context_builder::build_context_package_with_limit(
         &group,
@@ -983,11 +1089,7 @@ fn open_terminal_window_impl(
     terminals: State<'_, terminal_windows::TerminalWindows>,
     session_id: String,
 ) -> Result<String, String> {
-    let session = state
-        .sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| "Sessão não encontrada".to_string())?;
+    let session = state.connected_session(&session_id)?;
     let preferences = state.preferences()?;
     terminals.open(
         &app,
@@ -1309,7 +1411,7 @@ fn list_resumable_sessions(
     state: State<'_, AppState>,
 ) -> Result<Vec<integrations::ResumableSession>, String> {
     let open_sessions = state
-        .sessions()?
+        .connected_sessions()?
         .into_iter()
         .filter_map(|session| session.native_session_id)
         .collect::<HashSet<_>>();
@@ -1326,13 +1428,15 @@ fn diagnose_integration(
 ) -> Result<IntegrationDiagnostic, String> {
     let executable = integrations::lume_executable()?;
     let last_event_at = state
-        .sessions()?
+        .connected_sessions()?
         .into_iter()
         .filter(|session| {
             matches!(
                 (&kind, &session.agent),
                 (IntegrationKind::Codex, domain::AgentKind::Codex)
                     | (IntegrationKind::Claude, domain::AgentKind::ClaudeCode)
+                    | (IntegrationKind::Antigravity, domain::AgentKind::Antigravity)
+                    | (IntegrationKind::DeepSeek, domain::AgentKind::DeepSeek)
                     | (IntegrationKind::Gemini, domain::AgentKind::Gemini)
             )
         })
@@ -1426,10 +1530,25 @@ fn reveal_plugin_directory(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn launch_session(
+async fn launch_session(
     app: AppHandle,
     state: State<'_, AppState>,
     bridge: State<'_, codex_bridge::CodexBridge>,
+    request: LaunchRequest,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        launch_session_impl(&app, &state, &bridge, request)
+    })
+    .await
+    .map_err(|error| format!("Could not complete the session launch task: {error}"))?
+}
+
+fn launch_session_impl(
+    app: &AppHandle,
+    state: &AppState,
+    bridge: &codex_bridge::CodexBridge,
     mut request: LaunchRequest,
 ) -> Result<(), String> {
     if request.target == "vscode" && !integrations::vscode_status().configured {
@@ -1446,12 +1565,26 @@ fn launch_session(
         .flatten()
         .and_then(|session_id| integrations::resume_preview(&request.agent, session_id));
     let prepared_event = if request.agent == IntegrationKind::Codex {
-        let prepared = bridge.prepare_thread(
-            &request.working_directory,
-            request.resume_id.as_deref().filter(|_| request.resume),
-            request.permission_mode.as_ref(),
-            request.approval_policy.as_deref(),
-        )?;
+        let resume_id = request.resume_id.as_deref().filter(|_| request.resume);
+        let prepared = if let Some(thread_id) = resume_id {
+            let thread_name = integrations::indexed_session_names(&IntegrationKind::Codex)
+                .ok()
+                .and_then(|names| names.get(thread_id).cloned());
+            bridge.prepare_existing_thread_launch(
+                thread_id,
+                thread_name,
+                request.permission_mode.as_ref(),
+                request.approval_policy.as_deref(),
+            )
+        } else {
+            bridge.prepare_thread(
+                &request.working_directory,
+                None,
+                request.permission_mode.as_ref(),
+                request.approval_policy.as_deref(),
+            )
+        }
+        .map_err(codex_resume_error)?;
         request.resume = true;
         request.resume_id = Some(prepared.thread_id.clone());
         Some(prepared_codex_session_event(
@@ -1476,6 +1609,14 @@ fn launch_session(
     Ok(())
 }
 
+fn codex_resume_error(error: String) -> String {
+    if error.to_ascii_lowercase().contains("active writer") {
+        "This thread is still open in another Codex CLI or client. Close that origin and wait a moment, or transfer the detected session to Lume from its terminal.".into()
+    } else {
+        error
+    }
+}
+
 fn prepared_codex_session_event(
     request: &LaunchRequest,
     prepared: codex_bridge::PreparedThread,
@@ -1498,6 +1639,7 @@ fn prepared_codex_session_event(
             SessionSource::Cli
         }),
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some("Esperando ação".into()),
         started_at: None,
         process_id: None,
@@ -1522,6 +1664,8 @@ fn prepared_resume_preview_event(
     let (agent, agent_label, prefix) = match request.agent {
         IntegrationKind::Claude => (AgentKind::ClaudeCode, "Claude Code", "claude"),
         IntegrationKind::Codex => (AgentKind::Codex, "Codex", "codex"),
+        IntegrationKind::Antigravity => return None,
+        IntegrationKind::DeepSeek => return None,
         IntegrationKind::Gemini => return None,
     };
     let native_session_id = request.resume_id.clone()?;
@@ -1542,6 +1686,7 @@ fn prepared_resume_preview_event(
             SessionSource::Cli
         }),
         source_app: None,
+        control_origin: SessionControlOrigin::Lume,
         status_label: Some("Esperando ação".into()),
         started_at: None,
         process_id: None,
@@ -1612,6 +1757,11 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| error.to_string())?
                 .join("lume.sqlite3");
+            if let Err(error) = legacy_cli_gateway_cleanup::cleanup(
+                database_path.parent().unwrap_or(&database_path),
+            ) {
+                eprintln!("Could not finish the legacy CLI Gateway cleanup: {error}");
+            }
             let state = AppState::new(&database_path)?;
             app.manage(PendingShortcutAction(Mutex::new(
                 startup_shortcut_action.clone(),
@@ -1637,6 +1787,11 @@ pub fn run() {
                 eprintln!("{error}");
                 mobile_server::MobileServer::default()
             });
+            if state.preferences()?.mobile_gateway_enabled {
+                if let Err(error) = mobile_server.enable_network() {
+                    eprintln!("Could not restore mobile network access: {error}");
+                }
+            }
             app.manage(mobile_gateway);
             app.manage(mobile_server);
             app.manage(terminal_windows::TerminalWindows::default());
@@ -1737,9 +1892,15 @@ pub fn run() {
             interrupt_prompt,
             get_session_collaboration_mode,
             set_session_collaboration_mode,
+            get_session_model_settings,
+            set_session_model_settings,
+            get_claude_session_model_settings,
+            set_claude_session_model_settings,
             steer_queued_prompt,
             terminate_session,
+            take_control_session,
             list_history,
+            list_workflow_history,
             list_result_notes,
             save_result_note,
             delete_result_note,
@@ -1999,6 +2160,8 @@ mod tests {
             initial_prompt: None,
             permission_mode: None,
             approval_policy: None,
+            model: None,
+            reasoning_effort: None,
         };
         let event = prepared_codex_session_event(
             &request,
@@ -2027,6 +2190,15 @@ mod tests {
     }
 
     #[test]
+    fn active_codex_writer_has_an_actionable_resume_error() {
+        let message =
+            codex_resume_error("thread thread-1 already has an active writer (code -32600)".into());
+
+        assert!(message.contains("still open in another Codex CLI or client"));
+        assert!(!message.contains("-32600"));
+    }
+
+    #[test]
     fn resumed_session_starts_with_its_previous_agent_response() {
         let request = LaunchRequest {
             agent: IntegrationKind::Claude,
@@ -2037,6 +2209,8 @@ mod tests {
             initial_prompt: None,
             permission_mode: None,
             approval_policy: None,
+            model: None,
+            reasoning_effort: None,
         };
         let event = prepared_resume_preview_event(
             &request,

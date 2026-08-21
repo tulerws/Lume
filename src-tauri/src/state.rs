@@ -12,16 +12,18 @@ use crate::{
     domain::{
         AccessMode, AgentKind, AgentRateLimit, AgentSession, HistoryEntry, HookEvent,
         HookEventKind, PairedDevice, PermissionAction, PermissionProfile, PermissionRequest,
-        Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity, SessionNote,
-        SessionResult, SessionSource, SessionStatus,
+        Preferences, PromptAttachment, QuestionAnswer, ResultNote, SessionActivity,
+        SessionControlOrigin, SessionModelOverride, SessionNote, SessionResult, SessionSource,
+        SessionStatus, WorkflowHistoryRecord,
     },
-    integrations::{self, IntegrationKind, ResumableSession},
+    integrations::{self, IntegrationKind},
     store::Store,
 };
 
 const PROCESS_MISSING_SCAN_LIMIT: u8 = 2;
 const WEB_SESSION_STALE_MS: i64 = 90_000;
 const RECENT_NATIVE_SESSION_MS: i64 = 10 * 60 * 1_000;
+const PIDLESS_CODEX_SESSION_TTL_MS: i64 = 60_000;
 const LUME_ATTACHED_FILES_MARKER: &str = "Files attached through Lume. Inspect these local paths:";
 
 #[derive(Clone, Debug)]
@@ -42,6 +44,7 @@ pub struct AppState {
     agent_rate_limits: Arc<Mutex<HashMap<AgentKind, Vec<AgentRateLimit>>>>,
     session_aliases: Arc<Mutex<HashMap<String, String>>>,
     archived_conversations: Arc<Mutex<HashMap<String, Vec<SessionActivity>>>>,
+    session_model_overrides: Arc<Mutex<HashMap<(AgentKind, String), SessionModelOverride>>>,
 }
 
 impl AppState {
@@ -65,11 +68,12 @@ impl AppState {
             agent_rate_limits: Arc::new(Mutex::new(HashMap::new())),
             session_aliases: Arc::new(Mutex::new(preferences.session_aliases)),
             archived_conversations: Arc::new(Mutex::new(HashMap::new())),
+            session_model_overrides: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sessions(&self) -> Result<Vec<AgentSession>, String> {
-        let now = now_millis();
         let mut sessions = self
             .sessions
             .lock()
@@ -77,6 +81,122 @@ impl AppState {
             .clone();
         self.attach_archived_conversations(&mut sessions)?;
         self.attach_session_plans(&mut sessions)?;
+        self.finalize_sessions(sessions)
+    }
+
+    pub fn terminal_sessions<F>(
+        &self,
+        activity_limit: usize,
+        matches_terminal: F,
+    ) -> Result<Vec<AgentSession>, String>
+    where
+        F: Fn(&AgentSession) -> bool,
+    {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?
+            .iter()
+            .filter(|session| matches_terminal(session))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.attach_recent_archived_conversations(&mut sessions, activity_limit)?;
+        self.attach_session_plans(&mut sessions)?;
+        for session in &mut sessions {
+            let start = session
+                .activities
+                .len()
+                .saturating_sub(activity_limit.max(1));
+            if start > 0 {
+                let mut recent = session.activities.split_off(start);
+                recent.extend(session.activities.drain(..).filter(|activity| {
+                    activity.kind == "plan_document"
+                        || (activity.kind == "queued_prompt" && activity.status == "waiting")
+                }));
+                recent.sort_by_key(|activity| activity.created_at);
+                session.activities = recent;
+            }
+            let result_start = session.results.len().saturating_sub(activity_limit.max(1));
+            if result_start > 0 {
+                session.results.drain(..result_start);
+            }
+        }
+        self.finalize_sessions(sessions)
+    }
+
+    pub fn bounded_sessions(&self, activity_limit: usize) -> Result<Vec<AgentSession>, String> {
+        self.terminal_sessions(activity_limit, |_| true)
+    }
+
+    pub fn connected_sessions(&self) -> Result<Vec<AgentSession>, String> {
+        self.sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())
+            .map(|sessions| sessions.clone())
+    }
+
+    pub fn connected_session(&self, session_id: &str) -> Result<AgentSession, String> {
+        self.sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| "Session not found".to_string())
+    }
+
+    pub fn session_with_history(&self, session_id: &str) -> Result<AgentSession, String> {
+        let mut sessions = vec![self.connected_session(session_id)?];
+        self.attach_archived_conversations(&mut sessions)?;
+        self.attach_session_plans(&mut sessions)?;
+        self.finalize_sessions(sessions)?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())
+    }
+
+    pub fn session_status(
+        &self,
+        session_id: &str,
+        native_session_id: Option<&str>,
+    ) -> Result<Option<SessionStatus>, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?;
+        Ok(sessions
+            .iter()
+            .find(|session| {
+                session.id == session_id
+                    || native_session_id.is_some_and(|native_id| {
+                        session.native_session_id.as_deref() == Some(native_id)
+                    })
+            })
+            .map(|session| session.status.clone()))
+    }
+
+    pub fn session_automatically_approves(
+        &self,
+        session_id: &str,
+        native_session_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Não foi possível acessar as sessões".to_string())?;
+        Ok(sessions.iter().any(|session| {
+            (session.id == session_id
+                || native_session_id.is_some_and(|native_id| {
+                    session.native_session_id.as_deref() == Some(native_id)
+                }))
+                && session.permission_profile.automatically_approves()
+        }))
+    }
+
+    fn finalize_sessions(
+        &self,
+        mut sessions: Vec<AgentSession>,
+    ) -> Result<Vec<AgentSession>, String> {
         sessions.retain(|session| {
             !(session.agent == AgentKind::Codex
                 && session
@@ -122,20 +242,6 @@ impl AppState {
             .filter(|session| !is_provisional_process(session))
             .filter_map(|session| session.process_id.map(|pid| (session.agent.clone(), pid)))
             .collect::<Vec<_>>();
-        let native_contexts = deduplicated
-            .iter()
-            .filter(|session| !is_provisional_process(session))
-            .filter(|session| session_can_own_process(session, now))
-            .filter_map(|session| {
-                session.working_directory.as_ref().map(|directory| {
-                    (
-                        session.agent.clone(),
-                        session.source.clone(),
-                        directory.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
         let native_vscode_agents = deduplicated
             .iter()
             .filter(|session| !is_provisional_process(session))
@@ -148,14 +254,6 @@ impl AppState {
                     native_processes
                         .iter()
                         .any(|(agent, native_pid)| agent == &session.agent && *native_pid == pid)
-                }) && !session.working_directory.as_ref().is_some_and(|directory| {
-                    native_contexts
-                        .iter()
-                        .any(|(agent, source, native_directory)| {
-                            agent == &session.agent
-                                && source == &session.source
-                                && same_directory(Some(native_directory), Some(directory))
-                        })
                 }) && !(session.source == SessionSource::Vscode
                     && native_vscode_agents.contains(&session.agent)))
         });
@@ -163,6 +261,33 @@ impl AppState {
         ensure_unique_session_names(&mut sessions);
         sessions.sort_by_key(|session| (status_priority(&session.status), -session.updated_at));
         Ok(sessions)
+    }
+
+    fn attach_recent_archived_conversations(
+        &self,
+        sessions: &mut [AgentSession],
+        activity_limit: usize,
+    ) -> Result<(), String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Não foi possível acessar o histórico das conversas".to_string())?;
+        for session in sessions {
+            let archived = store.recent_conversation_activities(session, activity_limit)?;
+            for activity in archived {
+                if !session
+                    .activities
+                    .iter()
+                    .any(|current| current.id == activity.id)
+                {
+                    session.activities.push(activity);
+                }
+            }
+            session
+                .activities
+                .sort_by_key(|activity| activity.created_at);
+        }
+        Ok(())
     }
 
     fn attach_session_plans(&self, sessions: &mut [AgentSession]) -> Result<(), String> {
@@ -421,6 +546,66 @@ impl AppState {
         Ok(())
     }
 
+    pub fn mark_session_lume_controlled(&self, session_id: &str) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not transfer control of this session".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        session.control_origin = SessionControlOrigin::Lume;
+        session.source = SessionSource::Cli;
+        session.source_app = None;
+        session.process_id = None;
+        session.status = SessionStatus::WaitingForInput;
+        session.status_label = "Ready in Lume".into();
+        session.pending_permission = None;
+        session.pending_question = None;
+        session.permission_profile.can_respond_from_lume = true;
+        session.permission_profile.available_actions = vec![
+            PermissionAction::AllowOnce,
+            PermissionAction::AllowSession,
+            PermissionAction::Deny,
+        ];
+        session.updated_at = now_millis();
+        Ok(())
+    }
+
+    pub fn session_model_override(&self, session_id: &str) -> Result<SessionModelOverride, String> {
+        let session = self.connected_session(session_id)?;
+        let key = (
+            session.agent,
+            session
+                .native_session_id
+                .unwrap_or_else(|| session.id.clone()),
+        );
+        self.session_model_overrides
+            .lock()
+            .map_err(|_| "Could not read the session model settings".to_string())
+            .map(|settings| settings.get(&key).cloned().unwrap_or_default())
+    }
+
+    pub fn set_session_model_override(
+        &self,
+        session_id: &str,
+        settings: SessionModelOverride,
+    ) -> Result<SessionModelOverride, String> {
+        let session = self.connected_session(session_id)?;
+        let key = (
+            session.agent,
+            session
+                .native_session_id
+                .unwrap_or_else(|| session.id.clone()),
+        );
+        self.session_model_overrides
+            .lock()
+            .map_err(|_| "Could not save the session model settings".to_string())?
+            .insert(key, settings.clone());
+        Ok(settings)
+    }
+
     pub fn record_queued_prompt_activity(
         &self,
         session_id: &str,
@@ -479,6 +664,69 @@ impl AppState {
         activity.status = "completed".into();
         activity.created_at = now;
         session.updated_at = now;
+        Ok(())
+    }
+
+    pub fn remove_queued_prompt_activity(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+    ) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not update the Codex prompt queue".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        session
+            .activities
+            .retain(|activity| activity.id != activity_id);
+        session.updated_at = now_millis();
+        Ok(())
+    }
+
+    pub fn mark_queued_prompt_needs_attention(
+        &self,
+        session_id: &str,
+        activity_id: &str,
+    ) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Could not update the Codex prompt queue".to_string())?;
+        let session = sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        if let Some(activity) = session
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == activity_id)
+        {
+            activity.title = "Queued prompt was not replayed".into();
+            activity.status = "failed".into();
+        } else {
+            remember_activity(
+                session,
+                SessionActivity {
+                    id: activity_id.to_string(),
+                    kind: "queued_prompt".into(),
+                    title: "Queued prompt was not replayed".into(),
+                    detail: Some(
+                        "Lume could not confirm delivery and did not resend it automatically."
+                            .into(),
+                    ),
+                    status: "failed".into(),
+                    created_at: now_millis(),
+                    files: Vec::new(),
+                    attachments: Vec::new(),
+                    append_detail: false,
+                },
+            );
+        }
+        session.updated_at = now_millis();
         Ok(())
     }
 
@@ -641,10 +889,8 @@ impl AppState {
     }
 
     fn session_native_id(&self, session_id: &str) -> Result<String, String> {
-        self.sessions()?
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .and_then(|session| session.native_session_id)
+        self.connected_session(session_id)?
+            .native_session_id
             .ok_or_else(|| "This session does not have a persistent conversation id".to_string())
     }
 
@@ -665,6 +911,20 @@ impl AppState {
             .lock()
             .map_err(|_| "Could not restore workflow runs".to_string())?
             .workflow_runs()
+    }
+
+    pub fn save_workflow_history(&self, record: &WorkflowHistoryRecord) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "Could not persist the workflow history".to_string())?
+            .save_workflow_history(record)
+    }
+
+    pub fn workflow_history(&self, limit: usize) -> Result<Vec<WorkflowHistoryRecord>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Could not load the workflow history".to_string())?
+            .workflow_history(limit)
     }
 
     pub fn save_result_note(
@@ -1043,44 +1303,52 @@ impl AppState {
             }
             HookEventKind::Activity => None,
             HookEventKind::PermissionRequest => {
-                let mut permission = event
-                    .permission
-                    .ok_or_else(|| "A solicitação não contém a permissão".to_string())?;
-                if repeated_permission {
-                    if let Some(current) = session.pending_permission.as_ref() {
-                        permission.id.clone_from(&current.id);
-                        permission.requested_at.clone_from(&current.requested_at);
+                if session.permission_profile.automatically_approves() {
+                    session.status = SessionStatus::Running;
+                    session.status_label = "Executando".into();
+                    session.pending_permission = None;
+                    session.pending_question = None;
+                    None
+                } else {
+                    let mut permission = event
+                        .permission
+                        .ok_or_else(|| "A solicitação não contém a permissão".to_string())?;
+                    if repeated_permission {
+                        if let Some(current) = session.pending_permission.as_ref() {
+                            permission.id.clone_from(&current.id);
+                            permission.requested_at.clone_from(&current.requested_at);
+                        }
                     }
+                    let id = permission.id.clone();
+                    session.status = SessionStatus::PermissionRequired;
+                    session.status_label = event
+                        .status_label
+                        .unwrap_or_else(|| "Aguardando permissão".into());
+                    session.pending_permission = Some(permission);
+                    session.pending_question = None;
+                    remember_activity(
+                        session,
+                        SessionActivity {
+                            id: format!("permission:{id}"),
+                            kind: "permission".into(),
+                            title: session
+                                .pending_permission
+                                .as_ref()
+                                .map(|permission| permission.summary.clone())
+                                .unwrap_or_else(|| "Permissão solicitada".into()),
+                            detail: session
+                                .pending_permission
+                                .as_ref()
+                                .map(|permission| permission.resource.clone()),
+                            status: "waiting".into(),
+                            created_at: now,
+                            files: Vec::new(),
+                            attachments: Vec::new(),
+                            append_detail: false,
+                        },
+                    );
+                    Some(id)
                 }
-                let id = permission.id.clone();
-                session.status = SessionStatus::PermissionRequired;
-                session.status_label = event
-                    .status_label
-                    .unwrap_or_else(|| "Aguardando permissão".into());
-                session.pending_permission = Some(permission);
-                session.pending_question = None;
-                remember_activity(
-                    session,
-                    SessionActivity {
-                        id: format!("permission:{id}"),
-                        kind: "permission".into(),
-                        title: session
-                            .pending_permission
-                            .as_ref()
-                            .map(|permission| permission.summary.clone())
-                            .unwrap_or_else(|| "Permissão solicitada".into()),
-                        detail: session
-                            .pending_permission
-                            .as_ref()
-                            .map(|permission| permission.resource.clone()),
-                        status: "waiting".into(),
-                        created_at: now,
-                        files: Vec::new(),
-                        attachments: Vec::new(),
-                        append_detail: false,
-                    },
-                );
-                Some(id)
             }
             HookEventKind::QuestionRequest => {
                 let question = event
@@ -1565,6 +1833,13 @@ impl AppState {
         let recovered_identities = recover_process_identities(&discovered, &sessions);
         let recovered_work = recovered_identities
             .iter()
+            .filter(|(process_id, (native_id, _))| {
+                !sessions.iter().any(|session| {
+                    session.process_id == Some(**process_id)
+                        || (session.native_session_id.as_deref() == Some(native_id.as_str())
+                            && !session.activities.is_empty())
+                })
+            })
             .map(|(process_id, (native_id, _))| {
                 let kind = discovered
                     .iter()
@@ -1649,6 +1924,9 @@ impl AppState {
                     .filter(|session| exact_native_chat_ids.contains(&session.id))
                 {
                     let mut refreshed = false;
+                    if let Some(identity) = recovered_identities.get(&process.process_id) {
+                        refreshed |= apply_recovered_identity(session, identity);
+                    }
                     if session.process_id != Some(process.process_id) {
                         session.process_id = Some(process.process_id);
                         refreshed = true;
@@ -1678,7 +1956,7 @@ impl AppState {
                     !is_provisional_process(session)
                         && session_matches_process(session, &process)
                         && session.source == SessionSource::Vscode
-                        && session_can_own_process(session, now)
+                        && session_can_own_process(session, now, &active_pids)
                 });
             if has_recent_native_vscode_chat {
                 let provisional_ids = sessions
@@ -1708,7 +1986,7 @@ impl AppState {
                             session_matches_process(session, &process)
                                 && session.source == process.source
                                 && session.working_directory.as_ref() == Some(directory)
-                                && session_can_own_process(session, now)
+                                && session_can_own_process(session, now, &active_pids)
                                 && session.process_id.is_none_or(|pid| {
                                     pid == process.process_id || !active_pids.contains(&pid)
                                 })
@@ -1724,7 +2002,7 @@ impl AppState {
                     .filter(|session| {
                         session_matches_process(session, &process)
                             && session.source == process.source
-                            && session_can_own_process(session, now)
+                            && session_can_own_process(session, now, &active_pids)
                             && session.process_id.is_none_or(|pid| {
                                 pid == process.process_id || !active_pids.contains(&pid)
                             })
@@ -1796,12 +2074,8 @@ impl AppState {
                     session.agent_label = process.agent_label.clone();
                     refreshed = true;
                 }
-                if session.session_name.trim().is_empty() {
-                    if let Some((native_id, name)) = recovered_identities.get(&process.process_id) {
-                        session.native_session_id = Some(native_id.clone());
-                        session.session_name = name.clone();
-                        refreshed = true;
-                    }
+                if let Some(identity) = recovered_identities.get(&process.process_id) {
+                    refreshed |= apply_recovered_identity(session, identity);
                 }
                 if session.activities.is_empty() {
                     if let Some(activities) = recovered_work.get(&process.process_id) {
@@ -1875,6 +2149,7 @@ impl AppState {
                 project,
                 source: process.source,
                 source_app: None,
+                control_origin: SessionControlOrigin::External,
                 status: SessionStatus::WaitingForInput,
                 status_label: "Esperando ação".into(),
                 started_at: now.to_string(),
@@ -2001,6 +2276,7 @@ fn session_from_event(event: &HookEvent, now: i64) -> AgentSession {
         project,
         source: event.source.clone().unwrap_or(SessionSource::Cli),
         source_app: event.source_app.clone(),
+        control_origin: event.control_origin.clone(),
         status: SessionStatus::WaitingForInput,
         status_label: "Esperando ação".into(),
         started_at: event.started_at.clone().unwrap_or_else(|| now.to_string()),
@@ -2781,6 +3057,9 @@ fn apply_metadata(session: &mut AgentSession, event: &HookEvent) {
     if let Some(source_app) = &event.source_app {
         session.source_app = Some(source_app.clone());
     }
+    if event.control_origin == SessionControlOrigin::Lume {
+        session.control_origin = SessionControlOrigin::Lume;
+    }
     if let Some(process_id) = event.process_id {
         session.process_id = Some(process_id);
     }
@@ -2856,73 +3135,111 @@ fn recover_process_identities(
             sessions
                 .iter()
                 .find(|session| session.process_id == Some(process.process_id))
-                .is_none_or(|session| {
-                    session.native_session_id.is_none() || session.session_name.trim().is_empty()
-                })
+                .is_none_or(session_needs_recovered_identity)
         })
         .collect::<Vec<_>>();
     if unresolved.is_empty() {
         return HashMap::new();
     }
 
-    let mut catalogs = HashMap::<IntegrationKind, Vec<ResumableSession>>::new();
+    let mut indexed_names = unresolved
+        .iter()
+        .filter_map(|process| integration_kind_for_agent(&process.agent))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|kind| {
+            let names = integrations::indexed_session_names(&kind).unwrap_or_default();
+            (kind, names)
+        })
+        .collect::<HashMap<_, _>>();
     for process in &unresolved {
         let Some(kind) = integration_kind_for_agent(&process.agent) else {
             continue;
         };
-        catalogs
-            .entry(kind.clone())
-            .or_insert_with(|| integrations::resumable_sessions(&kind).unwrap_or_default());
+        let Some(names) = indexed_names.get_mut(&kind) else {
+            continue;
+        };
+        for native_id in &process.native_session_ids {
+            if names.contains_key(native_id) {
+                continue;
+            }
+            if let Some(title) = integrations::native_session_title(&kind, native_id) {
+                names.insert(native_id.clone(), title);
+            }
+        }
     }
 
+    recover_process_identities_from_index(unresolved, sessions, &indexed_names)
+}
+
+fn recover_process_identities_from_index(
+    unresolved: Vec<&DiscoveredProcess>,
+    sessions: &[AgentSession],
+    indexed_names: &HashMap<IntegrationKind, HashMap<String, String>>,
+) -> HashMap<u32, (String, String)> {
     unresolved
         .into_iter()
         .filter_map(|process| {
             let kind = integration_kind_for_agent(&process.agent)?;
-            let candidates = catalogs.get(&kind)?;
-            let exact = candidates.iter().find(|candidate| {
-                process
-                    .native_session_ids
-                    .iter()
-                    .any(|id| id == &candidate.id)
-            });
-            let fallback = if !cfg!(test)
-                && exact.is_none()
-                && discovered
-                    .iter()
-                    .filter(|other| {
-                        other.agent == process.agent
-                            && same_directory(
-                                other.working_directory.as_deref(),
-                                process.working_directory.as_deref(),
-                            )
-                    })
-                    .count()
-                    == 1
-            {
-                candidates.iter().find(|candidate| {
-                    same_directory(
-                        Some(&candidate.working_directory),
-                        process.working_directory.as_deref(),
-                    )
+            let native_id = process.native_session_ids.first()?.clone();
+            let name = indexed_names
+                .get(&kind)
+                .and_then(|names| names.get(&native_id))
+                .cloned()
+                .or_else(|| {
+                    sessions
+                        .iter()
+                        .find(|session| {
+                            session.process_id == Some(process.process_id)
+                                && session.native_session_id.as_deref() == Some(&native_id)
+                        })
+                        .map(|session| session.session_name.trim().to_string())
+                        .filter(|name| !name.is_empty())
                 })
-            } else {
-                None
-            };
-            exact.or(fallback).map(|candidate| {
-                (
-                    process.process_id,
-                    (candidate.id.clone(), candidate.name.clone()),
-                )
-            })
+                .or_else(|| {
+                    process
+                        .working_directory
+                        .as_deref()
+                        .and_then(|directory| Path::new(directory).file_name())
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| process.agent_label.clone());
+            Some((process.process_id, (native_id, name)))
         })
         .collect()
+}
+
+fn session_needs_recovered_identity(session: &AgentSession) -> bool {
+    session.native_session_id.is_none()
+        || session.session_name.trim().is_empty()
+        || (session.agent == AgentKind::Codex
+            && normalized_session_name(&session.session_name)
+                == normalized_session_name(&session.project))
+}
+
+fn apply_recovered_identity(
+    session: &mut AgentSession,
+    (native_id, name): &(String, String),
+) -> bool {
+    let mut changed = false;
+    if session.native_session_id.as_deref() != Some(native_id.as_str()) {
+        session.native_session_id = Some(native_id.clone());
+        changed = true;
+    }
+    if session.session_name != *name {
+        session.session_name = name.clone();
+        changed = true;
+    }
+    changed
 }
 
 fn integration_kind_for_agent(agent: &AgentKind) -> Option<IntegrationKind> {
     match agent {
         AgentKind::Codex => Some(IntegrationKind::Codex),
         AgentKind::ClaudeCode => Some(IntegrationKind::Claude),
+        AgentKind::Antigravity => Some(IntegrationKind::Antigravity),
+        AgentKind::DeepSeek => Some(IntegrationKind::DeepSeek),
         AgentKind::Gemini => Some(IntegrationKind::Gemini),
         AgentKind::ChatGpt | AgentKind::Claude | AgentKind::Unknown => None,
     }
@@ -2981,11 +3298,25 @@ fn session_matches_process(session: &AgentSession, process: &DiscoveredProcess) 
     )
 }
 
-fn session_can_own_process(session: &AgentSession, now: i64) -> bool {
-    matches!(
-        session.status,
-        SessionStatus::Running | SessionStatus::PermissionRequired | SessionStatus::WaitingForInput
-    ) || now.saturating_sub(session.updated_at) < RECENT_NATIVE_SESSION_MS
+fn session_can_own_process(
+    session: &AgentSession,
+    now: i64,
+    active_pids: &std::collections::HashSet<u32>,
+) -> bool {
+    match session.status {
+        SessionStatus::Running
+        | SessionStatus::PermissionRequired
+        | SessionStatus::WaitingForInput => {
+            if let Some(process_id) = session.process_id {
+                active_pids.contains(&process_id) || session.source == SessionSource::Cli
+            } else if session.agent == AgentKind::Codex && session.source == SessionSource::Cli {
+                now.saturating_sub(session.updated_at) < PIDLESS_CODEX_SESSION_TTL_MS
+            } else {
+                true
+            }
+        }
+        _ => now.saturating_sub(session.updated_at) < RECENT_NATIVE_SESSION_MS,
+    }
 }
 
 fn is_home_directory(directory: Option<&str>) -> bool {
@@ -3106,6 +3437,8 @@ fn agent_label(agent: &AgentKind) -> &'static str {
         AgentKind::ChatGpt => "ChatGPT",
         AgentKind::Claude => "Claude",
         AgentKind::ClaudeCode => "Claude Code",
+        AgentKind::Antigravity => "Antigravity",
+        AgentKind::DeepSeek => "DeepSeek",
         AgentKind::Gemini => "Gemini",
         AgentKind::Unknown => "Agente",
     }
@@ -3144,6 +3477,8 @@ fn persistent_session_alias_key(session: &AgentSession) -> Option<String> {
         AgentKind::ChatGpt => "chatgpt".to_string(),
         AgentKind::Claude => "claude".to_string(),
         AgentKind::ClaudeCode => "claude_code".to_string(),
+        AgentKind::Antigravity => "antigravity".to_string(),
+        AgentKind::DeepSeek => "deepseek".to_string(),
         AgentKind::Gemini => "gemini".to_string(),
         AgentKind::Unknown => format!("unknown:{}", session.agent_label.to_lowercase()),
     };
@@ -3231,6 +3566,7 @@ mod tests {
             project: Some("lume".into()),
             source: Some(SessionSource::Cli),
             source_app: None,
+            control_origin: SessionControlOrigin::External,
             status_label: Some("Sessão detectada".into()),
             started_at: None,
             process_id: Some(process_id),
@@ -3388,6 +3724,31 @@ mod tests {
     }
 
     #[test]
+    fn transferred_session_becomes_promptable_without_losing_its_thread() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:external", 4242);
+        event.agent = AgentKind::Codex;
+        event.source = Some(SessionSource::Vscode);
+        event.native_session_id = Some("thread-external".into());
+        state.ingest(event).expect("sessão externa");
+
+        state
+            .mark_session_lume_controlled("codex:external")
+            .expect("transferência");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.control_origin, SessionControlOrigin::Lume);
+        assert_eq!(session.source, SessionSource::Cli);
+        assert_eq!(
+            session.native_session_id.as_deref(),
+            Some("thread-external")
+        );
+        assert_eq!(session.status, SessionStatus::WaitingForInput);
+        assert!(session.process_id.is_none());
+        assert!(session.permission_profile.can_respond_from_lume);
+    }
+
+    #[test]
     fn session_names_are_unique_per_native_thread() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let first = started_event("claude:first", 4101);
@@ -3403,6 +3764,49 @@ mod tests {
             .map(|session| session.session_name)
             .collect::<HashSet<_>>();
         assert_eq!(names, HashSet::from(["lume".into(), "lume (2)".into()]));
+    }
+
+    #[test]
+    fn codex_project_fallback_is_replaced_by_the_native_thread_name() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:thread-1", 4103);
+        event.agent = AgentKind::Codex;
+        event.project = Some("user".into());
+        event.native_session_id = Some("thread-1".into());
+        state.ingest(event).expect("sessão");
+
+        let mut session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.session_name, "user");
+        assert!(session_needs_recovered_identity(&session));
+        assert!(apply_recovered_identity(
+            &mut session,
+            &("thread-1".into(), "Lume principal".into()),
+        ));
+        assert_eq!(session.session_name, "Lume principal");
+        assert_eq!(session.native_session_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn live_codex_identity_uses_the_exact_indexed_thread_name() {
+        let process = DiscoveredProcess {
+            agent: AgentKind::Codex,
+            agent_label: "Codex".into(),
+            process_id: 4104,
+            native_session_ids: vec!["thread-main".into()],
+            working_directory: Some("/home/user".into()),
+            source: SessionSource::Cli,
+        };
+        let names = HashMap::from([(
+            IntegrationKind::Codex,
+            HashMap::from([("thread-main".into(), "Lume principal".into())]),
+        )]);
+
+        let recovered = recover_process_identities_from_index(vec![&process], &[], &names);
+
+        assert_eq!(
+            recovered.get(&4104),
+            Some(&("thread-main".into(), "Lume principal".into()))
+        );
     }
 
     #[test]
@@ -3522,6 +3926,43 @@ mod tests {
         let started = state.sessions().expect("sessões").remove(0);
         assert_eq!(started.activities[0].kind, "prompt");
         assert_eq!(started.activities[0].status, "completed");
+    }
+
+    #[test]
+    fn uncertain_queued_prompt_is_marked_failed_instead_of_replayed() {
+        let state = AppState::new(Path::new(":memory:")).expect("state");
+        state
+            .ingest(started_event("codex:queue-recovery", 4242))
+            .expect("session");
+        state
+            .record_queued_prompt_activity(
+                "codex:queue-recovery",
+                "queued-1",
+                "Do not replay blindly",
+                Vec::new(),
+            )
+            .expect("queued prompt");
+        state
+            .mark_queued_prompt_needs_attention("codex:queue-recovery", "queued-1")
+            .expect("attention state");
+        let session = state.sessions().expect("sessions").remove(0);
+        assert_eq!(session.activities[0].kind, "queued_prompt");
+        assert_eq!(session.activities[0].status, "failed");
+        assert_eq!(
+            session.activities[0].title,
+            "Queued prompt was not replayed"
+        );
+
+        let recovered = AppState::new(Path::new(":memory:")).expect("recovered state");
+        recovered
+            .ingest(started_event("codex:queue-recovery", 4242))
+            .expect("recovered session");
+        recovered
+            .mark_queued_prompt_needs_attention("codex:queue-recovery", "queued-after-restart")
+            .expect("recovered attention state");
+        let session = recovered.sessions().expect("sessions").remove(0);
+        assert_eq!(session.activities[0].id, "queued-after-restart");
+        assert_eq!(session.activities[0].status, "failed");
     }
 
     #[test]
@@ -4492,6 +4933,37 @@ mod tests {
     }
 
     #[test]
+    fn automatic_profile_never_enters_the_permission_state() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut started = started_event("codex:chat-1", 4242);
+        started.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::WorkspaceWrite,
+            label: "Aprovar por mim".into(),
+            approval_policy: "on-request".into(),
+            approvals_reviewer: Some("auto_review".into()),
+            can_respond_from_lume: false,
+            available_actions: vec![PermissionAction::OpenSource],
+        });
+        state.ingest(started).expect("perfil automático");
+
+        let mut permission = started_event("codex:chat-1", 4242);
+        permission.event = HookEventKind::PermissionRequest;
+        permission.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Executar comando".into(),
+            resource: "cargo test".into(),
+            risk: "medium".into(),
+            requested_at: "1".into(),
+        });
+        state.ingest(permission).expect("permissão automática");
+
+        let session = state.sessions().expect("sessões").remove(0);
+        assert_eq!(session.status, SessionStatus::Running);
+        assert!(session.pending_permission.is_none());
+    }
+
+    #[test]
     fn one_agent_process_can_keep_multiple_native_chats() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let mut first = started_event("claude:chat-1", 4242);
@@ -4537,6 +5009,25 @@ mod tests {
     }
 
     #[test]
+    fn distinct_live_processes_remain_visible_after_one_receives_a_native_event() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        state
+            .ingest(started_event("claude:active-chat", 4242))
+            .expect("chat ativo");
+        state
+            .reconcile_processes(vec![discovered(4242), discovered(4343)])
+            .expect("descoberta");
+
+        let sessions = state.sessions().expect("sessões");
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .any(|session| session.process_id == Some(4242)));
+        assert!(sessions
+            .iter()
+            .any(|session| session.process_id == Some(4343)));
+    }
+    #[test]
     fn vscode_chat_hides_its_host_process_without_hiding_other_chats() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         state
@@ -4561,6 +5052,7 @@ mod tests {
                     project: Some("lume".into()),
                     source: Some(SessionSource::Vscode),
                     source_app: None,
+                    control_origin: SessionControlOrigin::External,
                     status_label: Some("Executando no VS Code".into()),
                     started_at: None,
                     process_id: None,

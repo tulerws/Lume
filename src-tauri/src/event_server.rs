@@ -35,11 +35,7 @@ pub fn start(state: AppState, app: AppHandle) -> Result<(), String> {
 
 fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
     let response = read_event(&stream).and_then(|mut event| {
-        let automatically_approved = matches!(event.event, HookEventKind::PermissionRequest)
-            && event
-                .permission_profile
-                .as_ref()
-                .is_some_and(|profile| profile.automatically_approves());
+        let automatically_approved = permission_is_automatically_approved(&state, &event)?;
         let wait_for_decision = event.wait_for_decision;
         let question_id = event.question.as_ref().map(|question| question.id.clone());
         if automatically_approved {
@@ -104,19 +100,35 @@ fn handle_connection(mut stream: TcpStream, state: AppState, app: AppHandle) {
     }
 }
 
+fn permission_is_automatically_approved(
+    state: &AppState,
+    event: &HookEvent,
+) -> Result<bool, String> {
+    if !matches!(event.event, HookEventKind::PermissionRequest) {
+        return Ok(false);
+    }
+    if event
+        .permission_profile
+        .as_ref()
+        .is_some_and(|profile| profile.automatically_approves())
+    {
+        return Ok(true);
+    }
+
+    state.session_automatically_approves(&event.session_id, event.native_session_id.as_deref())
+}
+
 pub fn publish_event(
     state: &AppState,
     app: &AppHandle,
     event: HookEvent,
 ) -> Result<Option<String>, String> {
-    let previous_status = state
-        .sessions()?
-        .into_iter()
-        .find(|session| session.id == event.session_id)
-        .map(|session| session.status);
+    let session_id = event.session_id.clone();
+    let native_session_id = event.native_session_id.clone();
+    let previous_status = state.session_status(&session_id, native_session_id.as_deref())?;
     let notification = notification_for(&event, previous_status.as_ref());
     let permission_id = state.ingest(event)?;
-    crate::protocol::emit_sessions_changed(app);
+    crate::protocol::emit_session_changed(app, &session_id, native_session_id.as_deref());
     if state.preferences()?.popup_notifications_enabled {
         if let Some((title, body)) = notification {
             let _ = app.notification().builder().title(title).body(body).show();
@@ -140,6 +152,8 @@ fn notification_for(
             crate::domain::AgentKind::ChatGpt => "ChatGPT".into(),
             crate::domain::AgentKind::Claude => "Claude".into(),
             crate::domain::AgentKind::ClaudeCode => "Claude Code".into(),
+            crate::domain::AgentKind::Antigravity => "Antigravity".into(),
+            crate::domain::AgentKind::DeepSeek => "DeepSeek".into(),
             crate::domain::AgentKind::Gemini => "Gemini".into(),
             crate::domain::AgentKind::Unknown => "Agente".into(),
         });
@@ -183,4 +197,69 @@ pub fn send_event(event_json: &str) -> Result<HookResponse, String> {
         .read_line(&mut response)
         .map_err(|error| error.to_string())?;
     serde_json::from_str(&response).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::domain::{
+        AccessMode, AgentKind, PermissionProfile, PermissionRequest, SessionSource,
+    };
+
+    fn event(kind: HookEventKind) -> HookEvent {
+        HookEvent {
+            event: kind,
+            session_id: "codex:thread-1".into(),
+            agent: AgentKind::Codex,
+            agent_label: Some("Codex".into()),
+            session_name: None,
+            project: Some("Lume".into()),
+            source: Some(SessionSource::Cli),
+            source_app: None,
+            control_origin: crate::domain::SessionControlOrigin::External,
+            status_label: None,
+            started_at: None,
+            process_id: Some(4242),
+            native_session_id: Some("thread-1".into()),
+            working_directory: Some("/work/lume".into()),
+            permission_profile: None,
+            permission: None,
+            question: None,
+            last_response: None,
+            activity: None,
+            activities: Vec::new(),
+            wait_for_decision: false,
+        }
+    }
+
+    #[test]
+    fn permission_uses_the_stored_automatic_profile_when_the_hook_omits_it() {
+        let state = AppState::new(Path::new(":memory:")).expect("state");
+        let mut started = event(HookEventKind::SessionStarted);
+        started.permission_profile = Some(PermissionProfile {
+            mode: AccessMode::WorkspaceWrite,
+            label: "Approve for me".into(),
+            approval_policy: "on-request".into(),
+            approvals_reviewer: Some("auto_review".into()),
+            can_respond_from_lume: false,
+            available_actions: vec![PermissionAction::OpenSource],
+        });
+        state.ingest(started).expect("stored profile");
+
+        let mut permission = event(HookEventKind::PermissionRequest);
+        permission.permission = Some(PermissionRequest {
+            id: "permission-1".into(),
+            kind: "command".into(),
+            summary: "Run command".into(),
+            resource: "cargo test".into(),
+            risk: "medium".into(),
+            requested_at: "1".into(),
+        });
+
+        assert!(
+            permission_is_automatically_approved(&state, &permission).expect("automatic decision")
+        );
+    }
 }

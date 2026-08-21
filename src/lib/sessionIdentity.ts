@@ -1,4 +1,4 @@
-import type { AgentSession, TerminalWindowState } from "$lib/domain";
+import type { AgentSession, ResumableSession, TerminalWindowState } from "$lib/domain";
 
 function normalizedDirectory(value?: string) {
   const normalized = value?.trim().replaceAll("\\", "/").replace(/\/+$/, "");
@@ -70,4 +70,14 @@ export function resolveTerminalSession<T extends AgentSession>(
     ),
   );
   return contextual.length === 1 ? contextual[0] : undefined;
+}
+
+export function resolveLiveResumableSession<T extends AgentSession>(
+  stored: ResumableSession,
+  sessions: T[],
+) {
+  const agent = stored.agent === "claude" ? "claude_code" : stored.agent;
+  return sessions.find((session) =>
+    session.agent === agent && session.nativeSessionId === stored.id
+  );
 }

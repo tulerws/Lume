@@ -13,7 +13,8 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     domain::{
         AgentKind, AgentSession, PermissionAction, PromptAttachmentInput, PromptDelivery,
-        QuestionAnswer, SessionActivity, SessionSource, SessionStatus,
+        QuestionAnswer, SessionActivity, SessionControlOrigin, SessionSource, SessionStatus,
+        WorkflowGroupDefinition, WorkflowHistoryRecord,
     },
     state::now_millis,
 };
@@ -36,6 +37,10 @@ pub const PROTOCOL_FEATURES: &[&str] = &[
     "prompt_interruption",
     "prompt_delivery",
     "response_files",
+    "session_takeover",
+    "session_model_settings",
+    "workflows",
+    "workflow_history",
 ];
 pub const STREAM_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 
@@ -46,6 +51,7 @@ pub enum PromptUnavailableReason {
     SessionNotConnected,
     WorkingDirectoryMissing,
     AgentBusy,
+    ExternalSession,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -60,6 +66,7 @@ pub struct SessionCapabilities {
     pub can_read_results: bool,
     pub can_attach_images: bool,
     pub can_interrupt: bool,
+    pub can_take_control: bool,
     pub prompt_deliveries: Vec<PromptDelivery>,
 }
 
@@ -77,6 +84,10 @@ impl SessionCapabilities {
             Some(PromptUnavailableReason::UnsupportedAgent)
         } else if session.native_session_id.is_none() {
             Some(PromptUnavailableReason::SessionNotConnected)
+        } else if session.control_origin == SessionControlOrigin::External
+            && matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode)
+        {
+            Some(PromptUnavailableReason::ExternalSession)
         } else if session.agent != AgentKind::Codex && session.working_directory.is_none() {
             Some(PromptUnavailableReason::WorkingDirectoryMissing)
         } else {
@@ -96,9 +107,16 @@ impl SessionCapabilities {
             can_interrupt: matches!(
                 session.status,
                 SessionStatus::Running | SessionStatus::PermissionRequired
-            ) && can_interrupt_session(session),
+            ) && session.control_origin == SessionControlOrigin::Lume
+                && can_interrupt_session(session),
+            can_take_control: session.control_origin == SessionControlOrigin::External
+                && matches!(session.source, SessionSource::Cli | SessionSource::Vscode)
+                && matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode)
+                && session.native_session_id.is_some()
+                && session.process_id.is_some(),
             prompt_deliveries: if session.agent == AgentKind::Codex
                 && session.source != SessionSource::Web
+                && session.control_origin == SessionControlOrigin::Lume
             {
                 vec![
                     PromptDelivery::NewTurn,
@@ -620,6 +638,8 @@ pub struct HubSnapshot {
     pub generated_at: i64,
     pub features: Vec<String>,
     pub sessions: Vec<HubSession>,
+    pub workflow_groups: Vec<WorkflowGroupDefinition>,
+    pub workflow_history: Vec<WorkflowHistoryRecord>,
 }
 
 impl HubSnapshot {
@@ -633,6 +653,8 @@ impl HubSnapshot {
                 .map(|feature| (*feature).to_string())
                 .collect(),
             sessions: sessions.into_iter().map(HubSession::from).collect(),
+            workflow_groups: Vec::new(),
+            workflow_history: Vec::new(),
         }
     }
 
@@ -650,6 +672,16 @@ impl HubSnapshot {
             }
         }
         snapshot
+    }
+
+    pub fn with_workflows(
+        mut self,
+        groups: Vec<WorkflowGroupDefinition>,
+        history: Vec<WorkflowHistoryRecord>,
+    ) -> Self {
+        self.workflow_groups = groups;
+        self.workflow_history = history;
+        self
     }
 }
 
@@ -693,6 +725,31 @@ pub enum HubCommand {
     },
     RefreshRateLimits {
         agent: AgentKind,
+    },
+    StartWorkflow {
+        workflow_id: String,
+        objective: String,
+    },
+    ApproveWorkflowHandoff {
+        workflow_id: String,
+    },
+    AdvanceWorkflow {
+        workflow_id: String,
+    },
+    PauseWorkflow {
+        workflow_id: String,
+    },
+    ResumeWorkflow {
+        workflow_id: String,
+    },
+    RetryWorkflowStep {
+        workflow_id: String,
+    },
+    SkipWorkflowStep {
+        workflow_id: String,
+    },
+    CancelWorkflow {
+        workflow_id: String,
     },
     ReportMobileVersion {
         version: String,
@@ -797,6 +854,33 @@ impl HubCommandRequest {
                 validate_identifier("attachment_id", attachment_id, 512)?;
             }
             HubCommand::RefreshRateLimits { .. } => {}
+            HubCommand::StartWorkflow {
+                workflow_id,
+                objective,
+            } => {
+                validate_identifier("workflow_id", workflow_id, 256)?;
+                if objective.trim().is_empty() {
+                    return Err(ProtocolError::new(
+                        "workflow_objective_empty",
+                        "Add an objective before running this workflow",
+                    ));
+                }
+                if objective.len() > 4_000 {
+                    return Err(ProtocolError::new(
+                        "workflow_objective_too_large",
+                        "The workflow objective exceeds 4000 characters",
+                    ));
+                }
+            }
+            HubCommand::ApproveWorkflowHandoff { workflow_id }
+            | HubCommand::AdvanceWorkflow { workflow_id }
+            | HubCommand::PauseWorkflow { workflow_id }
+            | HubCommand::ResumeWorkflow { workflow_id }
+            | HubCommand::RetryWorkflowStep { workflow_id }
+            | HubCommand::SkipWorkflowStep { workflow_id }
+            | HubCommand::CancelWorkflow { workflow_id } => {
+                validate_identifier("workflow_id", workflow_id, 256)?;
+            }
             HubCommand::ReportMobileVersion { version } => {
                 validate_identifier("version", version, 32)?;
                 if !version
@@ -931,6 +1015,7 @@ impl HubCommandResponse {
 )]
 pub enum HubEvent {
     SessionsChanged,
+    WorkflowsChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -992,23 +1077,58 @@ fn event_journal() -> &'static Mutex<VecDeque<HubEventEnvelope>> {
 }
 
 pub fn emit_sessions_changed(app: &AppHandle) {
+    emit_sessions_changed_for(app, None, None);
+}
+
+pub fn emit_session_changed(app: &AppHandle, session_id: &str, native_session_id: Option<&str>) {
+    emit_sessions_changed_for(app, Some(session_id), native_session_id);
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionChangePayload<'a> {
+    session_id: Option<&'a str>,
+    native_session_id: Option<&'a str>,
+}
+
+fn emit_sessions_changed_for(
+    app: &AppHandle,
+    session_id: Option<&str>,
+    native_session_id: Option<&str>,
+) {
+    let event = record_hub_event(HubEvent::SessionsChanged);
+    let _ = app.emit(
+        "lume://sessions-changed",
+        SessionChangePayload {
+            session_id,
+            native_session_id,
+        },
+    );
+    let _ = app.emit("lume://hub-event", event);
+}
+
+pub fn emit_workflows_changed(app: &AppHandle) {
+    let event = record_hub_event(HubEvent::WorkflowsChanged);
+    let _ = app.emit("lume://hub-event", event);
+}
+
+fn record_hub_event(event: HubEvent) -> HubEventEnvelope {
     let sequence = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let occurred_at = now_millis();
-    let event = HubEventEnvelope {
+    let envelope = HubEventEnvelope {
         protocol_version: PROTOCOL_VERSION,
         event_id: format!("{occurred_at}-{sequence}"),
         sequence,
         occurred_at,
-        event: HubEvent::SessionsChanged,
+        event,
     };
     if let Ok(mut journal) = event_journal().lock() {
         if journal.len() == 256 {
             journal.pop_front();
         }
-        journal.push_back(event.clone());
+        journal.push_back(envelope.clone());
     }
-    let _ = app.emit("lume://sessions-changed", ());
-    let _ = app.emit("lume://hub-event", event);
+    envelope
 }
 
 pub fn events_since(sequence: u64) -> Vec<HubEventEnvelope> {
@@ -1042,6 +1162,7 @@ mod tests {
             project: "Lume".into(),
             source: SessionSource::Cli,
             source_app: None,
+            control_origin: SessionControlOrigin::Lume,
             status: SessionStatus::WaitingForInput,
             status_label: "Esperando ação".into(),
             started_at: "1".into(),
@@ -1163,6 +1284,27 @@ mod tests {
                 PromptDelivery::Queue,
             ]
         );
+    }
+
+    #[test]
+    fn external_codex_cli_is_read_only_until_control_is_transferred() {
+        let mut external = session();
+        external.control_origin = SessionControlOrigin::External;
+        let capabilities = SessionCapabilities::for_session(&external);
+
+        assert!(!capabilities.can_prompt);
+        assert!(capabilities.can_take_control);
+        assert!(!capabilities.can_interrupt);
+        assert_eq!(
+            capabilities.prompt_unavailable_reason,
+            Some(PromptUnavailableReason::ExternalSession)
+        );
+        assert_eq!(
+            capabilities.prompt_deliveries,
+            vec![PromptDelivery::NewTurn]
+        );
+        external.source = SessionSource::Vscode;
+        assert!(SessionCapabilities::for_session(&external).can_take_control);
     }
 
     #[test]
@@ -1376,6 +1518,8 @@ mod tests {
         assert_eq!(snapshot["type"], "snapshot");
         assert_eq!(snapshot["sequence"], 9);
         assert_eq!(snapshot["snapshot"]["sessions"][0]["id"], "codex:thread-1");
+        assert!(snapshot["snapshot"]["workflowGroups"].is_array());
+        assert!(snapshot["snapshot"]["workflowHistory"].is_array());
     }
 
     #[test]
@@ -1428,6 +1572,34 @@ mod tests {
         assert_eq!(
             request.validate().expect_err("inválido").code,
             "prompt_empty"
+        );
+    }
+
+    #[test]
+    fn workflow_commands_are_versioned_and_validate_their_objective() {
+        let request: HubCommandRequest = serde_json::from_str(
+            r#"{"requestId":"workflow-mobile","type":"start_workflow","workflowId":"workflow-1","objective":"Review the change"}"#,
+        )
+        .expect("workflow command");
+        request.validate().expect("valid workflow command");
+        assert_eq!(
+            request.command,
+            HubCommand::StartWorkflow {
+                workflow_id: "workflow-1".into(),
+                objective: "Review the change".into(),
+            }
+        );
+
+        let invalid = HubCommandRequest {
+            request_id: "workflow-mobile-empty".into(),
+            command: HubCommand::StartWorkflow {
+                workflow_id: "workflow-1".into(),
+                objective: "  ".into(),
+            },
+        };
+        assert_eq!(
+            invalid.validate().expect_err("empty objective").code,
+            "workflow_objective_empty"
         );
     }
 

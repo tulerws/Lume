@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  resolveLiveResumableSession,
   resolveTerminalSession,
   terminalMatchesSession,
 } from "../src/lib/sessionIdentity.ts";
@@ -108,6 +109,24 @@ assert.equal(
   resolveTerminalSession(caseSensitiveTerminal, [lowerCaseParent, upperCaseParent])?.id,
   upperCaseParent.id,
   "Linux directory matching must remain case-sensitive",
+);
+
+assert.equal(
+  resolveLiveResumableSession(
+    { id: "thread-lume", agent: "codex" },
+    [vibePay, lume],
+  )?.id,
+  lume.id,
+  "resuming an already open Codex thread must reuse its detected Lume session",
+);
+
+assert.equal(
+  resolveLiveResumableSession(
+    { id: "claude-thread", agent: "claude" },
+    [session("claude-live", { agent: "claude_code", nativeSessionId: "claude-thread" })],
+  )?.id,
+  "claude-live",
+  "Claude resume entries must match the Claude Code runtime identity",
 );
 
 console.log("session identity test suite passed");

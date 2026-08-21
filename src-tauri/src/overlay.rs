@@ -612,6 +612,14 @@ mod linux {
             (22.0 - expansion).round() as i32
         };
         shape_xwayland_window(&gtk_window, width, height, radius);
+        if window.label() == "main" {
+            if width <= 78 && height <= 44 {
+                let input_region = rounded_window_region(width, height, radius);
+                gtk_window.input_shape_combine_region(Some(&input_region));
+            } else {
+                gtk_window.input_shape_combine_region(None);
+            }
+        }
         webview_resized
     }
 

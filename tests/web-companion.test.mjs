@@ -14,6 +14,7 @@ const { providerForHost, eventForTab } = context.LumeWebShared;
 assert.equal(providerForHost("chatgpt.com"), "chatgpt");
 assert.equal(providerForHost("chat.openai.com"), "chatgpt");
 assert.equal(providerForHost("claude.ai"), "claude");
+assert.equal(providerForHost("chat.deepseek.com"), "deepseek");
 assert.equal(providerForHost("gemini.google.com"), "gemini");
 assert.equal(providerForHost("example.com"), null);
 
@@ -26,6 +27,7 @@ const contentScripts = manifest.content_scripts?.[0]?.js ?? [];
 assert.deepEqual(contentScripts, ["shared.js", "content.js"]);
 assert.ok(manifest.content_scripts[0].matches.includes("https://chatgpt.com/*"));
 assert.ok(manifest.content_scripts[0].matches.includes("https://claude.ai/*"));
+assert.ok(manifest.content_scripts[0].matches.includes("https://chat.deepseek.com/*"));
 assert.ok(manifest.content_scripts[0].matches.includes("https://gemini.google.com/*"));
 
 console.log("web companion test suite passed");

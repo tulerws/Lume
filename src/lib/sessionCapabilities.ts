@@ -4,7 +4,8 @@ export type PromptUnavailableReason =
   | "unsupported_agent"
   | "session_not_connected"
   | "working_directory_missing"
-  | "agent_busy";
+  | "agent_busy"
+  | "external_session";
 
 export interface SessionCapabilities {
   canPrompt: boolean;
@@ -16,6 +17,7 @@ export interface SessionCapabilities {
   canReadResults: boolean;
   canAttachImages: boolean;
   canInterrupt: boolean;
+  canTakeControl: boolean;
   promptDeliveries: PromptDelivery[];
 }
 
@@ -31,6 +33,11 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
       promptUnavailableReason = "unsupported_agent";
     } else if (!session.nativeSessionId) {
       promptUnavailableReason = "session_not_connected";
+    } else if (
+      session.controlOrigin === "external"
+      && ["codex", "claude_code"].includes(session.agent)
+    ) {
+      promptUnavailableReason = "external_session";
     } else if (session.agent !== "codex" && !session.workingDirectory) {
       promptUnavailableReason = "working_directory_missing";
     }
@@ -49,11 +56,20 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
     canAttachImages: session.source !== "web" && session.agent !== "unknown",
     canInterrupt:
       ["running", "permission_required"].includes(session.status)
+      && session.controlOrigin === "lume"
       && session.source !== "web"
       && session.agent === "codex"
       && Boolean(session.nativeSessionId),
+    canTakeControl:
+      session.controlOrigin === "external"
+      && ["cli", "vscode"].includes(session.source)
+      && ["codex", "claude_code"].includes(session.agent)
+      && Boolean(session.nativeSessionId)
+      && Boolean(session.processId),
     promptDeliveries:
-      session.agent === "codex" && session.source !== "web"
+      session.agent === "codex"
+      && session.source !== "web"
+      && session.controlOrigin === "lume"
         ? ["new_turn", "steer", "queue"]
         : ["new_turn"],
   };

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { fade, slide } from "svelte/transition";
-  import { emit, listen } from "@tauri-apps/api/event";
+  import { emit, emitTo, listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
@@ -30,6 +30,7 @@
     prepareClipboardImage,
   } from "$lib/imageAttachments";
   import { renderSafeMarkdown } from "$lib/markdown.js";
+  import { BoundedRenderCache } from "$lib/boundedRenderCache";
   import { latestResponseText, sameResponseText } from "$lib/responseDedup.js";
   import {
     displayFileChangePath,
@@ -57,6 +58,8 @@
     decidePermission,
     finishLayeredTerminalResize,
     getSessionCollaborationMode,
+    getClaudeSessionModelSettings,
+    getSessionModelSettings,
     interruptPrompt,
     loadDisplayBackend,
     loadPreferences,
@@ -80,16 +83,20 @@
     saveSessionNote,
     setWorkflowConnectionHover,
     setSessionCollaborationMode,
+    setClaudeSessionModelSettings,
+    setSessionModelSettings,
     setTerminalFileDialogActive,
     steerQueuedPrompt,
     submitPrompt,
     syncTerminalWindowPosition,
     terminalGroupFullscreenActive,
+    takeControlSession,
     terminateSession,
     deleteSessionNote,
     toggleTerminalGroupFullscreen,
     undockTerminalWindow,
     type CollaborationMode,
+    type CodexThreadModelSettings,
     type DisplayBackend,
   } from "$lib/lume";
 
@@ -101,7 +108,7 @@
     name: string;
     description: string;
     source: "agent" | "lume";
-    action?: "plan" | "default" | "interrupt" | "steer" | "rename" | "detach" | "fullscreen" | "zoom-in" | "zoom-out" | "close";
+    action?: "model" | "plan" | "default" | "interrupt" | "steer" | "rename" | "detach" | "fullscreen" | "zoom-in" | "zoom-out" | "close";
   };
   let windowState = $state<TerminalWindowState | null>(null);
   let session = $state<HubSession | null>(null);
@@ -139,6 +146,16 @@
   let collaborationModeTarget = $state<CollaborationMode | null>(null);
   let collaborationModeNotice = $state<string | null>(null);
   let collaborationModeNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  let composerToolsOpen = $state(false);
+  let modelDialogOpen = $state(false);
+  let modelSettings = $state<CodexThreadModelSettings | null>(null);
+  let selectedModel = $state("");
+  let selectedEffort = $state("");
+  let claudeModel = $state("");
+  let claudeEffort = $state("");
+  let modelLoading = $state(false);
+  let modelSaving = $state(false);
+  let modelError = $state<string | null>(null);
   let questionSelections = $state<Record<string, string>>({});
   let dragging = $state(false);
   let dragMoved = false;
@@ -177,11 +194,15 @@
   let pendingResize: { x: number; y: number; width: number; height: number; fromLeft: boolean; fromTop: boolean } | null = null;
   let resizeSyncRunning = false;
   let resizeFrame: number | null = null;
+  let resizeThrottleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastResizeFlushAt = 0;
   let settling = $state(false);
   let dockMovingLabel = $state<string | null>(null);
   let dockPreview = $state<NonNullable<DockPreviewEvent["preview"]> | null>(null);
   let terminateConfirm = $state(false);
   let terminating = $state(false);
+  let takeoverConfirm = $state(false);
+  let takingControl = $state(false);
   let interrupting = $state(false);
   let renamingSession = $state(false);
   let renameDraft = $state("");
@@ -223,15 +244,15 @@
   let workflowRolePopoverStyle = $state("");
   let workflowRolePopoverAbove = $state(false);
   let workflowRolePopoverConstrained = $state(false);
-  let preparedWorkflowBridgeSide: DockSide | null = null;
-  let workflowBridgePreparation: Promise<void> | null = null;
+  let workflowBridgeOpeningSide = $state<DockSide | null>(null);
   let hoveredWorkflowConnectionSides = $state<DockSide[]>([]);
   let workflowConnectionLeaveTimer: ReturnType<typeof setTimeout> | undefined;
   let systemDark = $state(false);
   let workClock = $state(Date.now());
   let workClockTimer: ReturnType<typeof setTimeout> | undefined;
-  const markdownRenderCache = new Map<string, string>();
-  const activityChangeCache = new Map<string, { detail: string; filesKey: string; changes: FileChangeSummary[] }>();
+  const markdownRenderCache = new BoundedRenderCache();
+  const activityChangeCache = new Map<string, { detail: string; filesKey: string; changes: FileChangeSummary[]; cost: number }>();
+  let activityChangeCacheCost = 0;
   const composerMinHeight = 63;
   const composerAttachmentMinHeight = 120;
   const composerQueueMinHeight = 104;
@@ -246,7 +267,6 @@
     target: HTMLElement;
   } | null = null;
   let textZoom = $state(1);
-  let textZoomOpen = $state(false);
   let headerActionsOpen = $state(false);
   const effectiveDark = $derived(darkMode ?? systemDark);
   const workflowGroup = $derived.by(() => {
@@ -537,29 +557,41 @@
   async function openWorkflowBridgeFromConnection(event: MouseEvent, side: DockSide) {
     event.preventDefault();
     event.stopPropagation();
-    if (!windowState?.groupId) return;
+    if (!windowState?.groupId || workflowBridgeOpeningSide) return;
     workflowDraftError = null;
+    workflowBridgeOpeningSide = side;
+    let preparedLabel: string | null = null;
+    const readyLabels = new Set<string>();
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => (resolveReady = resolve));
+    let stopReady: (() => void) | undefined;
+    let readyTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      if (workflowBridgePreparation) await workflowBridgePreparation;
+      stopReady = await listen<{ label: string }>("lume://workflow-bridge-ready", ({ payload }) => {
+        readyLabels.add(payload.label);
+        if (payload.label === preparedLabel) resolveReady?.();
+      });
+      preparedLabel = await prepareWorkflowBridgeWindow(label, side);
+      await emitTo(preparedLabel, "lume://workflow-bridge-prepare");
+      if (!readyLabels.has(preparedLabel)) {
+        await Promise.race([
+          ready,
+          new Promise<never>((_, reject) => {
+            readyTimeout = setTimeout(() => reject(new Error(tr(
+              "The connection window took too long to load.",
+              "A janela de conexão demorou demais para carregar.",
+            ))), 8_000);
+          }),
+        ]);
+      }
       await openWorkflowBridgeWindow(label, side);
-      preparedWorkflowBridgeSide = null;
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      if (readyTimeout) clearTimeout(readyTimeout);
+      stopReady?.();
+      workflowBridgeOpeningSide = null;
     }
-  }
-
-  function prepareWorkflowBridge(side: DockSide) {
-    if (!windowState?.groupId || windowState.workflowBridgeOpen) return;
-    if (preparedWorkflowBridgeSide === side || workflowBridgePreparation) return;
-    preparedWorkflowBridgeSide = side;
-    workflowBridgePreparation = prepareWorkflowBridgeWindow(label, side)
-      .then(() => undefined)
-      .catch(() => {
-        preparedWorkflowBridgeSide = null;
-      })
-      .finally(() => {
-        workflowBridgePreparation = null;
-      });
   }
 
   function oppositeDockSide(side: DockSide): DockSide {
@@ -575,7 +607,6 @@
       workflowConnectionLeaveTimer = undefined;
     }
     void setWorkflowConnectionHover(label, side, true).catch(() => undefined);
-    prepareWorkflowBridge(side);
   }
 
   function leaveWorkflowConnection(side: DockSide) {
@@ -720,6 +751,7 @@
     session ? session.capabilities ?? sessionCapabilities(session) : null,
   );
   const canSubmit = $derived(Boolean(capabilities?.canPrompt));
+  const canCompose = $derived(Boolean(canSubmit || capabilities?.canTakeControl));
   const promptIsRunning = $derived(session?.status === "running");
   const canSendWhileRunning = $derived(
     Boolean(
@@ -738,6 +770,7 @@
       && (
         ["completed", "failed", "waiting_for_input"].includes(session.status)
         || canSendWhileRunning
+        || capabilities?.canTakeControl
       ),
     ),
   );
@@ -837,16 +870,38 @@
     ["quit", "Exit Gemini CLI"],
   ];
 
+  const antigravitySlashCommands: Array<[string, string]> = [
+    ["model", "Choose the Antigravity model"],
+    ["effort", "Choose the reasoning effort"],
+    ["resume", "Resume or switch conversations"],
+    ["tasks", "Inspect background tasks"],
+    ["permissions", "Review agent permissions"],
+    ["usage", "Inspect current usage"],
+    ["diff", "Review changed files"],
+    ["btw", "Add context without interrupting the task"],
+    ["hooks", "Manage lifecycle hooks"],
+    ["settings", "Open Antigravity settings"],
+    ["help", "Show Antigravity help"],
+    ["quit", "Exit Antigravity CLI"],
+  ];
+
   function agentSlashCommands(): SlashCommand[] {
     const catalog =
       session?.agent === "codex"
         ? codexSlashCommands
         : session?.agent === "claude_code"
           ? claudeSlashCommands
+          : session?.agent === "antigravity"
+            ? antigravitySlashCommands
           : session?.agent === "gemini"
             ? geminiSlashCommands
             : [];
-    return catalog.map(([name, description]) => ({ name, description, source: "agent" }));
+    return catalog.map(([name, description]) => ({
+      name,
+      description,
+      source: ["codex", "claude_code"].includes(session?.agent ?? "") && name === "model" ? "lume" : "agent",
+      action: ["codex", "claude_code"].includes(session?.agent ?? "") && name === "model" ? "model" : undefined,
+    }));
   }
 
   function availableSlashCommands(): SlashCommand[] {
@@ -1049,6 +1104,12 @@
         "Aguarde o agente web terminar antes de enviar outro prompt",
       );
     }
+    if (capabilities?.promptUnavailableReason === "external_session") {
+      return tr(
+        "Write a prompt to transfer this session to Lume",
+        "Escreva um prompt para transferir esta sessão para o Lume",
+      );
+    }
     return tr(
       "This agent does not support prompts through Lume yet",
       "Este agente ainda não aceita prompts pelo Lume",
@@ -1079,29 +1140,28 @@
     if (cached?.detail === detail && cached.filesKey === filesKey) {
       return cached.changes.map((change) => ({ ...change }));
     }
+    if (cached) activityChangeCacheCost -= cached.cost;
     const changes = summarizeFileChanges(detail, reportedFiles, session?.workingDirectory);
-    activityChangeCache.set(activity.id, {
+    const nextCacheEntry = {
       detail,
       filesKey,
       changes: changes.map((change) => ({ ...change })),
-    });
-    if (activityChangeCache.size > 600) {
+      cost: (detail.length + filesKey.length) * 2,
+    };
+    activityChangeCache.set(activity.id, nextCacheEntry);
+    activityChangeCacheCost += nextCacheEntry.cost;
+    while (activityChangeCache.size > 160 || activityChangeCacheCost > 4 * 1024 * 1024) {
       const oldest = activityChangeCache.keys().next().value;
-      if (oldest) activityChangeCache.delete(oldest);
+      if (!oldest) break;
+      const removed = activityChangeCache.get(oldest);
+      activityChangeCache.delete(oldest);
+      if (removed) activityChangeCacheCost -= removed.cost;
     }
     return changes;
   }
 
-  function renderCachedMarkdown(value: string): string {
-    const cached = markdownRenderCache.get(value);
-    if (cached !== undefined) return cached;
-    const rendered = renderSafeMarkdown(value);
-    markdownRenderCache.set(value, rendered);
-    if (markdownRenderCache.size > 240) {
-      const oldest = markdownRenderCache.keys().next().value;
-      if (oldest) markdownRenderCache.delete(oldest);
-    }
-    return rendered;
+  function renderCachedMarkdown(key: string, value: string): string {
+    return markdownRenderCache.render(key, value, renderSafeMarkdown);
   }
   const changedFiles = $derived.by(() => {
     const files: FileChangeSummary[] = [];
@@ -1429,6 +1489,9 @@
     let sessionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
     let sessionRefreshRunning = false;
     let sessionRefreshQueued = false;
+    let sessionRefreshDeferred = false;
+    let terminalVisible = document.visibilityState !== "hidden";
+    let handleDocumentVisibility: (() => void) | undefined;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = (event: MediaQueryListEvent | MediaQueryList) => {
       systemDark = event.matches;
@@ -1444,8 +1507,8 @@
     };
     const closeHeaderPopovers = (event: PointerEvent) => {
       if (!(event.target instanceof Element)) return;
-      if (!event.target.closest(".text-zoom-control")) textZoomOpen = false;
       if (!event.target.closest(".header-overflow")) headerActionsOpen = false;
+      if (!event.target.closest(".composer-tools")) composerToolsOpen = false;
       if (!event.target.closest(".workflow-role-control")) {
         workflowDraft = null;
         workflowRolePickerOpen = false;
@@ -1485,16 +1548,18 @@
     document.addEventListener("pointerdown", closeHeaderPopovers);
     window.addEventListener("keydown", interruptOnEscape);
     void (async () => {
-      const [nextPreferences, nextDisplayBackend, nextWorkflowTerminals] = await Promise.all([
+      const [nextPreferences, nextDisplayBackend, nextWorkflowTerminals, nextTerminalVisible] = await Promise.all([
         loadPreferences(),
         loadDisplayBackend(),
         loadTerminalWindows().catch(() => []),
+        currentWindow.isVisible().catch(() => true),
       ]);
       language = nextPreferences.language;
       darkMode = nextPreferences.darkMode;
       workflowGroups = nextPreferences.workflowGroups;
       workflowTerminals = nextWorkflowTerminals;
       displayBackend = nextDisplayBackend;
+      terminalVisible = nextTerminalVisible;
       fullscreen = await currentWindow.isFullscreen().catch(() => false);
       if (!fullscreen) fullscreen = await terminalGroupFullscreenActive(label).catch(() => false);
       await initializeTerminal();
@@ -1522,6 +1587,10 @@
         }
       };
       const queueSessionRefresh = () => {
+        if (!terminalVisible || document.visibilityState === "hidden") {
+          sessionRefreshDeferred = true;
+          return;
+        }
         sessionRefreshQueued = true;
         if (sessionRefreshRunning || sessionRefreshTimer) return;
         const refreshDelay = resizing || dragging
@@ -1534,16 +1603,40 @@
           void flushSessionRefresh();
         }, refreshDelay);
       };
-      stopListening = await listen("lume://sessions-changed", queueSessionRefresh);
+      const resumeDeferredRefresh = () => {
+        if (!terminalVisible || document.visibilityState === "hidden" || !sessionRefreshDeferred) return;
+        sessionRefreshDeferred = false;
+        queueSessionRefresh();
+      };
+      handleDocumentVisibility = () => {
+        terminalVisible = document.visibilityState !== "hidden";
+        resumeDeferredRefresh();
+      };
+      document.addEventListener("visibilitychange", handleDocumentVisibility);
+      stopListening = await listen<{
+        sessionId?: string;
+        nativeSessionId?: string;
+      }>("lume://sessions-changed", ({ payload }) => {
+        const targeted = Boolean(payload?.sessionId || payload?.nativeSessionId);
+        const affectsTerminal = !targeted
+          || payload.sessionId === session?.id
+          || payload.sessionId === windowState?.sessionId
+          || payload.nativeSessionId === session?.nativeSessionId
+          || payload.nativeSessionId === windowState?.sessionNativeId;
+        if (affectsTerminal) queueSessionRefresh();
+      });
       stopWindowChanges = await listen("lume://terminal-windows-changed", async () => {
         try {
-          const [nextWindowState, nextWorkflowTerminals] = await Promise.all([
+          const [nextWindowState, nextWorkflowTerminals, nextTerminalVisible] = await Promise.all([
             loadTerminalWindowState(label),
             loadTerminalWindows(),
+            currentWindow.isVisible().catch(() => terminalVisible),
           ]);
           windowState = nextWindowState;
           workflowTerminals = nextWorkflowTerminals;
+          terminalVisible = nextTerminalVisible;
           fullscreen = await terminalGroupFullscreenActive(label);
+          resumeDeferredRefresh();
         } catch {
           // The window may be closing.
         }
@@ -1636,9 +1729,11 @@
       colorScheme.removeEventListener("change", syncSystemTheme);
       document.removeEventListener("click", openMarkdownLink);
       document.removeEventListener("pointerdown", closeHeaderPopovers);
+      if (handleDocumentVisibility) document.removeEventListener("visibilitychange", handleDocumentVisibility);
       window.removeEventListener("keydown", interruptOnEscape);
       if (resizeEndTimer) clearTimeout(resizeEndTimer);
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      if (resizeThrottleTimer) clearTimeout(resizeThrottleTimer);
       if (nativeDragEndTimer) clearTimeout(nativeDragEndTimer);
       if (collaborationModeNoticeTimer) clearTimeout(collaborationModeNoticeTimer);
       if (workflowConnectionLeaveTimer) clearTimeout(workflowConnectionLeaveTimer);
@@ -1695,6 +1790,17 @@
     const notesSourceChanged = session?.id !== nextSession?.id;
     const previousActivity = session?.activities.at(-1);
     const nextActivity = nextSession?.activities.at(-1);
+    const previousRateLimits = session?.rateLimits ?? [];
+    const nextRateLimits = nextSession?.rateLimits ?? [];
+    const rateLimitsChanged = previousRateLimits.length !== nextRateLimits.length
+      || previousRateLimits.some((limit, index) => {
+        const next = nextRateLimits[index];
+        return !next
+          || limit.id !== next.id
+          || limit.usedPercent !== next.usedPercent
+          || limit.resetsAt !== next.resetsAt
+          || limit.windowMinutes !== next.windowMinutes;
+      });
     const sessionChanged = !session || !nextSession
       ? session !== nextSession
       : session.id !== nextSession.id
@@ -1705,7 +1811,8 @@
         || session.pendingPermission?.id !== nextSession.pendingPermission?.id
         || previousActivity?.id !== nextActivity?.id
         || previousActivity?.status !== nextActivity?.status
-        || previousActivity?.detail?.length !== nextActivity?.detail?.length;
+        || previousActivity?.detail?.length !== nextActivity?.detail?.length
+        || rateLimitsChanged;
     if (sessionChanged) session = nextSession;
     if (notesSourceChanged) {
       sessionNotes = [];
@@ -2278,10 +2385,19 @@
   function scheduleResizeFlush() {
     if (
       resizeFrame !== null
+      || resizeThrottleTimer
       || resizeSyncRunning
       || resizePreparing
       || !pendingResize
     ) return;
+    const remaining = 32 - (performance.now() - lastResizeFlushAt);
+    if (remaining > 1) {
+      resizeThrottleTimer = setTimeout(() => {
+        resizeThrottleTimer = undefined;
+        scheduleResizeFlush();
+      }, remaining);
+      return;
+    }
     resizeFrame = requestAnimationFrame(() => {
       resizeFrame = null;
       void flushResize();
@@ -2294,6 +2410,7 @@
     if (!next) return;
     pendingResize = null;
     resizeSyncRunning = true;
+    lastResizeFlushAt = performance.now();
     try {
       await resizeTerminalWindow(
         label,
@@ -2322,6 +2439,10 @@
     if (resizeFrame !== null) {
       cancelAnimationFrame(resizeFrame);
       resizeFrame = null;
+    }
+    if (resizeThrottleTimer) {
+      clearTimeout(resizeThrottleTimer);
+      resizeThrottleTimer = undefined;
     }
     while (resizeSyncRunning) {
       await new Promise((resolve) => setTimeout(resolve, 4));
@@ -2452,6 +2573,125 @@
     await applyCollaborationMode(nextMode);
   }
 
+  function currentModelOption() {
+    return modelSettings?.models.find((option) => option.model === selectedModel) ?? null;
+  }
+
+  function effortValues() {
+    if (session?.agent === "claude_code") {
+      return ["", "low", "medium", "high", "xhigh", "max"];
+    }
+    return currentModelOption()?.supportedReasoningEfforts.map((effort) => effort.value) ?? [];
+  }
+
+  function currentEffort() {
+    return session?.agent === "claude_code" ? claudeEffort : selectedEffort;
+  }
+
+  function currentEffortIndex() {
+    return Math.max(0, effortValues().indexOf(currentEffort()));
+  }
+
+  function chooseEffortIndex(event: Event) {
+    const values = effortValues();
+    const index = Number((event.currentTarget as HTMLInputElement).value);
+    const effort = values[Math.max(0, Math.min(values.length - 1, index))] ?? "";
+    if (session?.agent === "claude_code") claudeEffort = effort;
+    else selectedEffort = effort;
+  }
+
+  function effortLabel(value = currentEffort()) {
+    return value || tr("Default", "Padrão");
+  }
+
+  function chooseModel(model: string) {
+    if (!modelSettings || modelSaving) return;
+    selectedModel = model;
+    const option = modelSettings.models.find((candidate) => candidate.model === model);
+    if (!option) return;
+    if (!option.supportedReasoningEfforts.some((effort) => effort.value === selectedEffort)) {
+      selectedEffort = option.defaultReasoningEffort;
+    }
+  }
+
+  async function openModelDialog() {
+    if (!session || !["codex", "claude_code"].includes(session.agent)) return false;
+    composerToolsOpen = false;
+    if (session.controlOrigin !== "lume") {
+      message = tr(
+        "Take control of this external CLI before changing its model.",
+        "Assuma o controle desta CLI externa antes de mudar o modelo.",
+      );
+      return true;
+    }
+    if (promptIsRunning) {
+      message = tr(
+        "The model can be changed after the current task finishes.",
+        "O modelo pode ser alterado depois que a tarefa atual terminar.",
+      );
+      return true;
+    }
+    modelDialogOpen = true;
+    modelLoading = true;
+    modelError = null;
+    modelSettings = null;
+    try {
+      if (session.agent === "codex") {
+        modelSettings = await getSessionModelSettings(session.id);
+        selectedModel = modelSettings.model;
+        const option = currentModelOption();
+        selectedEffort = modelSettings.reasoningEffort
+          ?? option?.defaultReasoningEffort
+          ?? option?.supportedReasoningEfforts[0]?.value
+          ?? "";
+      } else {
+        const settings = await getClaudeSessionModelSettings(session.id);
+        claudeModel = settings.model ?? "";
+        claudeEffort = settings.reasoningEffort ?? "";
+      }
+    } catch (error) {
+      modelError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      modelLoading = false;
+    }
+    return true;
+  }
+
+  async function saveModelSettings() {
+    if (!session || modelSaving) return;
+    if (session.agent === "codex" && (!selectedModel || !selectedEffort)) return;
+    modelSaving = true;
+    modelError = null;
+    try {
+      if (session.agent === "codex") {
+        modelSettings = await setSessionModelSettings(
+          session.id,
+          selectedModel,
+          selectedEffort,
+        );
+      } else if (session.agent === "claude_code") {
+        const settings = await setClaudeSessionModelSettings(
+          session.id,
+          claudeModel.trim() || undefined,
+          claudeEffort || undefined,
+        );
+        claudeModel = settings.model ?? "";
+        claudeEffort = settings.reasoningEffort ?? "";
+      } else {
+        return;
+      }
+      modelDialogOpen = false;
+      message = tr(
+        "Model settings will apply to the next prompt.",
+        "As configurações de modelo serão aplicadas ao próximo prompt.",
+      );
+    } catch (error) {
+      modelError = String(error).replace(/^Error:\s*/, "");
+    } finally {
+      modelSaving = false;
+    }
+  }
+
   async function runSlashCommand(value: string) {
     const command = value.trim().toLowerCase();
     const selected = availableSlashCommands().find((item) => `/${item.name}` === command);
@@ -2464,6 +2704,9 @@
     if (!action) return false;
     let handled = true;
     switch (action) {
+      case "model":
+        await openModelDialog();
+        break;
       case "plan":
         await applyCollaborationMode("plan");
         break;
@@ -2509,9 +2752,13 @@
       !session
       || (!prompt.trim() && promptAttachments.length === 0)
       || sending
-      || !canSubmit
+      || !canCompose
       || !readyForPrompt
     ) return;
+    if (!canSubmit && capabilities?.canTakeControl) {
+      takeoverConfirm = true;
+      return;
+    }
     if (promptAttachments.length === 0 && await runSlashCommand(prompt)) return;
     sending = true;
     message = null;
@@ -2537,6 +2784,24 @@
     }
   }
 
+  async function confirmTakeover() {
+    if (!session || !capabilities?.canTakeControl || takingControl) return;
+    takingControl = true;
+    message = null;
+    try {
+      await takeControlSession(session.id);
+      takeoverConfirm = false;
+      await refresh();
+      await tick();
+      await sendPrompt();
+    } catch (error) {
+      message = String(error).replace(/^Error:\s*/, "");
+      await refresh().catch(() => undefined);
+    } finally {
+      takingControl = false;
+    }
+  }
+
   async function steerNextQueuedPrompt() {
     if (!session || !nextQueuedPrompt || !canSendWhileRunning || steeringQueued) return;
     steeringQueued = true;
@@ -2554,7 +2819,8 @@
   }
 
   async function chooseAttachments() {
-    if (!canSubmit || !readyForPrompt || sending) return;
+    if (!canCompose || !readyForPrompt || sending) return;
+    composerToolsOpen = false;
     message = null;
     try {
       let terminalLowered = false;
@@ -2804,8 +3070,11 @@
             onpointerleave={() => leaveWorkflowConnection(side)}
           >
             <button
+              class:loading={workflowBridgeOpeningSide === side}
               class="workflow-connection-editor workflow-editor-{side}"
               type="button"
+              aria-busy={workflowBridgeOpeningSide === side}
+              aria-disabled={workflowBridgeOpeningSide !== null}
               aria-label={tr("Edit workflow connection", "Editar conexão do workflow")}
               title={tr("Edit workflow", "Editar workflow")}
               onpointerdown={(event) => event.stopPropagation()}
@@ -2845,14 +3114,29 @@
             <strong>{sessionDisplayName(session)}</strong>
             <small title={session.workingDirectory}>{sessionDirectoryName(session)}</small>
           </div>
-          <button class="rename-button" type="button" onclick={beginSessionRename} aria-label={tr("Rename session", "Renomear sessão")} title={tr("Rename session", "Renomear sessão")}>
-            <svg viewBox="0 0 20 20"><path d="m4 14-.5 2.5L6 16l9-9-2-2-9 9Z"></path><path d="m11.5 6.5 2 2"></path></svg>
-          </button>
         {/if}
-        <span class="source-badge">
+        <span class="source-badge" title={sourceLabel(session)}>
           <BrandIcon name={sourceIcon(session)} size={10} />
-          {sourceLabel(session)}
+          <span class="badge-label">{sourceLabel(session)}</span>
         </span>
+        {#if session.permissionProfile.approvalsReviewer === "auto_review" && session.permissionProfile.mode !== "full_access"}
+          <span class="access-badge auto-review" title={tr("Automatic approval", "Aprovação automática")}>
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M6.8.8 2.9 6.3h2.5L4.9 11l4.2-5.7H6.5Z" /></svg>
+            <span class="badge-label">{tr("Auto", "Auto")}</span>
+          </span>
+        {/if}
+        {#if session.permissionProfile.mode === "full_access"}
+          <span class="access-badge full-access" title={tr("Full access", "Acesso total")}>
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 5V3.7a3 3 0 0 1 5.6-1.5M2.2 5.2h7.6v5.5H2.2Z" /></svg>
+            <span class="badge-label">{tr("Full access", "Acesso total")}</span>
+          </span>
+        {/if}
+        {#if session.controlOrigin === "external"}
+          <span class="access-badge external-session" title={tr("External session", "Sessão externa")}>
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.2 2.5H2.3v7.2h7.2V7.8M6.3 2.3h3.4v3.4M9.7 2.3 5.4 6.6" /></svg>
+            <span class="badge-label">{tr("External", "Externa")}</span>
+          </span>
+        {/if}
         {#if activeRateLimit}
           <div
             class:warning={rateLimitRemaining <= 50 && rateLimitRemaining > 20}
@@ -2867,46 +3151,6 @@
           </div>
         {/if}
         <span class="header-actions">
-          {#if session.source === "cli" && session.processId}
-            <button class="terminate-button" type="button" onclick={() => (terminateConfirm = true)} aria-label={tr("Stop agent", "Encerrar agente")} title={tr("Stop agent", "Encerrar agente")}>
-              <svg viewBox="0 0 20 20"><path d="M10 3v7M5.5 5.5a6 6 0 1 0 9 0" /></svg>
-            </button>
-          {/if}
-          <span class="text-zoom-control">
-            <button
-              class:active={textZoomOpen}
-              class="text-zoom-button"
-              type="button"
-              aria-expanded={textZoomOpen}
-              aria-label={tr("Adjust terminal text size", "Ajustar tamanho dos textos do terminal")}
-              title={tr("Text size", "Tamanho do texto")}
-              onclick={() => (textZoomOpen = !textZoomOpen)}
-            >
-              <svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="4.5"></circle><path d="m12 12 4 4M8.5 6.5v4M6.5 8.5h4"></path></svg>
-            </button>
-            {#if textZoomOpen}
-              <span
-                class="text-zoom-popover"
-                role="group"
-                aria-label={tr("Terminal text size", "Tamanho dos textos do terminal")}
-                onpointerdown={(event) => event.stopPropagation()}
-              >
-                <button
-                  disabled={textZoom <= textZoomMin}
-                  type="button"
-                  aria-label={tr("Decrease text size", "Diminuir textos")}
-                  onclick={() => setTextZoom(textZoom - 0.1)}
-                >−</button>
-                <output>{Math.round(textZoom * 100)}%</output>
-                <button
-                  disabled={textZoom >= textZoomMax}
-                  type="button"
-                  aria-label={tr("Increase text size", "Aumentar textos")}
-                  onclick={() => setTextZoom(textZoom + 0.1)}
-                >+</button>
-              </span>
-            {/if}
-          </span>
           {#if windowState?.docked}
             <button class="dock-button" type="button" onclick={detach} aria-label={tr("Undock terminal", "Desacoplar terminal")} title={tr("Undock", "Desacoplar")}>
               <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
@@ -2957,16 +3201,16 @@
                 <button disabled={textZoom >= textZoomMax} type="button" aria-label={tr("Increase text size", "Aumentar textos")} onclick={() => setTextZoom(textZoom + 0.1)}>+</button>
               </span>
               {#if windowState?.docked}
-                <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
+                <button class="compact-only" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void detach(); }}>
                   <svg viewBox="0 0 20 20"><path d="M7 6 5.5 7.5a3 3 0 0 0 4.2 4.2l1.2-1.2M13 14l1.5-1.5a3 3 0 0 0-4.2-4.2L9.1 9.5" /></svg>
                   <span>{tr("Undock terminal", "Desacoplar terminal")}</span>
                 </button>
               {/if}
-              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void minimizeTerminal(); }}>
+              <button class="compact-only" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void minimizeTerminal(); }}>
                 <svg viewBox="0 0 20 20"><path d="M5 14h10" /></svg>
                 <span>{tr("Minimize terminal", "Minimizar terminal")}</span>
               </button>
-              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void toggleFullscreen(); }}>
+              <button class="compact-only" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void toggleFullscreen(); }}>
                 {#if fullscreen}
                   <svg viewBox="0 0 20 20"><path d="M8 3v5H3M12 3v5h5M8 17v-5H3M12 17v-5h5" /></svg>
                   <span>{tr("Exit full screen", "Sair da tela cheia")}</span>
@@ -2975,7 +3219,7 @@
                   <span>{tr("Enter full screen", "Entrar em tela cheia")}</span>
                 {/if}
               </button>
-              <button type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void closeTerminal(); }}>
+              <button class="compact-only" type="button" role="menuitem" onclick={() => { headerActionsOpen = false; void closeTerminal(); }}>
                 <svg viewBox="0 0 20 20"><path d="m6 6 8 8M14 6l-8 8" /></svg>
                 <span>{tr("Close terminal", "Fechar terminal")}</span>
               </button>
@@ -3295,7 +3539,7 @@
                       <time>{activityTime(item.createdAt)}</time>
                     </header>
                     {#if receivedHandoff}
-                      <div class="markdown-content">{@html renderCachedMarkdown(receivedHandoff.body)}</div>
+                      <div class="markdown-content">{@html renderCachedMarkdown(`handoff:${entry.id}`, receivedHandoff.body)}</div>
                     {:else if item.detail}
                       <pre>{item.detail}</pre>
                     {/if}
@@ -3341,7 +3585,7 @@
                         </div>
                       </aside>
                     {/if}
-                    {#if item.detail}<div class="markdown-content">{@html renderCachedMarkdown(item.detail)}</div>{/if}
+                    {#if item.detail}<div class="markdown-content">{@html renderCachedMarkdown(`message:${entry.id}`, item.detail)}</div>{/if}
                     <ResponseAttachments
                       text={item.detail}
                       attachments={item.attachments ?? []}
@@ -3357,7 +3601,7 @@
                       <strong>{displayText(language, item.title)}</strong>
                       <time>{activityTime(item.createdAt)}</time>
                     </header>
-                    <div class="markdown-content">{@html renderCachedMarkdown(item.detail)}</div>
+                    <div class="markdown-content">{@html renderCachedMarkdown(`analysis:${entry.id}`, item.detail)}</div>
                   </section>
                 {/if}
                 {#if entry.files.length}
@@ -3438,7 +3682,7 @@
               </div>
             </header>
             {#if plan.content}
-              <div class="plan-document markdown-content">{@html renderCachedMarkdown(plan.content)}</div>
+              <div class="plan-document markdown-content">{@html renderCachedMarkdown(`plan:${plan.updatedAt}`, plan.content)}</div>
             {:else}
               {#if plan.explanation}
                 <p class="plan-explanation">{plan.explanation}</p>
@@ -3468,9 +3712,8 @@
                 <small>{tr("Session notebook", "Caderno da sessão")}</small>
                 <strong>{tr("Notes and previous plans", "Notas e planos anteriores")}</strong>
               </div>
-              <button type="button" onclick={createBlankNote}>
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
-                {tr("New note", "Nova nota")}
+              <button type="button" title={tr("New note", "Nova nota")} aria-label={tr("New note", "Nova nota")} onclick={createBlankNote}>
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3h7l3 3v11H5Z" /><path d="M12 3v3h3M10 8v6M7 11h6" /></svg>
               </button>
             </header>
 
@@ -3485,8 +3728,8 @@
                 </div>
                 <textarea bind:value={noteEditor.body} rows="8" maxlength="131072" placeholder={tr("Write a note or paste a longer plan…", "Escreva uma nota ou cole um planejamento maior…")}></textarea>
                 <footer>
-                  <button type="button" onclick={() => (noteEditor = null)}>{tr("Cancel", "Cancelar")}</button>
-                  <button class="primary" disabled={noteSaving || !noteEditor.body.trim()} type="submit">{noteSaving ? tr("Saving…", "Salvando…") : tr("Save", "Salvar")}</button>
+                  <button type="button" title={tr("Cancel", "Cancelar")} aria-label={tr("Cancel", "Cancelar")} onclick={() => (noteEditor = null)}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+                  <button class="primary" disabled={noteSaving || !noteEditor.body.trim()} type="submit" title={noteSaving ? tr("Saving…", "Salvando…") : tr("Save", "Salvar")} aria-label={noteSaving ? tr("Saving…", "Salvando…") : tr("Save", "Salvar")}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7" /></svg></button>
                 </footer>
               </form>
             {/if}
@@ -3508,8 +3751,8 @@
                         <button type="button" title={tr("Delete note", "Excluir nota")} aria-label={tr("Delete note", "Excluir nota")} onclick={() => void removeSessionNote(note)}><svg viewBox="0 0 20 20"><path d="M5 6h10M8 6V4h4v2M7 8v7M10 8v7M13 8v7M6 6l.6 11h6.8L14 6" /></svg></button>
                       </span>
                     </header>
-                    <div class="session-note-body markdown-content">{@html renderCachedMarkdown(note.body)}</div>
-                    <button class="use-note-button" type="button" onclick={() => void useSessionNote(note)}>{tr("Use as context", "Usar como contexto")}</button>
+                    <div class="session-note-body markdown-content">{@html renderCachedMarkdown(`note:${note.id}`, note.body)}</div>
+                    <button class="use-note-button" type="button" title={tr("Use as context", "Usar como contexto")} aria-label={tr("Use as context", "Usar como contexto")} onclick={() => void useSessionNote(note)}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12v10H9l-4 3v-3H4Z" /><path d="M8 9h5M11 6l3 3-3 3" /></svg></button>
                   </article>
                 {/each}
               </div>
@@ -3599,6 +3842,95 @@
         </div>
       {/if}
 
+      {#if takeoverConfirm}
+        <div class="terminate-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget && !takingControl) takeoverConfirm = false; }}>
+          <div class="terminate-dialog takeover-dialog" role="alertdialog" aria-modal="true" aria-labelledby="takeover-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+            <div>
+              <strong id="takeover-title">{tr("Continue this session in Lume?", "Continuar esta sessão no Lume?")}</strong>
+              <p>{session.status === "running"
+                ? tr("The external CLI is running a task. Taking control will stop that task, close only the agent process, and resume the same thread in Lume.", "A CLI externa está executando uma tarefa. Assumir o controle interromperá essa tarefa, fechará somente o processo do agente e retomará a mesma thread no Lume.")
+                : tr("Lume will close only the external agent process and resume the same thread here. The terminal and chat history will be preserved.", "O Lume fechará somente o processo externo do agente e retomará a mesma thread aqui. O terminal e o histórico do chat serão preservados.")}</p>
+            </div>
+            <footer>
+              <button disabled={takingControl} type="button" onclick={() => (takeoverConfirm = false)}>{tr("Cancel", "Cancelar")}</button>
+              <button class="takeover" disabled={takingControl} type="button" onclick={() => void confirmTakeover()}>{takingControl ? tr("Transferring…", "Transferindo…") : tr("Take control", "Assumir controle")}</button>
+            </footer>
+          </div>
+        </div>
+      {/if}
+
+      {#if modelDialogOpen}
+        <div class="terminate-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget && !modelSaving) modelDialogOpen = false; }}>
+          <div class="terminate-dialog model-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="model-settings-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+            <header>
+              <span class="model-settings-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M7 7.5 12 4l5 3.5v9L12 20l-5-3.5zM12 4v16m-5-3.5 5-3.5 5 3.5M7 7.5l5 3.5 5-3.5" /></svg>
+              </span>
+              <div>
+                <strong id="model-settings-title">{tr("Model and reasoning", "Modelo e raciocínio")}</strong>
+                <p>{tr("Next prompt", "Próximo prompt")}</p>
+              </div>
+            </header>
+
+            {#if modelLoading}
+              <div class="model-settings-loading"><span></span>{tr("Loading available models…", "Carregando modelos disponíveis…")}</div>
+            {:else if session.agent === "claude_code"}
+              <section class="model-settings-section claude-model-settings">
+                <label>
+                  <span class="model-settings-label">{tr("Model", "Modelo")}</span>
+                  <input bind:value={claudeModel} maxlength="128" placeholder={tr("Session default or model alias", "Padrão da sessão ou alias do modelo")} />
+                </label>
+                <small>{tr("Use an alias such as sonnet or opus, or the full model name. Leave blank to keep the session default.", "Use um alias como sonnet ou opus, ou o nome completo. Deixe vazio para manter o padrão da sessão.")}</small>
+              </section>
+              <section class="model-settings-section">
+                <span class="model-settings-label">{tr("Reasoning effort", "Nível de raciocínio")}<b>{effortLabel()}</b></span>
+                <div class="effort-slider">
+                  <input aria-label={tr("Reasoning effort", "Nível de raciocínio")} type="range" min="0" max={Math.max(0, effortValues().length - 1)} step="1" value={currentEffortIndex()} oninput={chooseEffortIndex} />
+                  <div class="effort-scale" aria-hidden="true">
+                    {#each effortValues() as effort (effort || "default")}
+                      <span class:active={currentEffort() === effort}>{effortLabel(effort)}</span>
+                    {/each}
+                  </div>
+                </div>
+              </section>
+            {:else if modelSettings}
+              <section class="model-settings-section">
+                <span class="model-settings-label">{tr("Model", "Modelo")}</span>
+                <div class="model-options">
+                  {#each modelSettings.models as option (option.model)}
+                    <button class:active={selectedModel === option.model} type="button" onclick={() => chooseModel(option.model)} title={option.description}>
+                      <span><strong>{option.displayName}</strong>{#if option.isDefault}<small>{tr("Default", "Padrão")}</small>{/if}</span>
+                    </button>
+                  {/each}
+                </div>
+              </section>
+
+              {#if currentModelOption()}
+                <section class="model-settings-section">
+                  <span class="model-settings-label">{tr("Reasoning effort", "Nível de raciocínio")}<b>{effortLabel()}</b></span>
+                  <div class="effort-slider">
+                    <input aria-label={tr("Reasoning effort", "Nível de raciocínio")} type="range" min="0" max={Math.max(0, effortValues().length - 1)} step="1" value={currentEffortIndex()} oninput={chooseEffortIndex} />
+                    <div class="effort-scale" aria-hidden="true">
+                      {#each effortValues() as effort (effort)}
+                        <span class:active={currentEffort() === effort}>{effort}</span>
+                      {/each}
+                    </div>
+                  </div>
+                </section>
+              {/if}
+            {/if}
+
+            {#if modelError}<p class="model-settings-error">{modelError}</p>{/if}
+            <footer>
+              <button disabled={modelSaving} type="button" onclick={() => (modelDialogOpen = false)}>{tr("Cancel", "Cancelar")}</button>
+              <button class="takeover" disabled={modelLoading || modelSaving || (session.agent === "codex" && (!selectedModel || !selectedEffort))} type="button" onclick={() => void saveModelSettings()}>
+                {modelSaving ? tr("Saving…", "Salvando…") : tr("Save", "Salvar")}
+              </button>
+            </footer>
+          </div>
+        </div>
+      {/if}
+
       <form
         class="terminal-composer"
         class:sending
@@ -3679,58 +4011,78 @@
           </button>
         {/if}
         <div class="composer-controls">
-          {#if session.agent === "codex" || (canSubmit && capabilities?.canAttachImages)}
-            <div class="composer-leading-actions">
-              {#if session.agent === "codex"}
-                <button
-                  class:plan={collaborationMode === "plan"}
-                  class="mode-button"
-                  disabled={promptIsRunning || collaborationModeChanging}
-                  type="button"
-                  onclick={() => void toggleCollaborationMode()}
-                  aria-label={collaborationMode === "plan" ? tr("Plan mode enabled. Switch to Default mode", "Modo Plan ativo. Mudar para o modo Default") : tr("Default mode enabled. Switch to Plan mode", "Modo Default ativo. Mudar para o modo Plan")}
-                  title={promptIsRunning ? tr("Mode can be changed after the current prompt", "O modo pode ser alterado após o prompt atual") : collaborationMode === "plan" ? tr("Plan mode — switch to Default", "Modo Plan — mudar para Default") : tr("Default mode — switch to Plan", "Modo Default — mudar para Plan")}
-                >
-                  {#if collaborationModeChanging}
-                    <span class="mode-spinner" aria-hidden="true"></span>
-                  {:else if collaborationMode === "plan"}
-                    <svg aria-hidden="true" viewBox="0 0 20 20">
-                      <path d="m4.8 5.8 1.3 1.3 2-2.2M10 6h5M4.8 10 6.1 11.3l2-2.2M10 10.2h5M4.8 14.2l1.3 1.3 2-2.2M10 14.4h5" />
-                    </svg>
-                  {:else}
-                    <svg aria-hidden="true" viewBox="0 0 20 20">
-                      <path d="M11 3.5 5.8 10H10l-1 6.5 5.2-7.5H10z" />
-                    </svg>
+          {#if ["codex", "claude_code"].includes(session.agent) || (canCompose && capabilities?.canAttachImages)}
+            <div class="composer-leading-actions composer-tools">
+              <button
+                class:active={composerToolsOpen}
+                class="composer-tools-trigger"
+                type="button"
+                aria-expanded={composerToolsOpen}
+                aria-haspopup="menu"
+                aria-label={tr("Prompt tools", "Ferramentas do prompt")}
+                title={tr("Prompt tools", "Ferramentas do prompt")}
+                onclick={() => (composerToolsOpen = !composerToolsOpen)}
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h7M14 6h2M4 14h2M9 14h7M11 4v4M6 12v4" /></svg>
+              </button>
+              {#if composerToolsOpen}
+                <div class="composer-tools-menu" role="menu" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+                  {#if canCompose && capabilities?.canAttachImages}
+                    <button disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" role="menuitem" onclick={() => void chooseAttachments()}>
+                      <span class="tool-icon"><svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg></span>
+                      <span><strong>{tr("Attach file", "Anexar arquivo")}</strong><small>{promptAttachments.length}/4</small></span>
+                    </button>
                   {/if}
-                </button>
-                {#if collaborationModeChanging && collaborationModeTarget}
-                  <span class="mode-feedback" aria-live="polite">
-                    {collaborationModeTarget === "plan"
-                      ? tr("Switching to Plan…", "Mudando para Plan…")
-                      : tr("Switching to Default…", "Mudando para Default…")}
-                  </span>
-                {:else if collaborationModeNotice}
-                  <span class="mode-feedback success" aria-live="polite">{collaborationModeNotice}</span>
-                {/if}
+                  {#if session.agent === "codex" && session.controlOrigin === "lume"}
+                    <button
+                      class:active={collaborationMode === "plan"}
+                      disabled={promptIsRunning || collaborationModeChanging}
+                      type="button"
+                      role="menuitem"
+                      onclick={() => { composerToolsOpen = false; void toggleCollaborationMode(); }}
+                    >
+                      <span class="tool-icon">
+                        {#if collaborationModeChanging}
+                          <span class="mode-spinner" aria-hidden="true"></span>
+                        {:else if collaborationMode === "plan"}
+                          <svg viewBox="0 0 20 20"><path d="m4.8 5.8 1.3 1.3 2-2.2M10 6h5M4.8 10 6.1 11.3l2-2.2M10 10.2h5M4.8 14.2l1.3 1.3 2-2.2M10 14.4h5" /></svg>
+                        {:else}
+                          <svg viewBox="0 0 20 20"><path d="M11 3.5 5.8 10H10l-1 6.5 5.2-7.5H10z" /></svg>
+                        {/if}
+                      </span>
+                      <span><strong>{tr("Agent mode", "Modo do agente")}</strong><small>{collaborationMode === "plan" ? "Plan" : "Default"}</small></span>
+                    </button>
+                  {/if}
+                  {#if ["codex", "claude_code"].includes(session.agent)}
+                    <button type="button" role="menuitem" onclick={() => void openModelDialog()}>
+                      <span class="tool-icon"><svg viewBox="0 0 20 20"><path d="M5 5.5 10 3l5 2.5v9L10 17l-5-2.5zM5 5.5l5 2.5 5-2.5M10 8v9" /></svg></span>
+                      <span><strong>{tr("Model and effort", "Modelo e effort")}</strong><small>{tr("Configure", "Configurar")}</small></span>
+                      <svg class="tool-chevron" viewBox="0 0 20 20"><path d="m8 5 5 5-5 5" /></svg>
+                    </button>
+                  {/if}
+                </div>
               {/if}
-              {#if canSubmit && capabilities?.canAttachImages}
-                <button class="attach-button" disabled={!readyForPrompt || sending || promptAttachments.length >= 4} type="button" onclick={() => void chooseAttachments()} aria-label={tr("Attach file", "Anexar arquivo")} title={tr("Attach file", "Anexar arquivo")}>
-                  <svg viewBox="0 0 20 20"><path d="M6.5 10.5 11 6a2.1 2.1 0 0 1 3 3l-6.2 6.2a3.4 3.4 0 1 1-4.8-4.8l6-6" /></svg>
-                </button>
+              {#if collaborationModeChanging && collaborationModeTarget}
+                <span class="mode-feedback" aria-live="polite">
+                  {collaborationModeTarget === "plan"
+                    ? tr("Switching to Plan…", "Mudando para Plan…")
+                    : tr("Switching to Default…", "Mudando para Default…")}
+                </span>
+              {:else if collaborationModeNotice}
+                <span class="mode-feedback success" aria-live="polite">{collaborationModeNotice}</span>
               {/if}
             </div>
           {/if}
           <textarea
             bind:this={promptInput}
             bind:value={prompt}
-            disabled={!canSubmit || !readyForPrompt || sending}
+            disabled={!canCompose || !readyForPrompt || sending}
             oninput={handlePromptInput}
             onkeydown={sendPromptOnEnter}
             rows="2"
             aria-label={tr(`Prompt for ${sessionDisplayName(session)}`, `Prompt para ${sessionDisplayName(session)}`)}
             placeholder={sending ? tr("Sending prompt…", "Enviando prompt…") : !canSubmit ? promptUnavailableText() : canSendWhileRunning ? tr("Write the next prompt and press Enter to queue…", "Escreva o próximo prompt e pressione Enter para adicionar à fila…") : readyForPrompt ? tr(`Prompt for ${sessionDisplayName(session)}…`, `Prompt para ${sessionDisplayName(session)}…`) : tr("Agent is running…", "Agente em execução…")}
           ></textarea>
-          {#if sending}<span class="send-status" role="status">{tr("Sending…", "Enviando…")}</span>{/if}
           {#if promptIsRunning}
             <button
               class="interrupt-submit"
@@ -3747,7 +4099,7 @@
                 <svg viewBox="0 0 20 20"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg>
               {/if}
             </button>
-          {:else if canSubmit}
+          {:else if canCompose}
             <button disabled={(!prompt.trim() && promptAttachments.length === 0) || !readyForPrompt || sending} type="submit" aria-label={sending ? tr("Sending prompt", "Enviando prompt") : tr("Send prompt", "Enviar prompt")}>
               {#if sending}
                 <span class="send-spinner" aria-hidden="true"></span>
@@ -3908,6 +4260,12 @@
   .terminal-name-editor input:focus { border-color: rgba(48, 139, 96, 0.5); box-shadow: 0 0 0 2px rgba(48, 139, 96, 0.08); }
   .terminal-name-editor button { width: 22px; height: 22px; }
   .source-badge { padding: 3px 5px; display: inline-flex; align-items: center; gap: 3px; border-radius: 999px; color: #718079; background: rgba(80, 104, 94, 0.075); font-size: 7px; font-weight: 760; letter-spacing: 0.04em; text-transform: uppercase; }
+  .access-badge { padding: 3px 5px; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; border-radius: 999px; font-size: 7px; font-weight: 780; line-height: 1; white-space: nowrap; }
+  .access-badge svg { width: 9px; height: 9px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.35; }
+  .access-badge.auto-review { color: #315f86; background: #cbdff0; }
+  .access-badge.auto-review svg { fill: currentColor; stroke: none; }
+  .access-badge.full-access { color: #764c2e; background: #e8ceb1; }
+  .access-badge.external-session { color: #405d50; background: #c7d6ca; }
   .workflow-role-control { position: relative; z-index: 82; height: 0; display: flex; flex: 0 0 0; justify-content: center; overflow: visible; transition: opacity 100ms ease; }
   .workflow-role-fab { position: relative; top: 7px; width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid rgba(54, 148, 101, 0.24); border-radius: 50%; color: #47755f; background: radial-gradient(circle at 34% 24%, rgba(255,255,255,.96) 0 13%, rgba(255,255,255,.34) 31%, transparent 52%), linear-gradient(145deg, #fbfdfc 12%, #e5efe9 88%); box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 5px rgba(43,91,67,.1), 0 5px 10px rgba(24,58,41,.18), 0 1px 2px rgba(24,58,41,.14), 0 0 0 3px rgba(59,151,104,.045); cursor: pointer; transition: border-color 150ms ease, box-shadow 170ms ease, transform 170ms cubic-bezier(.2,.8,.2,1); }
   .workflow-role-fab:hover { border-color: rgba(54, 148, 101, 0.38); box-shadow: inset 0 1px 0 rgba(255,255,255,.98), inset 0 -3px 5px rgba(43,91,67,.11), 0 7px 14px rgba(24,58,41,.2), 0 2px 3px rgba(24,58,41,.14), 0 0 0 4px rgba(59,151,104,.07); transform: translateY(-2px); }
@@ -3948,14 +4306,14 @@
   header button { position: relative; z-index: 25; width: 25px; height: 25px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 7px; color: #73817b; background: transparent; cursor: pointer; }
   header button:hover { color: #43574e; background: rgba(72, 99, 87, 0.07); }
   header button.active { color: #347b5b; background: rgba(52, 139, 94, 0.09); }
-  header .rename-button { width: 21px; height: 21px; }
   .header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
-  .header-overflow { position: relative; z-index: 60; display: none; flex: 0 0 auto; }
+  .header-overflow { position: relative; z-index: 60; display: flex; flex: 0 0 auto; }
   .header-actions-menu { position: absolute; z-index: 70; top: 30px; right: 0; width: 190px; padding: 5px; display: grid; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 10px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 10px 28px rgba(30, 55, 43, 0.17); cursor: default; }
   header .header-actions-menu > button { z-index: auto; width: 100%; min-height: 29px; height: auto; padding: 0 8px; display: flex; justify-content: flex-start; gap: 8px; border-radius: 7px; color: #53665d; font: 700 8px Inter, sans-serif; text-align: left; }
   header .header-actions-menu > button:hover { color: #287452; background: rgba(57, 145, 99, 0.08); }
   header .header-actions-menu > button.danger { color: #9d615c; }
   header .header-actions-menu > button.terminal-stop-menu { margin-top: 3px; box-shadow: 0 -1px rgba(80, 105, 94, 0.11); }
+  header .header-actions-menu > button.compact-only { display: none; }
   .header-actions-menu > button svg { width: 13px; height: 13px; flex: 0 0 auto; }
   .header-menu-zoom { box-sizing: border-box; width: 100%; min-height: 29px; padding: 0 4px 0 8px; display: grid; grid-template-columns: minmax(0, 1fr) 23px 34px 23px; align-items: center; gap: 2px; color: #53665d; font: 700 8px Inter, sans-serif; }
   .header-menu-zoom > span { min-width: 0; display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3964,17 +4322,15 @@
   header .header-menu-zoom > button:hover { color: #287452; background: rgba(57, 145, 99, 0.1); }
   header .header-menu-zoom > button:disabled { opacity: 0.32; cursor: default; }
   .header-menu-zoom output { color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
-  @container (max-width: 390px) {
-    header .rename-button,
+  @container (max-width: 480px) {
     .header-actions { display: none; }
     .header-overflow { display: flex; }
+    header .header-actions-menu > button.compact-only { display: flex; }
+    .source-badge,
+    .access-badge { width: 20px; height: 20px; padding: 0; justify-content: center; gap: 0; }
+    .source-badge > .badge-label,
+    .access-badge > .badge-label { display: none; }
   }
-  .text-zoom-control { position: relative; z-index: 45; display: flex; flex: 0 0 auto; }
-  .text-zoom-popover { position: absolute; z-index: 50; top: 30px; right: 0; min-width: 91px; height: 31px; padding: 3px; display: flex; align-items: center; gap: 2px; border: 1px solid rgba(80, 105, 94, 0.14); border-radius: 9px; color: #53665d; background: rgba(248, 251, 249, 0.98); box-shadow: 0 8px 22px rgba(30, 55, 43, 0.15); cursor: default; }
-  .text-zoom-popover button { z-index: auto; width: 23px; height: 23px; border-radius: 6px; color: #4b6c5d; background: rgba(73, 110, 93, 0.055); font: 800 13px/1 Inter, sans-serif; }
-  .text-zoom-popover button:hover { color: #287452; background: rgba(57, 145, 99, 0.1); }
-  .text-zoom-popover button:disabled { opacity: 0.32; cursor: default; }
-  .text-zoom-popover output { min-width: 35px; color: #687970; font: 750 8px Inter, sans-serif; text-align: center; }
   .dock-button { color: #4a7564; }
   .workflow-connection { position: absolute; z-index: 25; overflow: hidden; background: linear-gradient(180deg, rgba(62, 162, 111, 0.14), rgba(82, 185, 130, 0.72) 45%, rgba(62, 162, 111, 0.14)); pointer-events: none; opacity: 0.62; animation: workflow-connect-confirm 620ms cubic-bezier(0.22, 1, 0.36, 1) 1; }
   .workflow-bridge-link { opacity: .92; box-shadow: 0 0 10px rgba(68, 183, 123, .42); animation: workflow-bridge-current 2.2s ease-in-out infinite; }
@@ -3991,8 +4347,13 @@
   .workflow-control-top { top: -21px; left: 50%; width: 88px; height: 42px; transform: translateX(-50%); }
   .workflow-connection-editor { position: relative; width: 27px; height: 27px; padding: 6px; display: grid; place-items: center; border: 1px solid rgba(70, 161, 111, .3); border-radius: 50%; color: #36865d; background: radial-gradient(circle at 35% 28%, rgba(255,255,255,.96), rgba(240,249,244,.96) 58%, rgba(213,237,224,.98)); box-shadow: 0 4px 13px rgba(30,70,49,.2), 0 0 0 3px rgba(74,174,121,.055); cursor: pointer; opacity: 0; pointer-events: auto; transform: scale(.82); transform-origin: center; transition: opacity 130ms ease, transform 160ms cubic-bezier(.2,.8,.2,1), filter 150ms ease, box-shadow 150ms ease; }
   .workflow-connection-editor svg { width: 14px; height: 14px; }
+  .workflow-connection-editor.loading { opacity: 1; cursor: wait; }
   .workflow-connection-control.visible .workflow-connection-editor,
   .workflow-connection-editor:focus-visible { opacity: 1; transform: scale(1); outline: none; filter: brightness(1.05); box-shadow: 0 5px 16px rgba(34,112,70,.26), 0 0 0 3px rgba(74,174,121,.1); }
+  .workflow-control-right .workflow-connection-editor.loading { transform: translateX(-14px) scale(1); }
+  .workflow-control-left .workflow-connection-editor.loading { transform: translateX(14px) scale(1); }
+  .workflow-control-bottom .workflow-connection-editor.loading { transform: translateY(-14px) scale(1); }
+  .workflow-control-top .workflow-connection-editor.loading { transform: translateY(14px) scale(1); }
   @keyframes workflow-connect-confirm {
     0% { opacity: 0.18; filter: brightness(0.85); }
     48% { opacity: 1; filter: brightness(1.55); }
@@ -4002,7 +4363,6 @@
     0%, 100% { opacity: .7; }
     50% { opacity: 1; }
   }
-  .terminate-button { color: #9d615c; }
   svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
   .work-tray { overflow: hidden; border-bottom: 1px solid rgba(97, 119, 109, 0.09); background: rgba(63, 91, 78, 0.022); }
   .work-tray-toggle { width: 100%; min-height: 27px; padding: 4px 9px; display: flex; align-items: center; gap: 7px; border: 0; color: #62756c; background: transparent; cursor: pointer; }
@@ -4055,9 +4415,7 @@
   .status-completed, .status-completed span { color: #55a473; }
   .status-failed, .status-failed span { color: #ad4f4f; }
   .chat-feed { min-width: 0; max-width: 100%; margin: 9px 0 7px; display: grid; gap: 7px; overflow-x: hidden; }
-  .chat-feed > * { min-width: 0; max-width: 100%; content-visibility: auto; contain-intrinsic-block-size: auto 76px; }
-  .terminal-card.resizing .chat-feed > *,
-  .terminal-card.settling .chat-feed > * { content-visibility: visible; }
+  .chat-feed > * { min-width: 0; max-width: 100%; }
   .chat-message { box-sizing: border-box; width: fit-content; min-width: 0; max-width: 94%; padding: 7px 8px; overflow: clip; overflow-clip-margin: 1px; border: 1px solid rgba(77, 104, 91, 0.09); border-radius: 9px; background: rgba(69, 99, 84, 0.035); }
   .chat-message.user-message { margin-left: auto; border-bottom-right-radius: 3px; background: rgba(50, 145, 99, 0.075); }
   .chat-message.agent-message { margin-right: auto; border-bottom-left-radius: 3px; }
@@ -4142,7 +4500,6 @@
   @keyframes reasoning-pulse { 50% { opacity: .55; transform: scale(.92); } }
   @container (max-width: 390px) {
     .terminal-output { padding-right: 8px; padding-left: 8px; }
-    .chat-feed > * { content-visibility: visible; }
     .chat-message,
     .reasoning-update,
     .turn-files { box-sizing: border-box; width: 100%; max-width: 100%; }
@@ -4203,6 +4560,7 @@
   .notes-panel > header > div { min-width: 0; display: grid; gap: 2px; }
   .notes-panel > header small { color: #8b9791; font: 700 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
   .notes-panel > header strong { color: #4d6358; font: 780 var(--chat-font-size) Inter, sans-serif; }
+  .notes-panel > header > button { width: 29px; height: 29px; padding: 0; justify-content: center; }
   .note-editor { padding: 8px; display: grid; gap: 7px; border: 1px solid rgba(64, 126, 96, .13); border-radius: 9px; background: rgba(68, 116, 91, .035); }
   .note-editor-heading { display: grid; grid-template-columns: minmax(0, 1fr) 26px; gap: 6px; }
   .note-editor-heading > input { min-width: 0; padding: 6px 7px; border: 1px solid rgba(79, 108, 94, .13); border-radius: 7px; outline: 0; color: #405249; background: rgba(255, 255, 255, .48); font: 700 var(--chat-small-font-size) Inter, sans-serif; }
@@ -4214,7 +4572,8 @@
   .note-editor input:focus,
   .note-editor textarea:focus { border-color: rgba(52, 151, 103, .4); box-shadow: 0 0 0 2px rgba(52, 151, 103, .06); }
   .note-editor footer { display: flex; justify-content: flex-end; gap: 5px; }
-  .note-editor footer button { min-height: 27px; padding: 0 9px; border: 0; border-radius: 6px; color: #718078; background: rgba(80, 107, 94, .06); font: 700 var(--chat-small-font-size)/1 Inter, sans-serif; cursor: pointer; }
+  .note-editor footer button { width: 28px; min-height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 7px; color: #718078; background: rgba(80, 107, 94, .06); cursor: pointer; }
+  .note-editor footer button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
   .note-editor footer button.primary { color: white; background: #3f9369; }
   .note-editor footer button:disabled { opacity: .45; cursor: default; }
   .session-note-list { display: grid; gap: 7px; }
@@ -4230,7 +4589,8 @@
   .session-note-actions button.active { color: #3f8862; background: rgba(61, 145, 100, .08); }
   .session-note-actions svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
   .session-note-body { max-height: 180px; margin: 0; overflow: auto; }
-  .use-note-button { width: max-content; min-height: 27px; padding: 0 9px; border: 0; border-radius: 6px; color: #3c805d; background: rgba(61, 145, 100, .07); font: 700 var(--chat-small-font-size)/1 Inter, sans-serif; cursor: pointer; }
+  .use-note-button { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 7px; color: #3c805d; background: rgba(61, 145, 100, .07); cursor: pointer; }
+  .use-note-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
   .permission { margin: 7px 0 2px; padding-left: 9px; display: grid; gap: 6px; border-left: 2px solid #c87d32; }
   .permission strong { color: #5a4633; font: 700 var(--chat-font-size)/1.35 Inter, sans-serif; }
   .permission code { padding: 5px 6px; overflow: hidden; border-radius: 6px; color: #5f6b66; background: rgba(74, 99, 88, 0.055); font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
@@ -4260,10 +4620,59 @@
   .terminate-dialog footer { display: flex; justify-content: flex-end; gap: 5px; }
   .terminate-dialog button { min-height: 26px; padding: 0 8px; border: 1px solid rgba(84, 101, 93, 0.14); border-radius: 7px; color: #596861; background: transparent; font: 750 var(--chat-small-font-size) Inter, sans-serif; cursor: pointer; }
   .terminate-dialog button.danger { color: white; border-color: #a85656; background: #a85656; }
+  .terminate-dialog button.takeover { color: white; border-color: #3d8063; background: #3d8063; }
   .terminate-dialog button:disabled { opacity: 0.48; cursor: default; }
+  .model-settings-dialog { width: min(370px, 100%); max-height: min(500px, 86%); grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 11px; border-color: rgba(74, 112, 94, 0.18); }
+  .model-settings-dialog > header { min-width: 0; display: flex; align-items: center; gap: 9px; }
+  .model-settings-dialog > header > div { min-width: 0; display: grid; gap: 2px; }
+  .model-settings-dialog > header strong { color: #3b5549; }
+  .model-settings-icon { width: 31px; height: 31px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 9px; color: #397a5c; background: rgba(57, 122, 92, 0.09); }
+  .model-settings-icon svg { width: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .model-settings-section { min-height: 0; display: grid; gap: 6px; }
+  .model-settings-section:first-of-type { overflow: hidden; }
+  .claude-model-settings label { display: grid; gap: 6px; }
+  .claude-model-settings input { box-sizing: border-box; width: 100%; min-height: 35px; padding: 0 9px; border: 1px solid rgba(72, 103, 88, 0.14); border-radius: 8px; outline: none; color: #40564b; background: rgba(76, 113, 95, 0.035); font: 650 var(--chat-small-font-size) Inter, sans-serif; }
+  .claude-model-settings input:focus { border-color: rgba(48, 139, 95, 0.52); box-shadow: 0 0 0 2px rgba(57, 143, 99, 0.08); }
+  .claude-model-settings > small { color: #7b8982; font: 550 var(--chat-tiny-font-size)/1.4 Inter, sans-serif; }
+  .model-settings-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #718078; font: 800 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0.06em; text-transform: uppercase; }
+  .model-settings-label b { padding: 2px 6px; border-radius: 999px; color: #3d8063; background: rgba(57, 143, 99, 0.09); font: 780 var(--chat-tiny-font-size) Inter, sans-serif; letter-spacing: 0; text-transform: capitalize; }
+  .model-options { min-height: 0; max-height: 170px; padding-right: 2px; display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 5px; overflow-y: auto; scrollbar-width: thin; }
+  .terminate-dialog .model-options > button { min-width: 0; min-height: 38px; height: auto; padding: 6px 8px; display: grid; align-content: center; gap: 2px; border-color: rgba(72, 103, 88, 0.11); background: rgba(76, 113, 95, 0.035); text-align: left; }
+  .terminate-dialog .model-options > button:hover { border-color: rgba(53, 126, 90, 0.24); background: rgba(59, 133, 96, 0.07); }
+  .terminate-dialog .model-options > button.active { border-color: rgba(48, 139, 95, 0.48); background: rgba(57, 143, 99, 0.1); box-shadow: inset 2px 0 #3a9267; }
+  .model-options button > span { min-width: 0; display: flex; align-items: center; gap: 5px; }
+  .model-options button strong { min-width: 0; overflow: hidden; color: #40564b; font-size: var(--chat-small-font-size); text-overflow: ellipsis; white-space: nowrap; }
+  .model-options button small { padding: 2px 4px; border-radius: 4px; color: #4c8067; background: rgba(63, 137, 101, 0.09); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .effort-slider { display: grid; gap: 5px; }
+  .effort-slider input { width: 100%; height: 16px; margin: 0; accent-color: #3d8b64; cursor: pointer; }
+  .effort-scale { display: flex; align-items: center; justify-content: space-between; gap: 3px; }
+  .effort-scale span { min-width: 0; color: #93a098; font: 650 calc(var(--chat-tiny-font-size) - 1px) Inter, sans-serif; text-transform: capitalize; transition: color 140ms ease, transform 140ms ease; }
+  .effort-scale span.active { color: #397d5d; font-weight: 820; transform: translateY(-1px); }
+  .model-settings-loading { min-height: 110px; place-content: center; color: #718078; font: 650 var(--chat-small-font-size) Inter, sans-serif; }
+  .model-settings-loading span { width: 16px; height: 16px; margin: 0 auto 4px; border: 2px solid rgba(61, 128, 99, 0.18); border-top-color: #3d8063; border-radius: 50%; animation: model-spin 0.8s linear infinite; }
+  @keyframes model-spin { to { transform: rotate(360deg); } }
+  .model-settings-error { padding: 6px 8px; border-radius: 7px; color: #9b4f4f !important; background: rgba(170, 79, 79, 0.08); }
   .terminal-composer { position: relative; box-sizing: border-box; min-height: 63px; padding: 7px 8px 8px 10px; display: flex; flex: 0 0 auto; flex-direction: column; align-items: stretch; gap: 6px; border-top: 1px solid rgba(97, 119, 109, 0.11); }
   .composer-controls { min-width: 0; min-height: 0; display: flex; flex: 1; align-items: flex-end; gap: 6px; }
   .composer-leading-actions { position: relative; display: flex; flex: 0 0 auto; flex-direction: column; justify-content: flex-end; gap: 4px; }
+  .terminal-composer .composer-tools-trigger { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); transition: color 140ms ease, border-color 140ms ease, background 140ms ease, transform 140ms ease; }
+  .terminal-composer .composer-tools-trigger:hover,
+  .terminal-composer .composer-tools-trigger.active { color: #347c59; border-color: rgba(52, 139, 94, 0.25); background: rgba(52, 139, 94, 0.09); }
+  .terminal-composer .composer-tools-trigger.active { transform: rotate(4deg); }
+  .composer-tools-trigger svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
+  .composer-tools-menu { position: absolute; z-index: 52; bottom: calc(100% + 7px); left: 0; width: 212px; padding: 5px; display: grid; gap: 2px; border: 1px solid rgba(73, 106, 90, 0.15); border-radius: 11px; color: #52665c; background: rgba(248, 251, 249, 0.99); box-shadow: 0 14px 34px rgba(24, 45, 34, 0.19); animation: composer-tools-in 140ms cubic-bezier(.2,.8,.2,1); }
+  @keyframes composer-tools-in { from { opacity: 0; transform: translateY(5px) scale(.97); } }
+  .terminal-composer .composer-tools-menu > button { width: 100%; min-height: 38px; height: auto; padding: 5px 6px; display: grid; grid-template-columns: 27px minmax(0, 1fr) auto; align-items: center; gap: 7px; place-items: initial; border: 0; border-radius: 8px; color: inherit; background: transparent; text-align: left; }
+  .terminal-composer .composer-tools-menu > button:hover:not(:disabled),
+  .terminal-composer .composer-tools-menu > button.active { color: #347b59; background: rgba(52, 139, 94, 0.075); }
+  .composer-tools-menu .tool-icon { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; background: rgba(75, 112, 94, 0.07); }
+  .composer-tools-menu .tool-icon svg,
+  .composer-tools-menu .tool-chevron { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+  .composer-tools-menu .tool-icon .mode-spinner { width: 11px; height: 11px; }
+  .composer-tools-menu button > span:nth-child(2) { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .composer-tools-menu strong { overflow: hidden; color: #465b50; font: 740 var(--chat-small-font-size) Inter, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+  .composer-tools-menu small { flex: 0 0 auto; color: #8a9891; font: 680 var(--chat-tiny-font-size) Inter, sans-serif; }
+  .composer-tools-menu .tool-chevron { width: 13px; color: #94a199; }
   .pending-images { width: 100%; min-height: 51px; padding: 4px 5px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-radius: 8px; background: rgba(52, 145, 99, 0.045); }
   .pending-images-label { max-width: 52px; flex: 0 0 auto; color: #829088; font: 750 var(--chat-tiny-font-size)/1.25 Inter, sans-serif; text-transform: uppercase; }
   .pending-images > span { position: relative; width: 42px; height: 42px; flex: 0 0 auto; }
@@ -4275,7 +4684,6 @@
   .composer-controls textarea { min-width: 0; min-height: 46px; height: 100%; flex: 1; padding: 7px 8px; resize: none; border: 1px solid rgba(82, 106, 95, 0.14); border-radius: 9px; outline: none; color: #34443d; background: rgba(255, 255, 255, 0.5); font: var(--chat-font-size)/1.4 Inter, sans-serif; }
   .composer-controls textarea:focus { border-color: rgba(52, 151, 103, 0.42); box-shadow: 0 0 0 3px rgba(52, 151, 103, 0.07); }
   .composer-controls textarea:disabled { opacity: 0.58; }
-  .send-status { padding-bottom: 9px; color: #70827a; font: 700 var(--chat-small-font-size) Inter, sans-serif; white-space: nowrap; }
   .terminal-composer button { width: 29px; height: 29px; display: grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 8px; color: white; background: #318e62; cursor: pointer; }
   .slash-command-menu { position: absolute; z-index: 45; right: 8px; bottom: calc(100% + 5px); left: 10px; max-height: min(230px, 48vh); padding: 5px; display: grid; gap: 2px; overflow-x: hidden; overflow-y: auto; border: 1px solid rgba(80, 105, 94, 0.15); border-radius: 11px; color: #53665d; background: #f8fbf9; box-shadow: 0 12px 32px rgba(28, 52, 41, 0.2); }
   .slash-command-heading { min-height: 24px; padding: 2px 7px 4px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid rgba(80, 105, 94, 0.08); }
@@ -4299,9 +4707,6 @@
   .queue-shortcut { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; color: #748b9a; }
   .queue-shortcut kbd { min-width: 23px; padding: 2px 4px; border: 1px solid rgba(75, 106, 127, 0.17); border-bottom-width: 2px; border-radius: 5px; color: #547286; background: rgba(255, 255, 255, 0.48); font: 750 var(--chat-tiny-font-size) Inter, sans-serif; text-align: center; }
   .queue-shortcut small { font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; }
-  .terminal-composer .mode-button,
-  .terminal-composer .attach-button { color: #5d7469; border: 1px solid rgba(82, 106, 95, 0.12); background: rgba(80, 105, 94, 0.055); }
-  .terminal-composer .mode-button.plan { color: #527aa0; border-color: rgba(79, 123, 164, 0.2); background: rgba(75, 124, 169, 0.1); }
   .mode-spinner { width: 12px; height: 12px; border: 2px solid color-mix(in srgb, currentColor 24%, transparent); border-top-color: currentColor; border-radius: 50%; animation: send-spin 650ms linear infinite; }
   .mode-feedback { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; padding: 4px 6px; border: 1px solid rgba(74, 106, 91, 0.12); border-radius: 6px; color: #687b72; background: rgba(249, 252, 250, 0.97); box-shadow: 0 5px 14px rgba(35, 54, 45, 0.1); font: 650 var(--chat-tiny-font-size) Inter, sans-serif; white-space: nowrap; pointer-events: none; }
   .mode-feedback.success { color: #377a59; }
@@ -4334,32 +4739,32 @@
   .loading-actions button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(82, 105, 95, 0.16); border-radius: 8px; color: #4d6f61; background: rgba(255, 255, 255, 0.55); font-size: 8px; font-weight: 720; cursor: pointer; }
 
   .terminal-window:not(.dark) .terminal-card {
-    border-color: rgba(64, 91, 78, 0.32);
-    background: #edf3f0;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.66), 0 8px 24px rgba(31, 56, 44, 0.11);
+    border-color: rgba(48, 86, 64, 0.36);
+    background: #dce6d8;
+    box-shadow: inset 0 0 0 1px rgba(244, 239, 218, 0.5), 0 8px 24px rgba(31, 56, 44, 0.13);
   }
   .terminal-window:not(.dark) .terminal-card > header,
   .terminal-window:not(.dark) .terminal-composer {
     border-color: rgba(68, 95, 82, 0.18);
-    background: #f7faf8;
+    background: #e8e5d2;
   }
   .terminal-window:not(.dark) .terminal-output {
     color: #43564d;
-    background: linear-gradient(180deg, #e8f0ec 0, #edf3f0 76px);
+    background: linear-gradient(180deg, #d2e0d2 0, #dce6d8 84px);
   }
   .terminal-window:not(.dark) .hub-tabs,
   .terminal-window:not(.dark) .work-tray { border-color: rgba(68, 95, 82, 0.16); }
-  .terminal-window:not(.dark) .work-tray { background: #f2f7f4; }
+  .terminal-window:not(.dark) .work-tray { background: #cfdccd; }
   .terminal-window:not(.dark) .work-card,
   .terminal-window:not(.dark) .plan-items li,
   .terminal-window:not(.dark) .chat-message {
     border-color: rgba(66, 94, 81, 0.18);
-    background: #f8faf9;
+    background: #ebe8d6;
     box-shadow: 0 1px 3px rgba(39, 66, 53, 0.04);
   }
   .terminal-window:not(.dark) .chat-message.user-message {
     border-color: rgba(46, 132, 88, 0.2);
-    background: #e2f0e9;
+    background: #c7dfce;
   }
   .terminal-window:not(.dark) .reasoning-update {
     border-color: #668aa6;
@@ -4367,24 +4772,29 @@
   }
   .terminal-window:not(.dark) .turn-files {
     border-color: rgba(55, 132, 91, 0.22);
-    background: #e7f2ec;
+    background: #cce2d1;
   }
   .terminal-window:not(.dark) .turn-files code { border-color: rgba(65, 103, 84, 0.13); }
   .terminal-window:not(.dark) .agent-typing,
   .terminal-window:not(.dark) .load-earlier-chat {
     border-color: rgba(66, 94, 81, 0.18);
-    background: #f8faf9;
+    background: #e9e6d4;
   }
   .terminal-window:not(.dark) .slash-command-menu,
   .terminal-window:not(.dark) .header-actions-menu,
-  .terminal-window:not(.dark) .text-zoom-popover,
   .terminal-window:not(.dark) .workflow-role-menu,
   .terminal-window:not(.dark) .workflow-role-popover,
   .terminal-window:not(.dark) .handoff-dialog {
     border-color: rgba(64, 91, 78, 0.24);
-    background: #f7faf8;
+    background: #e9e6d4;
     box-shadow: 0 14px 34px rgba(27, 52, 40, 0.18);
   }
+  .terminal-window:not(.dark) .composer-controls textarea,
+  .terminal-window:not(.dark) .pending-images > span.file-attachment,
+  .terminal-window:not(.dark) .terminal-name-editor input { background: #eee9d8; }
+  .terminal-window:not(.dark) .composer-tools-menu,
+  .terminal-window:not(.dark) .terminate-dialog { background: #e9e6d4; }
+  .terminal-window:not(.dark) .hub-tabs button.active { color: #246b47; border-bottom-color: #32915e; }
 
   .terminal-window.dark { color-scheme: dark; }
   .handoff-backdrop { position: absolute; z-index: 60; inset: 0; padding: 14px; display: grid; place-items: center; background: rgba(19, 29, 24, 0.38); backdrop-filter: blur(3px); }
@@ -4508,7 +4918,9 @@
   .terminal-window.dark .agent-icon,
   .terminal-window.dark .source-badge { background: rgba(205, 222, 213, 0.07); }
   .terminal-window.dark .source-badge { color: #a7b5ae; }
-  .terminal-window.dark .text-zoom-button.active { color: #86cbaa; background: rgba(102, 190, 149, 0.09); }
+  .terminal-window.dark .access-badge.auto-review { color: #b4d3ee; background: #29445d; }
+  .terminal-window.dark .access-badge.full-access { color: #e4b88f; background: #543b29; }
+  .terminal-window.dark .access-badge.external-session { color: #c3d1c9; background: #35473e; }
   .terminal-window.dark .terminal-name-editor input { color: #d9e5df; border-color: rgba(195, 218, 207, 0.14); background: rgba(219, 233, 226, 0.055); }
   .terminal-window.dark .header-actions-menu { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.3); }
   .terminal-window.dark header .header-actions-menu > button,
@@ -4523,10 +4935,20 @@
   .terminal-window.dark .terminate-dialog strong { color: #e0a39d; }
   .terminal-window.dark .terminate-dialog p { color: #a7b7af; }
   .terminal-window.dark .terminate-dialog button:not(.danger) { color: #afbeb7; border-color: rgba(205, 222, 213, 0.13); }
-  .terminal-window.dark .text-zoom-popover { color: #b7c8bf; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 35, 30, 0.98); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
-  .terminal-window.dark .text-zoom-popover button { color: #b7cbc1; background: rgba(218, 234, 226, 0.055); }
-  .terminal-window.dark .text-zoom-popover button:hover { color: #8bd3b0; background: rgba(96, 187, 144, 0.1); }
-  .terminal-window.dark .text-zoom-popover output { color: #a5b6ad; }
+  .terminal-window.dark .model-settings-dialog { border-color: rgba(133, 188, 161, 0.16); }
+  .terminal-window.dark .model-settings-dialog > header strong,
+  .terminal-window.dark .model-options button strong { color: #d0e1d8; }
+  .terminal-window.dark .model-settings-icon { color: #8ed0b0; background: rgba(99, 181, 141, 0.1); }
+  .terminal-window.dark .model-settings-label,
+  .terminal-window.dark .model-settings-loading { color: #91a299; }
+  .terminal-window.dark .model-settings-label b { color: #8fd0af; background: rgba(91, 177, 136, 0.1); }
+  .terminal-window.dark .effort-scale span { color: #71847a; }
+  .terminal-window.dark .effort-scale span.active { color: #8fd0af; }
+  .terminal-window.dark .claude-model-settings input { color: #d0e1d8; border-color: rgba(205, 222, 213, 0.1); background: rgba(213, 233, 223, 0.035); }
+  .terminal-window.dark .claude-model-settings > small { color: #91a299; }
+  .terminal-window.dark .terminate-dialog .model-options > button { border-color: rgba(205, 222, 213, 0.08); background: rgba(213, 233, 223, 0.025); }
+  .terminal-window.dark .terminate-dialog .model-options > button:hover { border-color: rgba(117, 194, 155, 0.2); background: rgba(94, 176, 135, 0.07); }
+  .terminal-window.dark .terminate-dialog .model-options > button.active { border-color: rgba(112, 203, 157, 0.42); background: rgba(84, 171, 127, 0.11); box-shadow: inset 2px 0 #64b98f; }
   .terminal-window.dark .rate-limit-meter small,
   .terminal-window.dark .pending-images-label { color: #8f9f97; }
   .terminal-window.dark .rate-limit-meter > i { background: rgba(181, 207, 194, 0.12); }
@@ -4679,9 +5101,16 @@
   .terminal-window.dark .change-list code { color: #bdcbc4; }
   .terminal-window.dark .privacy-note { border-color: rgba(205, 222, 213, 0.07); color: #78877f; }
   .terminal-window.dark textarea { color: #d0ddd6; border-color: rgba(205, 222, 213, 0.12); background: rgba(220, 234, 227, 0.045); }
-  .terminal-window.dark .terminal-composer .mode-button,
-  .terminal-window.dark .terminal-composer .attach-button { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
-  .terminal-window.dark .terminal-composer .mode-button.plan { color: #9abddd; border-color: rgba(138, 183, 220, 0.18); background: rgba(91, 143, 184, 0.1); }
+  .terminal-window.dark .terminal-composer .composer-tools-trigger { color: #a9bbb2; border-color: rgba(205, 222, 213, 0.1); background: rgba(218, 234, 226, 0.045); }
+  .terminal-window.dark .terminal-composer .composer-tools-trigger:hover,
+  .terminal-window.dark .terminal-composer .composer-tools-trigger.active { color: #8ed0ae; border-color: rgba(119, 202, 160, 0.22); background: rgba(88, 176, 132, 0.1); }
+  .terminal-window.dark .composer-tools-menu { color: #afc0b7; border-color: rgba(205, 222, 213, 0.12); background: rgba(24, 34, 29, 0.99); box-shadow: 0 14px 34px rgba(0, 0, 0, 0.34); }
+  .terminal-window.dark .terminal-composer .composer-tools-menu > button:hover:not(:disabled),
+  .terminal-window.dark .terminal-composer .composer-tools-menu > button.active { color: #8fd0af; background: rgba(91, 177, 136, 0.09); }
+  .terminal-window.dark .composer-tools-menu .tool-icon { background: rgba(205, 225, 215, 0.055); }
+  .terminal-window.dark .composer-tools-menu strong { color: #cfddd6; }
+  .terminal-window.dark .composer-tools-menu small,
+  .terminal-window.dark .composer-tools-menu .tool-chevron { color: #85978e; }
   .terminal-window.dark .mode-feedback { color: #a6b8af; border-color: rgba(205, 222, 213, 0.1); background: rgba(29, 41, 35, 0.98); box-shadow: 0 5px 14px rgba(0, 0, 0, 0.22); }
   .terminal-window.dark .mode-feedback.success { color: #84c9a7; }
   .terminal-window.dark .terminal-composer .composer-resize-handle { color: #8fa49a; }
