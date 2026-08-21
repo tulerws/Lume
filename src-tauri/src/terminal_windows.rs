@@ -34,19 +34,11 @@ const MAX_REASONABLE_COORDINATE: i32 = 65_536;
 const TERMINAL_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn terminal_webview_path() -> &'static str {
-    if cfg!(debug_assertions) {
-        "terminal/"
-    } else {
-        "terminal/index.html"
-    }
+    "terminal/"
 }
 
 fn workflow_bridge_webview_path() -> &'static str {
-    if cfg!(debug_assertions) {
-        "workflow-bridge/"
-    } else {
-        "workflow-bridge/index.html"
-    }
+    "workflow-bridge/"
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3439,11 +3431,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn development_webviews_use_vite_routes_without_index_html() {
-        if cfg!(debug_assertions) {
-            assert_eq!(terminal_webview_path(), "terminal/");
-            assert_eq!(workflow_bridge_webview_path(), "workflow-bridge/");
-        }
+    fn webviews_use_canonical_routes_without_index_html() {
+        assert_eq!(terminal_webview_path(), "terminal/");
+        assert_eq!(workflow_bridge_webview_path(), "workflow-bridge/");
     }
 
     fn placement(label: &str, x: i32, y: i32) -> Placement {
