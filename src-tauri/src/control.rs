@@ -22,6 +22,7 @@ const MAX_PROMPT_ATTACHMENTS: usize = 4;
 const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_FILE_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_PREVIEW_LENGTH: usize = 384 * 1024;
+const TAKEOVER_WRITER_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(650);
 
 struct PreparedPromptAttachment {
     path: String,
@@ -938,6 +939,10 @@ pub fn take_control_session(
         if last_writer_error.is_some() {
             return Err("The external CLI closed, but Codex has not released this thread yet. Wait a moment and try transferring it again.".into());
         }
+        // A successful resume probe releases its writer when the temporary
+        // App Server connection is dropped. Give that release a short moment
+        // to propagate before the replacement TUI claims the same thread.
+        std::thread::sleep(TAKEOVER_WRITER_SETTLE_DELAY);
     }
     let integration = match session.agent {
         AgentKind::Codex => IntegrationKind::Codex,

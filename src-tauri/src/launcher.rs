@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,12 @@ struct TerminalPayload {
     command: String,
     arguments: Vec<String>,
     working_directory: String,
+    #[serde(default)]
+    retry_quick_resume: bool,
 }
+
+const QUICK_RESUME_MAX_ATTEMPTS: usize = 4;
+const QUICK_RESUME_EXIT_WINDOW: Duration = Duration::from_secs(8);
 
 pub fn launch(
     request: LaunchRequest,
@@ -76,25 +82,56 @@ pub fn run_terminal_payload(path: &str) -> i32 {
         }
     };
     let _ = fs::remove_file(path);
-    let mut command = match crate::executables::command(&payload.command) {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("{error}");
-            return 1;
-        }
-    };
-    match command
-        .args(&payload.arguments)
-        .env("LUME_MANAGED_SESSION", "1")
-        .current_dir(&payload.working_directory)
-        .status()
-    {
-        Ok(status) => status.code().unwrap_or_default(),
-        Err(error) => {
-            eprintln!("Não foi possível iniciar {}: {error}", payload.command);
-            1
+    for attempt in 0..QUICK_RESUME_MAX_ATTEMPTS {
+        let mut command = match crate::executables::command(&payload.command) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
+            }
+        };
+        let started_at = Instant::now();
+        match command
+            .args(&payload.arguments)
+            .env("LUME_MANAGED_SESSION", "1")
+            .current_dir(&payload.working_directory)
+            .status()
+        {
+            Ok(status)
+                if should_retry_quick_resume(
+                    payload.retry_quick_resume,
+                    attempt,
+                    status.code(),
+                    started_at.elapsed(),
+                ) =>
+            {
+                eprintln!("Lume: the resumed session ended during startup. Retrying…");
+                thread::sleep(quick_resume_retry_delay(attempt));
+            }
+            Ok(status) => return status.code().unwrap_or(1),
+            Err(error) => {
+                eprintln!("Não foi possível iniciar {}: {error}", payload.command);
+                return 1;
+            }
         }
     }
+    1
+}
+
+fn should_retry_quick_resume(
+    enabled: bool,
+    attempt: usize,
+    exit_code: Option<i32>,
+    elapsed: Duration,
+) -> bool {
+    enabled
+        && attempt + 1 < QUICK_RESUME_MAX_ATTEMPTS
+        && exit_code == Some(1)
+        && elapsed <= QUICK_RESUME_EXIT_WINDOW
+}
+
+fn quick_resume_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(350 * (attempt as u64 + 1))
 }
 
 fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalPayload {
@@ -172,6 +209,11 @@ fn payload_for(request: &LaunchRequest, codex_remote: Option<&str>) -> TerminalP
         command,
         arguments,
         working_directory: request.working_directory.clone(),
+        retry_quick_resume: request.resume
+            && matches!(
+                request.agent,
+                IntegrationKind::Codex | IntegrationKind::Claude
+            ),
     }
 }
 
@@ -308,6 +350,9 @@ fn windows_terminal_arguments(payload: &TerminalPayload) -> Vec<String> {
         "new-tab".into(),
         "-d".into(),
         payload.working_directory.clone(),
+        "cmd.exe".into(),
+        "/D".into(),
+        "/K".into(),
         payload.command.clone(),
     ];
     arguments.extend(payload.arguments.iter().cloned());
@@ -406,6 +451,7 @@ mod tests {
             payload.arguments,
             vec!["--remote", "ws://127.0.0.1:43131", "resume", "thread-id"]
         );
+        assert!(payload.retry_quick_resume);
     }
 
     #[test]
@@ -423,6 +469,35 @@ mod tests {
         let payload = payload_for(&request(IntegrationKind::DeepSeek, false, None), None);
         assert_eq!(payload.command, "dsh");
         assert_eq!(payload.arguments, vec!["--profile", "tui"]);
+        assert!(!payload.retry_quick_resume);
+    }
+
+    #[test]
+    fn quick_resume_retries_only_fast_startup_failures() {
+        assert!(should_retry_quick_resume(
+            true,
+            0,
+            Some(1),
+            Duration::from_secs(1)
+        ));
+        assert!(!should_retry_quick_resume(
+            true,
+            0,
+            Some(130),
+            Duration::from_secs(1)
+        ));
+        assert!(!should_retry_quick_resume(
+            true,
+            QUICK_RESUME_MAX_ATTEMPTS - 1,
+            Some(1),
+            Duration::from_secs(1)
+        ));
+        assert!(!should_retry_quick_resume(
+            true,
+            0,
+            Some(1),
+            QUICK_RESUME_EXIT_WINDOW + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -456,11 +531,47 @@ mod tests {
     }
 
     #[test]
-    fn windows_terminal_always_opens_a_new_window_in_the_project() {
+    fn windows_terminal_uses_cmd_for_cli_shims_in_the_project() {
         let payload = payload_for(&request(IntegrationKind::Codex, false, None), None);
         assert_eq!(
             windows_terminal_arguments(&payload),
-            vec!["-w", "-1", "new-tab", "-d", "/work/project", "codex"]
+            vec![
+                "-w",
+                "-1",
+                "new-tab",
+                "-d",
+                "/work/project",
+                "cmd.exe",
+                "/D",
+                "/K",
+                "codex"
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_terminal_keeps_resume_arguments_separate_after_cmd() {
+        let payload = payload_for(
+            &request(IntegrationKind::Codex, true, Some("thread-id")),
+            Some("ws://127.0.0.1:43131"),
+        );
+        assert_eq!(
+            windows_terminal_arguments(&payload),
+            vec![
+                "-w",
+                "-1",
+                "new-tab",
+                "-d",
+                "/work/project",
+                "cmd.exe",
+                "/D",
+                "/K",
+                "codex",
+                "--remote",
+                "ws://127.0.0.1:43131",
+                "resume",
+                "thread-id"
+            ]
         );
     }
 

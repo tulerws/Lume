@@ -4143,7 +4143,14 @@
 </main>
 
 <style>
-  .terminal-window { width: 100%; height: 100%; container-type: inline-size; }
+  .terminal-window { width: 100%; height: 100%; container-type: inline-size; --terminal-scroll-thumb: #b9c6bf; --terminal-scroll-thumb-hover: #8fa79b; scrollbar-width: thin; scrollbar-color: var(--terminal-scroll-thumb) transparent; }
+  .terminal-window :global(*) { scrollbar-width: thin; scrollbar-color: var(--terminal-scroll-thumb) transparent; }
+  .terminal-window :global(*::-webkit-scrollbar) { width: 5px; height: 5px; background: transparent; }
+  .terminal-window :global(*::-webkit-scrollbar-button) { width: 0; height: 0; display: none; }
+  .terminal-window :global(*::-webkit-scrollbar-track),
+  .terminal-window :global(*::-webkit-scrollbar-corner) { background: transparent; }
+  .terminal-window :global(*::-webkit-scrollbar-thumb) { border-radius: 999px; background: var(--terminal-scroll-thumb); }
+  .terminal-window :global(*::-webkit-scrollbar-thumb:hover) { background: var(--terminal-scroll-thumb-hover); }
   .terminal-card { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; --chat-font-adjust: 0px; --chat-small-font-adjust: 0px; --chat-tiny-font-adjust: 0px; --chat-font-size: calc(9px + var(--chat-font-adjust)); --chat-small-font-size: calc(8px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(7px + var(--chat-tiny-font-adjust)); border: 1px solid rgba(103, 126, 116, 0.2); border-radius: 17px; color: #26342e; background: #f8fbf9; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); transition: border-color 150ms ease, box-shadow 180ms ease, background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
   @container (min-width: 520px) {
     .terminal-card { --chat-font-size: calc(10px + var(--chat-font-adjust)); --chat-small-font-size: calc(9px + var(--chat-small-font-adjust)); --chat-tiny-font-size: calc(8px + var(--chat-tiny-font-adjust)); }
@@ -4796,7 +4803,7 @@
   .terminal-window:not(.dark) .terminate-dialog { background: #e9e6d4; }
   .terminal-window:not(.dark) .hub-tabs button.active { color: #246b47; border-bottom-color: #32915e; }
 
-  .terminal-window.dark { color-scheme: dark; }
+  .terminal-window.dark { --terminal-scroll-thumb: #50665b; --terminal-scroll-thumb-hover: #6f8c7d; color-scheme: dark; }
   .handoff-backdrop { position: absolute; z-index: 60; inset: 0; padding: 14px; display: grid; place-items: center; background: rgba(19, 29, 24, 0.38); backdrop-filter: blur(3px); }
   .handoff-dialog { width: min(430px, 100%); max-height: 100%; padding: 12px; display: grid; gap: 10px; overflow-y: auto; border: 1px solid rgba(81, 112, 97, 0.18); border-radius: 13px; color: #34463d; background: #f8fbf9; box-shadow: 0 16px 44px rgba(20, 35, 28, 0.2); }
   .handoff-dialog > header { min-height: auto; padding: 0; display: flex; align-items: flex-start; border: 0; }
