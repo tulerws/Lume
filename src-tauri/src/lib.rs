@@ -1602,7 +1602,13 @@ fn launch_session_impl(
     } else {
         None
     };
+    let codex_thread_id = (request.agent == IntegrationKind::Codex)
+        .then(|| request.resume_id.clone())
+        .flatten();
     launcher::launch(request, &executable, &app_data_dir, codex_remote)?;
+    if let Some(thread_id) = codex_thread_id.as_deref() {
+        bridge.wait_for_proxy_thread(thread_id, std::time::Duration::from_secs(12))?;
+    }
     if let Some(event) = prepared_event {
         event_server::publish_event(&state, &app, event)?;
     }

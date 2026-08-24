@@ -35,6 +35,7 @@ const SERVER_URL: &str = "ws://127.0.0.1:43130";
 const PROXY_ADDRESS: &str = "127.0.0.1:43131";
 pub const PROXY_URL: &str = "ws://127.0.0.1:43131";
 const MAX_LOCAL_CODEX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+const PROXY_SESSION_STABLE_FOR: Duration = Duration::from_millis(1_200);
 static NEXT_PROXY_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -60,6 +61,7 @@ struct ProxyPrompt {
 struct ActiveProxyConnection {
     connection_id: u64,
     sender: mpsc::Sender<ProxyPrompt>,
+    ready: bool,
 }
 
 type ActiveProxyThreads = Arc<Mutex<HashMap<String, ActiveProxyConnection>>>;
@@ -110,10 +112,12 @@ impl CodexBridge {
         cleanup_orphaned_server()?;
         let listener = TcpListener::bind(PROXY_ADDRESS)
             .map_err(|error| format!("Could not start the Codex bridge: {error}"))?;
+        let process = Arc::new(Mutex::new(None));
         let active_proxy_threads = Arc::new(Mutex::new(HashMap::new()));
         let proxy_state = state.clone();
         let proxy_app = app.clone();
         let proxy_threads = active_proxy_threads.clone();
+        let proxy_process = process.clone();
         thread::Builder::new()
             .name("lume-codex-proxy".into())
             .spawn(move || {
@@ -121,10 +125,12 @@ impl CodexBridge {
                     let state = proxy_state.clone();
                     let app = proxy_app.clone();
                     let active_threads = proxy_threads.clone();
+                    let process = proxy_process.clone();
                     let _ = thread::Builder::new()
                         .name("lume-codex-client".into())
                         .spawn(move || {
-                            if let Err(error) = proxy_connection(stream, state, app, active_threads)
+                            if let Err(error) =
+                                proxy_connection(stream, state, app, active_threads, process)
                             {
                                 eprintln!("Ponte do Codex encerrada: {error}");
                             }
@@ -132,7 +138,6 @@ impl CodexBridge {
                 }
             })
             .map_err(|error| error.to_string())?;
-        let process = Arc::new(Mutex::new(None));
         let queued_prompts = Arc::new(Mutex::new(HashMap::new()));
         let collaboration_modes = Arc::new(Mutex::new(HashMap::new()));
         start_queue_dispatcher(process.clone(), queued_prompts.clone(), state, app)?;
@@ -146,6 +151,24 @@ impl CodexBridge {
 
     pub fn ensure_server(&self) -> Result<(), String> {
         ensure_server_process(&self.process)
+    }
+
+    pub fn wait_for_proxy_thread(&self, thread_id: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut connected_since = None;
+        while Instant::now() < deadline {
+            let connected = proxy_thread_ready(&self.active_proxy_threads, thread_id)?;
+            if connected {
+                let since = connected_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= PROXY_SESSION_STABLE_FOR {
+                    return Ok(());
+                }
+            } else {
+                connected_since = None;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        Err("The Codex CLI could not keep its WebSocket connection to Lume. The session was not marked as controlled; you can try Resume again.".into())
     }
 
     pub fn prepare_thread(
@@ -340,6 +363,7 @@ impl CodexBridge {
             .lock()
             .map_err(|_| "Could not access active Codex sessions".to_string())?
             .get(thread_id)
+            .filter(|connection| connection.ready)
             .cloned();
         let Some(active) = active else {
             return Ok(false);
@@ -534,6 +558,17 @@ impl CodexBridge {
     }
 }
 
+fn proxy_thread_ready(threads: &ActiveProxyThreads, thread_id: &str) -> Result<bool, String> {
+    threads
+        .lock()
+        .map_err(|_| "Could not verify the Codex terminal connection".to_string())
+        .map(|threads| {
+            threads
+                .get(thread_id)
+                .is_some_and(|connection| connection.ready)
+        })
+}
+
 fn ensure_server_process(process_slot: &Mutex<Option<Child>>) -> Result<(), String> {
     if server_available() {
         return Ok(());
@@ -713,6 +748,28 @@ fn connect_server() -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
         .map_err(|error| error.to_string())
 }
 
+fn connect_managed_server(
+    process: &Mutex<Option<Child>>,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        ensure_server_process(process)?;
+        match connect_server() {
+            Ok(server) => return Ok(server),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    thread::sleep(Duration::from_millis(180));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "Could not connect the Codex terminal to the local App Server: {}",
+        last_error.unwrap_or_else(|| "unknown WebSocket error".into())
+    ))
+}
+
 fn start_queue_dispatcher(
     process: Arc<Mutex<Option<Child>>>,
     queued_prompts: Arc<Mutex<HashMap<String, VecDeque<QueuedPrompt>>>>,
@@ -805,14 +862,16 @@ fn proxy_connection(
     state: AppState,
     app: AppHandle,
     active_proxy_threads: ActiveProxyThreads,
+    process: Arc<Mutex<Option<Child>>>,
 ) -> Result<(), String> {
     let mut client = accept(stream).map_err(|error| error.to_string())?;
-    let mut server = connect_server()?;
+    let mut server = connect_managed_server(&process)?;
     configure_client_timeout(&mut client)?;
     configure_server_timeout(&mut server)?;
     let connection_id = NEXT_PROXY_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (proxy_sender, proxy_receiver) = mpsc::channel::<ProxyPrompt>();
     let mut pending_prompts = HashMap::new();
+    let mut pending_resumes = HashMap::new();
     let mut profiles = HashMap::new();
     let mut responses = HashMap::new();
 
@@ -835,7 +894,8 @@ fn proxy_connection(
             match client.read() {
                 Ok(message) => {
                     let closing = matches!(message, Message::Close(_));
-                    if let Some(thread_id) = proxy_client_resumed_thread(&message) {
+                    if let Some((request_id, thread_id)) = proxy_client_resume_request(&message) {
+                        pending_resumes.insert(request_id, thread_id.clone());
                         active_proxy_threads
                             .lock()
                             .map_err(|_| {
@@ -846,6 +906,7 @@ fn proxy_connection(
                                 ActiveProxyConnection {
                                     connection_id,
                                     sender: proxy_sender.clone(),
+                                    ready: false,
                                 },
                             );
                     }
@@ -863,6 +924,24 @@ fn proxy_connection(
             match server.read() {
                 Ok(message) => {
                     let closing = matches!(message, Message::Close(_));
+                    if let Some((request_id, accepted)) = proxy_response_outcome(&message) {
+                        if let Some(thread_id) = pending_resumes.remove(&request_id) {
+                            if let Ok(mut threads) = active_proxy_threads.lock() {
+                                if accepted {
+                                    if let Some(connection) = threads.get_mut(&thread_id) {
+                                        if connection.connection_id == connection_id {
+                                            connection.ready = true;
+                                        }
+                                    }
+                                } else {
+                                    threads.retain(|id, connection| {
+                                        id != &thread_id
+                                            || connection.connection_id != connection_id
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if let Some((thread_id, started)) = proxy_thread_lifecycle(&message) {
                         if started {
                             active_proxy_threads
@@ -875,6 +954,7 @@ fn proxy_connection(
                                     ActiveProxyConnection {
                                         connection_id,
                                         sender: proxy_sender.clone(),
+                                        ready: true,
                                     },
                                 );
                         } else {
@@ -921,13 +1001,40 @@ fn proxy_connection(
     result
 }
 
-fn proxy_client_resumed_thread(message: &Message) -> Option<String> {
+fn proxy_client_resume_request(message: &Message) -> Option<(String, String)> {
     let Message::Text(text) = message else {
         return None;
     };
     let value = serde_json::from_str::<Value>(text).ok()?;
-    (value.get("method").and_then(Value::as_str)? == "thread/resume")
-        .then(|| text_at(value.get("params")?, "threadId").map(str::to_string))?
+    if value.get("method").and_then(Value::as_str)? != "thread/resume" {
+        return None;
+    }
+    Some((
+        proxy_request_id(value.get("id")?)?,
+        text_at(value.get("params")?, "threadId")?.to_string(),
+    ))
+}
+
+fn proxy_response_outcome(message: &Message) -> Option<(String, bool)> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    if value.get("method").is_some() {
+        return None;
+    }
+    Some((
+        proxy_request_id(value.get("id")?)?,
+        value.get("error").is_none(),
+    ))
+}
+
+fn proxy_request_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn proxy_thread_lifecycle(message: &Message) -> Option<(String, bool)> {
@@ -3073,7 +3180,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_registers_a_resumed_thread_before_a_started_notification() {
+    fn proxy_tracks_a_resume_request_until_the_server_accepts_it() {
         let resumed = Message::Text(
             json!({
                 "method": "thread/resume",
@@ -3083,6 +3190,16 @@ mod tests {
             .to_string()
             .into(),
         );
+        let accepted = Message::Text(
+            json!({ "id": 2, "result": { "thread": { "id": "thread-live" } } })
+                .to_string()
+                .into(),
+        );
+        let rejected = Message::Text(
+            json!({ "id": 2, "error": { "message": "active writer" } })
+                .to_string()
+                .into(),
+        );
         let unrelated = Message::Text(
             json!({ "method": "turn/start", "params": { "threadId": "thread-live" } })
                 .to_string()
@@ -3090,10 +3207,35 @@ mod tests {
         );
 
         assert_eq!(
-            proxy_client_resumed_thread(&resumed),
-            Some("thread-live".into())
+            proxy_client_resume_request(&resumed),
+            Some(("2".into(), "thread-live".into()))
         );
-        assert_eq!(proxy_client_resumed_thread(&unrelated), None);
+        assert_eq!(proxy_response_outcome(&accepted), Some(("2".into(), true)));
+        assert_eq!(proxy_response_outcome(&rejected), Some(("2".into(), false)));
+        assert_eq!(proxy_client_resume_request(&unrelated), None);
+    }
+
+    #[test]
+    fn proxy_thread_is_ready_only_after_resume_acceptance() {
+        let threads = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, _receiver) = mpsc::channel();
+        threads.lock().expect("proxy threads").insert(
+            "thread-live".into(),
+            ActiveProxyConnection {
+                connection_id: 1,
+                sender,
+                ready: false,
+            },
+        );
+
+        assert!(!proxy_thread_ready(&threads, "thread-live").expect("pending resume"));
+        threads
+            .lock()
+            .expect("proxy threads")
+            .get_mut("thread-live")
+            .expect("thread")
+            .ready = true;
+        assert!(proxy_thread_ready(&threads, "thread-live").expect("accepted resume"));
     }
 
     #[test]

@@ -960,8 +960,6 @@ pub fn take_control_session(
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    state.mark_session_lume_controlled(session_id)?;
-    protocol::emit_sessions_changed(app);
     launcher::launch(
         launch_request,
         &executable,
@@ -971,6 +969,23 @@ pub fn take_control_session(
     .map_err(|error| {
         format!("Lume took control, but could not open the replacement CLI: {error}")
     })?;
+    if integration == IntegrationKind::Codex {
+        let thread_id = session.native_session_id.as_deref().ok_or_else(|| {
+            "This external CLI did not provide a resumable session id".to_string()
+        })?;
+        bridge.wait_for_proxy_thread(thread_id, std::time::Duration::from_secs(12))?;
+    }
+    let controlled_session_id = session
+        .native_session_id
+        .as_deref()
+        .and_then(|native_id| {
+            state.sessions().ok()?.into_iter().find_map(|candidate| {
+                (candidate.native_session_id.as_deref() == Some(native_id)).then_some(candidate.id)
+            })
+        })
+        .unwrap_or_else(|| session_id.to_string());
+    state.mark_session_lume_controlled(&controlled_session_id)?;
+    protocol::emit_sessions_changed(app);
     Ok(())
 }
 
