@@ -700,6 +700,12 @@ pub enum HubCommand {
         #[serde(default)]
         delivery: PromptDelivery,
     },
+    TakeControlSession {
+        session_id: String,
+        prompt: String,
+        #[serde(default)]
+        attachments: Vec<PromptAttachmentInput>,
+    },
     ResolvePermission {
         session_id: String,
         permission_id: String,
@@ -773,6 +779,11 @@ impl HubCommandRequest {
                 prompt,
                 attachments,
                 ..
+            }
+            | HubCommand::TakeControlSession {
+                session_id,
+                prompt,
+                attachments,
             } => {
                 validate_identifier("session_id", session_id, 512)?;
                 if prompt.trim().is_empty() && attachments.is_empty() {
@@ -1572,6 +1583,23 @@ mod tests {
         assert_eq!(
             request.validate().expect_err("inválido").code,
             "prompt_empty"
+        );
+    }
+
+    #[test]
+    fn mobile_takeover_preserves_the_pending_prompt() {
+        let request: HubCommandRequest = serde_json::from_str(
+            r#"{"requestId":"mobile-takeover","type":"take_control_session","sessionId":"codex:thread-1","prompt":"Continue from my phone"}"#,
+        )
+        .expect("takeover command");
+        request.validate().expect("valid takeover command");
+        assert_eq!(
+            request.command,
+            HubCommand::TakeControlSession {
+                session_id: "codex:thread-1".into(),
+                prompt: "Continue from my phone".into(),
+                attachments: Vec::new(),
+            }
         );
     }
 

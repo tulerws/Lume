@@ -263,6 +263,28 @@
         <button id="continue-in-browser" class="pair-dismiss-button" type="button">Continue in browser</button>
       </div>
     </aside>
+    <aside id="takeover-prompt" class="mobile-action-prompt" hidden>
+      <div
+        class="mobile-action-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="takeover-title"
+        aria-describedby="takeover-description"
+      >
+        <span class="mobile-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M8 7h8M8 12h5M5 3h14v18H5zM14 16h5M16.5 13.5 19 16l-2.5 2.5" /></svg>
+        </span>
+        <span class="mobile-action-copy">
+          <small>External CLI</small>
+          <strong id="takeover-title">Take control from Lume?</strong>
+        </span>
+        <p id="takeover-description">Lume will close the external CLI, reopen the same thread in a managed terminal on your computer, and then send this message.</p>
+        <div class="mobile-action-buttons">
+          <button id="cancel-takeover" type="button">Cancel</button>
+          <button id="confirm-takeover" class="primary" type="button">Take control &amp; send</button>
+        </div>
+      </div>
+    </aside>
     <script src="./app.js" type="module"></script>
   </body>
 </html>

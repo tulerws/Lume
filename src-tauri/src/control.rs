@@ -1067,6 +1067,28 @@ pub fn execute_hub_command(
             false,
         )
         .map(|_| None),
+        protocol::HubCommand::TakeControlSession {
+            session_id,
+            prompt,
+            attachments,
+        } => take_control_session(app, state, bridge, &session_id).and_then(
+            |controlled_session_id| {
+                submit_prompt(
+                    app,
+                    state,
+                    bridge,
+                    browser,
+                    &controlled_session_id,
+                    &prompt,
+                    attachments,
+                    PromptDelivery::NewTurn,
+                    false,
+                )?;
+                Ok(Some(serde_json::json!({
+                    "sessionId": controlled_session_id,
+                })))
+            },
+        ),
         protocol::HubCommand::ResolvePermission {
             session_id,
             permission_id,

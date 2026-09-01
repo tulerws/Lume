@@ -32,6 +32,10 @@ const chatAgentStatus = document.querySelector("#chat-agent-status");
 const chatRateLimit = document.querySelector("#chat-rate-limit");
 const chatWorkTray = document.querySelector("#chat-work-tray");
 const chatStopButton = document.querySelector("#chat-stop");
+const takeoverPrompt = document.querySelector("#takeover-prompt");
+const takeoverDescription = document.querySelector("#takeover-description");
+const cancelTakeover = document.querySelector("#cancel-takeover");
+const confirmTakeover = document.querySelector("#confirm-takeover");
 const dashboardMessage = document.querySelector("#dashboard-message");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionLabel = document.querySelector("#connection-label");
@@ -76,6 +80,7 @@ let pairInstallPromptDismissed = false;
 let bannerTimer;
 let openUpdateViewRequested = false;
 let activeChatSessionId;
+let pendingTakeoverSessionId;
 let lastChatRenderKey = "";
 let mascotTransitionTimer;
 const expandedResults = new Set();
@@ -1504,17 +1509,24 @@ function renderChat(sessions) {
   const supportsRunningPrompt =
     agentWorking
     && session.capabilities?.promptDeliveries?.includes("steer");
+  const canTakeControl = scopes.includes("prompt")
+    && session.capabilities?.canTakeControl;
   const canPrompt = scopes.includes("prompt")
     && session.capabilities?.canPrompt
     && (promptReady || supportsRunningPrompt);
+  const canCompose = canPrompt || canTakeControl;
   const promptSubmitting = submittingPromptSessions.has(session.id);
   const sendLocked = promptSubmitting;
   const promptDraft = promptDrafts.get(session.id) || "";
   const attachments = promptAttachments.get(session.id) || [];
   const promptDelivery = promptDeliveries.get(session.id) || "queue";
   const canAttachImages = Boolean(session.capabilities?.canAttachImages && !session.pendingQuestion);
-  chatComposer.innerHTML = canPrompt
+  chatComposer.innerHTML = canCompose
     ? `<form class="mobile-chat-form${canAttachImages ? " can-attach" : ""}${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}">
+        ${canTakeControl ? `<div class="mobile-takeover-hint">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h8M6 10h5M3 2h14v16H3zM12 14h5M14.5 11.5 17 14l-2.5 2.5" /></svg>
+          <span><strong>External CLI</strong><small>Sending transfers this thread to Lume.</small></span>
+        </div>` : ""}
         ${attachments.length ? `<div class="mobile-pending-images">
           <small>${attachments.length === 1 ? "Photo attached" : `${attachments.length} photos attached`}</small>
           ${attachments.map((attachment, index) => `
@@ -1530,8 +1542,8 @@ function renderChat(sessions) {
         </div>` : ""}
         ${canAttachImages ? `<input class="mobile-image-input" type="file" accept="image/*" multiple hidden />
           <button class="mobile-attach-button" type="button" data-attach-image aria-label="Attach image" ${promptSubmitting || attachments.length >= 4 ? "disabled" : ""}>${attachIconMarkup}</button>` : ""}
-        <textarea maxlength="16384" placeholder="Message ${escapeHtml(sessionDisplayName(session))}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
-        <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${sendLocked || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
+        <textarea maxlength="16384" placeholder="${canTakeControl ? "Take control and message" : "Message"} ${escapeHtml(sessionDisplayName(session))}…" ${promptSubmitting ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea>
+        <button class="mobile-send-button" type="submit" aria-label="${promptSubmitting ? "Sending prompt" : canTakeControl ? "Take control and send" : "Send prompt"}" ${sendLocked || (!promptDraft.trim() && !attachments.length) ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button>
         <span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span>
       </form>`
     : '<p class="mobile-composer-unavailable">Sending is unavailable for this session.</p>';
@@ -1631,12 +1643,13 @@ function renderSessions(snapshot, trackChanges = true) {
     const changes = files.length
       ? `<details class="changes"><summary><span>Changed files</span><em>${files.length}</em></summary><div>${files.map((file) => `<code>${escapeHtml(file)}</code>`).join("")}</div></details>`
       : "";
+    const canTakeControl = scopes.includes("prompt") && session.capabilities?.canTakeControl;
     const canPrompt = scopes.includes("prompt") && session.capabilities?.canPrompt &&
       ["completed", "failed", "waiting_for_input"].includes(session.status);
     const promptSubmitting = submittingPromptSessions.has(session.id);
     const promptDraft = promptDrafts.get(session.id) || "";
-    const prompt = canPrompt
-      ? `<form class="prompt-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(sessionDisplayName(session))}" placeholder="Continue with a new prompt…" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea><button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : "Send prompt"}" ${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button><span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span></form>`
+    const prompt = canPrompt || canTakeControl
+      ? `<form class="prompt-form${promptSubmitting ? " is-sending" : ""}" data-session="${escapeHtml(session.id)}" aria-busy="${promptSubmitting}"><textarea maxlength="16384" aria-label="Message ${escapeHtml(sessionDisplayName(session))}" placeholder="${canTakeControl ? "Take control and continue…" : "Continue with a new prompt…"}" ${promptSubmitting ? "disabled" : ""} required>${escapeHtml(promptDraft)}</textarea><button type="submit" aria-label="${promptSubmitting ? "Sending prompt" : canTakeControl ? "Take control and send" : "Send prompt"}" ${promptSubmitting ? "disabled" : ""}>${promptSubmitting ? sendSpinnerMarkup : sendIconMarkup}</button><span class="prompt-send-state" role="status" aria-live="polite">${promptSubmitting ? "Sending prompt…" : ""}</span></form>`
       : "";
     const stop = scopes.includes("terminate") && session.capabilities?.canTerminate
       ? `<button class="stop-agent" data-command="terminate" data-session="${escapeHtml(session.id)}">Stop agent</button>`
@@ -1835,6 +1848,7 @@ async function notifySession(session) {
         title: "Lume",
         body: questionBody || body,
         channelId: "lume-agent-events",
+        smallIcon: "ic_lume_notification",
         extra: { sessionId: session.id, status: session.status },
       }],
     });
@@ -2629,12 +2643,39 @@ async function readNativeClipboardImage() {
   return images.readClipboardImage();
 }
 
-async function submitPromptForm(form) {
+function closeTakeoverPrompt() {
+  pendingTakeoverSessionId = undefined;
+  takeoverPrompt.hidden = true;
+  document.body.classList.remove("mobile-action-modal-open");
+  confirmTakeover.disabled = false;
+  confirmTakeover.textContent = "Take control & send";
+}
+
+function openTakeoverPrompt(sessionId) {
+  pendingTakeoverSessionId = sessionId;
+  const session = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
+  takeoverDescription.textContent = session?.status === "running"
+    ? "This agent is still working. Lume will stop the external CLI, reopen the same thread in a managed terminal on your computer, and then send this message."
+    : "Lume will close the external CLI, reopen the same thread in a managed terminal on your computer, and then send this message.";
+  takeoverPrompt.hidden = false;
+  document.body.classList.add("mobile-action-modal-open");
+  cancelTakeover.focus();
+}
+
+function promptFormForSession(sessionId) {
+  return [...document.querySelectorAll(".mobile-chat-form, .prompt-form")]
+    .find((candidate) => candidate.dataset.session === sessionId);
+}
+
+async function submitPromptForm(form, takeoverConfirmed = false) {
   const sessionId = form.dataset.session;
   const session = currentSnapshot?.sessions?.find((item) => item.id === sessionId);
+  const canTakeControl = Boolean(
+    currentDevice?.scopes?.includes("prompt")
+    && session?.capabilities?.canTakeControl,
+  );
   const runningDelivery = session?.capabilities?.promptDeliveries?.includes("steer");
-  if (session?.status === "running" && !runningDelivery) return;
-  if (!(await verifySensitiveAction())) return;
+  if (session?.status === "running" && !runningDelivery && !canTakeControl) return;
   const textarea = form.querySelector("textarea");
   const button = form.querySelector(".mobile-send-button, button[type='submit']");
   const status = form.querySelector(".prompt-send-state");
@@ -2645,8 +2686,13 @@ async function submitPromptForm(form) {
       ? form.querySelector("[data-prompt-delivery].active")?.dataset.promptDelivery || "queue"
       : "new_turn";
   if ((!submittedPrompt && !attachments.length) || submittingPromptSessions.has(sessionId)) return;
-  submittingPromptSessions.add(sessionId);
   promptDrafts.set(sessionId, textarea.value);
+  if (canTakeControl && !takeoverConfirmed) {
+    openTakeoverPrompt(sessionId);
+    return;
+  }
+  if (!(await verifySensitiveAction())) return;
+  submittingPromptSessions.add(sessionId);
   form.classList.add("is-sending");
   form.setAttribute("aria-busy", "true");
   textarea.disabled = true;
@@ -2657,17 +2703,19 @@ async function submitPromptForm(form) {
   let promptAccepted = false;
   try {
     await executeCommand({
-      type: "submit_prompt",
+      type: canTakeControl ? "take_control_session" : "submit_prompt",
       sessionId,
       prompt: submittedPrompt,
       attachments,
-      delivery,
+      ...(canTakeControl ? {} : { delivery }),
     });
     promptAccepted = true;
+    if (canTakeControl) closeTakeoverPrompt();
     promptDrafts.delete(sessionId);
     promptAttachments.delete(sessionId);
     textarea.value = "";
   } catch (error) {
+    if (canTakeControl) closeTakeoverPrompt();
     showBanner(error.message, "error");
   } finally {
     submittingPromptSessions.delete(sessionId);
@@ -2686,6 +2734,30 @@ async function submitPromptForm(form) {
     }
   }
 }
+
+cancelTakeover.addEventListener("click", closeTakeoverPrompt);
+takeoverPrompt.addEventListener("click", (event) => {
+  if (event.target === takeoverPrompt) closeTakeoverPrompt();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !takeoverPrompt.hidden) closeTakeoverPrompt();
+});
+confirmTakeover.addEventListener("click", async () => {
+  const sessionId = pendingTakeoverSessionId;
+  const form = sessionId ? promptFormForSession(sessionId) : null;
+  if (!sessionId || !form) {
+    closeTakeoverPrompt();
+    showBanner("This session changed before Lume could take control.", "error");
+    return;
+  }
+  confirmTakeover.disabled = true;
+  confirmTakeover.textContent = "Taking control…";
+  await submitPromptForm(form, true);
+  if (!submittingPromptSessions.has(sessionId)) {
+    confirmTakeover.disabled = false;
+    confirmTakeover.textContent = "Take control & send";
+  }
+});
 
 function rememberPromptDraft(event) {
   const textarea = event.target.closest?.("textarea");

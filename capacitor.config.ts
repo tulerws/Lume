@@ -19,6 +19,12 @@ const config: CapacitorConfig = {
     backgroundColor: "#101713",
     contentInset: "automatic",
   },
+  plugins: {
+    LocalNotifications: {
+      smallIcon: "ic_lume_notification",
+      iconColor: "#68B887",
+    },
+  },
 };
 
 export default config;

@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Color;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -191,7 +192,8 @@ public final class UpdateCheckWorker extends Worker {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
         NotificationCompat.Builder notification = new NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_lume_notification)
+            .setColor(Color.rgb(104, 184, 135))
             .setContentTitle("Lume " + version + " is available")
             .setContentText("Tap to review and install the update.")
             .setStyle(new NotificationCompat.BigTextStyle()

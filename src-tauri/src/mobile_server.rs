@@ -1125,7 +1125,8 @@ fn route_core(
             Err(error) => return json_error(400, "invalid_command", &error.to_string()),
         };
         let required_scope = match &command.command {
-            protocol::HubCommand::SubmitPrompt { .. } => MobileScope::Prompt,
+            protocol::HubCommand::SubmitPrompt { .. }
+            | protocol::HubCommand::TakeControlSession { .. } => MobileScope::Prompt,
             protocol::HubCommand::ResolvePermission { .. } => MobileScope::Approve,
             protocol::HubCommand::ResolveQuestion { .. } => MobileScope::Prompt,
             protocol::HubCommand::TerminateSession { .. } => MobileScope::Terminate,
@@ -1961,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn monitoring_token_cannot_execute_prompts() {
+    fn monitoring_token_cannot_execute_prompts_or_take_over_sessions() {
         let state = AppState::new(Path::new(":memory:")).expect("estado");
         let gateway = MobileGateway::default();
         gateway.set_pairing_base_url("https://127.0.0.1:43122".into());
@@ -1986,6 +1987,24 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 403"));
         assert!(response.contains("scope_required"));
+
+        let takeover = route(
+            request(
+                "POST",
+                "/api/v1/commands",
+                Some(&credentials.token),
+                serde_json::json!({
+                    "requestId": "mobile-takeover-test",
+                    "type": "take_control_session",
+                    "sessionId": "codex:test",
+                    "prompt": "continue",
+                }),
+            ),
+            &state,
+            &gateway,
+        );
+        assert!(takeover.starts_with("HTTP/1.1 403"));
+        assert!(takeover.contains("scope_required"));
     }
 
     #[test]

@@ -405,11 +405,56 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 }
 .pair-dismiss-button:active { background: rgba(255, 255, 255, 0.05); }
 body.install-modal-open { overflow: hidden; }
+body.mobile-action-modal-open { overflow: hidden; }
 @keyframes install-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes install-dialog-in {
   from { opacity: 0; transform: translateY(12px) scale(0.97); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
+
+.mobile-action-prompt {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
+  display: grid;
+  place-items: center;
+  background: rgba(5, 9, 7, 0.68);
+  backdrop-filter: blur(8px);
+  animation: install-backdrop-in 160ms ease-out both;
+}
+.mobile-action-prompt[hidden] { display: none; }
+.mobile-action-dialog {
+  width: min(100%, 380px);
+  padding: 18px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  border: 1px solid rgba(104, 184, 135, 0.28);
+  border-radius: 20px;
+  background: var(--surface-raised);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
+  animation: install-dialog-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.mobile-action-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  color: #8fd0aa;
+  background: rgba(104, 184, 135, 0.12);
+}
+.mobile-action-icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.mobile-action-copy { min-width: 0; display: grid; gap: 3px; }
+.mobile-action-copy small { color: #8fd0aa; font-size: 9px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+.mobile-action-copy strong { font-size: 15px; }
+.mobile-action-dialog > p { grid-column: 1 / -1; margin: 3px 0 1px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.mobile-action-buttons { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.35fr); gap: 8px; margin-top: 5px; }
+.mobile-action-buttons button { min-height: 42px; border: 1px solid var(--line-strong); border-radius: 11px; color: var(--text-soft); background: transparent; font-size: 11px; font-weight: 780; }
+.mobile-action-buttons button.primary { border-color: transparent; color: #122018; background: #7bc297; }
+.mobile-action-buttons button:disabled { opacity: 0.65; }
 
 .screen {
   padding: 27px 16px calc(104px + env(safe-area-inset-bottom));
@@ -1281,6 +1326,19 @@ body.install-modal-open { overflow: hidden; }
 .mobile-prompt-delivery button[data-prompt-delivery="queue"].active { color: #d5a550; border-color: rgba(211, 161, 69, 0.2); background: rgba(211, 161, 69, 0.085); }
 .mobile-prompt-delivery button[data-prompt-delivery="steer"].active { color: #74bde1; border-color: rgba(76, 158, 201, 0.22); background: rgba(76, 158, 201, 0.09); }
 .mobile-prompt-delivery button.active small { color: currentColor; opacity: 0.7; }
+.mobile-takeover-hint {
+  grid-column: 1 / -1;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  color: #8fd0aa;
+}
+.mobile-takeover-hint svg { width: 16px; height: 16px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.mobile-takeover-hint span { min-width: 0; display: grid; gap: 1px; }
+.mobile-takeover-hint strong { font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.mobile-takeover-hint small { overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-pending-images { grid-column: 1 / -1; min-height: 68px; padding: 7px 8px; display: flex; align-items: center; gap: 8px; overflow-x: auto; border-bottom: 1px solid var(--line); border-radius: 11px 11px 5px 5px; background: rgba(123, 194, 151, 0.045); }
 .mobile-pending-images > small { max-width: 62px; flex: 0 0 auto; color: var(--muted); font-size: 8px; font-weight: 750; line-height: 1.25; text-transform: uppercase; }
 .mobile-pending-images > span { position: relative; width: 54px; height: 54px; flex: 0 0 auto; }

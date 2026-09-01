@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -118,7 +119,8 @@ internal class LumeAgentNotifier(context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_lume_notification)
+            .setColor(Color.rgb(104, 184, 135))
             .setContentTitle(agent)
             .setContentText(detail)
             .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
