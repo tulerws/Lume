@@ -110,7 +110,7 @@ impl SessionCapabilities {
             ) && session.control_origin == SessionControlOrigin::Lume
                 && can_interrupt_session(session),
             can_take_control: session.control_origin == SessionControlOrigin::External
-                && matches!(session.source, SessionSource::Cli | SessionSource::Vscode)
+                && session.source == SessionSource::Cli
                 && matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode)
                 && session.native_session_id.is_some()
                 && session.process_id.is_some(),
@@ -1304,7 +1304,7 @@ mod tests {
             vec![PromptDelivery::NewTurn]
         );
         external.source = SessionSource::Vscode;
-        assert!(SessionCapabilities::for_session(&external).can_take_control);
+        assert!(!SessionCapabilities::for_session(&external).can_take_control);
     }
 
     #[test]

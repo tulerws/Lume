@@ -22,7 +22,7 @@ const MAX_PROMPT_ATTACHMENTS: usize = 4;
 const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_FILE_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_PREVIEW_LENGTH: usize = 384 * 1024;
-const TAKEOVER_WRITER_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(650);
+const TAKEOVER_WRITER_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 struct PreparedPromptAttachment {
     path: String,
@@ -870,12 +870,18 @@ pub fn take_control_session(
     state: &AppState,
     bridge: &CodexBridge,
     session_id: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let session = state.connected_session(session_id)?;
     if session.control_origin == SessionControlOrigin::Lume {
-        return Ok(());
+        return Ok(session.id);
     }
-    if !matches!(session.source, SessionSource::Cli | SessionSource::Vscode) {
+    if session.source == SessionSource::Vscode {
+        return Err(
+            "Native VS Code sessions remain controlled by the extension. Open or resume the session through Lume to send prompts from Lume."
+                .into(),
+        );
+    }
+    if session.source != SessionSource::Cli {
         return Err("Only external CLI sessions can transfer control to Lume".into());
     }
     if !matches!(session.agent, AgentKind::Codex | AgentKind::ClaudeCode) {
@@ -986,7 +992,17 @@ pub fn take_control_session(
         .unwrap_or_else(|| session_id.to_string());
     state.mark_session_lume_controlled(&controlled_session_id)?;
     protocol::emit_sessions_changed(app);
-    Ok(())
+    let promptable_session_id = state
+        .sessions()?
+        .into_iter()
+        .find(|candidate| {
+            candidate.agent == session.agent
+                && candidate.control_origin == SessionControlOrigin::Lume
+                && candidate.native_session_id == session.native_session_id
+        })
+        .map(|candidate| candidate.id)
+        .unwrap_or(controlled_session_id);
+    Ok(promptable_session_id)
 }
 
 fn takeover_launch_request(

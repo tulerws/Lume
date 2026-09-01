@@ -62,7 +62,7 @@ export function sessionCapabilities(session: AgentSession): SessionCapabilities 
       && Boolean(session.nativeSessionId),
     canTakeControl:
       session.controlOrigin === "external"
-      && ["cli", "vscode"].includes(session.source)
+      && session.source === "cli"
       && ["codex", "claude_code"].includes(session.agent)
       && Boolean(session.nativeSessionId)
       && Boolean(session.processId),

@@ -408,10 +408,11 @@
     }
     if (sessions.some((session) => session.status === "failed")) return "failed";
     if (sessions.some((session) => session.status === "running")) return "running";
+    if (sessions.some((session) => session.status === "completed")) return "completed";
     if (sessions.some((session) => session.status === "waiting_for_input")) {
       return "waiting_for_input";
     }
-    return "completed";
+    return "idle";
   });
 
   onMount(() => {
@@ -688,17 +689,33 @@
   async function refreshSessions(withSound: boolean) {
     const next = await loadSessions();
     if (withSound && preferences.soundEnabled) {
-      const previous = new Map(sessions.map((session) => [session.id, session.status]));
+      const soundKey = (session: AgentSession) =>
+        session.nativeSessionId
+          ? `${session.agent}:${session.nativeSessionId}`
+          : session.id;
+      const previous = new Map(sessions.map((session) => [soundKey(session), session.status]));
+      const played = new Set<string>();
       for (const session of next) {
         if (!projectSoundEnabled(session)) continue;
-        const previousStatus = previous.get(session.id);
+        const key = soundKey(session);
+        const previousStatus = previous.get(key);
         if (previousStatus === session.status) continue;
-        if (session.status === "permission_required") playTone("permission");
+        if (session.status === "permission_required" && !played.has(`permission:${key}`)) {
+          played.add(`permission:${key}`);
+          playTone("permission");
+        }
         if (
           session.status === "completed" &&
-          (previousStatus === "running" || previousStatus === "permission_required")
-        ) playTone("completed");
-        if (session.status === "failed" && previousStatus) playTone("failed");
+          (previousStatus === "running" || previousStatus === "permission_required") &&
+          !played.has(`completed:${key}`)
+        ) {
+          played.add(`completed:${key}`);
+          playTone("completed");
+        }
+        if (session.status === "failed" && previousStatus && !played.has(`failed:${key}`)) {
+          played.add(`failed:${key}`);
+          playTone("failed");
+        }
       }
     }
     sessions = next;
@@ -3157,6 +3174,12 @@
                     <BrandIcon name={sourceIcon(session)} size={session.source === "web" ? 11 : 9} />
                     {sourceLabel(session)}
                   </span>
+                  {#if session.controlOrigin === "external"}
+                    <span class="access-badge external-session" title={tr("External session", "Sessão externa")}>
+                      <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.2 2.5H2.3v7.2h7.2V7.8M6.3 2.3h3.4v3.4M9.7 2.3 5.4 6.6" /></svg>
+                      {tr("External", "Externa")}
+                    </span>
+                  {/if}
                   <button
                     disabled={openingTerminal !== null || terminalIsOpen(session)}
                     type="button"
@@ -4292,6 +4315,7 @@
   .access-badge.auto-review { color: #315f86; background: #cbdff0; }
   .access-badge.auto-review svg { fill: currentColor; stroke: none; }
   .access-badge.full-access { color: #764c2e; background: #e8ceb1; }
+  .access-badge.external-session { color: #405d50; background: #c7d6ca; }
   .project-name { overflow: hidden; color: #56645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
   .status-line { display: flex; align-items: center; gap: 5px; color: #7a8580; font-size: 10px; }
@@ -4974,6 +4998,7 @@
   .overlay-shell.dark .source-label { color: #9daca5; background: rgba(205, 222, 213, 0.08); }
   .overlay-shell.dark .access-badge.auto-review { color: #b4d3ee; background: #29445d; }
   .overlay-shell.dark .access-badge.full-access { color: #e4b88f; background: #543b29; }
+  .overlay-shell.dark .access-badge.external-session { color: #c3d1c9; background: #35473e; }
   .overlay-shell.dark .terminal-picker-row,
   .overlay-shell.dark .workflow-missing-sessions { border-color: rgba(190, 209, 200, 0.09); }
   .overlay-shell.dark .terminal-picker-row > button { color: #b7c4be; border-color: rgba(207, 223, 215, 0.12); background: rgba(222, 233, 228, 0.04); }

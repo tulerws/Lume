@@ -2786,18 +2786,21 @@
 
   async function confirmTakeover() {
     if (!session || !capabilities?.canTakeControl || takingControl) return;
+    const pendingPrompt = prompt.trim();
+    const pendingAttachments = [...promptAttachments];
     takingControl = true;
     message = null;
     try {
-      await takeControlSession(session.id);
+      await takeControlSession(session.id, pendingPrompt, pendingAttachments);
       takeoverConfirm = false;
+      if (prompt.trim() === pendingPrompt) prompt = "";
+      promptAttachments = [];
       await refresh();
-      await tick();
-      await sendPrompt();
     } catch (error) {
       message = String(error).replace(/^Error:\s*/, "");
       await refresh().catch(() => undefined);
     } finally {
+      sending = false;
       takingControl = false;
     }
   }

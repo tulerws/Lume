@@ -547,29 +547,58 @@ impl AppState {
     }
 
     pub fn mark_session_lume_controlled(&self, session_id: &str) -> Result<(), String> {
-        let mut sessions = self
-            .sessions
+        let snapshots = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "Could not transfer control of this session".to_string())?;
+            let target = sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| "Session not found".to_string())?;
+            let matching_ids = sessions
+                .iter()
+                .filter(|session| {
+                    session.id == session_id
+                        || target.native_session_id.as_ref().is_some_and(|native_id| {
+                            session.agent == target.agent
+                                && session.native_session_id.as_ref() == Some(native_id)
+                        })
+                })
+                .map(|session| session.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let mut snapshots = Vec::new();
+            for session in sessions
+                .iter_mut()
+                .filter(|session| matching_ids.contains(&session.id))
+            {
+                session.control_origin = SessionControlOrigin::Lume;
+                session.source = SessionSource::Cli;
+                session.source_app = None;
+                session.process_id = None;
+                session.status = SessionStatus::WaitingForInput;
+                session.status_label = "Ready in Lume".into();
+                session.pending_permission = None;
+                session.pending_question = None;
+                session.permission_profile.can_respond_from_lume = true;
+                session.permission_profile.available_actions = vec![
+                    PermissionAction::AllowOnce,
+                    PermissionAction::AllowSession,
+                    PermissionAction::Deny,
+                ];
+                session.updated_at = now_millis();
+                snapshots.push(session.clone());
+            }
+            snapshots
+        };
+        let store = self
+            .store
             .lock()
-            .map_err(|_| "Could not transfer control of this session".to_string())?;
-        let session = sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| "Session not found".to_string())?;
-        session.control_origin = SessionControlOrigin::Lume;
-        session.source = SessionSource::Cli;
-        session.source_app = None;
-        session.process_id = None;
-        session.status = SessionStatus::WaitingForInput;
-        session.status_label = "Ready in Lume".into();
-        session.pending_permission = None;
-        session.pending_question = None;
-        session.permission_profile.can_respond_from_lume = true;
-        session.permission_profile.available_actions = vec![
-            PermissionAction::AllowOnce,
-            PermissionAction::AllowSession,
-            PermissionAction::Deny,
-        ];
-        session.updated_at = now_millis();
+            .map_err(|_| "Could not save the transferred session".to_string())?;
+        for snapshot in snapshots {
+            store.save_session(&snapshot)?;
+        }
         Ok(())
     }
 
@@ -3746,6 +3775,32 @@ mod tests {
         assert_eq!(session.status, SessionStatus::WaitingForInput);
         assert!(session.process_id.is_none());
         assert!(session.permission_profile.can_respond_from_lume);
+    }
+
+    #[test]
+    fn transfer_marks_every_alias_of_the_same_native_thread_as_controlled() {
+        let state = AppState::new(Path::new(":memory:")).expect("estado");
+        let mut event = started_event("codex:external", 4242);
+        event.agent = AgentKind::Codex;
+        event.native_session_id = Some("thread-shared".into());
+        state.ingest(event).expect("sessão externa");
+
+        let mut alias = state.sessions().expect("sessões").remove(0);
+        alias.id = "process:codex:5252".into();
+        alias.process_id = Some(5252);
+        state.sessions.lock().expect("sessões").push(alias);
+
+        state
+            .mark_session_lume_controlled("codex:external")
+            .expect("transferência");
+
+        let sessions = state.connected_sessions().expect("sessões");
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| {
+            session.control_origin == SessionControlOrigin::Lume
+                && session.process_id.is_none()
+                && session.permission_profile.can_respond_from_lume
+        }));
     }
 
     #[test]

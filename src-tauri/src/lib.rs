@@ -453,12 +453,33 @@ async fn take_control_session(
     app: AppHandle,
     state: State<'_, AppState>,
     bridge: State<'_, codex_bridge::CodexBridge>,
+    browser: State<'_, browser_server::BrowserControl>,
     session_id: String,
+    prompt: Option<String>,
+    attachments: Option<Vec<PromptAttachmentInput>>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let bridge = bridge.inner().clone();
+    let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        control::take_control_session(&app, &state, &bridge, &session_id)
+        let controlled_session_id =
+            control::take_control_session(&app, &state, &bridge, &session_id)?;
+        let prompt = prompt.unwrap_or_default();
+        let attachments = attachments.unwrap_or_default();
+        if !prompt.trim().is_empty() || !attachments.is_empty() {
+            control::submit_prompt(
+                &app,
+                &state,
+                &bridge,
+                &browser,
+                &controlled_session_id,
+                &prompt,
+                attachments,
+                PromptDelivery::NewTurn,
+                true,
+            )?;
+        }
+        Ok(())
     })
     .await
     .map_err(|error| format!("Could not complete the session takeover task: {error}"))?

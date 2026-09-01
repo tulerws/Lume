@@ -483,12 +483,23 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
                 .trim_matches(['"', '\''])
         })
         .collect::<Vec<_>>();
-    if name == "codex" || tokens.iter().any(|token| token == &"codex") {
+    let executable_matches = |candidate: &str| {
+        name == candidate
+            || name.strip_suffix(".exe") == Some(candidate)
+            || name.strip_suffix(".cmd") == Some(candidate)
+            || name.strip_suffix(".bat") == Some(candidate)
+            || tokens.iter().any(|token| {
+                *token == candidate
+                    || token.strip_suffix(".exe") == Some(candidate)
+                    || token.strip_suffix(".cmd") == Some(candidate)
+                    || token.strip_suffix(".bat") == Some(candidate)
+            })
+    };
+    if executable_matches("codex") {
         Some(AgentKind::Codex)
     } else if is_claude_infrastructure(&tokens) {
         None
-    } else if name == "claude"
-        || tokens.iter().any(|token| token == &"claude")
+    } else if executable_matches("claude")
         || raw_tokens
             .first()
             .is_some_and(|executable| is_versioned_claude_executable(executable))
@@ -506,7 +517,7 @@ fn detect_agent(name: &str, command: &str) -> Option<AgentKind> {
             .any(|token| matches!(*token, "dsh" | "dsh.exe"))
     {
         Some(AgentKind::DeepSeek)
-    } else if name == "gemini" || tokens.iter().any(|token| token == &"gemini") {
+    } else if executable_matches("gemini") {
         Some(AgentKind::Gemini)
     } else {
         None
@@ -834,6 +845,22 @@ mod tests {
         assert_eq!(
             detect_agent("codex", "codex --remote ws://127.0.0.1:43131 resume chat"),
             Some(AgentKind::Codex)
+        );
+    }
+
+    #[test]
+    fn windows_agent_executables_are_detected_before_the_first_prompt() {
+        assert_eq!(
+            detect_agent("codex.exe", r#"C:\Users\dev\.local\bin\codex.exe"#),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            detect_agent("claude.exe", r#"C:\Users\dev\bin\claude.exe"#),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(
+            detect_agent("node.exe", r#"C:\Users\dev\bin\gemini.cmd"#),
+            Some(AgentKind::Gemini)
         );
     }
 

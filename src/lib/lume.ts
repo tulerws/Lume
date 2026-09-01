@@ -204,8 +204,12 @@ export async function terminateSession(sessionId: string): Promise<void> {
   await invoke("terminate_session", { sessionId });
 }
 
-export async function takeControlSession(sessionId: string): Promise<void> {
-  await invoke("take_control_session", { sessionId });
+export async function takeControlSession(
+  sessionId: string,
+  prompt = "",
+  attachments: PromptAttachmentInput[] = [],
+): Promise<void> {
+  await invoke("take_control_session", { sessionId, prompt, attachments });
 }
 
 export async function interruptPrompt(sessionId: string): Promise<void> {
